@@ -40,7 +40,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    run(arena, io, out, in, cli) catch |err| {
+    // Persistence (M2). Best-effort: if the DB can't be opened we note it once
+    // and run without history/resume rather than refusing to play anything.
+    var store_opt: ?zigoku.Store = openStore(arena) catch |err| blk: {
+        try out.print("  (note: persistence off — {s})\n", .{@errorName(err)});
+        break :blk null;
+    };
+    defer if (store_opt) |*st| st.close();
+
+    run(arena, io, out, in, cli, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err);
         try out.flush();
         std.process.exit(1);
@@ -48,13 +56,21 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 }
 
-/// The whole vertical slice, top to bottom.
-fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli) !void {
+/// Open the on-disk store at its XDG default location.
+fn openStore(arena: std.mem.Allocator) !zigoku.Store {
+    const path = try zigoku.store.defaultDbPath(arena);
+    return zigoku.Store.open(path);
+}
+
+/// The whole vertical slice, top to bottom. `store` is optional — every
+/// persistence touch is best-effort so a DB hiccup never blocks playback.
+fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, store: ?*zigoku.Store) !void {
     try zigoku.writeBanner(out);
     if (!std.mem.eql(u8, cli.quality, "best")) {
         try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
     }
 
+    const SOURCE = zigoku.AllAnime.source_name;
     var allanime = zigoku.AllAnime.init();
     const provider = allanime.provider();
 
@@ -80,11 +96,12 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     };
     const show = results[show_idx];
 
-    // 2. Episodes.
-    try out.print("\n→ fetching episodes for \"{s}\"…\n", .{show.name});
-    try out.flush();
+    // ROD-66: remember this show. Refreshes source metadata, preserves any
+    // existing history (play_count/progress/status).
+    if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs()) catch {};
 
-    const eps = try provider.episodes(arena, io, show.id, cli.translation);
+    // 2. Episodes — ROD-68: serve from cache when warm, else fetch + cache.
+    const eps = try loadEpisodes(arena, io, out, provider, store, SOURCE, show, cli.translation);
     if (eps.len == 0) {
         try out.print("\n  no {s} episodes listed for this show.\n", .{cli.translation.str()});
         return;
@@ -101,6 +118,15 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     };
     const episode = eps[ep_idx];
 
+    // ROD-69 (read side): start where the viewer left off, if anywhere.
+    var start_seconds: u64 = 0;
+    if (store) |st| {
+        if (st.getResume(SOURCE, show.id, cli.translation, episode.raw) catch null) |r| {
+            start_seconds = r.startSeconds();
+            if (start_seconds > 0) try out.print("  ↺ resuming at {d}s\n", .{start_seconds});
+        }
+    }
+
     // 3. Resolve.
     try out.print("\n→ resolving ep {s} ({s})…\n", .{ episode.raw, cli.translation.str() });
     try out.flush();
@@ -114,8 +140,44 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     try out.print("  ▶ launching mpv…\n", .{});
     try out.flush();
 
-    try zigoku.player.play(arena, io, link, title, 0);
+    try zigoku.player.play(arena, io, link, title, start_seconds);
+
+    // ROD-69 (write side): record the play at episode granularity. Sub-second
+    // position write lands when M5's mpv IPC feeds saveProgress real numbers;
+    // the read path above is already wired to consume it.
+    if (store) |st| st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+
     try out.print("\n✓ done. That was Zigoku, end to end.\n", .{});
+}
+
+/// Episode list for a show: cache-first (ROD-68), falling back to a live fetch
+/// that then warms the cache. All store access is best-effort.
+fn loadEpisodes(
+    arena: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    provider: zigoku.SourceProvider,
+    store: ?*zigoku.Store,
+    source: []const u8,
+    show: zigoku.Anime,
+    tt: zigoku.Translation,
+) ![]zigoku.EpisodeNumber {
+    if (store) |st| {
+        if (st.getCachedEpisodes(arena, source, show.id, tt, zigoku.Store.nowSecs()) catch null) |cached| {
+            try out.print("\n→ episodes for \"{s}\" (cached)\n", .{show.name});
+            return cached;
+        }
+    }
+
+    try out.print("\n→ fetching episodes for \"{s}\"…\n", .{show.name});
+    try out.flush();
+    const fetched = try provider.episodes(arena, io, show.id, tt);
+
+    if (store) |st| {
+        if (fetched.len > 0)
+            st.putCachedEpisodes(source, show.id, tt, fetched, show.status, zigoku.Store.nowSecs(), arena) catch {};
+    }
+    return fetched;
 }
 
 /// Prompt, read a line, parse a 1-based choice in [1, max]. Returns the 0-based

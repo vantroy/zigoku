@@ -3,7 +3,8 @@
 //! Everything the app does lives behind this module: `main.zig` imports it as
 //! `@import("zigoku")`. As of M1 the vertical slice is real — domain types, the
 //! `SourceProvider` seam, the AllAnime provider behind it, and the mpv launcher
-//! all hang off here. The SQLite store and the TUI join them in M2/M3.
+//! all hang off here. M2 adds the SQLite `Store` (history/resume/cache); the TUI
+//! joins them in M3.
 
 const std = @import("std");
 
@@ -11,6 +12,11 @@ const std = @import("std");
 pub const domain = @import("domain.zig");
 pub const source = @import("source.zig");
 pub const player = @import("player.zig");
+pub const store = @import("store.zig");
+
+/// Persistence (M2): watch history, episode resume positions, episode-list cache.
+pub const Store = store.Store;
+pub const AnimeRecord = store.AnimeRecord;
 
 /// The provider seam and its first implementation.
 pub const SourceProvider = source.SourceProvider;
@@ -48,5 +54,6 @@ test {
     _ = domain;
     _ = source;
     _ = player;
+    _ = store;
     _ = @import("providers/allanime.zig");
 }

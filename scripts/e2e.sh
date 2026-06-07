@@ -30,8 +30,13 @@ MPV_FAKE="$MPV_DIR/mpv"
 MPV_LOG="$MPV_DIR/mpv.log"
 export MPV_STUB_LOG="$MPV_LOG"   # stub reads this at runtime to know where to write
 
-# Ensure the temp dir is cleaned up regardless of exit path.
-cleanup() { rm -rf "$MPV_DIR"; }
+# Isolated XDG data home so the M2 store writes to a throwaway DB, never the
+# user's real ~/.local/share/zigoku. zigoku resolves the DB under here.
+DATA_DIR="$(mktemp -d)"
+DB_PATH="$DATA_DIR/zigoku/zigoku.db"
+
+# Ensure the temp dirs are cleaned up regardless of exit path.
+cleanup() { rm -rf "$MPV_DIR" "$DATA_DIR"; }
 trap cleanup EXIT
 
 # How long to wait for any network-dependent invocation before timing out.
@@ -156,7 +161,8 @@ run_zigoku() {
     local input="$1"; shift
     rm -f "$MPV_LOG"
     # Prepend $MPV_DIR so "mpv" resolves to our stub, not the system binary.
-    PATH="$MPV_DIR:$PATH" \
+    # XDG_DATA_HOME points the M2 store at the throwaway DB.
+    PATH="$MPV_DIR:$PATH" XDG_DATA_HOME="$DATA_DIR" \
         timeout "$TIMEOUT_SEC" "$BINARY" "$@" <<< "$input" 2>&1 || true
 }
 
@@ -262,7 +268,9 @@ if [ "$NETWORK" = true ]; then
     out=$(run_zigoku $'abc\n999\n1\nq\n' frieren)
     assert_contains     "reprompt: error on non-number"      "$out" "enter a number"
     assert_contains     "reprompt: error on out-of-range"    "$out" "out of range"
-    assert_contains     "reprompt: reached episode prompt"   "$out" "fetching episodes"
+    # Cache-agnostic: the episode list header appears whether episodes came from
+    # a live fetch or the M2 cache (a prior scenario may have warmed it).
+    assert_contains     "reprompt: reached episode prompt"   "$out" "pick an episode"
     assert_not_contains "reprompt: mpv NOT launched"         "$out" "launching mpv"
 else
     skip "scenario 4: network unavailable"
@@ -315,6 +323,65 @@ if [ "$NETWORK" = true ]; then
     fi
 else
     skip "scenario 6: network unavailable"
+fi
+
+echo ""
+
+# ── Scenario 7: M2 persistence — play writes history + warms the cache ────────
+#
+# Drives a full play with a clean DB, then inspects the SQLite store directly:
+# the anime row must record the play, and the episode list must be cached.
+
+echo "── scenario 7: M2 persistence (history + cache written) ──────────────────"
+echo ""
+
+if [ "$NETWORK" = true ] && command -v sqlite3 >/dev/null 2>&1; then
+    rm -rf "$DATA_DIR"/*           # clean slate so assertions are unambiguous
+    out=$(run_zigoku $'1\n1\n' frieren)
+
+    if echo "$out" | grep -q "stream resolved"; then
+        assert_file_nonempty "DB created at XDG path" "$DB_PATH"
+
+        ver=$(sqlite3 "$DB_PATH" "PRAGMA user_version;" 2>/dev/null || echo "?")
+        [ "$ver" = "1" ] && pass "schema migrated to v1" || fail "schema user_version=$ver (expected 1)"
+
+        plays=$(sqlite3 "$DB_PATH" "SELECT play_count FROM anime LIMIT 1;" 2>/dev/null || echo 0)
+        [ "${plays:-0}" -ge 1 ] && pass "play recorded (play_count=$plays)" || fail "play_count=$plays (expected >=1)"
+
+        watched=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM anime WHERE last_watched_at IS NOT NULL;" 2>/dev/null || echo 0)
+        [ "${watched:-0}" -ge 1 ] && pass "last_watched_at stamped" || fail "last_watched_at not set"
+
+        cached=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM episode_cache WHERE length(episodes_blob)>0;" 2>/dev/null || echo 0)
+        [ "${cached:-0}" -ge 1 ] && pass "episode list cached" || fail "episode_cache empty"
+    else
+        skip "scenario 7: episode had no direct stream (ROD-92) — can't assert play write"
+    fi
+elif [ "$NETWORK" != true ]; then
+    skip "scenario 7: network unavailable"
+else
+    skip "scenario 7: sqlite3 CLI not installed"
+fi
+
+echo ""
+
+# ── Scenario 8: episode-list cache hit on a second run ────────────────────────
+#
+# Relies on scenario 7 having warmed the cache for the same show. A second run
+# must serve episodes from the store ("(cached)") instead of re-fetching.
+
+echo "── scenario 8: episode cache hit on re-run ───────────────────────────────"
+echo ""
+
+if [ "$NETWORK" = true ] && command -v sqlite3 >/dev/null 2>&1; then
+    if [ -s "$DB_PATH" ]; then
+        out=$(run_zigoku $'1\nq\n' frieren)
+        assert_contains     "second run serves cached episodes" "$out" "(cached)"
+        assert_not_contains "second run did NOT re-fetch"        "$out" "fetching episodes"
+    else
+        skip "scenario 8: no warm DB from scenario 7"
+    fi
+else
+    skip "scenario 8: network or sqlite3 unavailable"
 fi
 
 echo ""

@@ -39,7 +39,12 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        // M2 persistence (src/store.zig) talks to libsqlite3 via raw C interop,
+        // so the whole library module links libc + system sqlite3. The exe and
+        // test executables that include this module inherit the linkage.
+        .link_libc = true,
     });
+    mod.linkSystemLibrary("sqlite3", .{});
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function

@@ -48,6 +48,10 @@ const EXT_VIDEO = extJson(HASH_VIDEO);
 /// Provider state. Stateless today, but the struct gives the vtable a real
 /// `self` and a home for future config (debug logging, timeouts — ROD-92).
 pub const AllAnime = struct {
+    /// Stable identity for this source. The persistence layer keys history,
+    /// resume, and cache rows on `(source_name, show_id)` — see store.zig.
+    pub const source_name = "allanime";
+
     pub fn init() AllAnime {
         return .{};
     }
