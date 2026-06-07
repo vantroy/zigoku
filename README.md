@@ -24,6 +24,10 @@ zig build test           # run tests
 
 Requires Zig **0.16.0**. Playback will require `mpv` on `PATH`.
 
+The foundation was built as five isolated spikes (HTTP, SQLite/C-interop,
+concurrency, the AllAnime resolver, mpv playback). **[SPIKES.md](SPIKES.md)** is
+a guided, annotated tour through them — doubling as a Zig 0.16 crash course.
+
 ## Stack
 
 - **TUI:** libvaxis (Kitty graphics)
