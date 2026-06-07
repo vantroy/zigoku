@@ -148,6 +148,21 @@ pub fn build(b: *std.Build) void {
     const spike_stream_step = b.step("spike-stream", "ROD-62: AllAnime stream resolver spike");
     spike_stream_step.dependOn(&run_spike_stream.step);
 
+    // spike-mpv: full pipeline → play in mpv (ROD-57). Args after the query
+    // pass through to mpv (e.g. `-- frieren --frames=1 --vo=null` for a probe).
+    const spike_mpv = b.addExecutable(.{
+        .name = "spike-mpv",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/mpv_play.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_mpv = b.addRunArtifact(spike_mpv);
+    if (b.args) |args| run_spike_mpv.addArgs(args);
+    const spike_mpv_step = b.step("spike-mpv", "ROD-57: full pipeline → play in mpv");
+    spike_mpv_step.dependOn(&run_spike_mpv.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
