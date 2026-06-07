@@ -4,6 +4,9 @@
 //! mpv via std.process.spawn. This is the whole point of the project running in
 //! one command.
 //!
+//! The AllAnime resolution recipe was learned from anipy-cli (GPL-3.0):
+//! https://github.com/sdaqo/anipy-cli — reimplemented in Zig, no code copied.
+//!
 //!   zig build spike-mpv                       # play Frieren ep1 in an mpv window
 //!   zig build spike-mpv -- "bocchi"           # play something else
 //!   zig build spike-mpv -- frieren --frames=1 --vo=null --no-audio   # headless probe

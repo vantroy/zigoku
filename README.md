@@ -31,6 +31,16 @@ Requires Zig **0.16.0**. Playback will require `mpv` on `PATH`.
 - **Concurrency:** thread pool + channels
 - **Source:** AllAnime, behind a swappable `SourceProvider` interface
 
+## Acknowledgements
+
+- **[anipy-cli](https://github.com/sdaqo/anipy-cli)** by [sdaqo](https://github.com/sdaqo) (GPL-3.0) — showed us the way on AllAnime streaming when every other source had gone dark. The working recipe (POST instead of GET, Apollo persisted-query hashes, and the AES-256-GCM `tobeparsed` scheme) was learned by studying its `allanime_provider.py`. Zigoku reimplements the wire protocol in Zig from observed behavior — no code is copied — but the trail was theirs. Thank you. 🙏
+- **[ani-nexus-tui](https://github.com/OsamuDazai666/ani-nexus-tui)** (CC BY-NC-SA 4.0) — studied for feature/UX inspiration.
+- Catalog metadata & cover art from **[AniList](https://anilist.co/)**.
+
 ## License
 
-TBD.
+TBD. Note for whoever decides: our reference tool **anipy-cli is GPL-3.0**. We
+reimplemented the AllAnime *protocol* (facts/interop, not copyrightable
+expression) rather than copying code, so a permissive license is defensible —
+but if you want zero ambiguity, GPL-3.0 is the conservative choice. Not legal
+advice; make the call with eyes open.

@@ -8,6 +8,12 @@
 //!   3. base64 + AES-256-GCM decrypt the `tobeparsed` payload
 //!   4. pull the direct tools.fast4speed.rsvp 1080p URL out of sourceUrls
 //!
+//! Credit: the POST-not-GET insight, the Apollo persisted-query hashes, and the
+//! AES-256-GCM `tobeparsed` scheme were all learned by studying anipy-cli
+//! (GPL-3.0) — https://github.com/sdaqo/anipy-cli — specifically
+//! api/src/anipy_api/provider/providers/allanime_provider.py. Reimplemented in
+//! Zig from the observed protocol; no code was copied.
+//!
 //! Run: `zig build spike-stream -- frieren`
 
 const std = @import("std");
