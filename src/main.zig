@@ -1,34 +1,207 @@
-//! Zigoku — CLI entry point.
+//! Zigoku — CLI entry point (ROD-64).
 //!
-//! Thin shell for now: prints the banner and echoes the query. The real
-//! search → resolve → play pipeline lands in M1 (ROD-59..64).
+//! The first runnable Zigoku and the close of the M1 vertical slice:
+//!
+//!     zigoku <query> [--dub] [--quality best|1080|720|480|worst]
+//!
+//! → search → pick a show → pick an episode → resolve → play in mpv.
+//!
+//! The TUI (libvaxis) replaces this prompt-driven flow in M3; this CLI stays as
+//! the scriptable / headless path.
 
 const std = @import("std");
 const Io = std.Io;
-
 const zigoku = @import("zigoku");
 
+const Cli = struct {
+    query: []const u8,
+    translation: zigoku.Translation = .sub,
+    /// Parsed but not yet honoured — quality select needs the full resolver
+    /// (m3u8 variants), which is ROD-92. fast4speed is 1080p direct for now.
+    quality: []const u8 = "best",
+};
+
 pub fn main(init: std.process.Init) !void {
-    const arena: std.mem.Allocator = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const arena = init.arena.allocator();
     const io = init.io;
+    const args = try init.minimal.args.toSlice(arena);
 
-    var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout = &stdout_file_writer.interface;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
+    const out = &stdout_fw.interface;
 
-    try zigoku.writeBanner(stdout);
+    var stdin_buf: [256]u8 = undefined;
+    var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
+    const in = &stdin_fr.interface;
 
-    if (args.len > 1) {
-        try stdout.writeAll("\n  query: ");
-        for (args[1..], 0..) |a, i| {
-            if (i != 0) try stdout.writeByte(' ');
-            try stdout.writeAll(a);
-        }
-        try stdout.writeAll("\n  (search lands in M1 — nothing to play yet)\n");
-    } else {
-        try stdout.writeAll("\n  usage: zigoku <query>\n");
+    const cli = parseArgs(arena, args) catch {
+        try usage(out);
+        try out.flush();
+        return;
+    };
+
+    run(arena, io, out, in, cli) catch |err| {
+        try reportError(out, err);
+        try out.flush();
+        std.process.exit(1);
+    };
+    try out.flush();
+}
+
+/// The whole vertical slice, top to bottom.
+fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli) !void {
+    try zigoku.writeBanner(out);
+    if (!std.mem.eql(u8, cli.quality, "best")) {
+        try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
     }
 
-    try stdout.flush();
+    var allanime = zigoku.AllAnime.init();
+    const provider = allanime.provider();
+
+    // 1. Search.
+    try out.print("\n→ searching AllAnime for \"{s}\" ({s})…\n", .{ cli.query, cli.translation.str() });
+    try out.flush();
+
+    const results = try provider.search(arena, io, cli.query, .{ .translation = cli.translation, .limit = 20 });
+    if (results.len == 0) {
+        try out.print("\n  no results for \"{s}\". Try a different spelling or romaji.\n", .{cli.query});
+        return;
+    }
+
+    try out.print("\n  {d} results:\n\n", .{results.len});
+    for (results, 0..) |a, i| {
+        const eps = a.episodeCount(cli.translation);
+        try out.print("  {d:>2}. {s}  ·  {d} {s} eps\n", .{ i + 1, a.name, eps, cli.translation.str() });
+    }
+
+    const show_idx = (try promptChoice(out, in, "\n  pick a show # (q to quit): ", results.len)) orelse {
+        try out.writeAll("\n  bye.\n");
+        return;
+    };
+    const show = results[show_idx];
+
+    // 2. Episodes.
+    try out.print("\n→ fetching episodes for \"{s}\"…\n", .{show.name});
+    try out.flush();
+
+    const eps = try provider.episodes(arena, io, show.id, cli.translation);
+    if (eps.len == 0) {
+        try out.print("\n  no {s} episodes listed for this show.\n", .{cli.translation.str()});
+        return;
+    }
+
+    try out.print("\n  {d} episodes:\n\n", .{eps.len});
+    for (eps, 0..) |e, i| {
+        try out.print("  {d:>3}. ep {s}\n", .{ i + 1, e.raw });
+    }
+
+    const ep_idx = (try promptChoice(out, in, "\n  pick an episode # (q to quit): ", eps.len)) orelse {
+        try out.writeAll("\n  bye.\n");
+        return;
+    };
+    const episode = eps[ep_idx];
+
+    // 3. Resolve.
+    try out.print("\n→ resolving ep {s} ({s})…\n", .{ episode.raw, cli.translation.str() });
+    try out.flush();
+
+    const link = try provider.resolve(arena, io, show.id, episode, cli.translation);
+    const res_str = if (link.resolution) |r| r else 0;
+    try out.print("  ✓ stream resolved ({d}p)\n", .{res_str});
+
+    // 4. Play.
+    const title = try std.fmt.allocPrint(arena, "{s} — ep {s}", .{ show.name, episode.raw });
+    try out.print("  ▶ launching mpv…\n", .{});
+    try out.flush();
+
+    try zigoku.player.play(arena, io, link, title, 0);
+    try out.print("\n✓ done. That was Zigoku, end to end.\n", .{});
+}
+
+/// Prompt, read a line, parse a 1-based choice in [1, max]. Returns the 0-based
+/// index, or null if the user quits (q / empty EOF / Ctrl-D). Re-prompts on
+/// garbage instead of bailing.
+fn promptChoice(out: *Io.Writer, in: *Io.Reader, prompt: []const u8, max: usize) !?usize {
+    while (true) {
+        try out.writeAll(prompt);
+        try out.flush();
+
+        // Inclusive: consumes the trailing '\n' too. The exclusive variant
+        // leaves the delimiter in the buffer → next read returns "" forever.
+        const line = in.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => return null, // Ctrl-D / no trailing newline at EOF
+            error.StreamTooLong => return null, // absurd input; treat as quit
+            else => return err,
+        };
+        const t = std.mem.trim(u8, line, " \t\r\n");
+        if (t.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(t, "q")) return null;
+
+        const n = std.fmt.parseInt(usize, t, 10) catch {
+            try out.print("  ? enter a number 1–{d} (or q)\n", .{max});
+            continue;
+        };
+        if (n < 1 or n > max) {
+            try out.print("  ? out of range — pick 1–{d}\n", .{max});
+            continue;
+        }
+        return n - 1;
+    }
+}
+
+/// Parse `<query words…>` plus flags. Errors (→ usage) only when no query given.
+fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
+    var words: std.ArrayList([]const u8) = .empty;
+    var cli: Cli = .{ .query = "" };
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--dub")) {
+            cli.translation = .dub;
+        } else if (std.mem.eql(u8, a, "--sub")) {
+            cli.translation = .sub;
+        } else if (std.mem.eql(u8, a, "--quality")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            cli.quality = args[i];
+        } else if (std.mem.startsWith(u8, a, "--quality=")) {
+            cli.quality = a["--quality=".len..];
+        } else if (std.mem.startsWith(u8, a, "--")) {
+            return error.UnknownFlag;
+        } else {
+            try words.append(arena, a);
+        }
+    }
+
+    if (words.items.len == 0) return error.NoQuery;
+    cli.query = try std.mem.join(arena, " ", words.items);
+    return cli;
+}
+
+fn usage(out: *Io.Writer) !void {
+    try zigoku.writeBanner(out);
+    try out.writeAll(
+        \\
+        \\  usage: zigoku <query> [--dub] [--quality best|1080|720|480|worst]
+        \\
+        \\    zigoku frieren
+        \\    zigoku "cowboy bebop" --dub
+        \\
+    );
+}
+
+/// Turn an error into a human line instead of a Zig stack trace.
+fn reportError(out: *Io.Writer, err: anyerror) !void {
+    const msg: []const u8 = switch (err) {
+        error.MpvNotFound => "mpv isn't on your PATH. Install mpv and try again.",
+        error.MpvFailed => "mpv exited badly (closed early, or couldn't play the stream).",
+        error.NoDirectStream => "found the episode, but it only offers providers we can't resolve yet (the direct fast4speed link wasn't there). That's the ROD-92 follow-up — try another show/episode for now.",
+        error.NoResults, error.NoSearchData => "AllAnime returned nothing for that search.",
+        error.ShowNotFound, error.NoEpisodeData => "AllAnime had no episode data for that show.",
+        error.NotEncrypted => "AllAnime returned an unexpected (unencrypted) video payload — the protocol may have shifted.",
+        error.HttpNotOk => "AllAnime rejected the request (HTTP error). The site may be down, or the recipe drifted.",
+        else => @errorName(err),
+    };
+    try out.print("\n✗ {s}\n", .{msg});
 }
