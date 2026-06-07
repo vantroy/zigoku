@@ -30,6 +30,9 @@ pub fn play(
     try argv.append(arena, "mpv");
     try argv.append(arena, link.url);
     if (link.referer) |r| {
+        // Safe today: referer is a hardcoded constant. When ROD-92 lands and
+        // providers supply their own referer from API data, validate it (no
+        // CR/LF, no header injection) before embedding it in this arg.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));

@@ -90,6 +90,9 @@ pub const AllAnime = struct {
         _ = self;
         // For search, `variables` is a plain object (not stringified — that's the
         // quirk that differs per persisted op). Only the query needs escaping.
+        // We ask AllAnime for 26 candidates (its own page size) regardless of
+        // opts.limit, so the ranking comparator has a full pool to reorder before
+        // we trim to opts.limit below.
         const q = try jsonEscape(arena, query);
         const body = try std.fmt.allocPrint(
             arena,
@@ -129,8 +132,11 @@ pub const AllAnime = struct {
 
     pub fn episodes(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) ![]domain.EpisodeNumber {
         _ = self;
-        // Here `variables` IS a stringified JSON value: `"{\"_id\":\"...\"}"`.
-        const inner = try std.fmt.allocPrint(arena, "{{\"_id\":\"{s}\"}}", .{show_id});
+        // `variables` IS a stringified JSON value. The escaping happens twice on
+        // purpose: `episodesInner` escapes the id at the *inner* JSON level so it
+        // stays valid even with a stray `"`, then we escape the whole thing again
+        // for the *outer* string layer.
+        const inner = try episodesInner(arena, show_id);
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"variables\":\"{s}\",\"extensions\":\"{s}\"}}",
@@ -161,11 +167,10 @@ pub const AllAnime = struct {
 
     pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation) !domain.StreamLink {
         _ = self;
-        const inner = try std.fmt.allocPrint(
-            arena,
-            "{{\"showId\":\"{s}\",\"translationType\":\"{s}\",\"episodeString\":\"{s}\"}}",
-            .{ show_id, tt.str(), ep.raw },
-        );
+        // Same two-level escaping as episodes(): `videoInner` escapes show_id and
+        // the episode label at the inner JSON level, then jsonEscape wraps the
+        // whole inner object for the outer string layer.
+        const inner = try videoInner(arena, show_id, tt, ep.raw);
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"variables\":\"{s}\",\"extensions\":\"{s}\"}}",
@@ -275,9 +280,35 @@ fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
         '\n' => try out.appendSlice(arena, "\\n"),
         '\r' => try out.appendSlice(arena, "\\r"),
         '\t' => try out.appendSlice(arena, "\\t"),
-        else => try out.append(arena, c),
+        else => if (c < 0x20) {
+            // RFC 8259 forbids raw control chars in a JSON string — they must be
+            // \u-escaped. Below 0x20 the high byte is always 00, so `\u00XX`.
+            const hex = "0123456789abcdef";
+            try out.appendSlice(arena, "\\u00");
+            try out.append(arena, hex[(c >> 4) & 0xf]);
+            try out.append(arena, hex[c & 0xf]);
+        } else try out.append(arena, c),
     };
     return out.items;
+}
+
+/// Build the inner `variables` object for the episodes query, with `show_id`
+/// escaped at the inner JSON level. The caller wraps the result in a second
+/// `jsonEscape` pass for the outer string layer. Pulled out as a pure function
+/// so the escaping is unit-testable without hitting the network.
+fn episodesInner(arena: Allocator, show_id: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{\"_id\":\"{s}\"}}", .{try jsonEscape(arena, show_id)});
+}
+
+/// Build the inner `variables` object for the get_video query, with `show_id`
+/// and `episode` escaped at the inner JSON level. `tt` is only ever "sub"/"dub"
+/// so it needs no escaping. Same caller contract as `episodesInner`.
+fn videoInner(arena: Allocator, show_id: []const u8, tt: domain.Translation, episode: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"showId\":\"{s}\",\"translationType\":\"{s}\",\"episodeString\":\"{s}\"}}",
+        .{ try jsonEscape(arena, show_id), tt.str(), try jsonEscape(arena, episode) },
+    );
 }
 
 test "jsonEscape escapes quotes and backslashes" {
@@ -287,4 +318,120 @@ test "jsonEscape escapes quotes and backslashes" {
     try std.testing.expectEqualStrings("a\\\"b", try jsonEscape(a, "a\"b"));
     try std.testing.expectEqualStrings("c\\\\d", try jsonEscape(a, "c\\d"));
     try std.testing.expectEqualStrings("plain", try jsonEscape(a, "plain"));
+}
+
+test "jsonEscape: newline, tab, carriage-return, mixed, empty" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    try std.testing.expectEqualStrings("a\\nb", try jsonEscape(a, "a\nb"));
+    try std.testing.expectEqualStrings("a\\tb", try jsonEscape(a, "a\tb"));
+    try std.testing.expectEqualStrings("a\\rb", try jsonEscape(a, "a\rb"));
+    // Mixed: all mandatory escapes in one string.
+    try std.testing.expectEqualStrings("\\\"\\\\\\n", try jsonEscape(a, "\"\\\n"));
+    // Empty input → empty output.
+    try std.testing.expectEqualStrings("", try jsonEscape(a, ""));
+}
+
+test "jsonEscape: unicode passthrough" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Multi-byte UTF-8 sequences must pass through untouched.
+    try std.testing.expectEqualStrings("フリーレン", try jsonEscape(a, "フリーレン"));
+    try std.testing.expectEqualStrings("葬送のフリーレン", try jsonEscape(a, "葬送のフリーレン"));
+}
+
+test "relevance: exact > prefix > substring > no match" {
+    // Exact match scores highest.
+    const exact = AllAnime.relevance("Frieren", "Frieren", 12);
+    const prefix = AllAnime.relevance("Frieren: Beyond Journey's End", "Frieren", 12);
+    const sub = AllAnime.relevance("The World of Frieren", "Frieren", 12);
+    const none = AllAnime.relevance("Naruto", "Frieren", 12);
+
+    try std.testing.expect(exact > prefix);
+    try std.testing.expect(prefix > sub);
+    try std.testing.expect(sub > none);
+    // No match scores below any match.
+    try std.testing.expect(none < sub);
+}
+
+test "relevance: episode count breaks ties via log2" {
+    // Same title-match tier; more episodes should score strictly higher.
+    const more = AllAnime.relevance("Frieren", "Frieren", 28);
+    const fewer = AllAnime.relevance("Frieren", "Frieren", 1);
+    try std.testing.expect(more > fewer);
+}
+
+test "relevance: case-insensitive match" {
+    // The exact and prefix checks must be case-insensitive.
+    const upper = AllAnime.relevance("FRIEREN", "frieren", 1);
+    const lower = AllAnime.relevance("frieren", "FRIEREN", 1);
+    const mixed = AllAnime.relevance("Frieren", "frIEReN", 1);
+    // All three should land in the exact-match bucket (1000 + tiebreak).
+    const threshold: f64 = 999;
+    try std.testing.expect(upper > threshold);
+    try std.testing.expect(lower > threshold);
+    try std.testing.expect(mixed > threshold);
+}
+
+test "rankGreater: orders anime by descending relevance" {
+    // Build two shows where a exactly matches the query and b does not.
+    const ctx = AllAnime.RankCtx{ .query = "frieren", .tt = .sub };
+    const exact: domain.Anime = .{ .id = "1", .name = "frieren", .eps_sub = 1 };
+    const unrelated: domain.Anime = .{ .id = "2", .name = "naruto", .eps_sub = 500 };
+    // rankGreater returns true when a should sort before b.
+    try std.testing.expect(AllAnime.rankGreater(ctx, exact, unrelated));
+    try std.testing.expect(!AllAnime.rankGreater(ctx, unrelated, exact));
+}
+
+test "jsonEscape: control characters are \\u-escaped (RFC 8259)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // A NUL and a vertical tab (0x0B) must come out as \u00XX, not raw bytes.
+    try std.testing.expectEqualStrings("\\u0000", try jsonEscape(a, "\x00"));
+    try std.testing.expectEqualStrings("a\\u000bb", try jsonEscape(a, "a\x0bb"));
+}
+
+// H1 regression: the inner-body builders must escape ids/labels at the inner
+// JSON level. Without this, a `"` in a show id or episode label produced
+// structurally-broken JSON that the server silently rejected.
+test "episodesInner escapes the show id" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings("{\"_id\":\"abc\"}", try episodesInner(a, "abc"));
+    // A quote in the id is escaped → the inner object stays valid JSON.
+    try std.testing.expectEqualStrings("{\"_id\":\"a\\\"b\"}", try episodesInner(a, "a\"b"));
+}
+
+test "videoInner escapes show id and episode label" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings(
+        "{\"showId\":\"x\",\"translationType\":\"sub\",\"episodeString\":\"1\"}",
+        try videoInner(a, "x", .sub, "1"),
+    );
+    // Quotes in both the id and the episode label are escaped; tt stays literal.
+    try std.testing.expectEqualStrings(
+        "{\"showId\":\"a\\\"b\",\"translationType\":\"dub\",\"episodeString\":\"1\\\"\"}",
+        try videoInner(a, "a\"b", .dub, "1\""),
+    );
+}
+
+// M1 review (Elara/Astra): a canned AES-256-GCM fixture cements the exact
+// `tobeparsed` blob layout — 1-byte prefix, 12-byte nonce, ciphertext, 16-byte
+// tag, key = sha256("Xot36i3lK3:v1") — and guards against the server scheme
+// drifting silently. Generated offline with Python's `cryptography`.
+test "decryptTobeparsed: known blob round-trips to plaintext" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const blob = "AAABAgMEBQYHCAkKCw/k3QdUZIc5wIflWKnNrBJlDJDvuoUtnAhztwaZ0MPdc+7QLkxnnkAqseAyPNsmcPKDx4IlVT/nzzS1VVCzmf7KRsutWoKHB/11G9S8i9qBiKecETa/9Yrge8E1Rv/TJ35g7iREfYhMrh8s";
+    const want = "{\"episode\":{\"sourceUrls\":[{\"sourceName\":\"Default\",\"sourceUrl\":\"tools.fast4speed.rsvp/x\"}]}}";
+    const got = try AllAnime.decryptTobeparsed(a, blob);
+    try std.testing.expectEqualStrings(want, got);
 }

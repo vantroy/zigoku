@@ -126,3 +126,45 @@ test "has / episodeCount respect translation" {
     try std.testing.expect(!a.has(.dub));
     try std.testing.expectEqual(@as(u32, 12), a.episodeCount(.sub));
 }
+
+test "EpisodeNumber.sortKey: exact values" {
+    // Plain integers and decimals should parse exactly.
+    try std.testing.expectEqual(@as(f64, 1.0), (EpisodeNumber{ .raw = "1" }).sortKey());
+    try std.testing.expectEqual(@as(f64, 1.5), (EpisodeNumber{ .raw = "1.5" }).sortKey());
+    try std.testing.expectEqual(@as(f64, 13.5), (EpisodeNumber{ .raw = "13.5" }).sortKey());
+    try std.testing.expectEqual(@as(f64, 10.0), (EpisodeNumber{ .raw = "10" }).sortKey());
+}
+
+test "EpisodeNumber.sortKey: leading zeros and trailing text" {
+    // Leading zeros: "01" and "001" are still 1.0.
+    try std.testing.expectEqual(@as(f64, 1.0), (EpisodeNumber{ .raw = "01" }).sortKey());
+    try std.testing.expectEqual(@as(f64, 1.0), (EpisodeNumber{ .raw = "001" }).sortKey());
+    // Digits followed by text: sort key comes from the digit prefix only.
+    try std.testing.expectEqual(@as(f64, 12.0), (EpisodeNumber{ .raw = "12v2" }).sortKey());
+}
+
+test "EpisodeNumber.sortKey: non-numeric labels go to +inf" {
+    // No leading digit at all → treated as a special, sorts last.
+    const inf = std.math.inf(f64);
+    try std.testing.expectEqual(inf, (EpisodeNumber{ .raw = "SP1" }).sortKey());
+    try std.testing.expectEqual(inf, (EpisodeNumber{ .raw = "OVA" }).sortKey());
+    try std.testing.expectEqual(inf, (EpisodeNumber{ .raw = "OVA3" }).sortKey());
+    try std.testing.expectEqual(inf, (EpisodeNumber{ .raw = "" }).sortKey());
+}
+
+test "EpisodeNumber.lessThan: specials after numbered run" {
+    // All specials sort after any numbered episode.
+    const num = EpisodeNumber{ .raw = "100" };
+    const sp = EpisodeNumber{ .raw = "SP1" };
+    const ova = EpisodeNumber{ .raw = "OVA" };
+    try std.testing.expect(EpisodeNumber.lessThan({}, num, sp));
+    try std.testing.expect(!EpisodeNumber.lessThan({}, sp, num));
+    // Two specials are not less-than each other (neither < the other, both +inf).
+    try std.testing.expect(!EpisodeNumber.lessThan({}, sp, ova));
+    try std.testing.expect(!EpisodeNumber.lessThan({}, ova, sp));
+}
+
+test "Translation.str returns correct tag name" {
+    try std.testing.expectEqualStrings("sub", Translation.sub.str());
+    try std.testing.expectEqualStrings("dub", Translation.dub.str());
+}

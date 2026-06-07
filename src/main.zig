@@ -197,7 +197,7 @@ fn reportError(out: *Io.Writer, err: anyerror) !void {
         error.MpvNotFound => "mpv isn't on your PATH. Install mpv and try again.",
         error.MpvFailed => "mpv exited badly (closed early, or couldn't play the stream).",
         error.NoDirectStream => "found the episode, but it only offers providers we can't resolve yet (the direct fast4speed link wasn't there). That's the ROD-92 follow-up — try another show/episode for now.",
-        error.NoResults, error.NoSearchData => "AllAnime returned nothing for that search.",
+        error.NoSearchData => "AllAnime returned nothing for that search.",
         error.ShowNotFound, error.NoEpisodeData => "AllAnime had no episode data for that show.",
         error.NotEncrypted => "AllAnime returned an unexpected (unencrypted) video payload — the protocol may have shifted.",
         error.HttpNotOk => "AllAnime rejected the request (HTTP error). The site may be down, or the recipe drifted.",
