@@ -5,6 +5,10 @@
 > specification — every color, glyph, layout rule, and component state is a concrete
 > buildable thing. When there are gaps, this doc fills them with a deliberate call and
 > labels it as such. Do not leave states unimplemented because "the design didn't say."
+>
+> **M3 data rendering is governed by §9.** AllAnime is the sole live source; AniList
+> enrichment (covers, scores, status chips, genres, synopsis) arrives in M4/M5. §9
+> specifies exactly what every surface renders when those fields are null.
 
 ---
 
@@ -397,6 +401,10 @@ grid — `state.now` is only ever earned by one cell at a time.
 
 Toasts float above the bottom bar, right-aligned, temporary (2.5s auto-dismiss).
 Single line. Max width: 40 chars.
+
+> **See §9.3b** — M3 adds a `persistent` toast variant (for source-unreachable)
+> that does not auto-dismiss; it clears on recovery. The auto-dismiss rule below
+> is the default, not the only mode.
 
 Format: `[!] Something failed — details`
 
@@ -877,3 +885,313 @@ revisited without archaeology.
 | Help line updates contextually per view | The bottom bar doubles as a contextual hint line. Fewer permanent labels means less to ignore. | If users report confusion about available keys, add a `?` keybind that shows a full key reference in `bg.elevated` overlay. |
 | Score ≥ 91 earns `state.now` | The 91 threshold maps to AniList's "Favorites" tier. Below 91, scores are metadata. Above, they are a claim. | Adjust threshold if the distribution feels wrong in practice. |
 | List column 38% / detail 62% at default width | Tested against 120-col and 160-col terminals. 38% gives ~45 chars for the list — enough for most anime titles without truncation. Detail gets the rest. | Adjust if common terminal widths expose truncation problems. |
+
+---
+
+## 9. M3 Data Reality — AllAnime-first, degrade-by-design
+
+This section supersedes any AniList-sourced assumptions in §§1–8. It does not
+replace those sections — it governs how the Terminal Ghost chrome specified there
+renders when the fields those sections assume are null. In M3 they almost always
+are.
+
+**The model.** AllAnime search fills exactly three fields of `domain.Anime`:
+`id`, `name`, `eps_sub` / `eps_dub`. Everything else — `thumb`, `banner`,
+`mal_id`, `anilist_id`, `year`, `status`, `description`, `genres`, `score`,
+`studios`, `kind` — is `null` until enrichment lands (M4: cover art + metadata;
+M5: AniSkip / MAL). The `Store` (`AnimeRecord`) persists what the search gave us
+and carries nullable enrichment columns (`cover_url`, `mal_id`, `anilist_id`,
+`total_episodes`) that are blank until a future enrichment write fills them in.
+
+**The strategy.** Build the full Terminal Ghost chrome now. Let the null fields
+render in explicit, consistent degrade states. The UI should look intentional, not
+broken. A user on M3 should read the screen and understand it — not see a crash
+or a wall of missing values. The degrade states become invisible the moment M4
+writes the enriched data; no code changes required at those call sites.
+
+---
+
+### 9.1 Data Availability Matrix
+
+What is available per surface in M3 vs what is enrichment. "Available" means the
+field can be non-null in M3. "Enrichment" means it is always null in M3 and the
+degrade rendering applies. All degrade tokens reference §1.2 aliases.
+
+| Surface | Available in M3 | Enrichment (M4/M5) | M3 degrade rendering |
+|---|---|---|---|
+| **List row — title** | `domain.Anime.name` (always present) | `english_name` (optional alt) | Render `name` directly. No fallback needed. |
+| **List row — score** | nothing | AniList score (M4) | Render `[--/100]` in `color.fg3` ([d]). Score column is always 10 chars wide — the placeholder preserves that reservation. |
+| **List row — status glyph** | `store.AnimeRecord.list_status` (watching/planning/etc) | airing status (M4) | Use §2.4 watchlist glyph from DB `list_status`. The `◉` airing glyph is suppressed — `status` is null. |
+| **Detail pane — title** | `domain.Anime.name` | `english_name` | Render `name` in `color.fg` + bold. No subtitle line. |
+| **Detail pane — kanji status chip** | nothing | AniList `status` (M4) | Omit entirely. Do not render an empty chip or a placeholder span. The line simply reads: title only. |
+| **Detail pane — season chip** | nothing | AniList `season`/`year` (M4) | Omit entirely. Same rule as above — never render an empty chip. |
+| **Detail pane — score** | nothing | AniList score (M4) | Render `[--/100]` in [d] where the score line appears in the detail header. Omit the `✦` prefix and genre list entirely when score is null (no separators `·` for fields that do not exist). |
+| **Detail pane — cover art block** | nothing | cover URL (M4) | Render the §3.3 cell block filled with `color.surface` ([bg.surface]). Centered in the block: `no art yet` in [d] + italic. No spinner — this is a persistent absent state, not a loading state. The block still occupies its reserved cell dimensions; layout does not collapse. |
+| **Detail pane — episode count line** | `eps_sub` / `eps_dub` from AllAnime search (may be 0 if no episodes listed yet) | `total_episodes` from AniList (M4) | Render `N eps` from `eps_sub` or `eps_dub` per active translation. If both are 0, render `? eps` in [d]. Omit `kind` and `studios` segments — no separators for absent fields. |
+| **Detail pane — synopsis** | nothing | AniList description (M4) | Render a single line: `no synopsis yet` in [m] + italic. Word-wrap does not apply to a one-liner. |
+| **Detail pane — genres** | nothing | AniList genres (M4) | Omit entirely. Do not render the genres row or its `·` separator. |
+| **History view — progress bar** | `store.AnimeRecord.progress` (episode count), `total_episodes` (may be null) | — | If `total_episodes` is null, render `[████░░░░…]  N / ? eps` — the bar draws filled cells proportional to `progress` / `eps_sub` if `eps_sub` > 0, else fills to one-third width as a non-zero signal. Fraction text: `N / ?` in [m]. |
+| **History view — season chip** | nothing | AniList season (M4) | Omit. The history row title + progress bar + status glyph is sufficient. |
+| **History view — score badge** | nothing | AniList score (M4) | Omit. The `[NN]` score badge shown in §5.4 is not rendered in M3 — the space is reclaimed by the title. |
+| **Episode grid** | episode labels from AllAnime `episodes()` call (live fetch) | — | Episode grid renders normally from live data. The `total_episodes` field is not used for grid construction — AllAnime provides the actual list. |
+
+**Implementation note on the score placeholder.** `[--/100]` is always rendered
+in [d] in M3 — it does not participate in the score tier rules of §2.2. Those
+rules apply only to real integer scores. A null score is not a score of 0.
+
+**Implementation note on the cover block.** The "no art yet" persistent state is
+distinct from the §4.8 loading spinner. The spinner appears while an in-flight
+fetch is pending. The "no art yet" state appears when there is no fetch to run —
+`cover_url` is null and no enrichment has been written. The two must not be
+conflated in code. In M3, the cover block goes directly to "no art yet" state on
+render without attempting any network call.
+
+---
+
+### 9.2 History as Landing View
+
+In M3, the app opens to the History/Watchlist view. This is Rod's settled
+decision: History is home. Even when future Browse lists (trending, top-of-week)
+exist, the user lands in History first. Browse is reached by keybind `H` from
+History.
+
+**Normal state (DB has rows).** Reuse the §5.4 layout verbatim. The top bar
+reads `ZIGOKU  ░  Watchlist` — same as §5.4. The `·` pane focus dot is in [f].
+Section 9.1's degrade rules apply to any null enrichment fields in each row
+(season chips and score badges are omitted; progress bars degrade gracefully when
+`total_episodes` is null).
+
+**First-run empty state.** When the DB has zero rows — a fresh install, or a user
+who has never played anything — the History view cannot show a list. This state is
+not covered by §5.
+
+```
+  ZIGOKU  ░  Watchlist                                                            ·
+
+                                                                                     [spacer rows]
+
+
+
+
+                                 nothing here yet                                    [d + italic, centered]
+                               / to search for a show                               [m, centered]
+
+
+
+
+                                                                                     [spacer rows]
+  ▌  hjkl · / search · H browse · q quit
+```
+
+Rendering rules:
+
+- `nothing here yet` — centered in the viewport (horizontal and vertical center
+  of the rows between top bar and bottom bar). Color: [d] + italic. This is the
+  only italic English text in the app; it is annotation, not content.
+- `/ to search for a show` — one row below the above, centered. Color: [m].
+  The `/` character is in [f] + bold to visually match its role as the search
+  trigger. Do not underline — the help line already owns the underline treatment
+  for keybinds.
+- Bottom bar: idle help line as normal (§3.5 State 1), including the `▌` blink.
+  The empty state does not suppress navigation.
+- The two-line message block is treated as a unit for centering: together they
+  are 2 rows tall, horizontally centered to the longest line.
+- No section headers, no `─` rules, no progress bars. The screen is the void
+  until the user types `/`.
+
+---
+
+### 9.3 New States the Doc Was Missing
+
+#### 9.3a Empty Search Results
+
+The user submitted a query and AllAnime returned zero edges — the show does not
+exist in AllAnime's index, or the query matched nothing.
+
+**List column:** render the single line `no results` in [d] + italic, positioned
+at the top of the list column (row 0 of the list window). No list rows, no
+section headers.
+
+**Bottom bar (search state):**
+
+```
+  /  xyzzy_                                                          [0 results]
+```
+
+The result count `[0 results]` in [m] is already sufficient signal. No toast is
+issued for zero results — this is an expected search outcome, not an error.
+
+**Detail pane:** clears to `color.bg` fill. No stale detail from the previous
+selection remains. If nothing is selected, the detail pane is blank.
+
+**Returning to a non-empty state:** as soon as the query changes and results
+arrive, the list re-populates. No explicit "clear" action required.
+
+#### 9.3b Source Unreachable
+
+AllAnime is down, the network is gone, or the HTTP POST returns a non-200. This
+is a persistent failure state, not a transient one — it cannot be dismissed with
+a 2.5s toast because the condition has not resolved.
+
+**On search attempt (search state active, user presses `Enter` or first
+keystroke that triggers the live AllAnime call):**
+
+1. The bottom bar remains in search state with the query visible.
+2. A `[!]` error toast fires per §4.7: `[!] can't reach AllAnime` in [h] + bold,
+   `bg.elevated` background. This toast does not auto-dismiss in the usual 2.5s —
+   it persists until the next successful response clears it. (Implementation: add
+   a `persistent: bool` field to the `Toast` struct; persistent toasts are only
+   removed when explicitly cleared by the success path.)
+3. The list column shows any previously cached results if available, or `no
+   results` in [d] if the cache is also empty.
+
+**On startup (source unreachable before the first search):**
+
+The startup loading state (§9.4 below) fails. The loading copy updates to reflect
+the failure:
+
+```
+  ZIGOKU  ░  Watchlist                                                            ·
+
+
+
+
+                                      [!]
+                                 can't reach AllAnime                               [h + bold, centered]
+                               check your connection                                [m + italic, centered]
+
+
+
+
+  [!]  source unreachable · / to retry                                              [h [!], m text]
+```
+
+Rendering rules:
+
+- `[!]` marker: [h] + bold, centered. This is the `BTN_ERROR` glyph from §2.1.
+- `can't reach AllAnime` — [h] + bold, one row below the glyph, centered.
+- `check your connection` — [m] + italic, one row below that, centered.
+- Bottom bar: `[!]` in [h] replaces `▌`. Static, not blinking. Text: `source
+  unreachable · / to retry` in [m]. The `▌` blink is suppressed while in this
+  error state. Pressing `/` clears the error state and opens the search prompt,
+  which will attempt AllAnime on the next keystroke.
+- The History view (if any rows exist in the DB) is still accessible: `H` from
+  this screen navigates to it normally. Local data survives a network outage.
+
+**Recovery:** the first successful AllAnime response clears the persistent toast
+and returns the UI to normal state.
+
+---
+
+### 9.4 Re-labeling the AniList-catalog Surfaces
+
+The following surfaces in §§3–7 contain AniList-specific copy or types that no
+longer match the architecture. These are the correct M3 readings.
+
+#### §3.5 — `:sync` command
+
+`:sync` was specified as "force AniList catalog sync." In M3 there is no AniList
+catalog — search is live against AllAnime on every `/` query. `:sync` has no
+meaning in M3 and must not be wired to any action. Its correct M3 disposition:
+
+- Remove `:sync` from the M3 command table in §6.3.
+- The `:sync` slot is reserved for M4+ enrichment refresh (forcing a re-fetch of
+  AniList metadata for items already in the local DB). Until M4 ships, unknown
+  command handling applies: flash [h] for 800ms, return to idle.
+- The `[~]` / `BTN_SYNC` glyph is similarly reserved for M4+ use. Do not render
+  it in M3 for any active-sync indicator.
+
+#### §5.5 Settings — "AniList sync interval"
+
+The "AniList sync interval" row in the Catalog section of Settings has no
+backing implementation in M3 — there is nothing to sync. Correct M3 rendering:
+replace the row with a read-only informational line:
+
+```
+  Catalog
+  ─────────────────────────────────────────────────────────────────────────────────
+    enrichment sync              not available until M4                [d + italic, right-aligned hint]
+    cover art cache              ~/.cache/zigoku/covers/               enter to edit
+    preferred title              Romaji                                hjkl to cycle
+```
+
+The `enrichment sync` row is non-interactive: no `hjkl to cycle`, no `enter to
+edit`. It is [d] + italic to signal "not yet." It does not receive focus (skip it
+during `j`/`k` navigation of the settings list).
+
+#### §5.6 Loading / Now Resolving — startup copy
+
+The startup loading state references "syncing AniList catalog" — that is wrong.
+In M3, startup does two things: opens the local SQLite DB and loads history. It
+does not contact AniList. The corrected copy:
+
+```
+  ZIGOKU  ░  Watchlist                                                            ·
+
+
+
+
+                                      ⠙
+                                 loading history                                    [m + italic, centered]
+
+
+
+
+  [~]  opening local db…                                                            [f [~], m text]
+```
+
+If the DB opens and history loads fast (under ~200ms), skip this screen entirely
+and go straight to the landing view. The loading screen is only shown when the DB
+open is measurably slow (e.g., migration in progress on a large existing DB).
+
+**Slow threshold:** >3s shifts the spinner from [f] to [h] and the label updates
+to `taking a moment…` — identical to the §5.6 slow rule, just with corrected
+copy.
+
+There is no "syncing AniList catalog" state in M3. Any AllAnime search is
+triggered by the user explicitly via `/`, never automatically on startup.
+
+#### §7.6 State Machine — `results` field type
+
+The §7.6 state machine specifies `results: []AniListEntry`. The correct type is
+`[]domain.Anime` — the source-agnostic domain type filled by whatever
+`SourceProvider` is active (AllAnime in M3). Similarly `selected: ?AniListEntry`
+becomes `selected: ?domain.Anime`.
+
+The corrected state machine diff:
+
+```zig
+// §7.6 corrected for M3
+AppState {
+    mode:          enum { browse, history, settings, detail }
+    input_mode:    enum { normal, search, command }
+    list_cursor:   usize
+    detail_scroll: usize
+    episode_cursor: ?usize
+    search_query:  []u8
+    results:       []domain.Anime      // was []AniListEntry
+    selected:      ?domain.Anime       // was ?AniListEntry
+    cover_image:   ?vaxis.Image        // null in M3 — no cover URL to fetch
+    loading:       bool
+    sync_active:   bool                // reserved for M4+ enrichment sync; false in M3
+    source_error:  bool                // NEW: persistent unreachable state (§9.3b)
+    toast_queue:   []Toast
+}
+```
+
+`sync_active` remains in the struct so M4 can wire it without a state machine
+change. It is always `false` in M3. `source_error` is new — it drives the §9.3b
+unreachable rendering.
+
+---
+
+### 9.5 Design Decisions — §9 Additions
+
+| Decision | Rationale | Revisit trigger |
+|---|---|---|
+| Cover block renders "no art yet" (persistent absent) not a spinner | A spinner implies a fetch is in flight. In M3 there is no cover URL to fetch. Showing a spinner would be a lie. The absent state must be visually distinct from loading. | When M4 writes `cover_url` to the DB, the cover block switches to the §4.8 loading spinner immediately on next render. No code change needed at the cover block — just the URL going non-null. |
+| Score placeholder `[--/100]` in [d] rather than omitting the score field | Preserving the 10-char score reservation in the list row keeps column alignment stable across M3→M4 transition. A missing field would cause the title truncation point to shift when scores arrive. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
+| Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | When M4 fills `status`, chips reappear automatically. No intermediate state needed. |
+| History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source in M3. History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
+| Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
+| Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
