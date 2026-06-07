@@ -102,8 +102,24 @@ pub fn build(b: *std.Build) void {
     });
     const run_spike_http = b.addRunArtifact(spike_http);
     if (b.args) |args| run_spike_http.addArgs(args);
-    const spike_http_step = b.step("spike-http", "ROD-55: AllAnime HTTP search spike");
+    const spike_http_step = b.step("spike-http", "ROD-55: AniList HTTP search spike");
     spike_http_step.dependOn(&run_spike_http.step);
+
+    // spike-sqlite: SQLite via raw C interop (ROD-56). Links libc + system sqlite3.
+    const spike_sqlite_mod = b.createModule(.{
+        .root_source_file = b.path("src/spikes/sqlite_store.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    spike_sqlite_mod.linkSystemLibrary("sqlite3", .{});
+    const spike_sqlite = b.addExecutable(.{
+        .name = "spike-sqlite",
+        .root_module = spike_sqlite_mod,
+    });
+    const run_spike_sqlite = b.addRunArtifact(spike_sqlite);
+    const spike_sqlite_step = b.step("spike-sqlite", "ROD-56: SQLite C-interop spike");
+    spike_sqlite_step.dependOn(&run_spike_sqlite.step);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
