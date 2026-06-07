@@ -134,6 +134,20 @@ pub fn build(b: *std.Build) void {
     const spike_conc_step = b.step("spike-concurrency", "ROD-58: threads + channel spike");
     spike_conc_step.dependOn(&run_spike_conc.step);
 
+    // spike-stream: resolve a playable AllAnime stream via POST + AES-GCM (ROD-62).
+    const spike_stream = b.addExecutable(.{
+        .name = "spike-stream",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/allanime_stream.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_stream = b.addRunArtifact(spike_stream);
+    if (b.args) |args| run_spike_stream.addArgs(args);
+    const spike_stream_step = b.step("spike-stream", "ROD-62: AllAnime stream resolver spike");
+    spike_stream_step.dependOn(&run_spike_stream.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
