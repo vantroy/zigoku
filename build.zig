@@ -121,6 +121,19 @@ pub fn build(b: *std.Build) void {
     const spike_sqlite_step = b.step("spike-sqlite", "ROD-56: SQLite C-interop spike");
     spike_sqlite_step.dependOn(&run_spike_sqlite.step);
 
+    // spike-concurrency: thread pool + channel (ROD-58).
+    const spike_conc = b.addExecutable(.{
+        .name = "spike-concurrency",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/concurrency.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_conc = b.addRunArtifact(spike_conc);
+    const spike_conc_step = b.step("spike-concurrency", "ROD-58: threads + channel spike");
+    spike_conc_step.dependOn(&run_spike_conc.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
