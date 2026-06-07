@@ -43,7 +43,12 @@ pub fn main(init: std.process.Init) !void {
     // Persistence (M2). Best-effort: if the DB can't be opened we note it once
     // and run without history/resume rather than refusing to play anything.
     var store_opt: ?zigoku.Store = openStore(arena) catch |err| blk: {
-        try out.print("  (note: persistence off — {s})\n", .{@errorName(err)});
+        const why: []const u8 = switch (err) {
+            error.SchemaTooNew => "DB was written by a newer Zigoku — delete it to start fresh",
+            error.NoHomeDir => "couldn't locate a data directory (no $HOME/$XDG_DATA_HOME)",
+            else => @errorName(err),
+        };
+        try out.print("  (note: persistence off — {s})\n", .{why});
         break :blk null;
     };
     defer if (store_opt) |*st| st.close();

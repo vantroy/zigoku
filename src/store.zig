@@ -33,7 +33,7 @@ const c = @cImport({
     @cInclude("stdlib.h"); // getenv
 });
 
-pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir };
+pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, SchemaTooNew };
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
@@ -88,7 +88,8 @@ const MIGRATION_V1 =
     \\    episodes_blob TEXT NOT NULL,                  -- newline-joined raw episode labels
     \\    fetched_at    INTEGER NOT NULL,
     \\    expires_at    INTEGER NOT NULL,               -- fetched_at + status-aware TTL
-    \\    PRIMARY KEY (source, source_id, translation)
+    \\    PRIMARY KEY (source, source_id, translation),
+    \\    FOREIGN KEY (source, source_id) REFERENCES anime(source, source_id) ON DELETE CASCADE
     \\);
 ;
 
@@ -123,8 +124,10 @@ pub const AnimeRecord = struct {
             .source_id = a.id,
             .title = a.name,
             .title_english = a.english_name,
-            .mal_id = if (a.mal_id) |m| @intCast(m) else null,
-            .anilist_id = if (a.anilist_id) |x| @intCast(x) else null,
+            // A corrupt provider id past i64 range degrades to "not provided"
+            // rather than panicking on the cast.
+            .mal_id = if (a.mal_id) |m| std.math.cast(i64, m) else null,
+            .anilist_id = if (a.anilist_id) |x| std.math.cast(i64, x) else null,
             .cover_url = a.thumb,
             .total_episodes = if (eps > 0) @intCast(eps) else null,
         };
@@ -143,6 +146,10 @@ pub const Resume = struct {
         if (self.fully_watched) return 0;
         if (self.duration_secs > 0 and self.position_secs / self.duration_secs >= NATURAL_END_RATIO) return 0;
         if (self.position_secs <= 0) return 0;
+        // NaN slips past every comparison above; a corrupt huge value overflows
+        // the cast. Either way, just start from the top.
+        const u64_max_f: f64 = @floatFromInt(std.math.maxInt(u64));
+        if (!std.math.isFinite(self.position_secs) or self.position_secs >= u64_max_f) return 0;
         return @intFromFloat(self.position_secs);
     }
 };
@@ -357,9 +364,11 @@ pub const Store = struct {
     /// finished shows almost never change (7d), ongoing ones gain an episode a
     /// week (6h keeps "new ep?" snappy), unknown splits the difference (24h).
     pub fn cacheTtl(airing_status: ?[]const u8) i64 {
+        // eqIgnoreCase folds case on both sides, so only distinct *words* are
+        // worth listing (AllAnime "RELEASING" vs an AniList-ish "ongoing").
         const s = airing_status orelse return 24 * 60 * 60;
-        if (eqIgnoreCase(s, "FINISHED") or eqIgnoreCase(s, "finished")) return 7 * 24 * 60 * 60;
-        if (eqIgnoreCase(s, "RELEASING") or eqIgnoreCase(s, "ongoing") or eqIgnoreCase(s, "releasing")) return 6 * 60 * 60;
+        if (eqIgnoreCase(s, "FINISHED")) return 7 * 24 * 60 * 60;
+        if (eqIgnoreCase(s, "RELEASING") or eqIgnoreCase(s, "ongoing")) return 6 * 60 * 60;
         return 24 * 60 * 60;
     }
 
@@ -437,13 +446,17 @@ pub const Store = struct {
 
     fn migrate(self: *Store) Error!void {
         var v = try self.userVersion();
+        // A DB written by a newer Zigoku knows a schema we don't. Refuse it as a
+        // real error (the best-effort caller falls back to no persistence)
+        // rather than asserting our way into a panic.
+        if (v > SCHEMA_VERSION) return error.SchemaTooNew;
         if (v < 1) {
             try self.exec(MIGRATION_V1);
             try self.exec("PRAGMA user_version = 1;");
             v = 1;
         }
         // future: if (v < 2) { try self.exec(MIGRATION_V2); ... }
-        std.debug.assert(v == SCHEMA_VERSION);
+        std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
     fn userVersion(self: *Store) Error!c_int {
@@ -680,6 +693,7 @@ test "episode cache: hit, expiry, sub/dub separation" {
 
     var s = try Store.openMemory();
     defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000); // FK parent
 
     const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "1.5" }, .{ .raw = "2" } };
     // FINISHED → 7d TTL.
@@ -705,12 +719,32 @@ test "cacheTtl by airing status" {
     try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.cacheTtl("WEIRD"));
 }
 
-test "foreign key cascade deletes progress with its anime" {
+test "foreign key cascade deletes progress and cache with its anime" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
     var s = try Store.openMemory();
     defer s.close();
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
     try s.saveProgress(T_SOURCE, "x", .sub, "1", 100, 1400, 1001);
+    const eps = [_]domain.EpisodeNumber{.{ .raw = "1" }};
+    try s.putCachedEpisodes(T_SOURCE, "x", .sub, &eps, "FINISHED", 1000, arena);
 
     try s.exec("DELETE FROM anime WHERE source_id = 'x';");
     try testing.expect((try s.getResume(T_SOURCE, "x", .sub, "1")) == null);
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "x", .sub, 1001)) == null);
+}
+
+test "recordPlay on an unknown show is a silent no-op" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // No upsertAnime first: the UPDATE matches zero rows and must not error or
+    // conjure a row.
+    try s.recordPlay(T_SOURCE, "ghost", 1, 1000);
+    try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
 }
