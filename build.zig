@@ -89,6 +89,22 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // ── Spikes ────────────────────────────────────────────────────────────────
+    // Throwaway executables that prove a risky unknown. Not installed; run via
+    // their named step, e.g. `zig build spike-http -- frieren`.
+    const spike_http = b.addExecutable(.{
+        .name = "spike-http",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/http_search.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_http = b.addRunArtifact(spike_http);
+    if (b.args) |args| run_spike_http.addArgs(args);
+    const spike_http_step = b.step("spike-http", "ROD-55: AllAnime HTTP search spike");
+    spike_http_step.dependOn(&run_spike_http.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
