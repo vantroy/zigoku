@@ -1257,7 +1257,7 @@ const App = struct {
             var c: u16 = 0;
             while (c < cols and ep_idx < eps.len) : (c += 1) {
                 const ep = eps[ep_idx];
-                const focused = ep_idx == self.episode_cursor;
+                const focused = ep_idx == self.episode_cursor and self.active_pane == .detail;
 
                 // Use ep_scratch to avoid dangling stack buffers. Index relative
                 // to the viewport start so we never alias two live cells.
