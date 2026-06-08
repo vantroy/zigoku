@@ -20,6 +20,8 @@ pub const SearchOptions = struct {
     translation: domain.Translation = .sub,
     /// Cap on results returned after ranking.
     limit: usize = 20,
+    /// Page number for pagination (1-indexed).
+    page: u32 = 1,
 };
 
 pub const SourceProvider = struct {

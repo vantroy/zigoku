@@ -100,8 +100,8 @@ pub const AllAnime = struct {
         const q = try jsonEscape(arena, query);
         const body = try std.fmt.allocPrint(
             arena,
-            "{{\"variables\":{{\"search\":{{\"query\":\"{s}\"}},\"limit\":26,\"page\":1,\"translationType\":\"{s}\",\"countryOrigin\":\"ALL\"}},\"extensions\":\"{s}\"}}",
-            .{ q, opts.translation.str(), EXT_SEARCH },
+            "{{\"variables\":{{\"search\":{{\"query\":\"{s}\"}},\"limit\":26,\"page\":{d},\"translationType\":\"{s}\",\"countryOrigin\":\"ALL\"}},\"extensions\":\"{s}\"}}",
+            .{ q, opts.page, opts.translation.str(), EXT_SEARCH },
         );
 
         const raw = try post(arena, io, body, REFERER_API);

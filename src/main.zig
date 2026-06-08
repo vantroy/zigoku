@@ -79,7 +79,9 @@ fn openStore(arena: std.mem.Allocator) !zigoku.Store {
 fn runTui(init: std.process.Init, arena: std.mem.Allocator) !void {
     var store_opt: ?zigoku.Store = openStore(arena) catch null;
     defer if (store_opt) |*st| st.close();
-    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null);
+    var allanime = zigoku.AllAnime.init();
+    const provider = allanime.provider();
+    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider);
 }
 
 /// The whole vertical slice, top to bottom. `store` is optional — every

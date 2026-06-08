@@ -19,10 +19,14 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const colors = @import("colors.zig");
 const store_mod = @import("../store.zig");
+const source_mod = @import("../source.zig");
+const domain = @import("../domain.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
+const SourceProvider = source_mod.SourceProvider;
+const Anime = domain.Anime;
 
 /// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
 /// worker→UI messages, posted from background threads and drained in tick().
@@ -35,6 +39,14 @@ const Event = union(enum) {
     history_loaded: []AnimeRecord,
     /// A background task failed; payload is a human-readable reason.
     task_error: []const u8,
+    /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
+    /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
+    /// `page` is the page number this result set belongs to.
+    search_done: struct {
+        results: []Anime,
+        for_query: []const u8,
+        page: u32,
+    },
 };
 
 const Loop = vaxis.Loop(Event);
@@ -46,6 +58,7 @@ pub fn run(
     io: std.Io,
     environ_map: *std.process.Environ.Map,
     store: ?*Store,
+    provider: SourceProvider,
 ) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -105,6 +118,8 @@ pub fn run(
         app.history_loading = false;
     }
 
+    app.gpa = gpa;
+
     // First paint, then the event loop.
     try app.draw(&vx, writer);
     while (!app.should_quit) {
@@ -113,9 +128,59 @@ pub fn run(
         // run() owns it — that keeps tick() a pure state fold, testable without
         // a tty. tick() still sees the event; it just doesn't touch the screen.
         if (event == .winsize) try vx.resize(gpa, writer, event.winsize);
-        try app.tick(event);
+        try app.tick(event, &loop, io, provider);
         try app.draw(&vx, writer);
     }
+
+    app.clearResults();
+}
+
+/// Background task: search and post results back to the UI thread.
+fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, query: []const u8, page: u32, translation: domain.Translation) void {
+    defer gpa.free(query); // query was duped by caller; we own it
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const raw = provider.search(arena.allocator(), io, query, .{
+        .translation = translation,
+        .limit = 26,
+        .page = page,
+    }) catch {
+        loop.postEvent(.{ .task_error = "search failed" }) catch {};
+        return;
+    };
+
+    // Dupe id+name into GPA so they survive arena teardown.
+    // Other Anime fields (eps_sub, eps_dub, status, thumb…) are value types or
+    // null — copy them as-is without duplication.
+    var owned = std.ArrayListUnmanaged(Anime).empty;
+    owned.ensureTotalCapacity(gpa, raw.len) catch {
+        loop.postEvent(.{ .task_error = "search OOM" }) catch {};
+        return;
+    };
+    for (raw) |a| {
+        const id_owned = gpa.dupe(u8, a.id) catch continue;
+        const name_owned = gpa.dupe(u8, a.name) catch { gpa.free(id_owned); continue; };
+        owned.appendAssumeCapacity(.{
+            .id = id_owned,
+            .name = name_owned,
+            .eps_sub = a.eps_sub,
+            .eps_dub = a.eps_dub,
+            .status = a.status,
+        });
+    }
+
+    loop.postEvent(.{ .search_done = .{
+        .results = owned.items,
+        .for_query = query,
+        .page = page,
+    }}) catch {
+        // Free on post failure
+        for (owned.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+    };
+    // NOTE: owned.items pointer now belongs to the event; don't free it here.
+    // The backing array slice is what we posted, so just discard the list handle.
+    // (No call to owned.deinit — that would free the slice we just posted.)
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
@@ -159,6 +224,45 @@ const App = struct {
     /// rendering function can read it without a view branch.
     active_pane: enum { list, detail } = .list,
 
+    /// Current input mode. `.search` = typing a query; `.normal` = list navigation.
+    input_mode: enum { normal, search } = .normal,
+
+    /// Fixed-width query buffer. 127 usable bytes + null sentinel = 128 total.
+    search_query: [128]u8 = undefined,
+    search_len: usize = 0,
+
+    /// Whether a search HTTP request is in flight.
+    search_loading: bool = false,
+
+    /// Page count of loaded results (0 = no search run yet, 1 = first page, etc.).
+    search_page: u32 = 0,
+
+    /// Accumulated search results. Backed by gpa — strings owned, must be freed on query reset.
+    /// Access via `self.results.items`.
+    results: std.ArrayListUnmanaged(Anime) = .empty,
+
+    /// GPA reference for freeing search results. Set in run() before the event loop.
+    gpa: Allocator = undefined,
+
+    /// Sub/dub translation for searches.
+    translation: domain.Translation = .sub,
+
+    /// Current query as a slice (may be empty).
+    fn querySlice(self: *const App) []const u8 {
+        return self.search_query[0..self.search_len];
+    }
+
+    /// Free all accumulated search results and reset search state.
+    /// Call before a new page-1 search and when Esc clears the query.
+    fn clearResults(self: *App) void {
+        for (self.results.items) |r| {
+            self.gpa.free(r.id);
+            self.gpa.free(r.name);
+        }
+        self.results.clearRetainingCapacity();
+        self.search_page = 0;
+    }
+
     fn setHistory(self: *App, recs: []AnimeRecord) void {
         self.history = recs;
         self.history_loading = false;
@@ -166,20 +270,101 @@ const App = struct {
     }
 
     // ── tick: fold one event into state ──────────────────────────────────────
-    fn tick(self: *App, event: Event) !void {
+    fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, provider: SourceProvider) !void {
         switch (event) {
-            .key_press => |key| self.onKey(key),
+            .key_press => |key| self.onKey(key, loop, io, provider),
             .winsize => {}, // screen resize is handled in run()'s loop (it owns vx).
             .focus_in, .focus_out => {},
             .history_loaded => |recs| self.setHistory(recs),
             .task_error => |msg| {
                 self.load_error = msg;
                 self.history_loading = false;
+                self.search_loading = false;
+            },
+            .search_done => |ev| {
+                // Stale check: ignore if query has changed since this search was fired.
+                if (!std.mem.eql(u8, ev.for_query, self.querySlice())) {
+                    for (ev.results) |r| { self.gpa.free(r.id); self.gpa.free(r.name); }
+                    self.gpa.free(ev.for_query);
+                    // NOTE: ev.results is a slice into a GPA-allocated backing array.
+                    // We freed each element's strings above; now free the backing array itself.
+                    self.gpa.free(ev.results);
+                    return;
+                }
+                self.search_loading = false;
+                if (ev.page == 1) {
+                    self.clearResults(); // free old data
+                }
+                self.search_page = ev.page;
+                // Take ownership: append results into self.results, which already holds
+                // old page(s) for page > 1. The strings are already gpa-owned.
+                self.results.appendSlice(self.gpa, ev.results) catch {};
+                // Free the slice header (but NOT the strings, now owned by self.results).
+                self.gpa.free(ev.results);
+                self.gpa.free(ev.for_query);
+                // Reset cursor to top on fresh search.
+                if (ev.page == 1) {
+                    self.list_cursor = 0;
+                    self.list_top = 0;
+                }
             },
         }
     }
 
-    fn onKey(self: *App, key: vaxis.Key) void {
+    fn fireSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, page: u32) void {
+        const q = self.querySlice();
+        if (q.len == 0) return;
+        const q_copy = self.gpa.dupe(u8, q) catch return;
+        self.search_loading = true;
+        _ = std.Thread.spawn(.{}, searchTask, .{
+            loop, self.gpa, io, provider, q_copy, page, self.translation,
+        }) catch {
+            self.gpa.free(q_copy);
+            self.search_loading = false;
+            return;
+        };
+    }
+
+    fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Esc: clear query, clear results, return to normal mode.
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.search_len = 0;
+            self.clearResults();
+            self.search_loading = false;
+            self.input_mode = .normal;
+            return;
+        }
+        // Enter: lock results, return to normal mode (focus to list).
+        if (key.matches(vaxis.Key.enter, .{})) {
+            self.input_mode = .normal;
+            return;
+        }
+        // Backspace: pop last char, re-search.
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.search_len > 0) {
+                self.search_len -= 1;
+                if (self.search_len == 0) {
+                    self.clearResults();
+                    self.search_loading = false;
+                } else {
+                    self.clearResults();
+                    self.fireSearch(loop, io, provider, 1);
+                }
+            }
+            return;
+        }
+        // Printable ASCII: append and search.
+        if (key.text) |text| {
+            if (text.len > 0 and self.search_len + text.len <= 127) {
+                @memcpy(self.search_query[self.search_len..][0..text.len], text);
+                self.search_len += text.len;
+                self.clearResults();
+                self.fireSearch(loop, io, provider, 1);
+            }
+        }
+    }
+
+    fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // q key behavior by view (§10.6).
         if (key.matches('q', .{})) {
             switch (self.active_view) {
@@ -254,23 +439,49 @@ const App = struct {
             return;
         }
 
-        // Navigation is only active in history view (j/k/g/G).
-        if (self.active_view != .history) return;
+        // Search mode — typed input handling.
+        if (self.input_mode == .search) {
+            self.onSearchKey(key, loop, io, provider);
+            return;
+        }
 
-        const n = self.history.len;
-        if (n == 0) return;
+        // Normal mode — view-gated navigation.
+        // '/' in Browse enters search mode.
+        if (key.matches('/', .{})) {
+            if (self.active_view == .browse) {
+                self.input_mode = .search;
+            }
+            return;
+        }
 
-        // vim navigation over the history list.
+        // Navigation is active in both history (over history slice) and
+        // browse (over results list). Silent no-op in settings.
+        const nav_len: usize = switch (self.active_view) {
+            .history => self.history.len,
+            .browse => self.results.items.len,
+            .settings => return,
+        };
+        if (nav_len == 0) return;
+
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-            if (self.list_cursor + 1 < n) self.list_cursor += 1;
+            if (self.list_cursor + 1 < nav_len) self.list_cursor += 1;
         } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
             if (self.list_cursor > 0) self.list_cursor -= 1;
         } else if (key.matches('g', .{})) {
             self.list_cursor = 0;
         } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-            // Both forms: terminals that report shift explicitly vs. those that
-            // send the bare shifted codepoint.
-            self.list_cursor = n - 1;
+            self.list_cursor = nav_len - 1;
+        }
+        // Load-more: at last result + j, trigger page+1 if possible.
+        // "possible" = last results page was full (26 items == might have more).
+        if (key.matches('j', .{}) and
+            self.active_view == .browse and
+            self.list_cursor == nav_len - 1 and
+            self.search_page > 0 and
+            nav_len % 26 == 0 and
+            !self.search_loading)
+        {
+            self.fireSearch(loop, io, provider, self.search_page + 1);
         }
     }
 
@@ -408,14 +619,74 @@ const App = struct {
             },
 
             .browse => {
-                // Browse idle placeholder (ROD-73 will fill this).
-                const mid = top + visible / 2;
-                centerText(win, mid -| 1, w, "no feed yet", style(colors.fg3, .{ .italic = true }));
-                const action = " to start a search";
-                const total: u16 = 1 + @as(u16, @intCast(action.len));
-                const start: u16 = if (w > total) (w - total) / 2 else 0;
-                put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
-                putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
+                if (self.search_len == 0) {
+                    // Idle: invite the user to search.
+                    const mid = top + visible / 2;
+                    centerText(win, mid -| 1, w, "no feed yet", style(colors.fg3, .{ .italic = true }));
+                    const action = " to start a search";
+                    const total: u16 = 1 + @as(u16, @intCast(action.len));
+                    const start: u16 = if (w > total) (w - total) / 2 else 0;
+                    put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
+                    putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
+                } else if (self.search_loading and self.results.items.len == 0) {
+                    // First load spinner.
+                    const mid = top + visible / 2;
+                    centerText(win, mid, w, "⠋ searching…", style(colors.focus, .{}));
+                } else if (!self.search_loading and self.results.items.len == 0) {
+                    // No results.
+                    const mid = top + visible / 2;
+                    const q = self.querySlice();
+                    var buf: [160]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "no results for \"{s}\"", .{q}) catch "no results";
+                    centerText(win, mid, w, msg, style(colors.fg3, .{ .italic = true }));
+                } else {
+                    // Results list — same row format as history.
+                    self.scrollIntoView(visible);
+                    const show_meta = w >= meta_col + 12;
+                    const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
+                    const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
+
+                    var row: u16 = top;
+                    var slot: usize = 0;
+                    var i: usize = self.list_top;
+                    while (i < self.results.items.len and row < top + visible) : (i += 1) {
+                        const a = self.results.items[i];
+                        const selected = i == self.list_cursor;
+
+                        const row_bg = if (selected) colors.bg_surface else colors.bg_base;
+                        if (selected) fillRow(win, row, w, colors.bg_surface);
+
+                        const marker = if (selected) "▸ " else "  ";
+                        put(win, row, 2, marker, style(colors.focus, .{ .bg = row_bg }));
+
+                        const title_style = if (selected)
+                            style(colors.focus, .{ .bg = row_bg, .bold = true })
+                        else
+                            style(colors.fg, .{ .bg = row_bg });
+                        putClipped(win, row, title_col, title_w, a.name, title_style);
+
+                        if (show_meta and slot < self.meta_scratch.len) {
+                            const tt = self.translation;
+                            const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
+                            const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s} eps", .{ eps, tt.str() }) catch "";
+                            putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
+                            slot += 1;
+                        }
+
+                        row += 1;
+                    }
+
+                    // Load-more footer if we might have more pages.
+                    if (row < top + visible and
+                        self.search_page > 0 and
+                        self.results.items.len % 26 == 0 and
+                        self.results.items.len > 0)
+                    {
+                        const footer = if (self.search_loading) "⠋ loading more…" else "╌  load more  ╌";
+                        const footer_color = if (self.search_loading) colors.focus else colors.fg3;
+                        centerText(win, row, w, footer, style(footer_color, .{}));
+                    }
+                }
             },
 
             .settings => {
@@ -429,12 +700,40 @@ const App = struct {
     fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         const w = win.width;
         const row = h - 1;
+
+        // Search mode in Browse: suppress ▌, show /query_ + count.
+        if (self.active_view == .browse and self.input_mode == .search) {
+            const q = self.querySlice();
+            put(win, row, 2, "/", style(colors.focus, .{ .bold = true }));
+            const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
+            if (q.len > 0) {
+                putClipped(win, row, 3, cursor_col -| 3, q, style(colors.fg, .{ .bold = true }));
+            }
+            if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
+            // Right-aligned count.
+            var cnt_buf: [16]u8 = undefined;
+            const cnt: []const u8 = if (self.search_loading and self.results.items.len == 0)
+                "…"
+            else if (self.results.items.len > 0)
+                std.fmt.bufPrint(&cnt_buf, "[{d}]", .{self.results.items.len}) catch ""
+            else
+                "";
+            if (cnt.len > 0) {
+                const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
+                putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg3, .{}));
+            }
+            return;
+        }
+
         // The signature: a magenta block cursor, terminal-blinked, always alive.
         put(win, row, 2, "▌", style(colors.hot, .{ .blink = true }));
 
-        const help = switch (self.active_view) {
+        const help: []const u8 = switch (self.active_view) {
             .browse => switch (self.active_pane) {
-                .list => "hjkl · / search · F1/F2/F3 views · q quit",
+                .list => if (self.results.items.len > 0)
+                    "jk move · / search · enter detail · q quit"
+                else
+                    "hjkl · / search · F1/F2/F3 views · q quit",
                 .detail => "hjkl scroll · h back · enter play · q back",
             },
             .history => if (self.history.len == 0)
@@ -529,11 +828,37 @@ fn sampleHistory() [3]AnimeRecord {
     };
 }
 
+fn dummySearchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+    return &.{};
+}
+fn dummyEpisodesFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+    return &.{};
+}
+fn dummyResolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation) anyerror!domain.StreamLink {
+    return .{ .url = "" };
+}
+
+const dummy_vtable: SourceProvider.VTable = .{
+    .search = dummySearchFn,
+    .episodes = dummyEpisodesFn,
+    .resolve = dummyResolveFn,
+};
+
+fn dummyProvider() SourceProvider {
+    return .{ .ptr = undefined, .vtable = &dummy_vtable };
+}
+
+fn testTick(app: *App, event: Event) !void {
+    var loop: Loop = undefined;
+    const io: std.Io = undefined;
+    try app.tick(event, &loop, io, dummyProvider());
+}
+
 test "history_loaded drains into state and clears loading" {
     var app: App = .{};
     try testing.expect(app.history_loading);
     var recs = sampleHistory();
-    try app.tick(.{ .history_loaded = &recs });
+    try testTick(&app, .{ .history_loaded = &recs });
     try testing.expect(!app.history_loading);
     try testing.expectEqual(@as(usize, 3), app.history.len);
 }
@@ -544,17 +869,17 @@ test "j/k navigation stays in bounds" {
     app.setHistory(&recs);
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 
-    try app.tick(keyEv('k', .{})); // up at top — pinned
+    try testTick(&app, keyEv('k', .{})); // up at top — pinned
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 
-    try app.tick(keyEv('j', .{}));
-    try app.tick(keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 2), app.list_cursor);
 
-    try app.tick(keyEv('j', .{})); // down at bottom — pinned
+    try testTick(&app, keyEv('j', .{})); // down at bottom — pinned
     try testing.expectEqual(@as(usize, 2), app.list_cursor);
 
-    try app.tick(keyEv('k', .{}));
+    try testTick(&app, keyEv('k', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 }
 
@@ -562,9 +887,9 @@ test "g/G jump to ends" {
     var app: App = .{};
     var recs = sampleHistory();
     app.setHistory(&recs);
-    try app.tick(keyEv('G', .{}));
+    try testTick(&app, keyEv('G', .{}));
     try testing.expectEqual(@as(usize, 2), app.list_cursor);
-    try app.tick(keyEv('g', .{}));
+    try testTick(&app, keyEv('g', .{}));
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 }
 
@@ -573,20 +898,20 @@ test "quit keys: q from browse and Ctrl-C" {
     var app: App = .{};
     app.active_view = .browse;
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv('q', .{}));
+    try testTick(&app, keyEv('q', .{}));
     try testing.expect(app.should_quit);
 
     // Ctrl-C always quits.
     app = .{};
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv('c', .{ .ctrl = true }));
+    try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);
 }
 
 test "navigation is a no-op with empty history" {
     var app: App = .{};
     app.setHistory(&.{});
-    try app.tick(keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
     try testing.expect(!app.should_quit);
 }
@@ -629,7 +954,7 @@ test "F2 from browse goes to history" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .browse;
-    try app.tick(keyEv(vaxis.Key.f2, .{}));
+    try testTick(&app, keyEv(vaxis.Key.f2, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
 }
 
@@ -637,7 +962,7 @@ test "F2 from history is a no-op" {
     var app: App = .{};
     app.active_view = .history;
     app.active_pane = .list;
-    try app.tick(keyEv(vaxis.Key.f2, .{}));
+    try testTick(&app, keyEv(vaxis.Key.f2, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
 }
 
@@ -646,7 +971,7 @@ test "F1 from history switches to browse" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
-    try app.tick(keyEv(vaxis.Key.f1, .{}));
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
@@ -654,7 +979,7 @@ test "F1 from browse is a no-op and preserves active_pane" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.tick(keyEv(vaxis.Key.f1, .{}));
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
     // active_pane must not be reset — F1 from Browse is a no-op per §10.2
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
@@ -665,7 +990,7 @@ test "H from history toggles to browse" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
-    try app.tick(keyEv('H', .{ .shift = true }));
+    try testTick(&app, keyEv('H', .{ .shift = true }));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
@@ -674,7 +999,7 @@ test "H from browse toggles to history" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .browse;
-    try app.tick(keyEv('H', .{}));
+    try testTick(&app, keyEv('H', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
 }
 
@@ -682,7 +1007,7 @@ test "F3 / S from any view switches to settings" {
     for ([_]@TypeOf(@as(App, undefined).active_view){ .browse, .history }) |from_view| {
         var app: App = .{};
         app.active_view = from_view;
-        try app.tick(keyEv(vaxis.Key.f3, .{}));
+        try testTick(&app, keyEv(vaxis.Key.f3, .{}));
         try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
     }
 }
@@ -690,7 +1015,7 @@ test "F3 / S from any view switches to settings" {
 test "S from settings is a no-op" {
     var app: App = .{};
     app.active_view = .settings;
-    try app.tick(keyEv('S', .{}));
+    try testTick(&app, keyEv('S', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
 }
 
@@ -700,7 +1025,7 @@ test "q from history returns to browse without quitting" {
     app.setHistory(&recs);
     app.active_view = .history;
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv('q', .{}));
+    try testTick(&app, keyEv('q', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
     try testing.expect(!app.should_quit);
 }
@@ -709,7 +1034,7 @@ test "q from settings returns to browse without quitting" {
     var app: App = .{};
     app.active_view = .settings;
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv('q', .{}));
+    try testTick(&app, keyEv('q', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
     try testing.expect(!app.should_quit);
 }
@@ -720,7 +1045,7 @@ test "q from browse quits the app" {
     app.setHistory(&recs);
     app.active_view = .browse;
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv('q', .{}));
+    try testTick(&app, keyEv('q', .{}));
     try testing.expect(app.should_quit);
 }
 
@@ -728,7 +1053,7 @@ test "Esc from browse detail pane returns to list pane" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.tick(keyEv(vaxis.Key.escape, .{}));
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
@@ -736,7 +1061,7 @@ test "Esc from browse detail pane returns to list pane" {
 test "Esc from history returns to browse" {
     var app: App = .{};
     app.active_view = .history;
-    try app.tick(keyEv(vaxis.Key.escape, .{}));
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
@@ -745,7 +1070,7 @@ test "Esc from browse list pane is a no-op" {
     app.active_view = .browse;
     app.active_pane = .list;
     try testing.expect(!app.should_quit);
-    try app.tick(keyEv(vaxis.Key.escape, .{}));
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
     try testing.expect(!app.should_quit);
@@ -755,7 +1080,7 @@ test "h in browse list pane is a no-op (already leftmost)" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.tick(keyEv('h', .{}));
+    try testTick(&app, keyEv('h', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
@@ -763,7 +1088,7 @@ test "l in browse list pane switches to detail pane" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.tick(keyEv('l', .{}));
+    try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
@@ -771,7 +1096,7 @@ test "h in browse detail pane switches to list pane" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.tick(keyEv('h', .{}));
+    try testTick(&app, keyEv('h', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
@@ -779,7 +1104,7 @@ test "l in browse detail pane is a no-op (already rightmost)" {
     var app: App = .{};
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.tick(keyEv('l', .{}));
+    try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
@@ -788,18 +1113,18 @@ test "h / l in history view are no-ops (single pane)" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
-    try app.tick(keyEv('h', .{}));
+    try testTick(&app, keyEv('h', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
-    try app.tick(keyEv('l', .{}));
+    try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
 test "h / l in settings view are no-ops (single pane)" {
     var app: App = .{};
     app.active_view = .settings;
-    try app.tick(keyEv('h', .{}));
+    try testTick(&app, keyEv('h', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
-    try app.tick(keyEv('l', .{}));
+    try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
@@ -811,18 +1136,18 @@ test "navigation (j/k/g/G) only works in history view" {
     // In browse view, j should not move cursor
     app.active_view = .browse;
     app.list_cursor = 0;
-    try app.tick(keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 
     // In history view, j moves cursor
     app.active_view = .history;
     app.list_cursor = 0;
-    try app.tick(keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 
     // In settings view, j does not move cursor
     app.active_view = .settings;
     app.list_cursor = 1;
-    try app.tick(keyEv('j', .{}));
+    try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 }
