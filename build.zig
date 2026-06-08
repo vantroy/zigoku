@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) void {
     });
     mod.linkSystemLibrary("sqlite3", .{});
 
+    // libvaxis (ROD-71) — the M3 TUI toolkit. v0.6.0 targets Zig 0.16's std.Io.
+    const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
+    const vaxis_mod = vaxis_dep.module("vaxis");
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -167,6 +171,24 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_spike_mpv.addArgs(args);
     const spike_mpv_step = b.step("spike-mpv", "ROD-57: full pipeline → play in mpv");
     spike_mpv_step.dependOn(&run_spike_mpv.step);
+
+    // spike-tui: prove libvaxis boots under Zig 0.16 (ROD-71). Renders a
+    // Terminal Ghost frame + event loop in a real terminal.
+    const spike_tui = b.addExecutable(.{
+        .name = "spike-tui",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/tui_smoke.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vaxis", .module = vaxis_mod },
+            },
+        }),
+    });
+    const run_spike_tui = b.addRunArtifact(spike_tui);
+    if (b.args) |args| run_spike_tui.addArgs(args);
+    const spike_tui_step = b.step("spike-tui", "ROD-71: libvaxis boot spike");
+    spike_tui_step.dependOn(&run_spike_tui.step);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
