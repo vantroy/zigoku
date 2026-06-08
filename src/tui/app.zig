@@ -60,6 +60,8 @@ const Event = union(enum) {
     play_done,
     /// resolve or mpv spawn failed.
     play_error,
+    /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
+    tick,
 };
 
 const Loop = vaxis.Loop(Event);
@@ -139,6 +141,15 @@ pub fn run(
     defer if (app.search_thread) |t| t.join();
     defer if (app.episode_thread) |t| t.join();
     defer if (app.play_thread) |t| t.join();
+
+    // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
+    // loop.stop() (LIFO — this defer is declared after the loop.stop() defer).
+    var tick_quit: std.atomic.Value(bool) = .init(false);
+    const tick_thread = std.Thread.spawn(.{}, tickTask, .{ &loop, &tick_quit }) catch null;
+    defer {
+        tick_quit.store(true, .release);
+        if (tick_thread) |t| t.join();
+    }
 
     // First paint, then the event loop.
     try app.draw(&vx, writer);
@@ -292,6 +303,31 @@ fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, s
     loop.postEvent(.play_done) catch {};
 }
 
+/// Heartbeat thread: posts .tick every 100ms until `quit` is set.
+fn tickTask(loop: *Loop, quit: *std.atomic.Value(bool)) void {
+    while (!quit.load(.acquire)) {
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        loop.postEvent(.tick) catch {};
+    }
+}
+
+/// Current wall-clock time in milliseconds (ms since Unix epoch).
+fn nowMs(io: std.Io) i64 {
+    const ts = std.Io.Clock.real.now(io);
+    return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+const Toast = struct {
+    const Kind = enum { info, @"error", warn };
+    kind: Kind,
+    text: [80]u8 = undefined,
+    text_len: usize = 0,
+    /// Countdown ms for non-persistent toasts. 0 = expired/persistent.
+    ttl_ms: i32 = 4000,
+    /// Persistent toasts survive TTL and are only cleared by a recovery path.
+    persistent: bool = false,
+};
+
 const App = struct {
     should_quit: bool = false,
 
@@ -381,10 +417,48 @@ const App = struct {
     detail_meta_buf: [32]u8 = undefined,
     /// Stable storage for the "[N]" result count in drawBottomBar search mode.
     cnt_scratch: [16]u8 = undefined,
+    /// Scratch for the animated browse chip text ("⠋ search") in drawTopBar.
+    chip_buf: [16]u8 = undefined,
+
+    // ── async feedback (ROD-76) ───────────────────────────────────────────────
+    /// Current Braille spinner frame index (0–9, wraps on .tick).
+    spinner_frame: u8 = 0,
+    /// Timestamp (ms) when the current async op started. 0 = nothing running.
+    async_start_ms: i64 = 0,
+    /// Deadline for search debounce (ms). 0 = no pending debounce.
+    debounce_deadline_ms: i64 = 0,
+    /// Last tick timestamp (ms). Updated on every .tick event; used by draw functions.
+    now_ms: i64 = 0,
+    /// Toast queue (oldest first). null = empty slot.
+    toast_queue: [3]?Toast = .{ null, null, null },
 
     /// Current query as a slice (may be empty).
     fn querySlice(self: *const App) []const u8 {
         return self.search_query[0..self.search_len];
+    }
+
+    const spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"; // 10 × 3 UTF-8 bytes
+    fn spinnerChar(self: *const App) []const u8 {
+        const b = @as(usize, self.spinner_frame) * 3;
+        return spinner_frames[b .. b + 3];
+    }
+
+    fn pushToast(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool) void {
+        var idx: usize = 3;
+        for (self.toast_queue, 0..) |slot, i| {
+            if (slot == null) { idx = i; break; }
+        }
+        if (idx == 3) {
+            self.toast_queue[0] = self.toast_queue[1];
+            self.toast_queue[1] = self.toast_queue[2];
+            idx = 2;
+        }
+        var t: Toast = .{ .kind = kind, .persistent = persistent,
+            .ttl_ms = if (persistent) 0 else 4000 };
+        const n = @min(text.len, 79);
+        @memcpy(t.text[0..n], text[0..n]);
+        t.text_len = n;
+        self.toast_queue[idx] = t;
     }
 
     /// Free all accumulated search results and reset search state.
@@ -427,6 +501,9 @@ const App = struct {
                 self.load_error = msg;
                 self.history_loading = false;
                 self.search_loading = false;
+                self.debounce_deadline_ms = 0;
+                self.async_start_ms = 0;
+                self.pushToast(.@"error", msg, true);
             },
             .search_done => |ev| {
                 // Stale check: ignore if query has changed since this search was fired.
@@ -439,6 +516,13 @@ const App = struct {
                     return;
                 }
                 self.search_loading = false;
+                self.async_start_ms = 0;
+                // Clear persistent search-error toasts on a good result.
+                for (&self.toast_queue) |*slot| {
+                    if (slot.*) |t| {
+                        if (t.persistent and t.kind == .@"error") slot.* = null;
+                    }
+                }
                 if (ev.page == 1) {
                     self.clearResults(); // free old data
                 }
@@ -478,6 +562,24 @@ const App = struct {
             .play_done, .play_error => {
                 self.playing = false;
             },
+            .tick => {
+                const now = nowMs(io);
+                self.now_ms = now;
+                self.spinner_frame = (self.spinner_frame + 1) % 10;
+                if (self.debounce_deadline_ms > 0 and now >= self.debounce_deadline_ms) {
+                    self.debounce_deadline_ms = 0;
+                    self.clearResults();
+                    self.fireSearch(loop, io, provider, 1);
+                }
+                for (&self.toast_queue) |*slot| {
+                    if (slot.*) |*t| {
+                        if (!t.persistent) {
+                            t.ttl_ms -= 100;
+                            if (t.ttl_ms <= 0) slot.* = null;
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -494,6 +596,7 @@ const App = struct {
         }
         const q_copy = self.gpa.dupe(u8, q) catch return;
         self.search_loading = true;
+        self.async_start_ms = self.now_ms;
         self.search_thread = std.Thread.spawn(.{}, searchTask, .{
             loop, self.gpa, io, provider, q_copy, page, self.translation,
         }) catch {
@@ -561,40 +664,45 @@ const App = struct {
     }
 
     fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        // Esc: clear query, clear results, return to normal mode.
+        // Esc: clear query + any pending debounce, return to normal mode.
         if (key.matches(vaxis.Key.escape, .{})) {
             self.search_len = 0;
             self.clearResults();
             self.search_loading = false;
+            self.debounce_deadline_ms = 0;
             self.input_mode = .normal;
             return;
         }
-        // Enter: lock results, return to normal mode (focus to list).
+        // Enter: bypass debounce — fire immediately if pending, then lock results.
         if (key.matches(vaxis.Key.enter, .{})) {
+            if (self.debounce_deadline_ms > 0 and self.search_len > 0) {
+                self.debounce_deadline_ms = 0;
+                self.clearResults();
+                self.fireSearch(loop, io, provider, 1);
+            }
             self.input_mode = .normal;
             return;
         }
-        // Backspace: pop last char, re-search.
+        // Backspace: pop last char, schedule re-search via debounce.
         if (key.matches(vaxis.Key.backspace, .{})) {
             if (self.search_len > 0) {
                 self.search_len -= 1;
                 if (self.search_len == 0) {
                     self.clearResults();
                     self.search_loading = false;
+                    self.debounce_deadline_ms = 0;
                 } else {
-                    self.clearResults();
-                    self.fireSearch(loop, io, provider, 1);
+                    self.debounce_deadline_ms = nowMs(io) + 300;
                 }
             }
             return;
         }
-        // Printable ASCII: append and search.
+        // Printable: append and arm debounce — don't fire immediately.
         if (key.text) |text| {
             if (text.len > 0 and self.search_len + text.len <= 127) {
                 @memcpy(self.search_query[self.search_len..][0..text.len], text);
                 self.search_len += text.len;
-                self.clearResults();
-                self.fireSearch(loop, io, provider, 1);
+                self.debounce_deadline_ms = nowMs(io) + 300;
             }
         }
     }
@@ -772,8 +880,9 @@ const App = struct {
             return;
         }
 
-        drawTopBar(win, w, self.active_view, self.active_pane);
+        self.drawTopBar(win, w);
         self.drawContent(win, h);
+        self.drawToasts(win, h);
         self.drawBottomBar(win, h);
 
         try vx.render(writer);
@@ -783,26 +892,22 @@ const App = struct {
     /// as one primary H1 unit, then a hairline separator. No tabs here: the tab
     /// system + focus model is ROD-72 and needs a designed home (the active-tab
     /// cyan would collide with the focus color if it lived in this bar).
-    fn drawTopBar(win: vaxis.Window, w: u16, active_view: @TypeOf(@as(App, undefined).active_view), active_pane: @TypeOf(@as(App, undefined).active_pane)) void {
+    fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
         put(win, 0, 2, "地獄 zigoku", style(colors.fg, .{ .bold = true }));
         if (w > 16) put(win, 0, 14, "░", style(colors.chrome, .{}));
 
         // Render the chip after the separator (§10.3b).
         const chip_col: u16 = 16;
-        const chip = switch (active_view) {
+        const chip: []const u8 = switch (self.active_view) {
             .history => "Watchlist",
             .settings => "Settings",
-            .browse => "⠋ search",
+            .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
         };
-        const chip_color = switch (active_view) {
-            .history, .settings => colors.focus,
-            .browse => colors.focus,
-        };
-        put(win, 0, chip_col, chip, style(chip_color, .{}));
+        put(win, 0, chip_col, chip, style(colors.focus, .{}));
 
         // Render the · indicator right-aligned (§10.3b).
-        const dot_color = switch (active_view) {
-            .browse => if (active_pane == .detail) colors.focus else colors.fg3,
+        const dot_color = switch (self.active_view) {
+            .browse => if (self.active_pane == .detail) colors.focus else colors.fg3,
             .history, .settings => colors.focus,
         };
         if (w > 2) put(win, 0, w - 2, "·", style(dot_color, .{}));
@@ -821,8 +926,8 @@ const App = struct {
             .history => {
                 // History view — existing list rendering.
                 if (self.history_loading) {
-                    // Static placeholder; the animated Braille spinner is ROD-76.
-                    putClipped(win, top, 2, body_w, "⠋ loading history", style(colors.focus, .{}));
+                    const hist_spin = std.fmt.bufPrint(&self.no_results_buf, "{s} loading history", .{self.spinnerChar()}) catch "⠋ loading history";
+                    putClipped(win, top, 2, body_w, hist_spin, style(colors.focus, .{}));
                     return;
                 }
                 if (self.load_error) |msg| {
@@ -923,11 +1028,13 @@ const App = struct {
             putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
             return;
         }
-        if (self.search_loading and self.results.items.len == 0) {
-            centerText(win, pane_h / 2, w, "⠋ searching…", style(colors.focus, .{}));
+        const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
+        if (search_pending and self.results.items.len == 0) {
+            const spin_msg = std.fmt.bufPrint(&self.no_results_buf, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
+            centerText(win, pane_h / 2, w, spin_msg, style(colors.focus, .{}));
             return;
         }
-        if (!self.search_loading and self.results.items.len == 0) {
+        if (!search_pending and self.results.items.len == 0) {
             const q = self.querySlice();
             const msg = std.fmt.bufPrint(&self.no_results_buf, "no results for \"{s}\"", .{q}) catch "no results";
             putClipped(win, 0, 0, w, msg, style(colors.fg3, .{ .italic = true }));
@@ -1141,7 +1248,7 @@ const App = struct {
             }
             if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
             // Right-aligned count (text.muted = fg2 per §3.5).
-            const cnt: []const u8 = if (self.search_loading and self.results.items.len == 0)
+            const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
                 "…"
             else if (self.results.items.len > 0)
                 std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{self.results.items.len}) catch ""
@@ -1159,8 +1266,19 @@ const App = struct {
             return;
         }
 
-        // The signature: a magenta block cursor, terminal-blinked, always alive.
-        put(win, row, 2, "▌", style(colors.hot, .{ .blink = true }));
+        // When anything is loading, replace the ▌ with an animated spinner.
+        const any_loading = self.search_loading or self.history_loading or
+            self.episode_loading or self.debounce_deadline_ms > 0;
+        if (any_loading) {
+            const spin_color: vaxis.Color = if (self.async_start_ms > 0 and
+                self.now_ms - self.async_start_ms > 3000)
+                colors.hot
+            else
+                colors.focus;
+            put(win, row, 2, self.spinnerChar(), style(spin_color, .{}));
+        } else {
+            put(win, row, 2, "▌", style(colors.hot, .{ .blink = true }));
+        }
 
         const help: []const u8 = switch (self.active_view) {
             .browse => switch (self.active_pane) {
@@ -1174,6 +1292,35 @@ const App = struct {
             .settings => "jk navigate · space toggle · enter edit · esc cancel · q back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
+    }
+
+    fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
+        if (h < 4) return;
+        var row: u16 = h -| 2;
+        for (self.toast_queue) |maybe| {
+            const t = maybe orelse continue;
+            if (row < 1) break;
+            const fg_color: vaxis.Color = switch (t.kind) {
+                .@"error" => colors.hot,
+                .warn => colors.warn,
+                .info => colors.focus,
+            };
+            const prefix: []const u8 = switch (t.kind) {
+                .@"error" => "[!] ",
+                .warn => "[~] ",
+                .info => "[·] ",
+            };
+            const w = win.width;
+            fillRow(win, row, w, colors.bg_elevated);
+            const pre_col: u16 = 2;
+            const pre_sty = style(fg_color, .{ .bold = true, .bg = colors.bg_elevated });
+            put(win, row, pre_col, prefix, pre_sty);
+            const txt_col: u16 = pre_col + @as(u16, @intCast(prefix.len));
+            const txt_w: u16 = if (w > txt_col + 1) w - txt_col - 1 else 0;
+            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len],
+                style(fg_color, .{ .bg = colors.bg_elevated }));
+            row -|= 1;
+        }
     }
 
     fn scrollIntoView(self: *App, visible: u16) void {
@@ -1858,4 +2005,45 @@ test "episodes_done stale result is discarded" {
 
     // Cleanup detail_for_id manually.
     if (app.detail_for_id) |id| { std.testing.allocator.free(id); app.detail_for_id = null; }
+}
+
+test "search mode: char appends and arms debounce, does not fire immediately" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    const k = vaxis.Key{ .codepoint = 'a', .text = "a" };
+    try testTick(&app, .{ .key_press = k });
+    try testing.expectEqual(@as(usize, 1), app.search_len);
+    try testing.expect(!app.search_loading);
+    try testing.expect(app.debounce_deadline_ms > 0);
+}
+
+test "tick advances spinner frame and wraps at 10" {
+    var app: App = .{};
+    try testing.expectEqual(@as(u8, 0), app.spinner_frame);
+    for (0..10) |_| try testTick(&app, .tick);
+    try testing.expectEqual(@as(u8, 0), app.spinner_frame);
+}
+
+test "tick fires debounced search when deadline has passed" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.search_len = 3;
+    @memcpy(app.search_query[0..3], "abc");
+    app.debounce_deadline_ms = 1; // well in the past — always expired
+    try testTick(&app, .tick);
+    try testing.expectEqual(@as(i64, 0), app.debounce_deadline_ms);
+    try testing.expect(app.search_loading);
+    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    app.results.deinit(std.testing.allocator);
+}
+
+test "task_error pushes a persistent error toast" {
+    var app: App = .{};
+    try testTick(&app, .{ .task_error = "network down" });
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.@"error", t.kind);
+    try testing.expect(t.persistent);
+    try testing.expectEqualStrings("network down", t.text[0..t.text_len]);
 }
