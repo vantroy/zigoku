@@ -39,10 +39,6 @@ const Event = union(enum) {
 
 const Loop = vaxis.Loop(Event);
 
-/// Top-level navigation. F1/F2/F3 switching is ROD-72; for now History is the
-/// only live tab and the bar renders the others as upcoming.
-const Tab = enum { anime, history, settings };
-
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -124,7 +120,6 @@ fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 }
 
 const App = struct {
-    tab: Tab = .history,
     should_quit: bool = false,
 
     /// Landing data. Backed by run()'s history arena — App only reads it.
@@ -207,33 +202,20 @@ const App = struct {
             return;
         }
 
-        self.drawTopBar(win, w);
+        drawTopBar(win, w);
         self.drawContent(win, h);
         self.drawBottomBar(win, h);
 
         try vx.render(writer);
     }
 
-    fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
-        put(win, 0, 2, "地獄", style(colors.fg, .{ .bold = true }));
-        put(win, 0, 7, "zigoku", style(colors.fg2, .{}));
-
-        // Tab strip. Active tab in cyan, the rest dim. Switching is ROD-72.
-        // Each label is clipped to the remaining width so a narrow terminal
-        // truncates the strip cleanly instead of overflowing.
-        const tabs = [_]struct { tab: Tab, label: []const u8 }{
-            .{ .tab = .anime, .label = "ANIME" },
-            .{ .tab = .history, .label = "HISTORY" },
-            .{ .tab = .settings, .label = "SETTINGS" },
-        };
-        var col: u16 = 18;
-        for (tabs) |t| {
-            if (col >= w) break;
-            const active = t.tab == self.tab;
-            const sty = if (active) style(colors.focus, .{ .bold = true }) else style(colors.fg3, .{});
-            putClipped(win, 0, col, w - col, t.label, sty);
-            col += @intCast(t.label.len + 2);
-        }
+    /// §3.4: the top bar is read-only context, not navigation — `地獄 zigoku`
+    /// as one primary H1 unit, then a hairline separator. No tabs here: the tab
+    /// system + focus model is ROD-72 and needs a designed home (the active-tab
+    /// cyan would collide with the focus color if it lived in this bar).
+    fn drawTopBar(win: vaxis.Window, w: u16) void {
+        put(win, 0, 2, "地獄 zigoku", style(colors.fg, .{ .bold = true }));
+        if (w > 16) put(win, 0, 14, "░", style(colors.chrome, .{}));
     }
 
     fn drawContent(self: *App, win: vaxis.Window, h: u16) void {
@@ -243,27 +225,35 @@ const App = struct {
         const visible: u16 = h - 3;
         const body_w: u16 = if (win.width > 2) win.width - 2 else 0;
 
+        const w = win.width;
+
         if (self.history_loading) {
-            putClipped(win, top, 2, body_w, "⟳ loading history…", style(colors.focus, .{}));
+            // Static placeholder; the animated Braille spinner is ROD-76.
+            putClipped(win, top, 2, body_w, "⠋ loading history", style(colors.focus, .{}));
             return;
         }
         if (self.load_error) |msg| {
-            put(win, top, 2, "history unavailable:", style(colors.warn, .{}));
+            // Hard failure → magenta (state.error = state.now, §1.1).
+            put(win, top, 2, "history unavailable", style(colors.hot, .{ .bold = true }));
             putClipped(win, top + 1, 2, body_w, msg, style(colors.fg3, .{}));
             return;
         }
         if (self.history.len == 0) {
-            // First-run empty state (DESIGN §9).
-            putClipped(win, top + 1, 2, body_w, "no history yet.", style(colors.fg, .{}));
-            putClipped(win, top + 2, 2, body_w, "search lands in ROD-73 — for now, play from the CLI:", style(colors.fg3, .{}));
-            putClipped(win, top + 3, 2, body_w, "zigoku frieren", style(colors.fg2, .{}));
+            // First-run empty state (§9.2): the void, one quiet line, one
+            // invitation — both centered. `/` wires up in ROD-73.
+            const mid = top + visible / 2;
+            centerText(win, mid -| 1, w, "nothing here yet", style(colors.fg3, .{ .italic = true }));
+            const action = " to search for a show";
+            const total: u16 = 1 + @as(u16, @intCast(action.len));
+            const start: u16 = if (w > total) (w - total) / 2 else 0;
+            put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
+            putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
             return;
         }
 
         // Keep the cursor inside the viewport.
         self.scrollIntoView(visible);
 
-        const w = win.width;
         // Meta only earns its column when the terminal is wide enough to hold it
         // without colliding the title — otherwise the title takes the full width.
         const show_meta = w >= meta_col + 12;
@@ -277,13 +267,20 @@ const App = struct {
             const rec = self.history[i];
             const selected = i == self.list_cursor;
 
+            // §4.1 focus affordance: the focused row's background shifts to
+            // bg.surface (a full-width band), its marker is the ▸ play glyph in
+            // focus cyan, and its title goes cyan+bold. Magenta is reserved for
+            // the one cursor in the status bar — never a list marker (§8).
+            const row_bg = if (selected) colors.bg_surface else colors.bg_base;
+            if (selected) fillRow(win, row, w, colors.bg_surface);
+
             const marker = if (selected) "▸ " else "  ";
-            put(win, row, 2, marker, style(colors.hot, .{}));
+            put(win, row, 2, marker, style(colors.focus, .{ .bg = row_bg }));
 
             const title_style = if (selected)
-                style(colors.focus, .{ .bold = true })
+                style(colors.focus, .{ .bg = row_bg, .bold = true })
             else
-                style(colors.fg, .{});
+                style(colors.fg, .{ .bg = row_bg });
             // Clipped to its column budget so long titles can't bleed into meta.
             putClipped(win, row, title_col, title_w, rec.title, title_style);
 
@@ -292,7 +289,7 @@ const App = struct {
             // more visible rows than slots.
             if (show_meta and slot < self.meta_scratch.len) {
                 const meta = formatMeta(&self.meta_scratch[slot], rec);
-                putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{}));
+                putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
                 slot += 1;
             }
 
@@ -304,7 +301,7 @@ const App = struct {
         const w = win.width;
         const row = h - 1;
         // The signature: a magenta block cursor, terminal-blinked, always alive.
-        put(win, row, 2, "▌", style2(colors.hot, .{ .blink = true }));
+        put(win, row, 2, "▌", style(colors.hot, .{ .blink = true }));
 
         const help = if (self.history.len == 0)
             "q quit"
@@ -348,21 +345,36 @@ fn putClipped(win: vaxis.Window, row: u16, col: u16, max_w: u16, text: []const u
     _ = child.printSegment(.{ .text = text, .style = sty }, .{});
 }
 
+/// Paint a full-width 1-row band in `bg` — the focused-row background shift.
+fn fillRow(win: vaxis.Window, row: u16, w: u16, bg: vaxis.Color) void {
+    const child = win.child(.{ .x_off = 0, .y_off = @intCast(row), .width = w, .height = 1 });
+    child.fill(.{ .style = .{ .bg = bg } });
+}
+
+/// Horizontally centre an ASCII string on `row` (byte length == display width
+/// for the ASCII copy this is used with).
+fn centerText(win: vaxis.Window, row: u16, w: u16, text: []const u8, sty: vaxis.Style) void {
+    const tw: u16 = @intCast(text.len);
+    const col: u16 = if (w > tw) (w - tw) / 2 else 0;
+    putClipped(win, row, col, w, text, sty);
+}
+
 // History-row layout columns. The detail/responsive layout is ROD-72+; this is
 // the fixed two-column (title | meta) skeleton.
 const title_col: u16 = 4;
 const meta_col: u16 = 48;
 const title_meta_gap: u16 = 2;
 
-// Two tiny constructors for foreground-on-void styles. They're split by which
-// SGR toggle they expose (bold vs. blink) only because blink has exactly one
-// call site — the cursor. Merge into one `opts` struct if a third toggle shows up.
-fn style(fg: vaxis.Color, opts: struct { bold: bool = false }) vaxis.Style {
-    return .{ .fg = fg, .bg = colors.bg_base, .bold = opts.bold };
-}
-
-fn style2(fg: vaxis.Color, opts: struct { blink: bool = false }) vaxis.Style {
-    return .{ .fg = fg, .bg = colors.bg_base, .blink = opts.blink };
+// One style constructor for foreground-on-(void|surface) cells. bg defaults to
+// the void so most call sites stay terse; the focused list row passes bg.surface
+// to get §4.1's background shift.
+fn style(fg: vaxis.Color, opts: struct {
+    bg: vaxis.Color = colors.bg_base,
+    bold: bool = false,
+    italic: bool = false,
+    blink: bool = false,
+}) vaxis.Style {
+    return .{ .fg = fg, .bg = opts.bg, .bold = opts.bold, .italic = opts.italic, .blink = opts.blink };
 }
 
 // ── tests: the App state machine (no tty needed) ────────────────────────────
