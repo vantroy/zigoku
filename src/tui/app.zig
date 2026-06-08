@@ -119,6 +119,10 @@ pub fn run(
     }
 
     app.gpa = gpa;
+    // Join the last search thread before loop teardown so in-flight threads
+    // can't dereference a torn-down loop or gpa. Declared after loop.stop()'s
+    // defer so it executes first (Zig defers are LIFO).
+    defer if (app.search_thread) |t| t.join();
 
     // First paint, then the event loop.
     try app.draw(&vx, writer);
@@ -132,12 +136,19 @@ pub fn run(
         try app.draw(&vx, writer);
     }
 
-    app.clearResults();
+    // Teardown: free results strings and the backing allocation.
+    // clearResults only calls clearRetainingCapacity (keeps the buffer for
+    // mid-session reuse); here we want the full deinit.
+    for (app.results.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+    app.results.deinit(gpa);
 }
 
 /// Background task: search and post results back to the UI thread.
 fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, query: []const u8, page: u32, translation: domain.Translation) void {
-    defer gpa.free(query); // query was duped by caller; we own it
+    // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
+    // on the success path; the UI thread frees it there. On all error paths we free it
+    // here explicitly before returning. Do NOT add a defer — it would free the string
+    // before the UI thread reads `ev.for_query`, causing a use-after-free.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
@@ -146,15 +157,18 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         .limit = 26,
         .page = page,
     }) catch {
+        gpa.free(query);
         loop.postEvent(.{ .task_error = "search failed" }) catch {};
         return;
     };
 
     // Dupe id+name into GPA so they survive arena teardown.
     // Other Anime fields (eps_sub, eps_dub, status, thumb…) are value types or
-    // null — copy them as-is without duplication.
+    // null — copy them as-is. Arena-pointing optional strings (status, thumb…)
+    // are omitted so they default to null rather than dangling after arena teardown.
     var owned = std.ArrayListUnmanaged(Anime).empty;
     owned.ensureTotalCapacity(gpa, raw.len) catch {
+        gpa.free(query);
         loop.postEvent(.{ .task_error = "search OOM" }) catch {};
         return;
     };
@@ -166,7 +180,6 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
             .name = name_owned,
             .eps_sub = a.eps_sub,
             .eps_dub = a.eps_dub,
-            .status = a.status,
         });
     }
 
@@ -175,12 +188,13 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         .for_query = query,
         .page = page,
     }}) catch {
-        // Free on post failure
+        // Post failed — we still own everything; free it all.
         for (owned.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+        owned.deinit(gpa); // free the backing array (strings already freed above)
+        gpa.free(query);
     };
-    // NOTE: owned.items pointer now belongs to the event; don't free it here.
-    // The backing array slice is what we posted, so just discard the list handle.
-    // (No call to owned.deinit — that would free the slice we just posted.)
+    // On success: `owned.items` and `query` are now owned by the event.
+    // Do NOT call owned.deinit here — that would free the slice the UI thread holds.
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
@@ -242,7 +256,13 @@ const App = struct {
     results: std.ArrayListUnmanaged(Anime) = .empty,
 
     /// GPA reference for freeing search results. Set in run() before the event loop.
+    /// Intentionally not zero-initialised — only valid after run() sets it.
     gpa: Allocator = undefined,
+
+    /// Handle for the most recent search thread. Joined in fireSearch before a new
+    /// spawn, and in run() teardown. This bounds concurrent search threads to 1,
+    /// preventing use-after-free of `loop` and `gpa` on fast quit.
+    search_thread: ?std.Thread = null,
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -314,9 +334,17 @@ const App = struct {
     fn fireSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, page: u32) void {
         const q = self.querySlice();
         if (q.len == 0) return;
+        // Join any previous search thread before spawning a new one. This bounds
+        // concurrent threads to 1 and prevents `loop`/`gpa` use-after-free on quit.
+        // At ~1s per request, rapid typing may block briefly here — a cancellation
+        // token is future scope (ROD-76+).
+        if (self.search_thread) |t| {
+            t.join();
+            self.search_thread = null;
+        }
         const q_copy = self.gpa.dupe(u8, q) catch return;
         self.search_loading = true;
-        _ = std.Thread.spawn(.{}, searchTask, .{
+        self.search_thread = std.Thread.spawn(.{}, searchTask, .{
             loop, self.gpa, io, provider, q_copy, page, self.translation,
         }) catch {
             self.gpa.free(q_copy);
@@ -390,12 +418,16 @@ const App = struct {
             if (self.active_view != .history) {
                 self.active_view = .history;
                 self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
             return;
         }
         if (key.matches('H', .{ .shift = true }) or key.matches('H', .{})) {
             self.active_view = if (self.active_view == .history) .browse else .history;
             self.active_pane = .list;
+            self.list_cursor = 0;
+            self.list_top = 0;
             return;
         }
         if (key.matches(vaxis.Key.f3, .{}) or
@@ -404,6 +436,8 @@ const App = struct {
             if (self.active_view != .settings) {
                 self.active_view = .settings;
                 self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
             return;
         }
@@ -412,6 +446,8 @@ const App = struct {
             if (self.active_view != .browse) {
                 self.active_view = .browse;
                 self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
             return;
         }
@@ -426,8 +462,14 @@ const App = struct {
             return;
         }
 
-        // Esc chain (§10.4). input_mode is ROD-73 scope; in ROD-72 only the
-        // pane-return and view-return branches are wired.
+        // Search mode intercepts all keys (including Esc) before the view chain.
+        // Esc in search mode clears the query; Esc in normal mode runs the view chain.
+        if (self.input_mode == .search) {
+            self.onSearchKey(key, loop, io, provider);
+            return;
+        }
+
+        // Esc chain (§10.4): only reached in normal mode.
         if (key.matches(vaxis.Key.escape, .{})) {
             if (self.active_view == .browse and self.active_pane == .detail) {
                 self.active_pane = .list;
@@ -436,12 +478,6 @@ const App = struct {
                 self.active_pane = .list;
             }
             // Browse + list + normal: no-op. q handles quit.
-            return;
-        }
-
-        // Search mode — typed input handling.
-        if (self.input_mode == .search) {
-            self.onSearchKey(key, loop, io, provider);
             return;
         }
 
@@ -633,12 +669,11 @@ const App = struct {
                     const mid = top + visible / 2;
                     centerText(win, mid, w, "⠋ searching…", style(colors.focus, .{}));
                 } else if (!self.search_loading and self.results.items.len == 0) {
-                    // No results.
-                    const mid = top + visible / 2;
+                    // No results — top-aligned per §9.3a.
                     const q = self.querySlice();
                     var buf: [160]u8 = undefined;
                     const msg = std.fmt.bufPrint(&buf, "no results for \"{s}\"", .{q}) catch "no results";
-                    centerText(win, mid, w, msg, style(colors.fg3, .{ .italic = true }));
+                    putClipped(win, top, 2, body_w, msg, style(colors.fg3, .{ .italic = true }));
                 } else {
                     // Results list — same row format as history.
                     self.scrollIntoView(visible);
@@ -710,17 +745,22 @@ const App = struct {
                 putClipped(win, row, 3, cursor_col -| 3, q, style(colors.fg, .{ .bold = true }));
             }
             if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
-            // Right-aligned count.
+            // Right-aligned count (text.muted = fg2 per §3.5).
             var cnt_buf: [16]u8 = undefined;
             const cnt: []const u8 = if (self.search_loading and self.results.items.len == 0)
                 "…"
             else if (self.results.items.len > 0)
                 std.fmt.bufPrint(&cnt_buf, "[{d}]", .{self.results.items.len}) catch ""
+            else if (self.search_len > 0)
+                "[0 results]"
             else
                 "";
             if (cnt.len > 0) {
                 const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
-                putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg3, .{}));
+                // Overlap guard: suppress count if it would collide with the cursor.
+                if (cnt_col > cursor_col + 1) {
+                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg2, .{}));
+                }
             }
             return;
         }
@@ -730,10 +770,7 @@ const App = struct {
 
         const help: []const u8 = switch (self.active_view) {
             .browse => switch (self.active_pane) {
-                .list => if (self.results.items.len > 0)
-                    "jk move · / search · enter detail · q quit"
-                else
-                    "hjkl · / search · F1/F2/F3 views · q quit",
+                .list => "hjkl · / search · F1/F2/F3 views · q quit",
                 .detail => "hjkl scroll · h back · enter play · q back",
             },
             .history => if (self.history.len == 0)
@@ -1128,26 +1165,194 @@ test "h / l in settings view are no-ops (single pane)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
-test "navigation (j/k/g/G) only works in history view" {
+test "navigation j/k — history with data, browse empty (no-op), settings no-op" {
     var app: App = .{};
     var recs = sampleHistory();
     app.setHistory(&recs);
 
-    // In browse view, j should not move cursor
+    // Browse with no results: j is a no-op (nav_len == 0).
     app.active_view = .browse;
     app.list_cursor = 0;
     try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 
-    // In history view, j moves cursor
+    // History: j moves cursor.
     app.active_view = .history;
     app.list_cursor = 0;
     try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 
-    // In settings view, j does not move cursor
+    // Settings: j is always a no-op.
     app.active_view = .settings;
     app.list_cursor = 1;
     try testTick(&app, keyEv('j', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
+}
+
+test "/ in Browse enters search mode" {
+    var app: App = .{};
+    app.active_view = .browse;
+    try testing.expectEqual(.normal, app.input_mode);
+    try testTick(&app, keyEv('/', .{}));
+    try testing.expectEqual(.search, app.input_mode);
+}
+
+test "/ in History is a no-op for search mode" {
+    var app: App = .{};
+    app.active_view = .history;
+    try testTick(&app, keyEv('/', .{}));
+    try testing.expectEqual(.normal, app.input_mode);
+}
+
+test "search mode: Esc clears query and returns to normal" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    app.search_len = 5;
+    @memcpy(app.search_query[0..5], "hello");
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(.normal, app.input_mode);
+    try testing.expectEqual(@as(usize, 0), app.search_len);
+}
+
+test "search mode: Enter locks results and returns to normal" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    app.search_len = 5;
+    @memcpy(app.search_query[0..5], "hello");
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(.normal, app.input_mode);
+    try testing.expectEqual(@as(usize, 5), app.search_len); // query preserved
+}
+
+test "search_done page 1 populates results" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.search_len = 7;
+    @memcpy(app.search_query[0..7], "frieren");
+
+    const query_copy = try std.testing.allocator.dupe(u8, "frieren");
+    const results_backing = try std.testing.allocator.alloc(Anime, 1);
+    results_backing[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "abc123"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+    };
+
+    try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 1 } });
+    try testing.expectEqual(@as(usize, 1), app.results.items.len);
+    try testing.expectEqualStrings("Frieren", app.results.items[0].name);
+    try testing.expectEqual(@as(u32, 1), app.search_page);
+    try testing.expect(!app.search_loading);
+
+    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    app.results.deinit(std.testing.allocator);
+}
+
+test "search_done stale result is discarded" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    // Current query is "frieren"; incoming result is for "bebop" — stale.
+    app.search_len = 7;
+    @memcpy(app.search_query[0..7], "frieren");
+
+    const query_copy = try std.testing.allocator.dupe(u8, "bebop");
+    const results_backing = try std.testing.allocator.alloc(Anime, 1);
+    results_backing[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "xyz789"),
+        .name = try std.testing.allocator.dupe(u8, "Bebop"),
+        .eps_sub = 26,
+    };
+
+    try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 1 } });
+    // All stale data freed by tick — results untouched.
+    try testing.expectEqual(@as(usize, 0), app.results.items.len);
+    try testing.expectEqual(@as(u32, 0), app.search_page);
+
+    app.results.deinit(std.testing.allocator); // capacity is 0; safe no-op
+}
+
+test "search_done page 2 appends to existing results" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.search_len = 4;
+    @memcpy(app.search_query[0..4], "test");
+    app.search_page = 1;
+
+    // Seed a page-1 result directly.
+    try app.results.ensureTotalCapacity(std.testing.allocator, 2);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "id1"),
+        .name = try std.testing.allocator.dupe(u8, "Show One"),
+        .eps_sub = 12,
+    });
+
+    const query_copy = try std.testing.allocator.dupe(u8, "test");
+    const results_backing = try std.testing.allocator.alloc(Anime, 1);
+    results_backing[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "id2"),
+        .name = try std.testing.allocator.dupe(u8, "Show Two"),
+        .eps_sub = 24,
+    };
+
+    try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 2 } });
+    try testing.expectEqual(@as(usize, 2), app.results.items.len);
+    try testing.expectEqual(@as(u32, 2), app.search_page);
+    try testing.expectEqualStrings("Show One", app.results.items[0].name);
+    try testing.expectEqualStrings("Show Two", app.results.items[1].name);
+
+    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    app.results.deinit(std.testing.allocator);
+}
+
+test "browse j/k navigates results list" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.search_page = 1;
+
+    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    for (0..3) |_| {
+        app.results.appendAssumeCapacity(.{
+            .id = try std.testing.allocator.dupe(u8, "id"),
+            .name = try std.testing.allocator.dupe(u8, "X"),
+            .eps_sub = 12,
+        });
+    }
+
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testTick(&app, keyEv('j', .{})); // pinned (3 % 26 != 0 → no load-more)
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testTick(&app, keyEv('k', .{}));
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+
+    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    app.results.deinit(std.testing.allocator);
+}
+
+test "view switch resets cursor to 0" {
+    var app: App = .{};
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.list_cursor = 2;
+
+    // F1 → Browse: cursor resets.
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+
+    app.list_cursor = 5;
+    // F2 → History: cursor resets.
+    try testTick(&app, keyEv(vaxis.Key.f2, .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
 }
