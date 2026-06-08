@@ -382,7 +382,8 @@ Format: `[████████░░░░░░░░]  8 / 28 eps`
 ### 4.6 Episode Grid Cell
 
 The episode grid is rendered in the detail pane below the metadata, as a grid of
-numbered cells. Cell width: 4 chars (`[NN]` or `[NNN]`). Cells wrap to fill the
+numbered cells. Cell width: 5 chars (`[NN] ` with trailing space for 2-digit
+episodes, `[NNN]` without trailing space for 3-digit). Cells wrap to fill the
 available column width.
 
 | State | Glyph | Background | Foreground |
@@ -1195,6 +1196,7 @@ unreachable rendering.
 | History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source in M3. History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
+| Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
 
 ---
 
