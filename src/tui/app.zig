@@ -322,7 +322,7 @@ const Toast = struct {
     kind: Kind,
     text: [80]u8 = undefined,
     text_len: usize = 0,
-    /// Countdown ms for non-persistent toasts. 0 = expired/persistent.
+    /// Remaining TTL in ms. Ignored when persistent = true.
     ttl_ms: i32 = 4000,
     /// Persistent toasts survive TTL and are only cleared by a recovery path.
     persistent: bool = false,
@@ -548,6 +548,7 @@ const App = struct {
                     return;
                 }
                 self.episode_loading = false;
+                self.async_start_ms = 0;
                 // Free any old results (fireEpisodes clears them, but be defensive).
                 if (self.episode_results) |old| {
                     for (old) |ep| self.gpa.free(ep.raw);
@@ -558,9 +559,11 @@ const App = struct {
             },
             .episodes_error => {
                 self.episode_loading = false;
+                self.async_start_ms = 0;
             },
             .play_done, .play_error => {
                 self.playing = false;
+                self.async_start_ms = 0;
             },
             .tick => {
                 const now = nowMs(io);
@@ -615,6 +618,7 @@ const App = struct {
         self.freeEpisodeResults();
         self.episode_loading = true;
         self.episode_cursor = 0;
+        self.async_start_ms = self.now_ms;
 
         // Two GPA-duped copies: one for App.detail_for_id, one for the task (→ event).
         const id_for_app = self.gpa.dupe(u8, selected.id) catch return;
@@ -661,6 +665,7 @@ const App = struct {
             return;
         };
         self.playing = true;
+        self.async_start_ms = self.now_ms;
     }
 
     fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1205,8 +1210,9 @@ const App = struct {
                 const ep = eps[ep_idx];
                 const focused = ep_idx == self.episode_cursor;
 
-                // Use ep_scratch to avoid dangling stack buffers.
-                const slot = ep_idx % 512;
+                // Use ep_scratch to avoid dangling stack buffers. Index relative
+                // to the viewport start so we never alias two live cells.
+                const slot = (ep_idx - view_top * cols) % 512;
                 const cell_buf = &self.ep_scratch[slot];
                 const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
@@ -1297,8 +1303,11 @@ const App = struct {
     fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
         if (h < 4) return;
         var row: u16 = h -| 2;
-        for (self.toast_queue) |maybe| {
-            const t = maybe orelse continue;
+        // Iterate newest-first (index 2→0) so the most recent toast anchors at h-2.
+        var qi: usize = self.toast_queue.len;
+        while (qi > 0) {
+            qi -= 1;
+            const t = self.toast_queue[qi] orelse continue;
             if (row < 1) break;
             const fg_color: vaxis.Color = switch (t.kind) {
                 .@"error" => colors.hot,
@@ -1316,7 +1325,8 @@ const App = struct {
             const pre_sty = style(fg_color, .{ .bold = true, .bg = colors.bg_elevated });
             put(win, row, pre_col, prefix, pre_sty);
             const txt_col: u16 = pre_col + @as(u16, @intCast(prefix.len));
-            const txt_w: u16 = if (w > txt_col + 1) w - txt_col - 1 else 0;
+            const raw_w: u16 = if (w > txt_col + 1) w - txt_col - 1 else 0;
+            const txt_w: u16 = @min(raw_w, 40); // §4.7: max 40 display columns
             putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len],
                 style(fg_color, .{ .bg = colors.bg_elevated }));
             row -|= 1;
@@ -1458,6 +1468,7 @@ fn testTick(app: *App, event: Event) !void {
                 app.gpa.free(d.results);
                 app.gpa.free(d.for_query);
             },
+            // task_error and most other events carry no owned heap payloads.
             else => {},
         }
     }
