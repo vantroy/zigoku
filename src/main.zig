@@ -35,8 +35,10 @@ pub fn main(init: std.process.Init) !void {
     const in = &stdin_fr.interface;
 
     const cli = parseArgs(arena, args) catch |err| switch (err) {
-        // No query → open the TUI, M3's default interface. Flags-without-query
-        // or bad flags still fall through to usage.
+        // No positional query → open the TUI, M3's default interface. This also
+        // catches a lone flag like `zigoku --dub` (no query): the flag is
+        // dropped and the TUI opens. Malformed flags (UnknownFlag/MissingValue)
+        // still fall through to usage.
         error.NoQuery => return runTui(init, arena),
         else => {
             try usage(out);

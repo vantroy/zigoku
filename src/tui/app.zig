@@ -85,6 +85,9 @@ pub fn run(
     // result into the same queue the tty reader feeds; tick() drains it. The
     // thread is short-lived and joined before teardown.
     var hist_thread: ?std.Thread = null;
+    // TODO(ROD-75): no cancellation — quitting while loadHistory is mid-query
+    // blocks here until it returns. Fine for local SQLite; revisit if a real
+    // async fetch lands behind this seam.
     defer if (hist_thread) |t| t.join();
     if (store) |st| {
         hist_thread = std.Thread.spawn(.{}, loadHistoryTask, .{ &loop, hist_arena.allocator(), st }) catch blk: {
@@ -137,8 +140,9 @@ const App = struct {
     /// Per-row scratch for formatted meta strings. vaxis stores printed text by
     /// *reference*, not by copy, so anything we print must outlive the matching
     /// vx.render() call. A loop-local stack buffer dangles by render time; this
-    /// App-owned buffer persists across the draw→render cycle. One slot per
-    /// visible row (a terminal taller than this just renders fewer meta lines).
+    /// App-owned buffer persists across the draw→render cycle. Soft cap of 256
+    /// slots: a terminal with more than 256 visible history rows renders titles
+    /// for the overflow rows without the meta column (no crash, just no meta).
     meta_scratch: [256][48]u8 = undefined,
 
     fn setHistory(self: *App, recs: []AnimeRecord) void {
@@ -182,6 +186,8 @@ const App = struct {
         } else if (key.matches('g', .{})) {
             self.list_cursor = 0;
         } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            // Both forms: terminals that report shift explicitly vs. those that
+            // send the bare shifted codepoint.
             self.list_cursor = n - 1;
         }
     }
@@ -209,11 +215,12 @@ const App = struct {
     }
 
     fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
-        _ = w;
         put(win, 0, 2, "地獄", style(colors.fg, .{ .bold = true }));
         put(win, 0, 7, "zigoku", style(colors.fg2, .{}));
 
         // Tab strip. Active tab in cyan, the rest dim. Switching is ROD-72.
+        // Each label is clipped to the remaining width so a narrow terminal
+        // truncates the strip cleanly instead of overflowing.
         const tabs = [_]struct { tab: Tab, label: []const u8 }{
             .{ .tab = .anime, .label = "ANIME" },
             .{ .tab = .history, .label = "HISTORY" },
@@ -221,36 +228,47 @@ const App = struct {
         };
         var col: u16 = 18;
         for (tabs) |t| {
+            if (col >= w) break;
             const active = t.tab == self.tab;
             const sty = if (active) style(colors.focus, .{ .bold = true }) else style(colors.fg3, .{});
-            put(win, 0, col, t.label, sty);
+            putClipped(win, 0, col, w - col, t.label, sty);
             col += @intCast(t.label.len + 2);
         }
     }
 
     fn drawContent(self: *App, win: vaxis.Window, h: u16) void {
+        // Row 0 is the top bar; row 1 is intentional breathing room; content
+        // starts at row 2 and runs to h-2; the bottom bar owns h-1.
         const top: u16 = 2;
-        const visible: u16 = h - 3; // rows [2 .. h-2); bottom bar is h-1.
+        const visible: u16 = h - 3;
+        const body_w: u16 = if (win.width > 2) win.width - 2 else 0;
 
         if (self.history_loading) {
-            put(win, top, 2, "⟳ loading history…", style(colors.focus, .{}));
+            putClipped(win, top, 2, body_w, "⟳ loading history…", style(colors.focus, .{}));
             return;
         }
         if (self.load_error) |msg| {
             put(win, top, 2, "history unavailable:", style(colors.warn, .{}));
-            put(win, top, 23, msg, style(colors.fg3, .{}));
+            putClipped(win, top + 1, 2, body_w, msg, style(colors.fg3, .{}));
             return;
         }
         if (self.history.len == 0) {
             // First-run empty state (DESIGN §9).
-            put(win, top + 1, 2, "no history yet.", style(colors.fg, .{}));
-            put(win, top + 2, 2, "search lands in ROD-73 — for now, play from the CLI:", style(colors.fg3, .{}));
-            put(win, top + 3, 2, "zigoku frieren", style(colors.fg2, .{}));
+            putClipped(win, top + 1, 2, body_w, "no history yet.", style(colors.fg, .{}));
+            putClipped(win, top + 2, 2, body_w, "search lands in ROD-73 — for now, play from the CLI:", style(colors.fg3, .{}));
+            putClipped(win, top + 3, 2, body_w, "zigoku frieren", style(colors.fg2, .{}));
             return;
         }
 
         // Keep the cursor inside the viewport.
         self.scrollIntoView(visible);
+
+        const w = win.width;
+        // Meta only earns its column when the terminal is wide enough to hold it
+        // without colliding the title — otherwise the title takes the full width.
+        const show_meta = w >= meta_col + 12;
+        const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
+        const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
 
         var row: u16 = top;
         var slot: usize = 0;
@@ -266,14 +284,15 @@ const App = struct {
                 style(colors.focus, .{ .bold = true })
             else
                 style(colors.fg, .{});
-            put(win, row, 4, rec.title, title_style);
+            // Clipped to its column budget so long titles can't bleed into meta.
+            putClipped(win, row, title_col, title_w, rec.title, title_style);
 
             // Format into App-owned scratch (see meta_scratch's note on why a
             // stack buffer would dangle by render time). Skip if we somehow have
             // more visible rows than slots.
-            if (slot < self.meta_scratch.len) {
+            if (show_meta and slot < self.meta_scratch.len) {
                 const meta = formatMeta(&self.meta_scratch[slot], rec);
-                put(win, row, 48, meta, style(colors.fg3, .{}));
+                putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{}));
                 slot += 1;
             }
 
@@ -282,6 +301,7 @@ const App = struct {
     }
 
     fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
+        const w = win.width;
         const row = h - 1;
         // The signature: a magenta block cursor, terminal-blinked, always alive.
         put(win, row, 2, "▌", style2(colors.hot, .{ .blink = true }));
@@ -290,7 +310,7 @@ const App = struct {
             "q quit"
         else
             "j/k move · g/G top/bottom · q quit";
-        put(win, row, 4, help, style(colors.fg3, .{}));
+        putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
     }
 
     fn scrollIntoView(self: *App, visible: u16) void {
@@ -318,7 +338,25 @@ fn put(win: vaxis.Window, row: u16, col: u16, text: []const u8, sty: vaxis.Style
     _ = win.printSegment(.{ .text = text, .style = sty }, .{ .row_offset = row, .col_offset = col });
 }
 
-/// Style on the void background. opts carries the SGR toggles we actually use.
+/// Like `put`, but clipped to `max_w` columns via a 1-row child window. The
+/// child bounds stop a long string from bleeding past its column budget into a
+/// neighbour (and the clip lands on a grapheme boundary, so multibyte titles
+/// stay valid). max_w == 0 draws nothing.
+fn putClipped(win: vaxis.Window, row: u16, col: u16, max_w: u16, text: []const u8, sty: vaxis.Style) void {
+    if (max_w == 0) return;
+    const child = win.child(.{ .x_off = @intCast(col), .y_off = @intCast(row), .width = max_w, .height = 1 });
+    _ = child.printSegment(.{ .text = text, .style = sty }, .{});
+}
+
+// History-row layout columns. The detail/responsive layout is ROD-72+; this is
+// the fixed two-column (title | meta) skeleton.
+const title_col: u16 = 4;
+const meta_col: u16 = 48;
+const title_meta_gap: u16 = 2;
+
+// Two tiny constructors for foreground-on-void styles. They're split by which
+// SGR toggle they expose (bold vs. blink) only because blink has exactly one
+// call site — the cursor. Merge into one `opts` struct if a third toggle shows up.
 fn style(fg: vaxis.Color, opts: struct { bold: bool = false }) vaxis.Style {
     return .{ .fg = fg, .bg = colors.bg_base, .bold = opts.bold };
 }
