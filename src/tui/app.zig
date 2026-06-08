@@ -21,6 +21,7 @@ const colors = @import("colors.zig");
 const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
+const player_mod = @import("../player.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
@@ -47,6 +48,18 @@ const Event = union(enum) {
         for_query: []const u8,
         page: u32,
     },
+    /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
+    /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.
+    episodes_done: struct {
+        episodes: []domain.EpisodeNumber,
+        for_id: []const u8,
+    },
+    /// Episode fetch failed.
+    episodes_error,
+    /// mpv exited (success or failure — we don't distinguish in M3).
+    play_done,
+    /// resolve or mpv spawn failed.
+    play_error,
 };
 
 const Loop = vaxis.Loop(Event);
@@ -119,10 +132,13 @@ pub fn run(
     }
 
     app.gpa = gpa;
+    app.store = store;
     // Join the last search thread before loop teardown so in-flight threads
     // can't dereference a torn-down loop or gpa. Declared after loop.stop()'s
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
+    defer if (app.episode_thread) |t| t.join();
+    defer if (app.play_thread) |t| t.join();
 
     // First paint, then the event loop.
     try app.draw(&vx, writer);
@@ -141,6 +157,7 @@ pub fn run(
     // mid-session reuse); here we want the full deinit.
     for (app.results.items) |r| { gpa.free(r.id); gpa.free(r.name); }
     app.results.deinit(gpa);
+    app.freeEpisodeResults();
 }
 
 /// Background task: search and post results back to the UI thread.
@@ -219,6 +236,62 @@ fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     loop.postEvent(.{ .history_loaded = recs }) catch {};
 }
 
+/// Background task: fetch episode list and post to UI.
+/// `id` ownership: transferred to episodes_done.for_id on success; freed here on error.
+fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation) void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const raw = provider.episodes(arena.allocator(), io, id, translation) catch {
+        gpa.free(id);
+        loop.postEvent(.episodes_error) catch {};
+        return;
+    };
+
+    var owned: std.ArrayListUnmanaged(domain.EpisodeNumber) = .empty;
+    owned.ensureTotalCapacity(gpa, raw.len) catch {
+        gpa.free(id);
+        loop.postEvent(.episodes_error) catch {};
+        return;
+    };
+    for (raw) |ep| {
+        const raw_owned = gpa.dupe(u8, ep.raw) catch continue;
+        owned.appendAssumeCapacity(.{ .raw = raw_owned });
+    }
+    const exact = owned.toOwnedSlice(gpa) catch {
+        for (owned.items) |ep| gpa.free(ep.raw);
+        owned.deinit(gpa);
+        gpa.free(id);
+        return;
+    };
+
+    loop.postEvent(.{ .episodes_done = .{ .episodes = exact, .for_id = id } }) catch {
+        for (exact) |ep| gpa.free(ep.raw);
+        gpa.free(exact);
+        gpa.free(id);
+    };
+}
+
+/// Background task: resolve stream and launch mpv.
+/// All string params are GPA-owned by this task and freed before return.
+fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, store: ?*Store, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8) void {
+    _ = store; // resume lookup deferred to M5 (needs source_name in vtable)
+    defer gpa.free(id);
+    defer gpa.free(ep_raw);
+    defer gpa.free(title);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
+    const link = provider.resolve(arena.allocator(), io, id, ep, translation) catch {
+        loop.postEvent(.play_error) catch {};
+        return;
+    };
+    player_mod.play(arena.allocator(), io, link, title, 0) catch {};
+    loop.postEvent(.play_done) catch {};
+}
+
 const App = struct {
     should_quit: bool = false,
 
@@ -279,6 +352,28 @@ const App = struct {
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
 
+    /// Handle for the most recent episode-fetch thread. Joined in fireEpisodes before a new spawn.
+    episode_thread: ?std.Thread = null,
+    /// Current episode list for the detail pane. GPA-owned (each .raw owned); null until fetched.
+    /// Use freeEpisodeResults() to release.
+    episode_results: ?[]domain.EpisodeNumber = null,
+    /// GPA-duped id of the show whose episodes are in episode_results (or in-flight).
+    /// null = nothing requested yet.
+    detail_for_id: ?[]const u8 = null,
+    /// Whether an episode fetch is in flight.
+    episode_loading: bool = false,
+    /// Cursor position within the episode grid (0-based index into episode_results).
+    episode_cursor: usize = 0,
+    /// Handle for the most recent play thread. Joined before a new spawn.
+    play_thread: ?std.Thread = null,
+    /// Whether mpv is running (play thread in-flight).
+    playing: bool = false,
+    /// Store reference — set in run() for getResume in the play thread.
+    store: ?*Store = null,
+    /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
+    /// vaxis stores text by reference, so we need stable storage that survives vx.render().
+    ep_scratch: [512][6]u8 = undefined,
+
     /// Current query as a slice (may be empty).
     fn querySlice(self: *const App) []const u8 {
         return self.search_query[0..self.search_len];
@@ -293,6 +388,18 @@ const App = struct {
         }
         self.results.clearRetainingCapacity();
         self.search_page = 0;
+    }
+
+    fn freeEpisodeResults(self: *App) void {
+        if (self.episode_results) |eps| {
+            for (eps) |ep| self.gpa.free(ep.raw);
+            self.gpa.free(eps);
+            self.episode_results = null;
+        }
+        if (self.detail_for_id) |id| {
+            self.gpa.free(id);
+            self.detail_for_id = null;
+        }
     }
 
     fn setHistory(self: *App, recs: []AnimeRecord) void {
@@ -340,6 +447,29 @@ const App = struct {
                     self.list_top = 0;
                 }
             },
+            .episodes_done => |ev| {
+                defer self.gpa.free(ev.for_id);
+                // Stale: discard if not for the current detail show.
+                if (self.detail_for_id == null or !std.mem.eql(u8, ev.for_id, self.detail_for_id.?)) {
+                    for (ev.episodes) |ep| self.gpa.free(ep.raw);
+                    self.gpa.free(ev.episodes);
+                    return;
+                }
+                self.episode_loading = false;
+                // Free any old results (fireEpisodes clears them, but be defensive).
+                if (self.episode_results) |old| {
+                    for (old) |ep| self.gpa.free(ep.raw);
+                    self.gpa.free(old);
+                }
+                self.episode_results = ev.episodes;
+                self.episode_cursor = 0;
+            },
+            .episodes_error => {
+                self.episode_loading = false;
+            },
+            .play_done, .play_error => {
+                self.playing = false;
+            },
         }
     }
 
@@ -363,6 +493,63 @@ const App = struct {
             self.search_loading = false;
             return;
         };
+    }
+
+    fn fireEpisodes(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return;
+        const selected = self.results.items[self.list_cursor];
+
+        if (self.episode_thread) |t| { t.join(); self.episode_thread = null; }
+
+        self.freeEpisodeResults();
+        self.episode_loading = true;
+        self.episode_cursor = 0;
+
+        // Two GPA-duped copies: one for App.detail_for_id, one for the task (→ event).
+        const id_for_app = self.gpa.dupe(u8, selected.id) catch return;
+        const id_for_task = self.gpa.dupe(u8, selected.id) catch {
+            self.gpa.free(id_for_app);
+            return;
+        };
+        self.detail_for_id = id_for_app;
+
+        self.episode_thread = std.Thread.spawn(.{}, episodesTask, .{
+            loop, self.gpa, io, provider, id_for_task, self.translation,
+        }) catch {
+            self.gpa.free(id_for_task);
+            self.episode_loading = false;
+            return;
+        };
+    }
+
+    fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const eps = self.episode_results orelse return;
+        if (eps.len == 0 or self.episode_cursor >= eps.len) return;
+        if (self.playing) return;
+
+        if (self.play_thread) |t| { t.join(); self.play_thread = null; }
+
+        const selected_id = self.detail_for_id orelse return;
+        const ep = eps[self.episode_cursor];
+
+        const title_src: []const u8 = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
+            self.results.items[self.list_cursor].name
+        else
+            "zigoku";
+
+        const id_copy = self.gpa.dupe(u8, selected_id) catch return;
+        const ep_copy = self.gpa.dupe(u8, ep.raw) catch { self.gpa.free(id_copy); return; };
+        const title_copy = self.gpa.dupe(u8, title_src) catch { self.gpa.free(id_copy); self.gpa.free(ep_copy); return; };
+
+        self.play_thread = std.Thread.spawn(.{}, playTask, .{
+            loop, self.gpa, io, provider, self.store, id_copy, ep_copy, self.translation, title_copy,
+        }) catch {
+            self.gpa.free(id_copy);
+            self.gpa.free(ep_copy);
+            self.gpa.free(title_copy);
+            return;
+        };
+        self.playing = true;
     }
 
     fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -466,11 +653,26 @@ const App = struct {
 
         // h / l pane switching (Browse only) (§10.3c).
         if (key.matches('h', .{})) {
-            if (self.active_view == .browse) self.active_pane = .list;
+            if (self.active_view == .browse and self.active_pane == .detail) {
+                self.active_pane = .list;
+            }
             return;
         }
-        if (key.matches('l', .{})) {
-            if (self.active_view == .browse) self.active_pane = .detail;
+        // Enter is only handled here in normal mode. In search mode it must fall
+        // through to the search mode check below so onSearchKey can lock the results.
+        if (key.matches('l', .{}) or (key.matches(vaxis.Key.enter, .{}) and self.input_mode == .normal)) {
+            if (self.active_view == .browse) {
+                if (self.active_pane == .list and self.results.items.len > 0) {
+                    self.active_pane = .detail;
+                    self.fireEpisodes(loop, io, provider);
+                } else if (self.active_pane == .detail) {
+                    // Enter on episode in detail pane: play
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        self.firePlay(loop, io, provider);
+                    }
+                    // l in detail: no-op (already rightmost)
+                }
+            }
             return;
         }
 
@@ -502,8 +704,23 @@ const App = struct {
             return;
         }
 
-        // Navigation is active in both history (over history slice) and
-        // browse (over results list). Silent no-op in settings.
+        // In detail pane: j/k/g/G navigate the episode grid.
+        if (self.active_view == .browse and self.active_pane == .detail) {
+            const ep_len: usize = if (self.episode_results) |eps| eps.len else 0;
+            if (ep_len == 0) return;
+            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+                if (self.episode_cursor + 1 < ep_len) self.episode_cursor += 1;
+            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+                if (self.episode_cursor > 0) self.episode_cursor -= 1;
+            } else if (key.matches('g', .{})) {
+                self.episode_cursor = 0;
+            } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+                self.episode_cursor = ep_len - 1;
+            }
+            return;
+        }
+
+        // List navigation (history + browse list pane).
         const nav_len: usize = switch (self.active_view) {
             .history => self.history.len,
             .browse => self.results.items.len,
@@ -521,7 +738,6 @@ const App = struct {
             self.list_cursor = nav_len - 1;
         }
         // Load-more: at last result + j, trigger page+1 if possible.
-        // "possible" = last results page was full (26 items == might have more).
         if (key.matches('j', .{}) and
             self.active_view == .browse and
             self.list_cursor == nav_len - 1 and
@@ -667,73 +883,16 @@ const App = struct {
             },
 
             .browse => {
-                if (self.search_len == 0) {
-                    // Idle: invite the user to search.
-                    const mid = top + visible / 2;
-                    centerText(win, mid -| 1, w, "no feed yet", style(colors.fg3, .{ .italic = true }));
-                    const action = " to start a search";
-                    const total: u16 = 1 + @as(u16, @intCast(action.len));
-                    const start: u16 = if (w > total) (w - total) / 2 else 0;
-                    put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
-                    putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
-                } else if (self.search_loading and self.results.items.len == 0) {
-                    // First load spinner.
-                    const mid = top + visible / 2;
-                    centerText(win, mid, w, "⠋ searching…", style(colors.focus, .{}));
-                } else if (!self.search_loading and self.results.items.len == 0) {
-                    // No results — top-aligned per §9.3a.
-                    const q = self.querySlice();
-                    var buf: [160]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "no results for \"{s}\"", .{q}) catch "no results";
-                    putClipped(win, top, 2, body_w, msg, style(colors.fg3, .{ .italic = true }));
-                } else {
-                    // Results list — same row format as history.
-                    self.scrollIntoView(visible);
-                    const show_meta = w >= meta_col + 12;
-                    const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
-                    const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
+                const list_w: u16 = @max(30, (w * 38) / 100);
+                const detail_x: u16 = 2 + list_w + 2;
+                const detail_w: u16 = if (w > detail_x + 1) w - detail_x - 1 else 0;
+                const pane_h: u16 = visible;
 
-                    var row: u16 = top;
-                    var slot: usize = 0;
-                    var i: usize = self.list_top;
-                    while (i < self.results.items.len and row < top + visible) : (i += 1) {
-                        const a = self.results.items[i];
-                        const selected = i == self.list_cursor;
+                const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = list_w, .height = pane_h });
+                const detail_win = win.child(.{ .x_off = @intCast(detail_x), .y_off = top, .width = detail_w, .height = pane_h });
 
-                        const row_bg = if (selected) colors.bg_surface else colors.bg_base;
-                        if (selected) fillRow(win, row, w, colors.bg_surface);
-
-                        const marker = if (selected) "▸ " else "  ";
-                        put(win, row, 2, marker, style(colors.focus, .{ .bg = row_bg }));
-
-                        const title_style = if (selected)
-                            style(colors.focus, .{ .bg = row_bg, .bold = true })
-                        else
-                            style(colors.fg, .{ .bg = row_bg });
-                        putClipped(win, row, title_col, title_w, a.name, title_style);
-
-                        if (show_meta and slot < self.meta_scratch.len) {
-                            const tt = self.translation;
-                            const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
-                            const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s} eps", .{ eps, tt.str() }) catch "";
-                            putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
-                            slot += 1;
-                        }
-
-                        row += 1;
-                    }
-
-                    // Load-more footer if we might have more pages.
-                    if (row < top + visible and
-                        self.search_page > 0 and
-                        self.results.items.len % 26 == 0 and
-                        self.results.items.len > 0)
-                    {
-                        const footer = if (self.search_loading) "⠋ loading more…" else "╌  load more  ╌";
-                        const footer_color = if (self.search_loading) colors.focus else colors.fg3;
-                        centerText(win, row, w, footer, style(footer_color, .{}));
-                    }
-                }
+                self.drawBrowseList(list_win, pane_h, list_w);
+                self.drawDetailPane(detail_win, detail_w, pane_h);
             },
 
             .settings => {
@@ -741,6 +900,218 @@ const App = struct {
                 const mid = top + visible / 2;
                 centerText(win, mid, w, "settings — coming soon", style(colors.fg3, .{ .italic = true }));
             },
+        }
+    }
+
+    fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
+        const w = pane_w;
+        if (self.search_len == 0) {
+            const mid = pane_h / 2;
+            centerText(win, mid -| 1, w, "no feed yet", style(colors.fg3, .{ .italic = true }));
+            const action = " to start a search";
+            const total: u16 = 1 + @as(u16, @intCast(action.len));
+            const start: u16 = if (w > total) (w - total) / 2 else 0;
+            put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
+            putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
+            return;
+        }
+        if (self.search_loading and self.results.items.len == 0) {
+            centerText(win, pane_h / 2, w, "⠋ searching…", style(colors.focus, .{}));
+            return;
+        }
+        if (!self.search_loading and self.results.items.len == 0) {
+            const q = self.querySlice();
+            var buf: [160]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "no results for \"{s}\"", .{q}) catch "no results";
+            putClipped(win, 0, 0, w, msg, style(colors.fg3, .{ .italic = true }));
+            return;
+        }
+
+        // Results list — col offsets relative to list_win (no x=2 leading margin).
+        const list_title_col: u16 = 2; // marker is col 0–1, title starts at 2
+        self.scrollIntoView(pane_h);
+
+        var row: u16 = 0;
+        var slot: usize = 0;
+        var i: usize = self.list_top;
+        while (i < self.results.items.len and row < pane_h) : (i += 1) {
+            const a = self.results.items[i];
+            const selected = i == self.list_cursor;
+
+            const row_bg = if (selected) colors.bg_surface else colors.bg_base;
+            if (selected) fillRow(win, row, w, colors.bg_surface);
+
+            const marker = if (selected) "▸ " else "  ";
+            put(win, row, 0, marker, style(colors.focus, .{ .bg = row_bg }));
+
+            const title_style = if (selected)
+                style(colors.focus, .{ .bg = row_bg, .bold = true })
+            else
+                style(colors.fg, .{ .bg = row_bg });
+            // Title fills remaining width (no meta column in narrow list pane).
+            const title_w: u16 = if (w > list_title_col) w - list_title_col else 0;
+            putClipped(win, row, list_title_col, title_w, a.name, title_style);
+
+            // Meta (eps) if pane is wide enough — rarely true in split view.
+            const list_meta_col: u16 = 46;
+            if (w >= list_meta_col + 8 and slot < self.meta_scratch.len) {
+                const tt = self.translation;
+                const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
+                const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
+                putClipped(win, row, list_meta_col, w - list_meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
+                slot += 1;
+            }
+            row += 1;
+        }
+
+        // Load-more footer.
+        if (row < pane_h and
+            self.search_page > 0 and
+            self.results.items.len % 26 == 0 and
+            self.results.items.len > 0)
+        {
+            const footer = if (self.search_loading) "⠋ loading…" else "╌ more ╌";
+            const footer_color = if (self.search_loading) colors.focus else colors.fg3;
+            centerText(win, row, w, footer, style(footer_color, .{}));
+        }
+    }
+
+    fn drawDetailPane(self: *App, win: vaxis.Window, w: u16, h: u16) void {
+        if (w < 10) return;
+
+        var row: u16 = 0;
+
+        // Cover art block (§3.3 + §9.1): always "no art yet" in M3.
+        // 20×28 at ≥100 total terminal cols, 14×20 at 80–99, hidden below 80.
+        const cover_w: u16 = if (w >= 60) 20 else if (w >= 40) 14 else 0;
+        const cover_h: u16 = if (w >= 60) 7 else if (w >= 40) 5 else 0;
+        if (cover_w > 0 and cover_h > 0) {
+            const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
+            cover_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
+            if (cover_h > 1) {
+                centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+            }
+            row += cover_h + 1;
+        }
+
+        // Title — the selected result's name, or placeholder.
+        const title: []const u8 = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
+            self.results.items[self.list_cursor].name
+        else
+            "";
+        if (title.len > 0) {
+            putClipped(win, row, 0, w, title, style(colors.fg, .{ .bold = true }));
+        } else {
+            putClipped(win, row, 0, w, "—", style(colors.fg3, .{}));
+        }
+        row += 1;
+
+        // Score — always [--/100] in M3 (score is null).
+        putClipped(win, row, 0, w, "[--/100]", style(colors.fg3, .{}));
+        row += 1;
+
+        // Hairline.
+        if (row < h) {
+            _ = win.printSegment(.{ .text = "─" ** 160, .style = .{ .fg = colors.chrome, .bg = colors.bg_base } }, .{ .row_offset = row });
+        }
+        row += 1;
+
+        // Metadata: episode count.
+        if (row < h) {
+            const anime: ?Anime = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
+                self.results.items[self.list_cursor]
+            else
+                null;
+            var meta_buf: [32]u8 = undefined;
+            const meta: []const u8 = if (anime) |a| blk: {
+                const eps = a.episodeCount(self.translation);
+                if (eps == 0) break :blk "? eps";
+                break :blk std.fmt.bufPrint(&meta_buf, "{d} eps", .{eps}) catch "? eps";
+            } else "? eps";
+            const meta_style = if (anime != null and anime.?.episodeCount(self.translation) > 0)
+                style(colors.fg2, .{})
+            else
+                style(colors.fg3, .{});
+            putClipped(win, row, 0, w, meta, meta_style);
+            row += 1;
+        }
+
+        // Synopsis stub.
+        if (row < h) {
+            putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
+            row += 1;
+        }
+
+        if (row < h) row += 1; // blank line before grid
+
+        // Episode grid.
+        if (row >= h) return;
+        const grid_h: u16 = h - row;
+        const grid_win = win.child(.{ .x_off = 0, .y_off = row, .width = w, .height = grid_h });
+        self.drawEpisodeGrid(grid_win, w, grid_h);
+    }
+
+    fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
+        if (self.episode_loading) {
+            centerText(win, 0, w, "⠋ loading episodes…", style(colors.focus, .{}));
+            return;
+        }
+        const eps = self.episode_results orelse {
+            // No fetch fired yet (detail pane opened but no item selected).
+            return;
+        };
+        if (eps.len == 0) {
+            putClipped(win, 0, 0, w, "no episodes", style(colors.fg3, .{ .italic = true }));
+            return;
+        }
+
+        // Each cell is 5 chars wide: "[NN] " or "[NNN]" — allocate 5 per cell.
+        const cell_w: u16 = 5;
+        const cols: u16 = @max(1, w / cell_w);
+
+        // Scroll so that episode_cursor is in view.
+        const cursor_row: usize = self.episode_cursor / cols;
+        const viewport_rows: usize = h;
+        const view_top: usize = if (cursor_row >= viewport_rows)
+            cursor_row + 1 - viewport_rows
+        else
+            0;
+
+        var grid_row: u16 = 0;
+        var ep_idx: usize = view_top * cols;
+        while (grid_row < h and ep_idx < eps.len) : (grid_row += 1) {
+            var col_off: u16 = 0;
+            var c: u16 = 0;
+            while (c < cols and ep_idx < eps.len) : (c += 1) {
+                const ep = eps[ep_idx];
+                const focused = ep_idx == self.episode_cursor;
+
+                // Use ep_scratch to avoid dangling stack buffers.
+                const slot = ep_idx % 512;
+                const cell_buf = &self.ep_scratch[slot];
+                const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
+
+                const cell_style = if (focused)
+                    style(colors.focus, .{ .bg = colors.bg_surface, .bold = true })
+                else
+                    style(colors.fg2, .{});
+
+                if (focused) {
+                    const cell_win = win.child(.{
+                        .x_off = @intCast(col_off),
+                        .y_off = @intCast(grid_row),
+                        .width = cell_w,
+                        .height = 1,
+                    });
+                    cell_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
+                    _ = cell_win.printSegment(.{ .text = cell_text, .style = cell_style }, .{});
+                } else {
+                    putClipped(win, grid_row, col_off, cell_w, cell_text, cell_style);
+                }
+
+                col_off += cell_w;
+                ep_idx += 1;
+            }
         }
     }
 
@@ -898,9 +1269,40 @@ fn dummyProvider() SourceProvider {
 }
 
 fn testTick(app: *App, event: Event) !void {
-    var loop: Loop = undefined;
-    const io: std.Io = undefined;
+    // Use a properly initialized loop so that background threads spawned during
+    // tick() can safely call loop.postEvent() (which locks a mutex via io).
+    // tty and vaxis are never accessed by postEvent, so undefined is safe there.
+    const io = std.testing.io;
+    var loop: Loop = .{
+        .io = io,
+        .tty = undefined,
+        .vaxis = undefined,
+        .queue = .{ .io = io },
+    };
     try app.tick(event, &loop, io, dummyProvider());
+    // Join any threads spawned during tick so they finish using &loop before the
+    // stack frame tears down. Without this the thread dereferences a dangling
+    // loop pointer in the next test and triggers an ABRT.
+    if (app.episode_thread) |t| { t.join(); app.episode_thread = null; }
+    if (app.search_thread) |t| { t.join(); app.search_thread = null; }
+    if (app.play_thread) |t| { t.join(); app.play_thread = null; }
+    // Drain events the threads may have posted; free their owned payloads so the
+    // test allocator doesn't report leaks.
+    while (loop.queue.tryPop() catch null) |ev| {
+        switch (ev) {
+            .episodes_done => |d| {
+                for (d.episodes) |ep| app.gpa.free(ep.raw);
+                app.gpa.free(d.episodes);
+                app.gpa.free(d.for_id);
+            },
+            .search_done => |d| {
+                for (d.results) |r| { app.gpa.free(r.id); app.gpa.free(r.name); }
+                app.gpa.free(d.results);
+                app.gpa.free(d.for_query);
+            },
+            else => {},
+        }
+    }
 }
 
 test "history_loaded drains into state and clears loading" {
@@ -1135,10 +1537,20 @@ test "h in browse list pane is a no-op (already leftmost)" {
 
 test "l in browse list pane switches to detail pane" {
     var app: App = .{};
+    app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
+    // l requires a selected result.
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+    });
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    app.results.deinit(std.testing.allocator);
+    app.freeEpisodeResults();
 }
 
 test "h in browse detail pane switches to list pane" {
@@ -1367,4 +1779,72 @@ test "view switch resets cursor to 0" {
     try testTick(&app, keyEv(vaxis.Key.f2, .{}));
     try testing.expectEqual(.history, app.active_view);
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
+}
+
+test "episode_cursor j/k navigation in detail pane" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+
+    // Seed 3 episodes.
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 3);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
+    app.episode_results = eps;
+    app.episode_cursor = 0;
+
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 1), app.episode_cursor);
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testTick(&app, keyEv('j', .{})); // pinned at last
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testTick(&app, keyEv('k', .{}));
+    try testing.expectEqual(@as(usize, 1), app.episode_cursor);
+    try testTick(&app, keyEv('g', .{}));
+    try testing.expectEqual(@as(usize, 0), app.episode_cursor);
+    try testTick(&app, keyEv('G', .{}));
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+
+    app.freeEpisodeResults();
+}
+
+test "episodes_done populates episode_results" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    const for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.episode_loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 2);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+    try testing.expect(!app.episode_loading);
+    try testing.expectEqual(@as(usize, 2), app.episode_results.?.len);
+
+    app.freeEpisodeResults();
+}
+
+test "episodes_done stale result is discarded" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    // Current show: "anime2"; incoming event is for "anime1" — stale.
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime2");
+    app.episode_loading = true;
+
+    const stale_id = try std.testing.allocator.dupe(u8, "anime1");
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = stale_id } });
+    // Still loading (wasn't cleared by stale event), episode_results still null.
+    try testing.expect(app.episode_loading);
+    try testing.expect(app.episode_results == null);
+
+    // Cleanup detail_for_id manually.
+    if (app.detail_for_id) |id| { std.testing.allocator.free(id); app.detail_for_id = null; }
 }
