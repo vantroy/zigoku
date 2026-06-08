@@ -781,7 +781,7 @@ const App = struct {
         }
         // Enter is only handled here in normal mode. In search mode it must fall
         // through to the search mode check below so onSearchKey can lock the results.
-        if (key.matches('l', .{}) or (key.matches(vaxis.Key.enter, .{}) and self.input_mode == .normal)) {
+        if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.enter, .{}))) {
             if (self.active_view == .browse) {
                 if (self.active_pane == .list and self.results.items.len > 0) {
                     self.active_pane = .detail;
@@ -2057,4 +2057,27 @@ test "task_error pushes a persistent error toast" {
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expect(t.persistent);
     try testing.expectEqualStrings("network down", t.text[0..t.text_len]);
+}
+
+test "firePlay: double-play guard is a no-op when playing is true" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    app.playing = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    app.episode_results = eps;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+
+    // Guard held — no thread spawned, playing still true.
+    try testing.expect(app.play_thread == null);
+    try testing.expect(app.playing);
+
+    std.testing.allocator.free(app.detail_for_id.?);
+    std.testing.allocator.free(eps[0].raw);
+    std.testing.allocator.free(eps);
 }
