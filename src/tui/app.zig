@@ -145,7 +145,7 @@ pub fn run(
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
     // loop.stop() (LIFO — this defer is declared after the loop.stop() defer).
     var tick_quit: std.atomic.Value(bool) = .init(false);
-    const tick_thread = std.Thread.spawn(.{}, tickTask, .{ &loop, &tick_quit }) catch null;
+    const tick_thread = std.Thread.spawn(.{}, tickTask, .{ &loop, io, &tick_quit }) catch null;
     defer {
         tick_quit.store(true, .release);
         if (tick_thread) |t| t.join();
@@ -304,9 +304,9 @@ fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, s
 }
 
 /// Heartbeat thread: posts .tick every 100ms until `quit` is set.
-fn tickTask(loop: *Loop, quit: *std.atomic.Value(bool)) void {
+fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
     while (!quit.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
         loop.postEvent(.tick) catch {};
     }
 }
