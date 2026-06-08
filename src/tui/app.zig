@@ -460,7 +460,7 @@ const App = struct {
             idx = 2;
         }
         var t: Toast = .{ .kind = kind, .persistent = persistent,
-            .ttl_ms = if (persistent) 0 else 4000 };
+            .ttl_ms = if (persistent) 0 else 2500 };
         const n = @min(text.len, 79);
         @memcpy(t.text[0..n], text[0..n]);
         t.text_len = n;
@@ -1394,13 +1394,15 @@ const App = struct {
                 .info => "[·] ",
             };
             const w = win.width;
+            // §4.7: right-aligned, max 40 display columns.
+            const pre_len: u16 = @intCast(prefix.len);
+            const txt_len: u16 = @intCast(t.text_len);
+            const toast_w: u16 = @min(pre_len + txt_len, @min(40, w -| 2));
+            const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
             fillRow(win, row, w, colors.bg_elevated);
-            const pre_col: u16 = 2;
-            const pre_sty = style(fg_color, .{ .bold = true, .bg = colors.bg_elevated });
-            put(win, row, pre_col, prefix, pre_sty);
-            const txt_col: u16 = pre_col + @as(u16, @intCast(prefix.len));
-            const raw_w: u16 = if (w > txt_col + 1) w - txt_col - 1 else 0;
-            const txt_w: u16 = @min(raw_w, 40); // §4.7: max 40 display columns
+            put(win, row, pre_col, prefix, style(fg_color, .{ .bold = true, .bg = colors.bg_elevated }));
+            const txt_col: u16 = pre_col + pre_len;
+            const txt_w: u16 = if (toast_w > pre_len) toast_w - pre_len else 0;
             putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len],
                 style(fg_color, .{ .bg = colors.bg_elevated }));
             row -|= 1;
