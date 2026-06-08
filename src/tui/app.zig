@@ -337,6 +337,9 @@ const App = struct {
     /// Set if the background history load failed.
     load_error: ?[]const u8 = null,
 
+    history_filter: [128]u8 = undefined,
+    history_filter_len: usize = 0,
+
     list_cursor: usize = 0,
     /// Topmost visible row index — the viewport offset for scrolling.
     list_top: usize = 0,
@@ -348,6 +351,9 @@ const App = struct {
     /// slots: a terminal with more than 256 visible history rows renders titles
     /// for the overflow rows without the meta column (no crash, just no meta).
     meta_scratch: [256][48]u8 = undefined,
+    /// Per-row scratch for progress bar fraction strings ("N / M eps"). Same
+    /// lifetime contract as meta_scratch — must outlive vx.render().
+    bar_scratch: [256][32]u8 = undefined,
 
     /// Which top-level view is currently displayed.
     /// Defaults to .history — the M3 landing (§9.2).
@@ -669,6 +675,32 @@ const App = struct {
     }
 
     fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // History view: local in-memory filter — no network calls.
+        if (self.active_view == .history) {
+            if (key.matches(vaxis.Key.escape, .{})) {
+                self.history_filter_len = 0;
+                self.list_cursor = 0;
+                self.list_top = 0;
+                self.input_mode = .normal;
+            } else if (key.matches(vaxis.Key.enter, .{})) {
+                self.input_mode = .normal;
+            } else if (key.matches(vaxis.Key.backspace, .{})) {
+                if (self.history_filter_len > 0) {
+                    self.history_filter_len -= 1;
+                    self.list_cursor = 0;
+                    self.list_top = 0;
+                }
+            } else if (key.text) |text| {
+                if (text.len > 0 and self.history_filter_len + text.len <= 127) {
+                    @memcpy(self.history_filter[self.history_filter_len..][0..text.len], text);
+                    self.history_filter_len += text.len;
+                    self.list_cursor = 0;
+                    self.list_top = 0;
+                }
+            }
+            return;
+        }
+
         // Esc: clear query + any pending debounce, return to normal mode.
         if (key.matches(vaxis.Key.escape, .{})) {
             self.search_len = 0;
@@ -843,7 +875,7 @@ const App = struct {
 
         // List navigation (history + browse list pane).
         const nav_len: usize = switch (self.active_view) {
-            .history => self.history.len,
+            .history => self.filteredHistoryLen(),
             .browse => self.results.items.len,
             .settings => return,
         };
@@ -954,26 +986,31 @@ const App = struct {
                     return;
                 }
 
-                // Keep the cursor inside the viewport.
-                self.scrollIntoView(visible);
+                // Each history entry occupies 2 rows (title + progress bar).
+                self.scrollIntoView(visible / 2);
 
                 // Meta only earns its column when the terminal is wide enough to hold it
                 // without colliding the title — otherwise the title takes the full width.
                 const show_meta = w >= meta_col + 12;
                 const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
                 const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
+                const bar_w: u16 = @min(24, @max(16, if (w > 20) w - 20 else 16));
 
                 var row: u16 = top;
                 var slot: usize = 0;
-                var i: usize = self.list_top;
-                while (i < self.history.len and row < top + visible) : (i += 1) {
+                var visible_i: usize = 0;
+                var i: usize = 0;
+                while (i < self.history.len) : (i += 1) {
                     const rec = self.history[i];
-                    const selected = i == self.list_cursor;
+                    if (!self.historyEntryVisible(rec.title)) continue;
+                    if (visible_i < self.list_top) { visible_i += 1; continue; }
+                    if (row + 1 >= top + visible) break;
+
+                    const selected = visible_i == self.list_cursor;
 
                     // §4.1 focus affordance: the focused row's background shifts to
                     // bg.surface (a full-width band), its marker is the ▸ play glyph in
-                    // focus cyan, and its title goes cyan+bold. Magenta is reserved for
-                    // the one cursor in the status bar — never a list marker (§8).
+                    // focus cyan, and its title goes cyan+bold.
                     const row_bg = if (selected) colors.bg_surface else colors.bg_base;
                     if (selected) fillRow(win, row, w, colors.bg_surface);
 
@@ -984,19 +1021,21 @@ const App = struct {
                         style(colors.focus, .{ .bg = row_bg, .bold = true })
                     else
                         style(colors.fg, .{ .bg = row_bg });
-                    // Clipped to its column budget so long titles can't bleed into meta.
                     putClipped(win, row, title_col, title_w, rec.title, title_style);
 
-                    // Format into App-owned scratch (see meta_scratch's note on why a
-                    // stack buffer would dangle by render time). Skip if we somehow have
-                    // more visible rows than slots.
                     if (show_meta and slot < self.meta_scratch.len) {
                         const meta = formatMeta(&self.meta_scratch[slot], rec);
                         putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
-                        slot += 1;
                     }
 
-                    row += 1;
+                    // Row 2: §4.5 progress bar.
+                    if (slot < self.bar_scratch.len) {
+                        drawProgressBar(win, row + 1, title_col, bar_w, rec, &self.bar_scratch[slot]);
+                    }
+
+                    slot += 1;
+                    row += 2;
+                    visible_i += 1;
                 }
             },
 
@@ -1272,6 +1311,31 @@ const App = struct {
             return;
         }
 
+        // Search mode in History: suppress ▌, show /filter_ + filtered count.
+        if (self.active_view == .history and self.input_mode == .search) {
+            const q = self.history_filter[0..self.history_filter_len];
+            put(win, row, 2, "/", style(colors.focus, .{ .bold = true }));
+            const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
+            if (q.len > 0) {
+                putClipped(win, row, 3, cursor_col -| 3, q, style(colors.fg, .{ .bold = true }));
+            }
+            if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
+            const n = self.filteredHistoryLen();
+            const cnt: []const u8 = if (q.len == 0)
+                ""
+            else if (n > 0)
+                std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{n}) catch ""
+            else
+                "[0]";
+            if (cnt.len > 0) {
+                const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
+                if (cnt_col > cursor_col + 1) {
+                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg2, .{}));
+                }
+            }
+            return;
+        }
+
         // When anything is loading, replace the ▌ with an animated spinner.
         const any_loading = self.search_loading or self.history_loading or
             self.episode_loading or self.debounce_deadline_ms > 0;
@@ -1292,9 +1356,9 @@ const App = struct {
                 .detail => "hjkl scroll · h back · enter play · q back",
             },
             .history => if (self.history.len == 0)
-                "/ search · F1 browse · q quit"
+                "/ search · H browse · q quit"
             else
-                "jk move · enter open · F1 browse · F3 settings · q quit",
+                "hjkl · H browse · / filter · enter open · q quit",
             .settings => "jk navigate · space toggle · enter edit · esc cancel · q back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
@@ -1341,6 +1405,20 @@ const App = struct {
             self.list_top = self.list_cursor + 1 - v;
         }
     }
+
+    fn historyEntryVisible(self: *const App, title: []const u8) bool {
+        if (self.history_filter_len == 0) return true;
+        return std.ascii.indexOfIgnoreCase(title, self.history_filter[0..self.history_filter_len]) != null;
+    }
+
+    fn filteredHistoryLen(self: *const App) usize {
+        if (self.history_filter_len == 0) return self.history.len;
+        var n: usize = 0;
+        for (self.history) |rec| {
+            if (self.historyEntryVisible(rec.title)) n += 1;
+        }
+        return n;
+    }
 };
 
 /// "ep 3/12 · watching" — whatever we actually know. total_episodes can be null
@@ -1353,6 +1431,44 @@ fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 }
 
 // ── tiny render helpers ─────────────────────────────────────────────────────
+
+/// §4.5 progress bar for a history row. `frac_buf` must be App-owned (vaxis
+/// holds a reference until the next render call).
+fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: AnimeRecord, frac_buf: []u8) void {
+    const is_planning = std.mem.eql(u8, rec.list_status, "planning");
+    const is_watching = std.mem.eql(u8, rec.list_status, "watching");
+    const is_paused = std.mem.eql(u8, rec.list_status, "paused");
+
+    const filled: u16 = if (is_planning) 0 else blk: {
+        if (rec.total_episodes) |total| {
+            if (total <= 0) break :blk if (rec.progress > 0) bar_w / 3 else 0;
+            const bw: i64 = @intCast(bar_w);
+            const f = @divTrunc(@max(0, rec.progress) * bw, total);
+            break :blk @intCast(@min(bw, f));
+        }
+        break :blk if (rec.progress > 0) bar_w / 3 else 0;
+    };
+
+    const fill_color = if (is_watching or is_paused) colors.focus else colors.fg3;
+    const frac_color = if (is_watching or is_paused) colors.fg2 else colors.fg3;
+
+    put(win, row, col, "[", style(colors.fg3, .{}));
+    var c: u16 = 0;
+    while (c < bar_w) : (c += 1) {
+        if (c < filled) {
+            put(win, row, col + 1 + c, "█", style(fill_color, .{ .dim = is_paused }));
+        } else {
+            put(win, row, col + 1 + c, "░", style(colors.chrome, .{}));
+        }
+    }
+    put(win, row, col + 1 + bar_w, "]", style(colors.fg3, .{}));
+
+    const frac: []const u8 = if (rec.total_episodes) |total|
+        std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ rec.progress, total }) catch ""
+    else
+        std.fmt.bufPrint(frac_buf, "  {d} / ? eps", .{ rec.progress }) catch "";
+    put(win, row, col + 1 + bar_w + 1, frac, style(frac_color, .{}));
+}
 
 fn put(win: vaxis.Window, row: u16, col: u16, text: []const u8, sty: vaxis.Style) void {
     _ = win.printSegment(.{ .text = text, .style = sty }, .{ .row_offset = row, .col_offset = col });
@@ -1396,8 +1512,9 @@ fn style(fg: vaxis.Color, opts: struct {
     bold: bool = false,
     italic: bool = false,
     blink: bool = false,
+    dim: bool = false,
 }) vaxis.Style {
-    return .{ .fg = fg, .bg = opts.bg, .bold = opts.bold, .italic = opts.italic, .blink = opts.blink };
+    return .{ .fg = fg, .bg = opts.bg, .bold = opts.bold, .italic = opts.italic, .blink = opts.blink, .dim = opts.dim };
 }
 
 // ── tests: the App state machine (no tty needed) ────────────────────────────
@@ -2080,4 +2197,62 @@ test "firePlay: double-play guard is a no-op when playing is true" {
     std.testing.allocator.free(app.detail_for_id.?);
     std.testing.allocator.free(eps[0].raw);
     std.testing.allocator.free(eps);
+}
+
+test "history filter: reduces nav_len to matching entries only" {
+    var hist = sampleHistory(); // Frieren, K-On!, Bebop
+    var app: App = .{};
+    app.history = &hist;
+    app.active_view = .history;
+
+    // No filter: all 3 entries visible.
+    try testing.expectEqual(@as(usize, 3), app.filteredHistoryLen());
+
+    // Filter "on" matches K-On! only.
+    @memcpy(app.history_filter[0..2], "on");
+    app.history_filter_len = 2;
+    try testing.expectEqual(@as(usize, 1), app.filteredHistoryLen());
+
+    // Filter "bop" matches Bebop only.
+    @memcpy(app.history_filter[0..3], "bop");
+    app.history_filter_len = 3;
+    try testing.expectEqual(@as(usize, 1), app.filteredHistoryLen());
+
+    // Filter "zzz" matches nothing.
+    @memcpy(app.history_filter[0..3], "zzz");
+    app.history_filter_len = 3;
+    try testing.expectEqual(@as(usize, 0), app.filteredHistoryLen());
+}
+
+test "history filter: esc clears filter and resets cursor" {
+    var hist = sampleHistory();
+    var app: App = .{};
+    app.history = &hist;
+    app.active_view = .history;
+    app.input_mode = .search;
+    @memcpy(app.history_filter[0..5], "Frien");
+    app.history_filter_len = 5;
+    app.list_cursor = 2;
+    app.list_top = 1;
+
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+
+    try testing.expectEqual(@as(usize, 0), app.history_filter_len);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testing.expectEqual(@as(usize, 0), app.list_top);
+    try testing.expectEqual(.normal, app.input_mode);
+}
+
+test "history 2-row scroll: scrollIntoView with visible/2 keeps cursor in view" {
+    var hist = sampleHistory();
+    var app: App = .{};
+    app.history = &hist;
+    app.active_view = .history;
+    app.list_cursor = 2;
+    app.list_top = 0;
+
+    // visible = 4 terminal rows → 2 entry slots. Cursor at entry 2 must push list_top.
+    app.scrollIntoView(4 / 2);
+    try testing.expect(app.list_cursor >= app.list_top);
+    try testing.expect(app.list_cursor < app.list_top + 2);
 }
