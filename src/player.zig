@@ -40,7 +40,13 @@ pub fn play(
         try argv.append(arena, try std.fmt.allocPrint(arena, "--start={d}", .{start_seconds}));
     }
 
-    var child = std.process.spawn(io, .{ .argv = argv.items }) catch |err| switch (err) {
+    // Redirect mpv's stdout and stderr to /dev/null so its status lines and
+    // codec info don't bleed through the alt-screen into the TUI's terminal.
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch |err| switch (err) {
         error.FileNotFound => return error.MpvNotFound,
         else => return err,
     };
