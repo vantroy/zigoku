@@ -47,8 +47,10 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("sqlite3", .{});
 
     // libvaxis (ROD-71) — the M3 TUI toolkit. v0.6.0 targets Zig 0.16's std.Io.
+    // The whole zigoku module gets it so src/tui/* can @import("vaxis").
     const vaxis_dep = b.dependency("vaxis", .{ .target = target, .optimize = optimize });
     const vaxis_mod = vaxis_dep.module("vaxis");
+    mod.addImport("vaxis", vaxis_mod);
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function

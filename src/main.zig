@@ -34,10 +34,15 @@ pub fn main(init: std.process.Init) !void {
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
 
-    const cli = parseArgs(arena, args) catch {
-        try usage(out);
-        try out.flush();
-        return;
+    const cli = parseArgs(arena, args) catch |err| switch (err) {
+        // No query → open the TUI, M3's default interface. Flags-without-query
+        // or bad flags still fall through to usage.
+        error.NoQuery => return runTui(init, arena),
+        else => {
+            try usage(out);
+            try out.flush();
+            return;
+        },
     };
 
     // Persistence (M2). Best-effort: if the DB can't be opened we note it once
@@ -65,6 +70,14 @@ pub fn main(init: std.process.Init) !void {
 fn openStore(arena: std.mem.Allocator) !zigoku.Store {
     const path = try zigoku.store.defaultDbPath(arena);
     return zigoku.Store.open(path);
+}
+
+/// Launch the libvaxis TUI (ROD-71). Persistence is best-effort — if the DB
+/// won't open, the shell just shows an empty history rather than refusing to run.
+fn runTui(init: std.process.Init, arena: std.mem.Allocator) !void {
+    var store_opt: ?zigoku.Store = openStore(arena) catch null;
+    defer if (store_opt) |*st| st.close();
+    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null);
 }
 
 /// The whole vertical slice, top to bottom. `store` is optional — every

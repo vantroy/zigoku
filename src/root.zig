@@ -14,6 +14,9 @@ pub const source = @import("source.zig");
 pub const player = @import("player.zig");
 pub const store = @import("store.zig");
 
+/// The TUI shell (M3, libvaxis). `zigoku` with no query opens it.
+pub const tui = @import("tui/app.zig");
+
 /// Persistence (M2): watch history, episode resume positions, episode-list cache.
 pub const Store = store.Store;
 pub const AnimeRecord = store.AnimeRecord;
@@ -55,5 +58,6 @@ test {
     _ = source;
     _ = player;
     _ = store;
+    _ = tui;
     _ = @import("providers/allanime.zig");
 }
