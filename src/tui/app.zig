@@ -183,18 +183,30 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         });
     }
 
+    // `owned.items` is a sub-slice of an over-allocated backing buffer —
+    // `ensureTotalCapacity` grows by more than requested so len < capacity.
+    // `gpa.free(owned.items)` would mismatch the allocation length and panic.
+    // `toOwnedSlice` resizes to exact fit (len == capacity), giving a slice
+    // safe to pass to gpa.free on either path below.
+    const exact = owned.toOwnedSlice(gpa) catch {
+        for (owned.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+        owned.deinit(gpa);
+        gpa.free(query);
+        return;
+    };
+
     loop.postEvent(.{ .search_done = .{
-        .results = owned.items,
+        .results = exact,
         .for_query = query,
         .page = page,
     }}) catch {
         // Post failed — we still own everything; free it all.
-        for (owned.items) |r| { gpa.free(r.id); gpa.free(r.name); }
-        owned.deinit(gpa); // free the backing array (strings already freed above)
+        for (exact) |r| { gpa.free(r.id); gpa.free(r.name); }
+        gpa.free(exact); // exact-fit: len == capacity, free is valid
         gpa.free(query);
     };
-    // On success: `owned.items` and `query` are now owned by the event.
-    // Do NOT call owned.deinit here — that would free the slice the UI thread holds.
+    // On success: `exact` and `query` are now owned by the event.
+    // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
