@@ -955,13 +955,19 @@ const App = struct {
                 style(colors.focus, .{ .bg = row_bg, .bold = true })
             else
                 style(colors.fg, .{ .bg = row_bg });
-            // Title fills remaining width (no meta column in narrow list pane).
-            const title_w: u16 = if (w > list_title_col) w - list_title_col else 0;
-            putClipped(win, row, list_title_col, title_w, a.name, title_style);
-
             // Meta (eps) if pane is wide enough — rarely true in split view.
             const list_meta_col: u16 = 46;
-            if (w >= list_meta_col + 8 and slot < self.meta_scratch.len) {
+            const show_list_meta = w >= list_meta_col + 8;
+            // Title clips short enough to leave room for the meta column. The 2-char
+            // gap (title_meta_gap) prevents the last title char from touching the first
+            // meta char. Without this guard the title fills the full pane width and
+            // its tail bleeds through the meta text (vaxis writes cells; later write wins).
+            const title_w: u16 = if (show_list_meta)
+                list_meta_col -| list_title_col -| 2
+            else if (w > list_title_col) w - list_title_col else 0;
+            putClipped(win, row, list_title_col, title_w, a.name, title_style);
+
+            if (show_list_meta and slot < self.meta_scratch.len) {
                 const tt = self.translation;
                 const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
                 const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
