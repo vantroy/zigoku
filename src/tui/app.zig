@@ -372,7 +372,15 @@ const App = struct {
     store: ?*Store = null,
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
-    ep_scratch: [512][6]u8 = undefined,
+    /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
+    /// for labels like "1000a" — silently fell back to "[?]".
+    ep_scratch: [512][8]u8 = undefined,
+    /// Stable storage for the "no results for…" message in drawBrowseList.
+    no_results_buf: [160]u8 = undefined,
+    /// Stable storage for the "N eps" metadata line in drawDetailPane.
+    detail_meta_buf: [32]u8 = undefined,
+    /// Stable storage for the "[N]" result count in drawBottomBar search mode.
+    cnt_scratch: [16]u8 = undefined,
 
     /// Current query as a slice (may be empty).
     fn querySlice(self: *const App) []const u8 {
@@ -788,7 +796,7 @@ const App = struct {
         };
         const chip_color = switch (active_view) {
             .history, .settings => colors.focus,
-            .browse => colors.fg3,
+            .browse => colors.focus,
         };
         put(win, 0, chip_col, chip, style(chip_color, .{}));
 
@@ -921,8 +929,7 @@ const App = struct {
         }
         if (!self.search_loading and self.results.items.len == 0) {
             const q = self.querySlice();
-            var buf: [160]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "no results for \"{s}\"", .{q}) catch "no results";
+            const msg = std.fmt.bufPrint(&self.no_results_buf, "no results for \"{s}\"", .{q}) catch "no results";
             putClipped(win, 0, 0, w, msg, style(colors.fg3, .{ .italic = true }));
             return;
         }
@@ -1022,14 +1029,13 @@ const App = struct {
                 self.results.items[self.list_cursor]
             else
                 null;
-            var meta_buf: [32]u8 = undefined;
             const meta: []const u8 = if (anime) |a| blk: {
                 const eps = a.episodeCount(self.translation);
                 if (eps == 0) break :blk "? eps";
-                break :blk std.fmt.bufPrint(&meta_buf, "{d} eps", .{eps}) catch "? eps";
+                break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
             } else "? eps";
-            const meta_style = if (anime != null and anime.?.episodeCount(self.translation) > 0)
-                style(colors.fg2, .{})
+            const meta_style = if (anime) |a|
+                if (a.episodeCount(self.translation) > 0) style(colors.fg2, .{}) else style(colors.fg3, .{})
             else
                 style(colors.fg3, .{});
             putClipped(win, row, 0, w, meta, meta_style);
@@ -1129,11 +1135,10 @@ const App = struct {
             }
             if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
             // Right-aligned count (text.muted = fg2 per §3.5).
-            var cnt_buf: [16]u8 = undefined;
             const cnt: []const u8 = if (self.search_loading and self.results.items.len == 0)
                 "…"
             else if (self.results.items.len > 0)
-                std.fmt.bufPrint(&cnt_buf, "[{d}]", .{self.results.items.len}) catch ""
+                std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{self.results.items.len}) catch ""
             else if (self.search_len > 0)
                 "[0 results]"
             else
