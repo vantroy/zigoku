@@ -1195,3 +1195,383 @@ unreachable rendering.
 | History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source in M3. History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
+
+---
+
+## 10. ROD-72: View System & Focus Model
+
+This section is the implementable specification for view switching, the per-view
+focus model, F1/F2/F3 keybinds, bottom-bar help strings, and the Esc chain.
+Everything here is a concrete buildable decision. Haru should need zero additional
+design calls to implement `active_view`, `active_pane`, and the keybind dispatch
+table below.
+
+---
+
+### 10.1 Views
+
+Zigoku has three views. They share the same top-bar / bottom-bar chrome and the
+same `bg.base` void background. They differ in content layout and available
+keybinds.
+
+| View | Identifier | Default | Layout |
+|---|---|---|---|
+| Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2) |
+| History | `active_view = .history` | Yes (M3 landing, §9.2) | Single-pane: full-width watchlist (§5.4) |
+| Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
+
+Browse is not available as a landing view in M3 — there is no feed to populate it.
+It becomes live when the user presses `F1` or `H` from History (which triggers a
+search prompt, since Browse idle needs a query). This is unchanged from §9.2.
+
+---
+
+### 10.2 View Switching Keybinds
+
+#### Primary binds (vim-native, single-key)
+
+| Key | Action | From |
+|---|---|---|
+| `H` | Toggle: if in History → switch to Browse; if elsewhere → switch to History | Any view |
+| `S` | Switch to Settings | Any view (except already in Settings → no-op) |
+
+`H` is a toggle because it is the only way to reach Browse in M3 (Browse has no
+dedicated single-key bind of its own — `F1` covers that path, see below). From
+Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
+
+`S` from Settings is a no-op. There is no "toggle Settings" semantic — `q` or
+`Esc` exits Settings.
+
+#### F-key aliases (discoverable navigation)
+
+F-keys are aliases for the primary binds. They do the same thing. They exist so
+a new user pressing function keys lands in the right place.
+
+| Key | Action |
+|---|---|
+| `F1` | Switch to Browse (equivalent to pressing `H` from History, or a no-op if already in Browse) |
+| `F2` | Switch to History (equivalent to pressing `H` from Browse/Settings) |
+| `F3` | Switch to Settings (equivalent to `S`) |
+
+**F1 from Browse:** no-op. The user is already there.
+**F2 from History:** no-op. The user is already there.
+**F3 from Settings:** no-op. The user is already there.
+
+F-keys appear in the bottom-bar help line (see §10.5) so they are the primary
+discovery surface for new users. Vim-native users will use `H`/`S` and never
+need them. Both coexist without conflict.
+
+**libvaxis key matching for F-keys:**
+
+```zig
+// F1 = vaxis.Key.f1, F2 = vaxis.Key.f2, F3 = vaxis.Key.f3
+// Match in onKey exactly like any named key:
+if (key.matches(vaxis.Key.f1, .{})) { ... }
+```
+
+---
+
+### 10.3 Focus Model
+
+#### 10.3a What "focus" means
+
+Focus is which pane currently receives keyboard input. It has two dimensions:
+
+1. **View-level focus** — which view is displayed. Controlled by view switching
+   keybinds (`H`, `S`, `F1`–`F3`).
+2. **Pane-level focus** — within a multi-pane view, which pane is active.
+   Controlled by `h` and `l`.
+
+In single-pane views (History, Settings), pane-level focus is always `.list`
+and does not change. There is no second pane to move to.
+
+In Browse, pane-level focus switches between `.list` (left) and `.detail`
+(right) via `h` / `l`.
+
+#### 10.3b The `·` indicator (§3.4)
+
+The `·` dot rendered right-aligned in the top bar marks pane-level focus.
+
+| View | `active_pane` | `·` color |
+|---|---|---|
+| Browse | `.list` | `color.fg3` (dim — list is the default, no emphasis needed) |
+| Browse | `.detail` | `color.focus` (cyan — detail pane is explicitly selected) |
+| History | `.list` (only value) | `color.focus` (the screen is focused, render at full focus weight) |
+| Settings | `.list` (only value) | `color.focus` |
+
+**Rationale for Browse list dim:** when the detail pane is not open, the `·`
+being dim signals "browse mode, no secondary selection." When focus moves to
+detail, it lights to cyan — the user has gone "deeper" and the indicator tracks
+that. This maps to the §8 decision "single magenta cursor, not per-pane focus
+indicators" — the `·` uses cyan only, never magenta.
+
+The `·` is always rendered. It does not disappear in single-pane views. Its
+persistent presence at a fixed right-aligned position is the anchor that makes
+the top bar feel stable across view transitions.
+
+Top bar rendering by view — the chip after `░` changes with `active_view`:
+
+| `active_view` | Top bar chip | Color |
+|---|---|---|
+| `.browse` | Season/year kanji (e.g. `冬 2026`) | `color.focus` |
+| `.history` | `Watchlist` | `color.focus` |
+| `.settings` | `Settings` | `color.focus` |
+
+This is already implied by §5.4 and §5.5 mocks. Stated here explicitly so Haru
+does not have to infer it from two different sections.
+
+#### 10.3c `h` / `l` behavior by view
+
+| View | `h` | `l` |
+|---|---|---|
+| Browse, `active_pane = .list` | no-op (already leftmost) | set `active_pane = .detail` |
+| Browse, `active_pane = .detail` | set `active_pane = .list` | no-op (already rightmost) |
+| History | no-op | no-op |
+| Settings | no-op | no-op |
+
+In single-pane views, `h` and `l` are silently consumed — they do not trigger
+an error toast or any visual feedback. The `j`/`k` navigation still works
+normally in all views.
+
+---
+
+### 10.4 Esc Chain
+
+`Esc` behavior is context-dependent. This table is exhaustive — every
+`(active_view, input_mode, active_pane)` combination that needs a non-trivial
+Esc action is listed. Everything not listed is a no-op.
+
+| View | `input_mode` | `active_pane` | `Esc` action |
+|---|---|---|---|
+| Any | `search` | any | Close search prompt. Restore full list. Set `input_mode = .normal`. Stay in current view. |
+| Any | `command` | any | Close command prompt. Set `input_mode = .normal`. Stay in current view. |
+| Browse | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
+| Browse | `normal` | `.list` | No-op. `q` handles quit from Browse. Esc does not quit. |
+| History | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to `H`. |
+| Settings | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to pressing `q` from Settings. |
+| Settings | `edit` (field under edit) | `.list` | Cancel field edit. Return to Settings normal. `input_mode` stays `.normal`; the edit buffer is discarded. |
+
+**Why Esc does not quit from Browse normal:** `q` is the quit key throughout
+(§6.1). Esc-to-quit is a common beginner assumption but it conflicts with the
+vim idiom of Esc-as-return. Keeping Esc as "go back one level" and `q` as "quit
+or back" is consistent and does not surprise vim users.
+
+**Why Esc from History goes to Browse (not quit):** History is not the root
+application level — it is a view. There is no concept of "quit the History
+view" meaning "quit the app." Esc navigates backward in the view hierarchy
+(History → Browse), and `q` from Browse prompts quit.
+
+---
+
+### 10.5 Bottom Bar Help Strings
+
+The help line is the idle state of the bottom bar (§3.5 State 1). It updates per
+view. The `▌` blink and rendering rules from §3.5 are unchanged; only the text
+content varies.
+
+The keybind characters listed in the help line use `color.fg2` + underline
+(§1.3: "Underline is for navigation hints only"). Surrounding text uses
+`color.fg3`. The `▌` uses `color.hot` + blink as always.
+
+**Character budget:** at 80 cols, the help line has ~74 chars after the `▌`
+and its padding. The strings below are written to fit that budget.
+
+#### Browse — normal, list pane focused
+
+```
+  ▌  hjkl · / search · F1/F2/F3 views · q quit
+```
+
+Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `F1`, `F2`, `F3`, `q`.
+
+#### Browse — normal, detail pane focused
+
+```
+  ▌  hjkl scroll · h back · enter play · q back
+```
+
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `q`.
+
+Note: this is the §5.3 detail-pane context. `q` means "return to list" here, not
+"quit app" — consistent with §6.1's `q` = "quit current view (back one level)."
+
+#### History — normal
+
+```
+  ▌  jk move · enter open · F1 browse · F3 settings · q quit
+```
+
+Underlined: `j`, `k`, `enter`, `F1`, `F3`, `q`.
+
+Note: `F2` is not shown (the user is already in History). Show only the other
+two view destinations. `H` is not shown because the help line targets newcomers;
+vim users who want `H` already know it.
+
+#### History — empty (no records)
+
+```
+  ▌  / search · F1 browse · q quit
+```
+
+Underlined: `/`, `F1`, `q`.
+
+This is the §9.2 empty state. Minimal help — the screen itself already says
+`/ to search for a show`.
+
+#### Settings — normal
+
+```
+  ▌  jk navigate · space toggle · enter edit · esc cancel · q back
+```
+
+Underlined: `j`, `k`, `space`, `enter`, `esc`, `q`.
+
+This matches the §5.5 mock exactly, with `q back` replacing `q quit` because
+Settings is not root level.
+
+#### Settings — field under edit
+
+```
+  ▌  type value · enter confirm · esc cancel
+```
+
+Underlined: `enter`, `esc`.
+
+The `▌` blink is suppressed in this mode — the field edit cursor takes that
+visual slot. However this help string still displays to confirm what keys are
+available. The `▌` reappears when the edit is committed or cancelled.
+
+#### Any view — search active (§3.5 State 2 unchanged)
+
+The bottom bar becomes the search prompt. The help string is replaced by the
+live query display. No changes from §3.5.
+
+#### Any view — command active (§3.5 State 3 unchanged)
+
+The bottom bar becomes the command prompt. No changes from §3.5.
+
+---
+
+### 10.6 State Delta — Fields Added in ROD-72
+
+The current `App` struct in `src/tui/app.zig` has these fields:
+`should_quit`, `history`, `history_loading`, `load_error`, `list_cursor`,
+`list_top`, `meta_scratch`.
+
+ROD-72 adds exactly two fields:
+
+```zig
+/// Which top-level view is currently displayed.
+/// Defaults to .history — the M3 landing (§9.2).
+active_view: enum { browse, history, settings } = .history,
+
+/// Which pane has keyboard focus within the current view.
+/// Only meaningful in Browse (two panes). History and Settings are single-pane
+/// and treat this field as always .list — it still exists so the top-bar `·`
+/// rendering function can read it without a view branch.
+active_pane: enum { list, detail } = .list,
+```
+
+**Do not add** `input_mode`, `search_query`, `results`, `selected`,
+`detail_scroll`, `episode_cursor`, or `cover_image` in this ticket. Those belong
+to ROD-73 (search), ROD-74 (detail pane), and ROD-75 (history filter / progress
+bars). Adding them speculatively in ROD-72 expands the scope and creates
+uninitialized state that the draw functions are not yet prepared to read.
+
+**Do not add** `mode: enum { browse, history, settings, detail }` from §7.6.
+The §7.6 state machine is the *target* architecture; ROD-72 introduces
+`active_view` and `active_pane` as the minimal increment. The refactor that
+collapses them into `mode` is a future integration step once the downstream
+tickets land.
+
+#### keybind dispatch additions to `onKey`
+
+Add the following to `onKey`, after the existing navigation block:
+
+```zig
+// View switching — F-keys (discoverable) and H/S (vim-native).
+if (key.matches(vaxis.Key.f2, .{}) or
+    (key.matches('H', .{ .shift = true }) or key.matches('H', .{})))
+{
+    self.active_view = if (self.active_view == .history) .browse else .history;
+    self.active_pane = .list;
+    return;
+}
+if (key.matches(vaxis.Key.f3, .{}) or
+    key.matches('S', .{ .shift = true }) or key.matches('S', .{}))
+{
+    if (self.active_view != .settings) {
+        self.active_view = .settings;
+        self.active_pane = .list;
+    }
+    return;
+}
+if (key.matches(vaxis.Key.f1, .{})) {
+    self.active_view = .browse;
+    self.active_pane = .list;
+    return;
+}
+// h / l pane switching (Browse only).
+if (key.matches('h', .{})) {
+    if (self.active_view == .browse) self.active_pane = .list;
+    return;
+}
+if (key.matches('l', .{})) {
+    if (self.active_view == .browse) self.active_pane = .detail;
+    return;
+}
+// Esc chain (§10.4). input_mode is ROD-73 scope; in ROD-72 only the
+// pane-return and view-return branches are wired.
+if (key.matches(vaxis.Key.escape, .{})) {
+    if (self.active_view == .browse and self.active_pane == .detail) {
+        self.active_pane = .list;
+    } else if (self.active_view == .history or self.active_view == .settings) {
+        self.active_view = .browse;
+        self.active_pane = .list;
+    }
+    // Browse + list + normal: no-op. q handles quit.
+    return;
+}
+```
+
+**Note on the existing Esc handler:** the current `onKey` fires `should_quit` on
+`Esc`. That must be removed when this block is added — the Esc chain above
+supersedes it. The `Ctrl-C` quit path stays unchanged.
+
+#### `q` key behavior by view
+
+`q` currently always sets `should_quit = true`. ROD-72 changes this:
+
+| View | `q` action |
+|---|---|
+| Browse | `should_quit = true` (root level — confirm quit) |
+| History | `active_view = .browse` (back one level, no quit) |
+| Settings | `active_view = .browse` (back one level, no quit) |
+
+The `q` handler needs a view branch. Add it before the navigation block:
+
+```zig
+if (key.matches('q', .{})) {
+    switch (self.active_view) {
+        .browse => self.should_quit = true,
+        .history, .settings => {
+            self.active_view = .browse;
+            self.active_pane = .list;
+        },
+    }
+    return;
+}
+```
+
+---
+
+### 10.7 Design Decisions — §10 Additions
+
+| Decision | Rationale | Revisit trigger |
+|---|---|---|
+| F-keys are aliases, not primary binds | H/S are already in §6.1 and the codebase. Adding F-keys as separate primary binds would create two authoritative tables to keep in sync. Aliases give discoverability without forking the semantic. | If a future milestone removes H/S (unlikely), promote F-keys to primary. |
+| F-keys appear in help line; H/S do not | The help line targets users who are not already vim-native. Showing H/S alongside F1/F2/F3 doubles the character cost for no benefit — the vim user already knows H/S. If both appear, the line gets crowded and both become less legible. | If user feedback shows H/S are missed, add them as secondary text in a second help mode toggled by `?`. |
+| `·` stays lit at `color.focus` in single-pane views | Dimming or hiding the `·` in History/Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
+| `·` is dim for Browse list, lit for Browse detail | The detail pane is the "deeper" selection — the user has moved into a secondary surface. Lighting the `·` on detail-entry is a confirmation that the focus moved. Keeping it dim on list avoids the indicator fighting with the active row highlight for attention. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
+| Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
+| `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | Collapse into `mode` when ROD-74 lands and detail navigation is implemented. |
