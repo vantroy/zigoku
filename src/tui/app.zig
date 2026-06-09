@@ -66,13 +66,12 @@ const Event = union(enum) {
     },
     /// Episode fetch failed.
     episodes_error,
-    /// Cover image bytes were fetched + decoded. `rgba`, `encoded`, and `for_id`
-    /// are GPA-owned; App takes ownership on the fresh path.
+    /// Cover image bytes were fetched + decoded. `rgba` and `for_id` are
+    /// GPA-owned; App takes ownership on the fresh path.
     cover_done: struct {
         rgba: []u8,
         width: u32,
         height: u32,
-        encoded: []u8,
         for_id: []const u8,
     },
     /// Cover fetch/decode failed for this show id.
@@ -459,12 +458,7 @@ fn coverTask(loop: *Loop, gpa: Allocator, io: std.Io, url: []const u8, for_id: [
         return;
     }
 
-    const encoded = gpa.dupe(u8, body) catch {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
-        return;
-    };
-    const decoded = cover_mod.decodeRgba(gpa, encoded) catch {
-        gpa.free(encoded);
+    const decoded = cover_mod.decodeRgba(gpa, body) catch {
         loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
         return;
     };
@@ -473,11 +467,9 @@ fn coverTask(loop: *Loop, gpa: Allocator, io: std.Io, url: []const u8, for_id: [
         .rgba = decoded.rgba,
         .width = decoded.w,
         .height = decoded.h,
-        .encoded = encoded,
         .for_id = for_id,
     } }) catch {
         gpa.free(decoded.rgba);
-        gpa.free(encoded);
         gpa.free(for_id);
     };
 }
@@ -594,8 +586,6 @@ const App = struct {
     cover_thread: ?std.Thread = null,
     /// Decoded cover pixels for the currently tracked show id.
     cover_pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
-    /// Original encoded cover bytes (JPEG/PNG) for Kitty upload.
-    cover_encoded: ?[]u8 = null,
     /// Which show id the current cover state belongs to.
     cover_for_id: ?[]const u8 = null,
     /// Whether a cover fetch/decode is in flight.
@@ -704,10 +694,6 @@ const App = struct {
             self.gpa.free(px.rgba);
             self.cover_pixels = null;
         }
-        if (self.cover_encoded) |buf| {
-            self.gpa.free(buf);
-            self.cover_encoded = null;
-        }
         self.cover_fallback_color = .default;
     }
 
@@ -761,7 +747,7 @@ const App = struct {
             return;
         };
         if (self.cover_for_id) |id| {
-            if (std.mem.eql(u8, id, target_id) and (self.cover_loading or self.cover_pixels != null or self.cover_encoded != null)) return;
+            if (std.mem.eql(u8, id, target_id) and (self.cover_loading or self.cover_pixels != null)) return;
         }
 
         if (self.cover_thread) |t| {
@@ -1009,7 +995,6 @@ const App = struct {
                 defer self.gpa.free(ev.for_id);
                 if (self.cover_for_id == null or !std.mem.eql(u8, ev.for_id, self.cover_for_id.?)) {
                     self.gpa.free(ev.rgba);
-                    self.gpa.free(ev.encoded);
                     return;
                 }
                 self.cover_loading = false;
@@ -1021,7 +1006,6 @@ const App = struct {
                 if (!keep) {
                     self.clearCoverState();
                     self.gpa.free(ev.rgba);
-                    self.gpa.free(ev.encoded);
                     return;
                 }
 
@@ -1029,7 +1013,6 @@ const App = struct {
                 self.invalidateCoverImage();
                 self.freeCoverBuffers();
                 self.cover_pixels = .{ .rgba = ev.rgba, .w = ev.width, .h = ev.height };
-                self.cover_encoded = ev.encoded;
                 self.cover_fallback_color = cover_mod.dominantColor(.{ .rgba = ev.rgba, .w = ev.width, .h = ev.height });
             },
             .cover_error => |for_id| {
@@ -2219,7 +2202,6 @@ fn testTick(app: *App, event: Event) !void {
             },
             .cover_done => |d| {
                 app.gpa.free(d.rgba);
-                app.gpa.free(d.encoded);
                 app.gpa.free(d.for_id);
             },
             .cover_error => |id| app.gpa.free(id),
@@ -2827,14 +2809,12 @@ test "cover_done fresh result stores decoded cover state" {
     app.cover_loading = true;
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
-    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
-    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
     try testing.expect(!app.cover_loading);
     try testing.expect(app.cover_pixels != null);
     try testing.expectEqual(@as(u32, 1), app.cover_pixels.?.w);
-    try testing.expectEqual(@as(usize, 8), app.cover_encoded.?.len);
 
     app.clearCoverState();
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
@@ -2857,10 +2837,9 @@ test "cover_done stale result is discarded" {
     app.cover_loading = true;
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
-    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
-    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
     try testing.expect(app.cover_pixels == null);
     try testing.expect(app.cover_loading);
 
@@ -2885,14 +2864,12 @@ test "cover_done while not in detail clears stale loading state" {
     app.cover_loading = true;
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
-    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
-    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
     try testing.expect(!app.cover_loading);
     try testing.expect(app.cover_for_id == null);
     try testing.expect(app.cover_pixels == null);
-    try testing.expect(app.cover_encoded == null);
 
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
@@ -2918,7 +2895,6 @@ test "cover_error clears state so a later revisit can refetch" {
     try testing.expect(!app.cover_loading);
     try testing.expect(app.cover_for_id == null);
     try testing.expect(app.cover_pixels == null);
-    try testing.expect(app.cover_encoded == null);
     try testing.expect(app.cover_failed_for_id != null);
     try testing.expectEqualStrings("anime1", app.cover_failed_for_id.?);
 
