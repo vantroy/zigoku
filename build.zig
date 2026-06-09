@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.linkSystemLibrary("sqlite3", .{});
+    mod.addIncludePath(b.path("src/c"));
+    mod.addCSourceFile(.{ .file = b.path("src/c/stb_image_impl.c") });
 
     // libvaxis (ROD-71) — the M3 TUI toolkit. v0.6.0 targets Zig 0.16's std.Io.
     // The whole zigoku module gets it so src/tui/* can @import("vaxis").

@@ -1,9 +1,17 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const vaxis = @import("vaxis");
-const zigimg = @import("zigimg");
 
 const Allocator = std.mem.Allocator;
+
+extern fn stbi_load_from_memory(
+    buffer: [*c]const u8,
+    len: c_int,
+    x: [*c]c_int,
+    y: [*c]c_int,
+    channels_in_file: [*c]c_int,
+    desired_channels: c_int,
+) ?[*]u8;
+extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 
 pub const Pixels = struct {
     rgba: []u8,
@@ -21,22 +29,30 @@ pub fn probeDimensions(encoded: []const u8) ?Dimensions {
 }
 
 pub fn decodeRgba(alloc: Allocator, encoded: []const u8) !Pixels {
-    // Zig 0.16 currently blows up codegenning the exe in Debug mode when this
-    // decode path is live. Keep Debug builds usable by degrading to the existing
-    // no-art state there; ReleaseSafe/ReleaseFast carry the real cover pipeline.
-    if (builtin.mode == .Debug) return error.DecodeUnavailableInDebug;
     if (encoded.len == 0) return error.DecodeFailed;
 
-    var img = zigimg.Image.fromMemory(alloc, encoded) catch return error.DecodeFailed;
-    defer img.deinit(alloc);
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var channels: c_int = 0;
+    const ptr = stbi_load_from_memory(
+        encoded.ptr,
+        @intCast(encoded.len),
+        &w,
+        &h,
+        &channels,
+        4,
+    ) orelse return error.DecodeFailed;
+    defer stbi_image_free(@ptrCast(ptr));
 
-    img.convert(alloc, .rgba32) catch return error.DecodeFailed;
-    const rgba = try alloc.dupe(u8, img.rawBytes());
-    return .{
-        .rgba = rgba,
-        .w = @intCast(img.width),
-        .h = @intCast(img.height),
-    };
+    if (w <= 0 or h <= 0) return error.DecodeFailed;
+    const width: u32 = @intCast(w);
+    const height: u32 = @intCast(h);
+    const pixel_count = std.math.mul(usize, width, height) catch return error.DecodeFailed;
+    const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.DecodeFailed;
+
+    const rgba = try alloc.alloc(u8, rgba_len);
+    @memcpy(rgba, @as([*]const u8, @ptrCast(ptr))[0..rgba_len]);
+    return .{ .rgba = rgba, .w = width, .h = height };
 }
 
 fn readBeU16(buf: []const u8, off: usize) u16 {
