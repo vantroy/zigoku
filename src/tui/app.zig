@@ -785,6 +785,40 @@ const App = struct {
         };
     }
 
+    fn renderedDetailAnime(self: *const App) ?Anime {
+        return switch (self.active_view) {
+            .browse => self.selectedAnime(),
+            .detail => switch (self.detail_origin) {
+                .browse => self.selectedAnime(),
+                .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
+            },
+            .history, .settings => null,
+        };
+    }
+
+    const DetailRenderInfo = struct {
+        anime: ?Anime,
+        title: []const u8,
+        meta: []const u8,
+        has_meta: bool,
+    };
+
+    fn detailRenderInfo(self: *App) DetailRenderInfo {
+        const anime = self.renderedDetailAnime();
+        const title: []const u8 = if (anime) |a|
+            if (a.name.len > 0) a.name else "—"
+        else
+            "—";
+        const meta: []const u8 = if (anime) |a| blk: {
+            const eps = a.episodeCount(self.translation);
+            if (eps > 0) break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
+            if (a.total_episodes) |total| break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{total}) catch "? eps";
+            break :blk "? eps";
+        } else "? eps";
+        const has_meta = if (anime) |a| a.episodeCount(self.translation) > 0 or a.total_episodes != null else false;
+        return .{ .anime = anime, .title = title, .meta = meta, .has_meta = has_meta };
+    }
+
     fn currentDetailSourceName(self: *const App, provider: SourceProvider) []const u8 {
         if (self.active_view == .detail and self.detail_origin == .history) {
             if (self.selectedHistoryRecord()) |rec| return rec.source;
@@ -1608,7 +1642,7 @@ const App = struct {
             .history => "Watchlist",
             .detail => switch (self.detail_origin) {
                 .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
-                .history => "Watchlist",
+                .history => "▸ Watchlist",
             },
             .settings => "Settings",
             .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
@@ -1913,7 +1947,8 @@ const App = struct {
 
         var row: u16 = 0;
 
-        const anime = self.currentDetailAnime();
+        const info = self.detailRenderInfo();
+        const anime = info.anime;
 
         // Cover art block (§3.3 + §7.3/§7.5).
         // Width stays fixed by layout tier; height is derived from terminal pixel
@@ -1950,11 +1985,10 @@ const App = struct {
         }
 
         // Title — the selected result's name, or placeholder.
-        const title: []const u8 = if (anime) |a| a.name else "";
-        if (title.len > 0) {
-            putClipped(win, row, 0, w, title, style(colors.fg, .{ .bold = true }));
+        if (anime != null and !std.mem.eql(u8, info.title, "—")) {
+            putClipped(win, row, 0, w, info.title, style(colors.fg, .{ .bold = true }));
         } else {
-            putClipped(win, row, 0, w, "—", style(colors.fg3, .{}));
+            putClipped(win, row, 0, w, info.title, style(colors.fg3, .{}));
         }
         row += 1;
 
@@ -1987,17 +2021,8 @@ const App = struct {
 
         // Metadata: episode count, falling back to AniList total when needed.
         if (row < h) {
-            const meta: []const u8 = if (anime) |a| blk: {
-                const eps = a.episodeCount(self.translation);
-                if (eps > 0) break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
-                if (a.total_episodes) |total| break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{total}) catch "? eps";
-                break :blk "? eps";
-            } else "? eps";
-            const meta_style = if (anime) |a|
-                if (a.episodeCount(self.translation) > 0 or a.total_episodes != null) style(colors.fg2, .{}) else style(colors.fg3, .{})
-            else
-                style(colors.fg3, .{});
-            putClipped(win, row, 0, w, meta, meta_style);
+            const meta_style = if (info.has_meta) style(colors.fg2, .{}) else style(colors.fg3, .{});
+            putClipped(win, row, 0, w, info.meta, meta_style);
             row += 1;
         }
 
@@ -2164,13 +2189,13 @@ const App = struct {
         const help: []const u8 = switch (self.active_view) {
             .browse => switch (self.active_pane) {
                 .list => "hjkl · / search · F1/F2/F3 views · q quit",
-                .detail => "hjkl scroll · h back · enter play · q back",
+                .detail => "jk scroll · h back · enter play · q back",
             },
             .history => if (self.history.len == 0)
                 "/ search · F1 browse · q quit"
             else
                 "jk move · enter open · F1 browse · F3 settings · q quit",
-            .detail => "hjkl scroll · h back · enter play · q back",
+            .detail => "jk scroll · h back · enter play · q back",
             .settings => "jk navigate · space toggle · enter edit · esc cancel · q back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
@@ -2741,6 +2766,29 @@ test "l in browse detail pane is a no-op (already rightmost)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+test "browse list pane detail render info uses selected anime" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+        .eps_sub = 12,
+    });
+
+    try testing.expect(app.currentDetailAnime() == null);
+    const info = app.detailRenderInfo();
+    try testing.expect(info.anime != null);
+    try testing.expectEqualStrings("X", info.title);
+    try testing.expectEqualStrings("12 eps", info.meta);
+    try testing.expect(info.has_meta);
+
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+}
+
 test "h / l in history view are no-ops (single pane)" {
     var app: App = .{};
     var recs = sampleHistory();
@@ -2802,6 +2850,32 @@ test "history detail episodes_done seeds cursor from progress" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
     try testing.expectEqual(@as(usize, 4), app.episode_cursor);
+
+    app.freeEpisodeResults();
+}
+
+test "history detail completed show defaults cursor to episode one" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var hist = [_]AnimeRecord{
+        .{ .source = "allanime", .source_id = "done", .title = "Done Show", .total_episodes = 4, .progress = 4 },
+    };
+    app.setHistory(&hist);
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "done");
+    app.episode_loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 4);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
+    eps[3] = .{ .raw = try std.testing.allocator.dupe(u8, "4") };
+    const for_id = try std.testing.allocator.dupe(u8, "done");
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+    try testing.expectEqual(@as(usize, 0), app.episode_cursor);
 
     app.freeEpisodeResults();
 }
