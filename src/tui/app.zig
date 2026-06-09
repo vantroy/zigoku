@@ -1633,11 +1633,23 @@ const App = struct {
     }
 
     fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
-        if (builtin.mode == .Debug) return false;
         if (!vx.caps.kitty_graphics) return false;
         if (self.cover_image != null) return true;
-        const encoded = self.cover_encoded orelse return false;
-        self.cover_image = vx.loadImage(self.gpa, writer, .{ .mem = encoded }) catch return false;
+        const px = self.cover_pixels orelse return false;
+        if (px.w == 0 or px.h == 0 or px.w > std.math.maxInt(u16) or px.h > std.math.maxInt(u16)) return false;
+
+        const enc_len = std.base64.standard.Encoder.calcSize(px.rgba.len);
+        const b64 = self.gpa.alloc(u8, enc_len) catch return false;
+        defer self.gpa.free(b64);
+        const encoded = std.base64.standard.Encoder.encode(b64, px.rgba);
+
+        self.cover_image = vx.transmitPreEncodedImage(
+            writer,
+            encoded,
+            @intCast(px.w),
+            @intCast(px.h),
+            .rgba,
+        ) catch return false;
         return true;
     }
 
