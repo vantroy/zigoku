@@ -384,7 +384,10 @@ fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, s
         loop.postEvent(.play_error) catch {};
         return;
     };
-    player_mod.play(arena.allocator(), io, link, title, 0) catch {};
+    player_mod.play(arena.allocator(), io, link, title, 0) catch {
+        loop.postEvent(.play_error) catch {};
+        return;
+    };
     if (store) |st| st.recordPlay(source_name, id, episode_index, Store.nowSecs()) catch {};
     loop.postEvent(.play_done) catch {};
 }
