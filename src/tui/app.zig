@@ -591,7 +591,9 @@ const App = struct {
 
     /// Which top-level view is currently displayed.
     /// Defaults to .history — the M3 landing (§9.2).
-    active_view: enum { browse, history, settings } = .history,
+    active_view: enum { browse, history, detail, settings } = .history,
+    /// Which top-level view opened the standalone detail screen.
+    detail_origin: enum { browse, history } = .browse,
 
     /// Which pane has keyboard focus within the current view.
     /// Only meaningful in Browse (two panes). History and Settings are single-pane
@@ -745,9 +747,53 @@ const App = struct {
         return self.results.items[self.list_cursor];
     }
 
+    fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
+        if (self.history.len == 0) return null;
+        var visible_i: usize = 0;
+        for (self.history) |rec| {
+            if (!self.historyEntryVisible(rec.title)) continue;
+            if (visible_i == self.list_cursor) return rec;
+            visible_i += 1;
+        }
+        return null;
+    }
+
+    fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
+        return .{
+            .id = rec.source_id,
+            .name = rec.title,
+            .english_name = rec.title_english,
+            .mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null,
+            .anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null,
+            .thumb = rec.cover_url,
+            .total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null,
+            .year = if (rec.year) |x| std.math.cast(u32, x) else null,
+            .status = rec.status,
+            .description = rec.description,
+            .score = if (rec.score) |x| std.math.cast(u32, x) else null,
+        };
+    }
+
+    fn currentDetailAnime(self: *const App) ?Anime {
+        return switch (self.active_view) {
+            .browse => if (self.active_pane == .detail) self.selectedAnime() else null,
+            .detail => switch (self.detail_origin) {
+                .browse => self.selectedAnime(),
+                .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
+            },
+            .history, .settings => null,
+        };
+    }
+
+    fn currentDetailSourceName(self: *const App, provider: SourceProvider) []const u8 {
+        if (self.active_view == .detail and self.detail_origin == .history) {
+            if (self.selectedHistoryRecord()) |rec| return rec.source;
+        }
+        return provider.name();
+    }
+
     fn currentCoverTargetId(self: *const App) ?[]const u8 {
-        if (self.active_view != .browse or self.active_pane != .detail) return null;
-        const anime = self.selectedAnime() orelse return null;
+        const anime = self.currentDetailAnime() orelse return null;
         return anime.id;
     }
 
@@ -817,7 +863,7 @@ const App = struct {
 
     fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return;
-        const anime = self.selectedAnime() orelse return;
+        const anime = self.currentDetailAnime() orelse return;
         const target_id = self.currentCoverTargetId() orelse return;
         if (self.cover_failed_for_id) |failed_id| {
             if (std.mem.eql(u8, failed_id, target_id)) return;
@@ -1078,6 +1124,14 @@ const App = struct {
                 }
                 self.episode_results = ev.episodes;
                 self.episode_cursor = 0;
+                if (self.active_view == .detail and self.detail_origin == .history) {
+                    if (self.selectedHistoryRecord()) |rec| {
+                        const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
+                        if (progress > 0 and progress < ev.episodes.len) {
+                            self.episode_cursor = progress;
+                        }
+                    }
+                }
             },
             .episodes_error => {
                 self.episode_loading = false;
@@ -1167,10 +1221,7 @@ const App = struct {
         };
     }
 
-    fn fireEpisodes(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return;
-        const selected = self.results.items[self.list_cursor];
-
+    fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
         if (self.episode_thread) |t| {
             t.join();
             self.episode_thread = null;
@@ -1182,8 +1233,8 @@ const App = struct {
         self.async_start_ms = self.now_ms;
 
         // Two GPA-duped copies: one for App.detail_for_id, one for the task (→ event).
-        const id_for_app = self.gpa.dupe(u8, selected.id) catch return;
-        const id_for_task = self.gpa.dupe(u8, selected.id) catch {
+        const id_for_app = self.gpa.dupe(u8, source_id) catch return;
+        const id_for_task = self.gpa.dupe(u8, source_id) catch {
             self.gpa.free(id_for_app);
             return;
         };
@@ -1196,6 +1247,19 @@ const App = struct {
             self.episode_loading = false;
             return;
         };
+    }
+
+    fn fireEpisodes(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const selected = self.selectedAnime() orelse return;
+        self.fireEpisodesForId(loop, io, provider, selected.id);
+    }
+
+    fn openHistoryDetail(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const rec = self.selectedHistoryRecord() orelse return;
+        self.active_view = .detail;
+        self.detail_origin = .history;
+        self.active_pane = .detail;
+        self.fireEpisodesForId(loop, io, provider, rec.source_id);
     }
 
     fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1211,8 +1275,8 @@ const App = struct {
         const selected_id = self.detail_for_id orelse return;
         const ep = eps[self.episode_cursor];
 
-        const title_src: []const u8 = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
-            self.results.items[self.list_cursor].name
+        const title_src: []const u8 = if (self.currentDetailAnime()) |anime|
+            anime.name
         else
             "zigoku";
 
@@ -1228,7 +1292,17 @@ const App = struct {
         };
 
         self.play_thread = std.Thread.spawn(.{}, playTask, .{
-            loop, self.gpa, io, provider, self.store, provider.name(), id_copy, ep_copy, @as(i64, @intCast(self.episode_cursor + 1)), self.translation, title_copy,
+            loop,
+            self.gpa,
+            io,
+            provider,
+            self.store,
+            self.currentDetailSourceName(provider),
+            id_copy,
+            ep_copy,
+            @as(i64, @intCast(self.episode_cursor + 1)),
+            self.translation,
+            title_copy,
         }) catch {
             self.gpa.free(id_copy);
             self.gpa.free(ep_copy);
@@ -1318,6 +1392,13 @@ const App = struct {
                     self.active_view = .browse;
                     self.active_pane = .list;
                 },
+                .detail => {
+                    self.active_view = switch (self.detail_origin) {
+                        .browse => .browse,
+                        .history => .history,
+                    };
+                    self.active_pane = .list;
+                },
             }
             return;
         }
@@ -1373,23 +1454,38 @@ const App = struct {
         if (self.input_mode == .normal and key.matches('h', .{})) {
             if (self.active_view == .browse and self.active_pane == .detail) {
                 self.active_pane = .list;
+            } else if (self.active_view == .detail) {
+                self.active_view = switch (self.detail_origin) {
+                    .browse => .browse,
+                    .history => .history,
+                };
+                self.active_pane = .list;
             }
             return;
         }
         // Enter is only handled here in normal mode. In search mode it must fall
         // through to the search mode check below so onSearchKey can lock the results.
         if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.enter, .{}))) {
-            if (self.active_view == .browse) {
-                if (self.active_pane == .list and self.results.items.len > 0) {
-                    self.active_pane = .detail;
-                    self.fireEpisodes(loop, io, provider);
-                } else if (self.active_pane == .detail) {
-                    // Enter on episode in detail pane: play
-                    if (key.matches(vaxis.Key.enter, .{})) {
-                        self.firePlay(loop, io, provider);
+            switch (self.active_view) {
+                .browse => {
+                    if (self.active_pane == .list and self.results.items.len > 0) {
+                        self.active_pane = .detail;
+                        self.fireEpisodes(loop, io, provider);
+                    } else if (self.active_pane == .detail) {
+                        // Enter on episode in detail pane: play
+                        if (key.matches(vaxis.Key.enter, .{})) {
+                            self.firePlay(loop, io, provider);
+                        }
+                        // l in detail: no-op (already rightmost)
                     }
-                    // l in detail: no-op (already rightmost)
-                }
+                },
+                .history => {
+                    if (key.matches(vaxis.Key.enter, .{})) self.openHistoryDetail(loop, io, provider);
+                },
+                .detail => {
+                    if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, provider);
+                },
+                .settings => {},
             }
             return;
         }
@@ -1404,6 +1500,12 @@ const App = struct {
         // Esc chain (§10.4): only reached in normal mode.
         if (key.matches(vaxis.Key.escape, .{})) {
             if (self.active_view == .browse and self.active_pane == .detail) {
+                self.active_pane = .list;
+            } else if (self.active_view == .detail) {
+                self.active_view = switch (self.detail_origin) {
+                    .browse => .browse,
+                    .history => .history,
+                };
                 self.active_pane = .list;
             } else if (self.active_view == .history or self.active_view == .settings) {
                 self.active_view = .browse;
@@ -1423,7 +1525,7 @@ const App = struct {
         }
 
         // In detail pane: j/k/g/G navigate the episode grid.
-        if (self.active_view == .browse and self.active_pane == .detail) {
+        if ((self.active_view == .browse and self.active_pane == .detail) or self.active_view == .detail) {
             const ep_len: usize = if (self.episode_results) |eps| eps.len else 0;
             if (ep_len == 0) return;
             if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
@@ -1442,7 +1544,7 @@ const App = struct {
         const nav_len: usize = switch (self.active_view) {
             .history => self.filteredHistoryLen(),
             .browse => self.results.items.len,
-            .settings => return,
+            .detail, .settings => return,
         };
         if (nav_len == 0) return;
 
@@ -1504,6 +1606,10 @@ const App = struct {
         const chip_col: u16 = 16;
         const chip: []const u8 = switch (self.active_view) {
             .history => "Watchlist",
+            .detail => switch (self.detail_origin) {
+                .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
+                .history => "Watchlist",
+            },
             .settings => "Settings",
             .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
         };
@@ -1512,7 +1618,7 @@ const App = struct {
         // Render the · indicator right-aligned (§10.3b).
         const dot_color = switch (self.active_view) {
             .browse => if (self.active_pane == .detail) colors.focus else colors.fg3,
-            .history, .settings => colors.focus,
+            .history, .detail, .settings => colors.focus,
         };
         if (w > 2) put(win, 0, w - 2, "·", style(dot_color, .{}));
     }
@@ -1633,6 +1739,11 @@ const App = struct {
 
                 self.drawBrowseList(list_win, pane_h, list_w);
                 self.drawDetailPane(vx, writer, detail_win, detail_w, pane_h, w);
+            },
+
+            .detail => {
+                const detail_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = visible });
+                self.drawDetailPane(vx, writer, detail_win, body_w, visible, w);
             },
 
             .settings => {
@@ -1802,7 +1913,7 @@ const App = struct {
 
         var row: u16 = 0;
 
-        const anime = self.selectedAnime();
+        const anime = self.currentDetailAnime();
 
         // Cover art block (§3.3 + §7.3/§7.5).
         // Width stays fixed by layout tier; height is derived from terminal pixel
@@ -2059,6 +2170,7 @@ const App = struct {
                 "/ search · F1 browse · q quit"
             else
                 "jk move · enter open · F1 browse · F3 settings · q quit",
+            .detail => "hjkl scroll · h back · enter play · q back",
             .settings => "jk navigate · space toggle · enter edit · esc cancel · q back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
@@ -2638,6 +2750,60 @@ test "h / l in history view are no-ops (single pane)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+}
+
+test "Enter in history opens standalone detail view" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(.detail, app.active_view);
+    try testing.expectEqual(.history, app.detail_origin);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("a", app.detail_for_id orelse return error.TestExpectationFailed);
+
+    app.freeEpisodeResults();
+}
+
+test "q from history-opened detail returns to history" {
+    var app: App = .{};
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.list, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "history detail episodes_done seeds cursor from progress" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episode_loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 6);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
+    eps[3] = .{ .raw = try std.testing.allocator.dupe(u8, "4") };
+    eps[4] = .{ .raw = try std.testing.allocator.dupe(u8, "5") };
+    eps[5] = .{ .raw = try std.testing.allocator.dupe(u8, "6") };
+    const for_id = try std.testing.allocator.dupe(u8, "a");
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+    try testing.expectEqual(@as(usize, 4), app.episode_cursor);
+
+    app.freeEpisodeResults();
 }
 
 test "h / l in settings view are no-ops (single pane)" {
