@@ -116,11 +116,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
         try out.writeAll("\n  bye.\n");
         return;
     };
-    var show = results[show_idx];
-    // Best-effort metadata bridge: playback stays AllAnime-only if AniList is
-    // slow or unavailable, but successful enrichment gives us durable ids and
-    // cover/synopsis metadata for later sessions.
-    if (try zigoku.anilist.enrich(arena, io, show)) |meta| show = zigoku.anilist.apply(show, meta);
+    const show = results[show_idx];
 
     // ROD-66/97: remember this show. Refreshes source metadata, preserves any
     // existing history (play_count/progress/status).
