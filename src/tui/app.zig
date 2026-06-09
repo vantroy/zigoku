@@ -1675,6 +1675,20 @@ const App = struct {
         img.draw(draw_win, .{ .scale = .fit }) catch self.drawFallbackCover(cover_win);
     }
 
+    fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {
+        if (cover_w == 0 or max_h == 0) return 0;
+        if (win.screen.width == 0 or win.screen.height == 0) return max_h;
+
+        const pix_per_col = std.math.divCeil(u32, win.screen.width_pix, win.screen.width) catch return max_h;
+        const pix_per_row = std.math.divCeil(u32, win.screen.height_pix, win.screen.height) catch return max_h;
+        if (pix_per_col == 0 or pix_per_row == 0) return max_h;
+
+        const slot_w_px = @as(u32, cover_w) * pix_per_col;
+        const desired_h_px = std.math.divCeil(u32, slot_w_px * 3, 2) catch return max_h;
+        const cover_h = std.math.divCeil(u32, desired_h_px, pix_per_row) catch return max_h;
+        return @intCast(@max(@as(u32, 1), @min(@as(u32, max_h), cover_h)));
+    }
+
     fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16) void {
         if (w < 10) return;
 
@@ -1683,9 +1697,10 @@ const App = struct {
         const anime = self.selectedAnime();
 
         // Cover art block (§3.3 + §7.3/§7.5).
-        // 20×28 at ≥100 total terminal cols, 14×20 at 80–99, hidden below 80.
+        // Width stays fixed by layout tier; height is derived from terminal pixel
+        // geometry so the panel itself stays poster-shaped instead of cell-tall.
         const cover_w: u16 = if (term_w >= 100) 20 else if (term_w >= 80) 14 else 0;
-        const cover_h: u16 = if (term_w >= 100) 28 else if (term_w >= 80) 20 else 0;
+        const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
         if (cover_w > 0 and cover_h > 0) {
             const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
             cover_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
