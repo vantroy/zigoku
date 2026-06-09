@@ -92,9 +92,9 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
         try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
     }
 
-    const SOURCE = zigoku.AllAnime.source_name;
     var allanime = zigoku.AllAnime.init();
     const provider = allanime.provider();
+    const SOURCE = provider.name();
 
     // 1. Search.
     try out.print("\n→ searching AllAnime for \"{s}\" ({s})…\n", .{ cli.query, cli.translation.str() });
@@ -116,9 +116,13 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
         try out.writeAll("\n  bye.\n");
         return;
     };
-    const show = results[show_idx];
+    var show = results[show_idx];
+    // Best-effort metadata bridge: playback stays AllAnime-only if AniList is
+    // slow or unavailable, but successful enrichment gives us durable ids and
+    // cover/synopsis metadata for later sessions.
+    if (try zigoku.anilist.enrich(arena, io, show)) |meta| show = zigoku.anilist.apply(show, meta);
 
-    // ROD-66: remember this show. Refreshes source metadata, preserves any
+    // ROD-66/97: remember this show. Refreshes source metadata, preserves any
     // existing history (play_count/progress/status).
     if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs()) catch {};
 

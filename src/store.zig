@@ -37,7 +37,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, Sche
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 1;
+const SCHEMA_VERSION: c_int = 2;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -93,6 +93,13 @@ const MIGRATION_V1 =
     \\);
 ;
 
+const MIGRATION_V2 =
+    \\ALTER TABLE anime ADD COLUMN year INTEGER;
+    \\ALTER TABLE anime ADD COLUMN status TEXT;
+    \\ALTER TABLE anime ADD COLUMN description TEXT;
+    \\ALTER TABLE anime ADD COLUMN score INTEGER;
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -105,6 +112,10 @@ pub const AnimeRecord = struct {
     mal_id: ?i64 = null,
     anilist_id: ?i64 = null,
     cover_url: ?[]const u8 = null,
+    year: ?i64 = null,
+    status: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    score: ?i64 = null,
     total_episodes: ?i64 = null,
     list_status: []const u8 = "planning",
     user_rating: ?f64 = null,
@@ -129,7 +140,11 @@ pub const AnimeRecord = struct {
             .mal_id = if (a.mal_id) |m| std.math.cast(i64, m) else null,
             .anilist_id = if (a.anilist_id) |x| std.math.cast(i64, x) else null,
             .cover_url = a.thumb,
-            .total_episodes = if (eps > 0) @intCast(eps) else null,
+            .year = if (a.year) |y| std.math.cast(i64, y) else null,
+            .status = a.status,
+            .description = a.description,
+            .score = if (a.score) |s| std.math.cast(i64, s) else null,
+            .total_episodes = if (a.total_episodes) |n| @intCast(n) else if (eps > 0) @intCast(eps) else null,
         };
     }
 };
@@ -202,15 +217,19 @@ pub const Store = struct {
     pub fn upsertAnime(self: *Store, a: AnimeRecord, now: i64) Error!void {
         const sql =
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
-            \\    cover_url, total_episodes, list_status, user_rating, notes,
-            \\    play_count, progress, added_at, last_watched_at)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    cover_url, year, status, description, score, total_episodes,
+            \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
-            \\    title_english  = excluded.title_english,
+            \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
             \\    mal_id         = COALESCE(excluded.mal_id, anime.mal_id),
             \\    anilist_id     = COALESCE(excluded.anilist_id, anime.anilist_id),
             \\    cover_url      = COALESCE(excluded.cover_url, anime.cover_url),
+            \\    year           = COALESCE(excluded.year, anime.year),
+            \\    status         = COALESCE(excluded.status, anime.status),
+            \\    description    = COALESCE(excluded.description, anime.description),
+            \\    score          = COALESCE(excluded.score, anime.score),
             \\    total_episodes = COALESCE(excluded.total_episodes, anime.total_episodes)
         ;
         const stmt = try self.prepare(sql);
@@ -223,14 +242,18 @@ pub const Store = struct {
         bindOptI64(stmt, 5, a.mal_id);
         bindOptI64(stmt, 6, a.anilist_id);
         bindOptText(stmt, 7, a.cover_url);
-        bindOptI64(stmt, 8, a.total_episodes);
-        bindText(stmt, 9, a.list_status);
-        bindOptF64(stmt, 10, a.user_rating);
-        bindOptText(stmt, 11, a.notes);
-        _ = c.sqlite3_bind_int64(stmt, 12, a.play_count);
-        _ = c.sqlite3_bind_int64(stmt, 13, a.progress);
-        _ = c.sqlite3_bind_int64(stmt, 14, if (a.added_at != 0) a.added_at else now);
-        bindOptI64(stmt, 15, a.last_watched_at);
+        bindOptI64(stmt, 8, a.year);
+        bindOptText(stmt, 9, a.status);
+        bindOptText(stmt, 10, a.description);
+        bindOptI64(stmt, 11, a.score);
+        bindOptI64(stmt, 12, a.total_episodes);
+        bindText(stmt, 13, a.list_status);
+        bindOptF64(stmt, 14, a.user_rating);
+        bindOptText(stmt, 15, a.notes);
+        _ = c.sqlite3_bind_int64(stmt, 16, a.play_count);
+        _ = c.sqlite3_bind_int64(stmt, 17, a.progress);
+        _ = c.sqlite3_bind_int64(stmt, 18, if (a.added_at != 0) a.added_at else now);
+        bindOptI64(stmt, 19, a.last_watched_at);
 
         try self.stepDone(stmt);
     }
@@ -269,6 +292,43 @@ pub const Store = struct {
             });
         }
         return rows.toOwnedSlice(arena);
+    }
+
+    /// Full stored metadata for one show, or null if it was never persisted.
+    pub fn getAnime(self: *Store, arena: Allocator, source: []const u8, source_id: []const u8) Error!?AnimeRecord {
+        const sql =
+            \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
+            \\    year, status, description, score, total_episodes, list_status,
+            \\    user_rating, notes, play_count, progress, added_at, last_watched_at
+            \\FROM anime
+            \\WHERE source = ? AND source_id = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, source);
+        bindText(stmt, 2, source_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .source = try dupeText(arena, stmt, 0) orelse "",
+            .source_id = try dupeText(arena, stmt, 1) orelse "",
+            .title = try dupeText(arena, stmt, 2) orelse "",
+            .title_english = try dupeText(arena, stmt, 3),
+            .mal_id = colOptI64(stmt, 4),
+            .anilist_id = colOptI64(stmt, 5),
+            .cover_url = try dupeText(arena, stmt, 6),
+            .year = colOptI64(stmt, 7),
+            .status = try dupeText(arena, stmt, 8),
+            .description = try dupeText(arena, stmt, 9),
+            .score = colOptI64(stmt, 10),
+            .total_episodes = colOptI64(stmt, 11),
+            .list_status = try dupeText(arena, stmt, 12) orelse "planning",
+            .user_rating = colOptF64(stmt, 13),
+            .notes = try dupeText(arena, stmt, 14),
+            .play_count = c.sqlite3_column_int64(stmt, 15),
+            .progress = c.sqlite3_column_int64(stmt, 16),
+            .added_at = c.sqlite3_column_int64(stmt, 17),
+            .last_watched_at = colOptI64(stmt, 18),
+        };
     }
 
     /// Mark a play: bump play_count + last_watched_at, and advance `progress` to
@@ -455,7 +515,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 1;");
             v = 1;
         }
-        // future: if (v < 2) { try self.exec(MIGRATION_V2); ... }
+        if (v < 2) {
+            try self.exec(MIGRATION_V2);
+            try self.exec("PRAGMA user_version = 2;");
+            v = 2;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -598,6 +662,38 @@ test "upsertAnime + loadHistory round-trips" {
     try testing.expectEqual(@as(?i64, 28), rows[0].total_episodes);
     try testing.expectEqualStrings("planning", rows[0].list_status);
     try testing.expectEqual(@as(i64, 0), rows[0].play_count);
+}
+
+test "getAnime returns persisted enrichment" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "frieren",
+        .title = "Frieren",
+        .title_english = "Frieren: Beyond Journey's End",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+        .cover_url = "https://img.anili.st/frieren.jpg",
+        .year = 2023,
+        .status = "FINISHED",
+        .description = "Elf mage grief hour",
+        .score = 91,
+        .total_episodes = 28,
+    }, 1000);
+
+    const rec = (try s.getAnime(arena, T_SOURCE, "frieren")) orelse return error.TestExpectationFailed;
+    try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
+    try testing.expectEqual(@as(?i64, 52991), rec.mal_id);
+    try testing.expectEqual(@as(?i64, 2023), rec.year);
+    try testing.expectEqual(@as(?i64, 91), rec.score);
+    try testing.expectEqualStrings("FINISHED", rec.status orelse "");
+    try testing.expectEqualStrings("Elf mage grief hour", rec.description orelse "");
 }
 
 test "upsertAnime preserves user state on re-search" {

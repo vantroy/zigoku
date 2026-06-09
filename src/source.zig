@@ -29,6 +29,8 @@ pub const SourceProvider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Stable source identity used by persistence keys, e.g. "allanime".
+        name: *const fn (ptr: *anyopaque) []const u8,
         /// Search the catalog; return shows ranked best-match-first.
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
         /// List a show's episode numbers in the given track, numerically sorted.
@@ -37,6 +39,9 @@ pub const SourceProvider = struct {
         resolve: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation) anyerror!domain.StreamLink,
     };
 
+    pub fn name(self: SourceProvider) []const u8 {
+        return self.vtable.name(self.ptr);
+    }
     pub fn search(self: SourceProvider, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime {
         return self.vtable.search(self.ptr, arena, io, query, opts);
     }

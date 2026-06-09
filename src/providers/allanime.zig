@@ -63,12 +63,17 @@ pub const AllAnime = struct {
     }
 
     const vtable: source.SourceProvider.VTable = .{
+        .name = nameErased,
         .search = searchErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
     };
 
     // ── vtable trampolines: recover the typed self from the erased ptr ──────────
+    fn nameErased(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return source_name;
+    }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
         return self.search(arena, io, query, opts);
