@@ -25,12 +25,26 @@ const domain = @import("../domain.zig");
 const anilist = @import("../anilist.zig");
 const cover_mod = @import("../cover.zig");
 const player_mod = @import("../player.zig");
+const lru_mod = @import("../util/lru.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
 const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
+const DecodedCoverCacheOps = struct {
+    pub fn freeValue(alloc: Allocator, value: cover_mod.Pixels) void {
+        alloc.free(value.rgba);
+    }
+
+    pub fn valueBytes(value: cover_mod.Pixels) usize {
+        return value.rgba.len;
+    }
+};
+const RawCoverCache = lru_mod.LruCache([]const u8, []u8, 20, lru_mod.SliceValueOps([]u8));
+const DecodedCoverCache = lru_mod.LruCache([]const u8, cover_mod.Pixels, 5, DecodedCoverCacheOps);
+const max_cover_raw_cache_bytes = 32 * 1024 * 1024;
+const max_cover_decoded_cache_bytes = 48 * 1024 * 1024;
 
 /// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
 /// worker→UI messages, posted from background threads and drained in tick().
@@ -161,7 +175,9 @@ pub fn run(
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
     defer if (app.episode_thread) |t| t.join();
-    defer if (app.cover_thread) |t| t.join();
+    // Cover worker must be joined on both the normal shutdown path and any
+    // error unwind path before `loop`, `gpa`, or the caches are torn down.
+    defer app.joinCoverThread();
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -191,7 +207,9 @@ pub fn run(
     for (app.results.items) |r| freeOwnedAnime(gpa, r);
     app.results.deinit(gpa);
     app.freeEpisodeResults();
+    app.joinCoverThread();
     app.freeCoverState(&vx, writer);
+    app.deinitCoverCaches();
 }
 
 fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
@@ -289,7 +307,7 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         .results = exact,
         .for_query = query,
         .page = page,
-    }}) catch {
+    } }) catch {
         // Post failed — we still own everything; free it all.
         for (exact) |r| freeOwnedAnime(gpa, r);
         gpa.free(exact); // exact-fit: len == capacity, free is valid
@@ -409,17 +427,79 @@ const max_cover_encoded_bytes = 8 * 1024 * 1024;
 const max_cover_dimension = 4096;
 const max_cover_pixels = max_cover_dimension * max_cover_dimension;
 
+fn postCoverError(loop: *Loop, gpa: Allocator, for_id: []const u8) void {
+    loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+}
+
+fn postCoverDoneOwned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, for_id: []const u8) void {
+    loop.postEvent(.{ .cover_done = .{
+        .rgba = decoded.rgba,
+        .width = decoded.w,
+        .height = decoded.h,
+        .for_id = for_id,
+    } }) catch {
+        gpa.free(decoded.rgba);
+        gpa.free(for_id);
+    };
+}
+
+fn postCoverDoneCloned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, for_id: []const u8) void {
+    const rgba = gpa.dupe(u8, decoded.rgba) catch {
+        postCoverError(loop, gpa, for_id);
+        return;
+    };
+    postCoverDoneOwned(loop, gpa, .{ .rgba = rgba, .w = decoded.w, .h = decoded.h }, for_id);
+}
+
+fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
+    const dims = cover_mod.probeDimensions(body) orelse return error.DecodeFailed;
+    if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) {
+        return error.DecodeFailed;
+    }
+    const pixel_count = std.math.mul(u64, dims.w, dims.h) catch return error.DecodeFailed;
+    if (pixel_count > max_cover_pixels) return error.DecodeFailed;
+    return cover_mod.decodeRgba(gpa, body);
+}
+
 /// Background task: fetch cover bytes and decode them to RGBA.
 /// `url` is task-owned and freed before return. `for_id` is transferred to the
-/// event on success/error and freed by the UI thread there.
-fn coverTask(loop: *Loop, gpa: Allocator, io: std.Io, url: []const u8, for_id: []const u8) void {
+/// event on success/error and freed by the UI thread there. Cache ownership stays
+/// on the worker side; events get their own RGBA slice.
+fn coverTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    url: []const u8,
+    for_id: []const u8,
+    raw_cache: *RawCoverCache,
+    decoded_cache: *DecodedCoverCache,
+) void {
     defer gpa.free(url);
+
+    if (decoded_cache.get(url)) |decoded| {
+        postCoverDoneCloned(loop, gpa, decoded, for_id);
+        return;
+    }
+
+    if (raw_cache.get(url)) |body| {
+        const decoded = decodeCoverBody(gpa, body) catch {
+            postCoverError(loop, gpa, for_id);
+            return;
+        };
+        const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
+        if (!cached) {
+            postCoverDoneOwned(loop, gpa, decoded, for_id);
+            return;
+        }
+        postCoverDoneCloned(loop, gpa, decoded, for_id);
+        return;
+    }
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     const resp_buf = gpa.alloc(u8, max_cover_encoded_bytes) catch {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        postCoverError(loop, gpa, for_id);
         return;
     };
     defer gpa.free(resp_buf);
@@ -432,46 +512,29 @@ fn coverTask(loop: *Loop, gpa: Allocator, io: std.Io, url: []const u8, for_id: [
             .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
         },
     }) catch {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        postCoverError(loop, gpa, for_id);
         return;
     };
     if (res.status != .ok) {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        postCoverError(loop, gpa, for_id);
         return;
     }
 
     const body = resp_writer.buffered();
-    const dims = cover_mod.probeDimensions(body) orelse {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+    const decoded = decodeCoverBody(gpa, body) catch {
+        postCoverError(loop, gpa, for_id);
         return;
     };
-    if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+    if (gpa.dupe(u8, body)) |raw_copy| {
+        const cached = raw_cache.putOwnedBounded(gpa, url, raw_copy, max_cover_raw_cache_bytes) catch false;
+        if (!cached) gpa.free(raw_copy);
+    } else |_| {}
+    const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
+    if (!cached) {
+        postCoverDoneOwned(loop, gpa, decoded, for_id);
         return;
     }
-    const pixel_count = std.math.mul(u64, dims.w, dims.h) catch {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
-        return;
-    };
-    if (pixel_count > max_cover_pixels) {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
-        return;
-    }
-
-    const decoded = cover_mod.decodeRgba(gpa, body) catch {
-        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
-        return;
-    };
-
-    loop.postEvent(.{ .cover_done = .{
-        .rgba = decoded.rgba,
-        .width = decoded.w,
-        .height = decoded.h,
-        .for_id = for_id,
-    } }) catch {
-        gpa.free(decoded.rgba);
-        gpa.free(for_id);
-    };
+    postCoverDoneCloned(loop, gpa, decoded, for_id);
 }
 
 /// Heartbeat thread: posts .tick every 100ms until `quit` is set.
@@ -584,6 +647,10 @@ const App = struct {
     episode_cursor: usize = 0,
     /// Handle for the most recent cover-fetch thread. Joined before a new spawn.
     cover_thread: ?std.Thread = null,
+    /// Worker-thread raw-image cache (avoids refetch by URL).
+    cover_raw_cache: RawCoverCache = .{},
+    /// Worker-thread decoded-pixel cache (avoids re-decode by URL).
+    cover_decoded_cache: DecodedCoverCache = .{},
     /// Decoded cover pixels for the currently tracked show id.
     cover_pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
     /// Which show id the current cover state belongs to.
@@ -647,15 +714,17 @@ const App = struct {
     fn pushToast(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool) void {
         var idx: usize = 3;
         for (self.toast_queue, 0..) |slot, i| {
-            if (slot == null) { idx = i; break; }
+            if (slot == null) {
+                idx = i;
+                break;
+            }
         }
         if (idx == 3) {
             self.toast_queue[0] = self.toast_queue[1];
             self.toast_queue[1] = self.toast_queue[2];
             idx = 2;
         }
-        var t: Toast = .{ .kind = kind, .persistent = persistent,
-            .ttl_ms = if (persistent) 0 else 2500 };
+        var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 2500 };
         const n = @min(text.len, 79);
         @memcpy(t.text[0..n], text[0..n]);
         t.text_len = n;
@@ -734,6 +803,18 @@ const App = struct {
         self.clearCoverFailure();
     }
 
+    fn deinitCoverCaches(self: *App) void {
+        self.cover_decoded_cache.deinit(self.gpa);
+        self.cover_raw_cache.deinit(self.gpa);
+    }
+
+    fn joinCoverThread(self: *App) void {
+        if (self.cover_thread) |t| {
+            t.join();
+            self.cover_thread = null;
+        }
+    }
+
     fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return;
         const anime = self.selectedAnime() orelse return;
@@ -750,10 +831,7 @@ const App = struct {
             if (std.mem.eql(u8, id, target_id) and (self.cover_loading or self.cover_pixels != null)) return;
         }
 
-        if (self.cover_thread) |t| {
-            t.join();
-            self.cover_thread = null;
-        }
+        self.joinCoverThread();
 
         self.clearCoverState();
         self.cover_for_id = self.gpa.dupe(u8, target_id) catch return;
@@ -767,7 +845,15 @@ const App = struct {
             return;
         };
 
-        self.cover_thread = std.Thread.spawn(.{}, coverTask, .{ loop, self.gpa, io, url_copy, id_for_event }) catch {
+        self.cover_thread = std.Thread.spawn(.{}, coverTask, .{
+            loop,
+            self.gpa,
+            io,
+            url_copy,
+            id_for_event,
+            &self.cover_raw_cache,
+            &self.cover_decoded_cache,
+        }) catch {
             self.gpa.free(url_copy);
             self.gpa.free(id_for_event);
             self.clearCoverState();
@@ -940,7 +1026,10 @@ const App = struct {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.results);
                     self.gpa.free(ev.for_query);
-                    if (self.enrich_thread) |t| { t.join(); self.enrich_thread = null; }
+                    if (self.enrich_thread) |t| {
+                        t.join();
+                        self.enrich_thread = null;
+                    }
                     if (self.pending_enrich) |p| {
                         self.pending_enrich = null;
                         self.fireEnrich(loop, io, p.offset, p.count);
@@ -963,7 +1052,10 @@ const App = struct {
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
                 self.persistResults(source_name, ev.offset, ev.results.len, false);
-                if (self.enrich_thread) |t| { t.join(); self.enrich_thread = null; }
+                if (self.enrich_thread) |t| {
+                    t.join();
+                    self.enrich_thread = null;
+                }
                 if (self.pending_enrich) |p| {
                     self.pending_enrich = null;
                     self.fireEnrich(loop, io, p.offset, p.count);
@@ -998,7 +1090,7 @@ const App = struct {
                     return;
                 }
                 self.cover_loading = false;
-                if (self.cover_thread) |t| { t.join(); self.cover_thread = null; }
+                self.joinCoverThread();
                 if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
 
                 const target_id = self.currentCoverTargetId();
@@ -1019,7 +1111,7 @@ const App = struct {
                 defer self.gpa.free(for_id);
                 if (self.cover_for_id == null or !std.mem.eql(u8, for_id, self.cover_for_id.?)) return;
                 self.cover_loading = false;
-                if (self.cover_thread) |t| { t.join(); self.cover_thread = null; }
+                self.joinCoverThread();
                 if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
                 self.clearCoverState();
                 self.noteCoverFailure(for_id);
@@ -1079,7 +1171,10 @@ const App = struct {
         if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return;
         const selected = self.results.items[self.list_cursor];
 
-        if (self.episode_thread) |t| { t.join(); self.episode_thread = null; }
+        if (self.episode_thread) |t| {
+            t.join();
+            self.episode_thread = null;
+        }
 
         self.freeEpisodeResults();
         self.episode_loading = true;
@@ -1108,7 +1203,10 @@ const App = struct {
         if (eps.len == 0 or self.episode_cursor >= eps.len) return;
         if (self.playing) return;
 
-        if (self.play_thread) |t| { t.join(); self.play_thread = null; }
+        if (self.play_thread) |t| {
+            t.join();
+            self.play_thread = null;
+        }
 
         const selected_id = self.detail_for_id orelse return;
         const ep = eps[self.episode_cursor];
@@ -1119,8 +1217,15 @@ const App = struct {
             "zigoku";
 
         const id_copy = self.gpa.dupe(u8, selected_id) catch return;
-        const ep_copy = self.gpa.dupe(u8, ep.raw) catch { self.gpa.free(id_copy); return; };
-        const title_copy = self.gpa.dupe(u8, title_src) catch { self.gpa.free(id_copy); self.gpa.free(ep_copy); return; };
+        const ep_copy = self.gpa.dupe(u8, ep.raw) catch {
+            self.gpa.free(id_copy);
+            return;
+        };
+        const title_copy = self.gpa.dupe(u8, title_src) catch {
+            self.gpa.free(id_copy);
+            self.gpa.free(ep_copy);
+            return;
+        };
 
         self.play_thread = std.Thread.spawn(.{}, playTask, .{
             loop, self.gpa, io, provider, self.store, provider.name(), id_copy, ep_copy, @as(i64, @intCast(self.episode_cursor + 1)), self.translation, title_copy,
@@ -1468,7 +1573,10 @@ const App = struct {
                 while (i < self.history.len) : (i += 1) {
                     const rec = self.history[i];
                     if (!self.historyEntryVisible(rec.title)) continue;
-                    if (visible_i < self.list_top) { visible_i += 1; continue; }
+                    if (visible_i < self.list_top) {
+                        visible_i += 1;
+                        continue;
+                    }
                     if (row + 1 >= top + visible) break;
 
                     const selected = visible_i == self.list_cursor;
@@ -1985,8 +2093,7 @@ const App = struct {
             put(win, row, pre_col, prefix, style(fg_color, .{ .bold = true, .bg = colors.bg_elevated }));
             const txt_col: u16 = pre_col + pre_len;
             const txt_w: u16 = if (toast_w > pre_len) toast_w - pre_len else 0;
-            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len],
-                style(fg_color, .{ .bg = colors.bg_elevated }));
+            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], style(fg_color, .{ .bg = colors.bg_elevated }));
             row -|= 1;
         }
     }
@@ -2061,7 +2168,7 @@ fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: Anime
     const frac: []const u8 = if (rec.total_episodes) |total|
         std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ rec.progress, total }) catch ""
     else
-        std.fmt.bufPrint(frac_buf, "  {d} / ? eps", .{ rec.progress }) catch "";
+        std.fmt.bufPrint(frac_buf, "  {d} / ? eps", .{rec.progress}) catch "";
     put(win, row, col + 1 + bar_w + 1, frac, style(frac_color, .{ .bg = row_bg }));
 }
 
@@ -2178,54 +2285,85 @@ fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
 }
 
-fn testTick(app: *App, event: Event) !void {
-    // Use a properly initialized loop so that background threads spawned during
-    // tick() can safely call loop.postEvent() (which locks a mutex via io).
-    // tty and vaxis are never accessed by postEvent, so undefined is safe there.
+fn initTestLoop() Loop {
     const io = std.testing.io;
-    var loop: Loop = .{
+    return .{
         .io = io,
         .tty = undefined,
         .vaxis = undefined,
         .queue = .{ .io = io },
     };
+}
+
+fn testTick(app: *App, event: Event) !void {
+    // Use a properly initialized loop so that background threads spawned during
+    // tick() can safely call loop.postEvent() (which locks a mutex via io).
+    // tty and vaxis are never accessed by postEvent, so undefined is safe there.
+    const io = std.testing.io;
+    var loop = initTestLoop();
     try app.tick(event, &loop, io, dummyProvider());
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
-    if (app.episode_thread) |t| { t.join(); app.episode_thread = null; }
-    if (app.search_thread) |t| { t.join(); app.search_thread = null; }
-    if (app.enrich_thread) |t| { t.join(); app.enrich_thread = null; }
-    if (app.play_thread) |t| { t.join(); app.play_thread = null; }
+    if (app.episode_thread) |t| {
+        t.join();
+        app.episode_thread = null;
+    }
+    if (app.search_thread) |t| {
+        t.join();
+        app.search_thread = null;
+    }
+    if (app.enrich_thread) |t| {
+        t.join();
+        app.enrich_thread = null;
+    }
+    if (app.play_thread) |t| {
+        t.join();
+        app.play_thread = null;
+    }
     // Drain events the threads may have posted; free their owned payloads so the
     // test allocator doesn't report leaks.
-    while (loop.queue.tryPop() catch null) |ev| {
-        switch (ev) {
-            .episodes_done => |d| {
-                for (d.episodes) |ep| app.gpa.free(ep.raw);
-                app.gpa.free(d.episodes);
-                app.gpa.free(d.for_id);
-            },
-            .search_done => |d| {
-                for (d.results) |r| freeOwnedAnime(app.gpa, r);
-                app.gpa.free(d.results);
-                app.gpa.free(d.for_query);
-            },
-            .search_enriched => |d| {
-                for (d.results) |r| freeOwnedAnime(app.gpa, r);
-                app.gpa.free(d.results);
-                app.gpa.free(d.for_query);
-            },
-            .cover_done => |d| {
-                app.gpa.free(d.rgba);
-                app.gpa.free(d.for_id);
-            },
-            .cover_error => |id| app.gpa.free(id),
-            // task_error and most other events carry no owned heap payloads.
-            else => {},
-        }
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+fn freeTestEvent(alloc: Allocator, ev: Event) void {
+    switch (ev) {
+        .episodes_done => |d| {
+            for (d.episodes) |ep| alloc.free(ep.raw);
+            alloc.free(d.episodes);
+            alloc.free(d.for_id);
+        },
+        .search_done => |d| {
+            for (d.results) |r| freeOwnedAnime(alloc, r);
+            alloc.free(d.results);
+            alloc.free(d.for_query);
+        },
+        .search_enriched => |d| {
+            for (d.results) |r| freeOwnedAnime(alloc, r);
+            alloc.free(d.results);
+            alloc.free(d.for_query);
+        },
+        .cover_done => |d| {
+            alloc.free(d.rgba);
+            alloc.free(d.for_id);
+        },
+        .cover_error => |id| alloc.free(id),
+        // task_error and most other events carry no owned heap payloads.
+        else => {},
     }
 }
+
+const tiny_png = [_]u8{
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+    0x08, 0x04, 0x00, 0x00, 0x00, 0xb5, 0x1c, 0x0c,
+    0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00,
+    0x03, 0x03, 0x02, 0x00, 0xef, 0x9a, 0xf6, 0x64,
+    0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+    0xae, 0x42, 0x60, 0x82,
+};
 
 test "history_loaded drains into state and clears loading" {
     var app: App = .{};
@@ -2806,7 +2944,68 @@ test "episodes_done stale result is discarded" {
     try testing.expect(app.episode_results == null);
 
     // Cleanup detail_for_id manually.
-    if (app.detail_for_id) |id| { std.testing.allocator.free(id); app.detail_for_id = null; }
+    if (app.detail_for_id) |id| {
+        std.testing.allocator.free(id);
+        app.detail_for_id = null;
+    }
+}
+
+test "coverTask decoded-cache hit posts a cloned cover_done event" {
+    var loop = initTestLoop();
+    var raw_cache: RawCoverCache = .{};
+    defer raw_cache.deinit(testing.allocator);
+    var decoded_cache: DecodedCoverCache = .{};
+    defer decoded_cache.deinit(testing.allocator);
+
+    const decoded = try cover_mod.decodeRgba(testing.allocator, &tiny_png);
+    try testing.expect(try decoded_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", decoded, max_cover_decoded_cache_bytes));
+
+    coverTask(
+        &loop,
+        testing.allocator,
+        testing.io,
+        try testing.allocator.dupe(u8, "https://img/anime.png"),
+        try testing.allocator.dupe(u8, "anime1"),
+        &raw_cache,
+        &decoded_cache,
+    );
+
+    const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
+    defer freeTestEvent(testing.allocator, ev);
+    try testing.expect(ev == .cover_done);
+    try testing.expectEqualStrings("anime1", ev.cover_done.for_id);
+    try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
+    try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
+    try testing.expectEqual(@as(usize, 4), ev.cover_done.rgba.len);
+    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+}
+
+test "coverTask raw-cache hit decodes once and warms decoded cache" {
+    var loop = initTestLoop();
+    var raw_cache: RawCoverCache = .{};
+    defer raw_cache.deinit(testing.allocator);
+    var decoded_cache: DecodedCoverCache = .{};
+    defer decoded_cache.deinit(testing.allocator);
+
+    const raw = try testing.allocator.dupe(u8, &tiny_png);
+    try testing.expect(try raw_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", raw, max_cover_raw_cache_bytes));
+
+    coverTask(
+        &loop,
+        testing.allocator,
+        testing.io,
+        try testing.allocator.dupe(u8, "https://img/anime.png"),
+        try testing.allocator.dupe(u8, "anime1"),
+        &raw_cache,
+        &decoded_cache,
+    );
+
+    const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
+    defer freeTestEvent(testing.allocator, ev);
+    try testing.expect(ev == .cover_done);
+    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+    try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
+    try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
 }
 
 test "cover_done fresh result stores decoded cover state" {
