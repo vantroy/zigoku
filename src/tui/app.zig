@@ -23,6 +23,7 @@ const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
 const anilist = @import("../anilist.zig");
+const cover_mod = @import("../cover.zig");
 const player_mod = @import("../player.zig");
 
 const Allocator = std.mem.Allocator;
@@ -65,6 +66,17 @@ const Event = union(enum) {
     },
     /// Episode fetch failed.
     episodes_error,
+    /// Cover image bytes were fetched + decoded. `rgba`, `encoded`, and `for_id`
+    /// are GPA-owned; App takes ownership on the fresh path.
+    cover_done: struct {
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        encoded: []u8,
+        for_id: []const u8,
+    },
+    /// Cover fetch/decode failed for this show id.
+    cover_error: []const u8,
     /// mpv exited (success or failure — we don't distinguish in M3).
     play_done,
     /// resolve or mpv spawn failed.
@@ -150,6 +162,7 @@ pub fn run(
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
     defer if (app.episode_thread) |t| t.join();
+    defer if (app.cover_thread) |t| t.join();
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -179,6 +192,7 @@ pub fn run(
     for (app.results.items) |r| freeOwnedAnime(gpa, r);
     app.results.deinit(gpa);
     app.freeEpisodeResults();
+    app.freeCoverState(&vx, writer);
 }
 
 fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
@@ -392,6 +406,82 @@ fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, s
     loop.postEvent(.play_done) catch {};
 }
 
+const max_cover_encoded_bytes = 8 * 1024 * 1024;
+const max_cover_dimension = 4096;
+const max_cover_pixels = max_cover_dimension * max_cover_dimension;
+
+/// Background task: fetch cover bytes and decode them to RGBA.
+/// `url` is task-owned and freed before return. `for_id` is transferred to the
+/// event on success/error and freed by the UI thread there.
+fn coverTask(loop: *Loop, gpa: Allocator, io: std.Io, url: []const u8, for_id: []const u8) void {
+    defer gpa.free(url);
+
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    const resp_buf = gpa.alloc(u8, max_cover_encoded_bytes) catch {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+    defer gpa.free(resp_buf);
+    var resp_writer: std.Io.Writer = .fixed(resp_buf);
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &resp_writer,
+        .extra_headers = &.{
+            .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
+        },
+    }) catch {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+    if (res.status != .ok) {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    }
+
+    const body = resp_writer.buffered();
+    const dims = cover_mod.probeDimensions(body) orelse {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+    if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    }
+    const pixel_count = std.math.mul(u64, dims.w, dims.h) catch {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+    if (pixel_count > max_cover_pixels) {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    }
+
+    const encoded = gpa.dupe(u8, body) catch {
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+    const decoded = cover_mod.decodeRgba(gpa, encoded) catch {
+        gpa.free(encoded);
+        loop.postEvent(.{ .cover_error = for_id }) catch gpa.free(for_id);
+        return;
+    };
+
+    loop.postEvent(.{ .cover_done = .{
+        .rgba = decoded.rgba,
+        .width = decoded.w,
+        .height = decoded.h,
+        .encoded = encoded,
+        .for_id = for_id,
+    } }) catch {
+        gpa.free(decoded.rgba);
+        gpa.free(encoded);
+        gpa.free(for_id);
+    };
+}
+
 /// Heartbeat thread: posts .tick every 100ms until `quit` is set.
 fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
     while (!quit.load(.acquire)) {
@@ -500,6 +590,25 @@ const App = struct {
     episode_loading: bool = false,
     /// Cursor position within the episode grid (0-based index into episode_results).
     episode_cursor: usize = 0,
+    /// Handle for the most recent cover-fetch thread. Joined before a new spawn.
+    cover_thread: ?std.Thread = null,
+    /// Decoded cover pixels for the currently tracked show id.
+    cover_pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
+    /// Original encoded cover bytes (JPEG/PNG) for Kitty upload.
+    cover_encoded: ?[]u8 = null,
+    /// Which show id the current cover state belongs to.
+    cover_for_id: ?[]const u8 = null,
+    /// Whether a cover fetch/decode is in flight.
+    cover_loading: bool = false,
+    /// Last show id whose cover fetch/decode failed; suppresses immediate refetch
+    /// until the selection changes away from that id.
+    cover_failed_for_id: ?[]const u8 = null,
+    /// Dominant fallback color when Kitty graphics are unavailable.
+    cover_fallback_color: vaxis.Color = .default,
+    /// Uploaded Kitty image for the current cover, if any.
+    cover_image: ?vaxis.Image = null,
+    /// Old Kitty image id to delete on the next draw pass.
+    pending_cover_free_id: ?u32 = null,
     /// Handle for the most recent play thread. Joined before a new spawn.
     play_thread: ?std.Thread = null,
     /// Whether mpv is running (play thread in-flight).
@@ -570,6 +679,116 @@ const App = struct {
         for (self.results.items) |r| freeOwnedAnime(self.gpa, r);
         self.results.clearRetainingCapacity();
         self.search_page = 0;
+    }
+
+    fn selectedAnime(self: *const App) ?Anime {
+        if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return null;
+        return self.results.items[self.list_cursor];
+    }
+
+    fn currentCoverTargetId(self: *const App) ?[]const u8 {
+        if (self.active_view != .browse or self.active_pane != .detail) return null;
+        const anime = self.selectedAnime() orelse return null;
+        return anime.id;
+    }
+
+    fn invalidateCoverImage(self: *App) void {
+        if (self.cover_image) |img| {
+            self.pending_cover_free_id = img.id;
+            self.cover_image = null;
+        }
+    }
+
+    fn freeCoverBuffers(self: *App) void {
+        if (self.cover_pixels) |px| {
+            self.gpa.free(px.rgba);
+            self.cover_pixels = null;
+        }
+        if (self.cover_encoded) |buf| {
+            self.gpa.free(buf);
+            self.cover_encoded = null;
+        }
+        self.cover_fallback_color = .default;
+    }
+
+    fn clearCoverFailure(self: *App) void {
+        if (self.cover_failed_for_id) |id| {
+            self.gpa.free(id);
+            self.cover_failed_for_id = null;
+        }
+    }
+
+    fn noteCoverFailure(self: *App, id: []const u8) void {
+        self.clearCoverFailure();
+        self.cover_failed_for_id = self.gpa.dupe(u8, id) catch null;
+    }
+
+    fn clearCoverState(self: *App) void {
+        self.invalidateCoverImage();
+        self.freeCoverBuffers();
+        if (self.cover_for_id) |id| {
+            self.gpa.free(id);
+            self.cover_for_id = null;
+        }
+        self.cover_loading = false;
+    }
+
+    fn flushPendingCoverFree(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        if (self.pending_cover_free_id) |id| {
+            vx.freeImage(writer, id);
+            self.pending_cover_free_id = null;
+        }
+    }
+
+    fn freeCoverState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        self.flushPendingCoverFree(vx, writer);
+        if (self.cover_image) |img| vx.freeImage(writer, img.id);
+        self.cover_image = null;
+        self.clearCoverState();
+        self.clearCoverFailure();
+    }
+
+    fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
+        if (builtin.is_test) return;
+        const anime = self.selectedAnime() orelse return;
+        const target_id = self.currentCoverTargetId() orelse return;
+        if (self.cover_failed_for_id) |failed_id| {
+            if (std.mem.eql(u8, failed_id, target_id)) return;
+            self.clearCoverFailure();
+        }
+        const target_url = anime.thumb orelse {
+            if (self.cover_for_id == null or !std.mem.eql(u8, self.cover_for_id.?, target_id)) self.clearCoverState();
+            return;
+        };
+        if (self.cover_for_id) |id| {
+            if (std.mem.eql(u8, id, target_id) and (self.cover_loading or self.cover_pixels != null or self.cover_encoded != null)) return;
+        }
+
+        if (self.cover_thread) |t| {
+            t.join();
+            self.cover_thread = null;
+        }
+
+        self.clearCoverState();
+        self.cover_for_id = self.gpa.dupe(u8, target_id) catch return;
+        const id_for_event = self.gpa.dupe(u8, target_id) catch {
+            self.clearCoverState();
+            return;
+        };
+        const url_copy = self.gpa.dupe(u8, target_url) catch {
+            self.gpa.free(id_for_event);
+            self.clearCoverState();
+            return;
+        };
+
+        self.cover_thread = std.Thread.spawn(.{}, coverTask, .{ loop, self.gpa, io, url_copy, id_for_event }) catch {
+            self.gpa.free(url_copy);
+            self.gpa.free(id_for_event);
+            self.clearCoverState();
+            return;
+        };
+        self.cover_loading = true;
+        self.async_start_ms = self.now_ms;
     }
 
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
@@ -678,7 +897,11 @@ const App = struct {
     fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, provider: SourceProvider) !void {
         switch (event) {
             .key_press => |key| self.onKey(key, loop, io, provider),
-            .winsize => {}, // screen resize is handled in run()'s loop (it owns vx).
+            .winsize => |ws| {
+                // Screen resize is handled in run()'s loop (it owns vx), but the
+                // app still normalizes browse layout state here so draw remains pure.
+                if (ws.cols < 60 and self.active_view == .browse) self.active_pane = .list;
+            },
             .focus_in, .focus_out => {},
             .history_loaded => |recs| self.setHistory(recs),
             .task_error => |msg| {
@@ -782,6 +1005,43 @@ const App = struct {
                 self.episode_loading = false;
                 self.async_start_ms = 0;
             },
+            .cover_done => |ev| {
+                defer self.gpa.free(ev.for_id);
+                if (self.cover_for_id == null or !std.mem.eql(u8, ev.for_id, self.cover_for_id.?)) {
+                    self.gpa.free(ev.rgba);
+                    self.gpa.free(ev.encoded);
+                    return;
+                }
+                self.cover_loading = false;
+                if (self.cover_thread) |t| { t.join(); self.cover_thread = null; }
+                if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
+
+                const target_id = self.currentCoverTargetId();
+                const keep = target_id != null and std.mem.eql(u8, target_id.?, ev.for_id);
+                if (!keep) {
+                    self.clearCoverState();
+                    self.gpa.free(ev.rgba);
+                    self.gpa.free(ev.encoded);
+                    return;
+                }
+
+                self.clearCoverFailure();
+                self.invalidateCoverImage();
+                self.freeCoverBuffers();
+                self.cover_pixels = .{ .rgba = ev.rgba, .w = ev.width, .h = ev.height };
+                self.cover_encoded = ev.encoded;
+                self.cover_fallback_color = cover_mod.dominantColor(.{ .rgba = ev.rgba, .w = ev.width, .h = ev.height });
+            },
+            .cover_error => |for_id| {
+                defer self.gpa.free(for_id);
+                if (self.cover_for_id == null or !std.mem.eql(u8, for_id, self.cover_for_id.?)) return;
+                self.cover_loading = false;
+                if (self.cover_thread) |t| { t.join(); self.cover_thread = null; }
+                if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
+                self.clearCoverState();
+                self.noteCoverFailure(for_id);
+                std.log.debug("cover fetch/decode failed for {s}", .{for_id});
+            },
             .play_done, .play_error => {
                 self.playing = false;
                 self.async_start_ms = 0;
@@ -805,6 +1065,8 @@ const App = struct {
                 }
             },
         }
+
+        if (event != .tick) self.syncCover(loop, io);
     }
 
     fn fireSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, page: u32) void {
@@ -1119,6 +1381,8 @@ const App = struct {
 
     // ── draw: pure render from state ─────────────────────────────────────────
     fn draw(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
+        self.flushPendingCoverFree(vx, writer);
+
         const win = vx.window();
         win.clear();
         win.fill(.{ .style = .{ .bg = colors.bg_base } });
@@ -1133,7 +1397,7 @@ const App = struct {
         }
 
         self.drawTopBar(win, w);
-        self.drawContent(win, h);
+        self.drawContent(vx, writer, win, h);
         self.drawToasts(win, h);
         self.drawBottomBar(win, h);
 
@@ -1165,7 +1429,7 @@ const App = struct {
         if (w > 2) put(win, 0, w - 2, "·", style(dot_color, .{}));
     }
 
-    fn drawContent(self: *App, win: vaxis.Window, h: u16) void {
+    fn drawContent(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, h: u16) void {
         // Row 0 is the top bar; row 1 is intentional breathing room; content
         // starts at row 2 and runs to h-2; the bottom bar owns h-1.
         const top: u16 = 2;
@@ -1262,16 +1526,22 @@ const App = struct {
             },
 
             .browse => {
+                const pane_h: u16 = visible;
+                if (w < 60) {
+                    const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = pane_h });
+                    self.drawBrowseList(list_win, pane_h, body_w);
+                    return;
+                }
+
                 const list_w: u16 = @max(30, (w * 38) / 100);
                 const detail_x: u16 = 2 + list_w + 2;
                 const detail_w: u16 = if (w > detail_x + 1) w - detail_x - 1 else 0;
-                const pane_h: u16 = visible;
 
                 const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = list_w, .height = pane_h });
                 const detail_win = win.child(.{ .x_off = @intCast(detail_x), .y_off = top, .width = detail_w, .height = pane_h });
 
                 self.drawBrowseList(list_win, pane_h, list_w);
-                self.drawDetailPane(detail_win, detail_w, pane_h);
+                self.drawDetailPane(vx, writer, detail_win, detail_w, pane_h, w);
             },
 
             .settings => {
@@ -1362,28 +1632,92 @@ const App = struct {
         }
     }
 
-    fn drawDetailPane(self: *App, win: vaxis.Window, w: u16, h: u16) void {
+    fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
+        if (builtin.mode == .Debug) return false;
+        if (!vx.caps.kitty_graphics) return false;
+        if (self.cover_image != null) return true;
+        const encoded = self.cover_encoded orelse return false;
+        self.cover_image = vx.loadImage(self.gpa, writer, .{ .mem = encoded }) catch return false;
+        return true;
+    }
+
+    fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
+        cover_win.fill(.{ .style = .{ .bg = self.cover_fallback_color } });
+    }
+
+    fn drawKittyCover(self: *const App, img: vaxis.Image, cover_win: vaxis.Window) void {
+        const cols = cover_win.screen.width;
+        const rows = cover_win.screen.height;
+        if (cols == 0 or rows == 0 or cover_win.width == 0 or cover_win.height == 0) return;
+
+        const pix_per_col = std.math.divCeil(usize, cover_win.screen.width_pix, cols) catch return;
+        const pix_per_row = std.math.divCeil(usize, cover_win.screen.height_pix, rows) catch return;
+        const target_w = pix_per_col * cover_win.width;
+        const target_h = pix_per_row * cover_win.height;
+        if (target_w == 0 or target_h == 0) return;
+
+        var clip_x: u16 = 0;
+        var clip_y: u16 = 0;
+        var clip_w: u16 = img.width;
+        var clip_h: u16 = img.height;
+
+        const img_w = @as(usize, img.width);
+        const img_h = @as(usize, img.height);
+        if (img_w * target_h > img_h * target_w) {
+            const crop_w = @max(@as(usize, 1), (img_h * target_w) / target_h);
+            clip_w = @intCast(@min(crop_w, img_w));
+            clip_x = (img.width - clip_w) / 2;
+        } else if (img_w * target_h < img_h * target_w) {
+            const crop_h = @max(@as(usize, 1), (img_w * target_h) / target_w);
+            clip_h = @intCast(@min(crop_h, img_h));
+            clip_y = (img.height - clip_h) / 2;
+        }
+
+        img.draw(cover_win, .{
+            .size = .{ .rows = cover_win.height, .cols = cover_win.width },
+            .clip_region = .{ .x = clip_x, .y = clip_y, .width = clip_w, .height = clip_h },
+        }) catch self.drawFallbackCover(cover_win);
+    }
+
+    fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16) void {
         if (w < 10) return;
 
         var row: u16 = 0;
 
-        // Cover art block (§3.3 + §9.1): always "no art yet" in M3.
+        const anime = self.selectedAnime();
+
+        // Cover art block (§3.3 + §7.3/§7.5).
         // 20×28 at ≥100 total terminal cols, 14×20 at 80–99, hidden below 80.
-        const cover_w: u16 = if (w >= 60) 20 else if (w >= 40) 14 else 0;
-        const cover_h: u16 = if (w >= 60) 7 else if (w >= 40) 5 else 0;
+        const cover_w: u16 = if (term_w >= 100) 20 else if (term_w >= 80) 14 else 0;
+        const cover_h: u16 = if (term_w >= 100) 28 else if (term_w >= 80) 20 else 0;
         if (cover_w > 0 and cover_h > 0) {
             const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
             cover_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
-            if (cover_h > 1) {
+            if (anime) |a| {
+                const has_pixels = self.cover_pixels != null and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id);
+                if (a.thumb == null) {
+                    if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+                } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
+                    const spin = std.fmt.bufPrint(&self.no_results_buf, "{s}", .{self.spinnerChar()}) catch "⠋";
+                    centerText(cover_win, cover_h / 2, cover_w, spin, style(colors.focus, .{}));
+                } else if (has_pixels) {
+                    if (self.ensureCoverImage(vx, writer)) {
+                        if (self.cover_image) |img| {
+                            self.drawKittyCover(img, cover_win);
+                        } else {
+                            self.drawFallbackCover(cover_win);
+                        }
+                    } else {
+                        self.drawFallbackCover(cover_win);
+                    }
+                } else if (cover_h > 1) {
+                    centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+                }
+            } else if (cover_h > 1) {
                 centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
             }
             row += cover_h + 1;
         }
-
-        const anime: ?Anime = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
-            self.results.items[self.list_cursor]
-        else
-            null;
 
         // Title — the selected result's name, or placeholder.
         const title: []const u8 = if (anime) |a| a.name else "";
@@ -1585,7 +1919,7 @@ const App = struct {
 
         // When anything is loading, replace the ▌ with an animated spinner.
         const any_loading = self.search_loading or self.history_loading or
-            self.episode_loading or self.debounce_deadline_ms > 0;
+            self.episode_loading or self.cover_loading or self.debounce_deadline_ms > 0;
         if (any_loading) {
             const spin_color: vaxis.Color = if (self.async_start_ms > 0 and
                 self.now_ms - self.async_start_ms > 3000)
@@ -1871,6 +2205,12 @@ fn testTick(app: *App, event: Event) !void {
                 app.gpa.free(d.results);
                 app.gpa.free(d.for_query);
             },
+            .cover_done => |d| {
+                app.gpa.free(d.rgba);
+                app.gpa.free(d.encoded);
+                app.gpa.free(d.for_id);
+            },
+            .cover_error => |id| app.gpa.free(id),
             // task_error and most other events carry no owned heap payloads.
             else => {},
         }
@@ -2457,6 +2797,123 @@ test "episodes_done stale result is discarded" {
 
     // Cleanup detail_for_id manually.
     if (app.detail_for_id) |id| { std.testing.allocator.free(id); app.detail_for_id = null; }
+}
+
+test "cover_done fresh result stores decoded cover state" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "anime1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
+        .eps_sub = 28,
+    });
+    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover_loading = true;
+
+    const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
+    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
+    const for_id = try std.testing.allocator.dupe(u8, "anime1");
+
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testing.expect(!app.cover_loading);
+    try testing.expect(app.cover_pixels != null);
+    try testing.expectEqual(@as(u32, 1), app.cover_pixels.?.w);
+    try testing.expectEqual(@as(usize, 8), app.cover_encoded.?.len);
+
+    app.clearCoverState();
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+}
+
+test "cover_done stale result is discarded" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "anime2"),
+        .name = try std.testing.allocator.dupe(u8, "Bebop"),
+        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/bebop.jpg"),
+        .eps_sub = 26,
+    });
+    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime2");
+    app.cover_loading = true;
+
+    const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
+    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
+    const for_id = try std.testing.allocator.dupe(u8, "anime1");
+
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testing.expect(app.cover_pixels == null);
+    try testing.expect(app.cover_loading);
+
+    app.clearCoverState();
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+}
+
+test "cover_done while not in detail clears stale loading state" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "anime1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
+        .eps_sub = 28,
+    });
+    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover_loading = true;
+
+    const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
+    const encoded = try std.testing.allocator.dupe(u8, "pngbytes");
+    const for_id = try std.testing.allocator.dupe(u8, "anime1");
+
+    try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .encoded = encoded, .for_id = for_id } });
+    try testing.expect(!app.cover_loading);
+    try testing.expect(app.cover_for_id == null);
+    try testing.expect(app.cover_pixels == null);
+    try testing.expect(app.cover_encoded == null);
+
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+}
+
+test "cover_error clears state so a later revisit can refetch" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "anime1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
+        .eps_sub = 28,
+    });
+    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover_loading = true;
+
+    const for_id = try std.testing.allocator.dupe(u8, "anime1");
+    try testTick(&app, .{ .cover_error = for_id });
+    try testing.expect(!app.cover_loading);
+    try testing.expect(app.cover_for_id == null);
+    try testing.expect(app.cover_pixels == null);
+    try testing.expect(app.cover_encoded == null);
+    try testing.expect(app.cover_failed_for_id != null);
+    try testing.expectEqualStrings("anime1", app.cover_failed_for_id.?);
+
+    app.clearCoverFailure();
+
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
 }
 
 test "search mode: char appends and arms debounce, does not fire immediately" {
