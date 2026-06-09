@@ -37,7 +37,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, Sche
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 3;
+const SCHEMA_VERSION: c_int = 4;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -102,6 +102,20 @@ const MIGRATION_V2 =
 
 const MIGRATION_V3 =
     \\ALTER TABLE anime ADD COLUMN history_visible INTEGER NOT NULL DEFAULT 1;
+;
+
+const MIGRATION_V4 =
+    \\UPDATE anime
+    \\SET history_visible = CASE
+    \\    WHEN last_watched_at IS NOT NULL
+    \\      OR play_count > 0
+    \\      OR progress > 0
+    \\      OR user_rating IS NOT NULL
+    \\      OR notes IS NOT NULL
+    \\      OR list_status != 'planning'
+    \\    THEN 1
+    \\    ELSE 0
+    \\END;
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -541,6 +555,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 3;");
             v = 3;
         }
+        if (v < 4) {
+            try self.exec(MIGRATION_V4);
+            try self.exec("PRAGMA user_version = 4;");
+            v = 4;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -700,6 +719,26 @@ test "loadHistory excludes hidden metadata-cache rows" {
     const rows = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), rows.len);
     try testing.expectEqualStrings("shown", rows[0].source_id);
+}
+
+test "migration v4 hides polluted search-cache rows while preserving real history" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "search-only", .title = "Search Only", .history_visible = true }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "played", .title = "Played", .history_visible = true, .play_count = 1, .progress = 3, .last_watched_at = 2000 }, 1001);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "rated", .title = "Rated", .history_visible = true, .user_rating = 8.5 }, 1002);
+
+    try s.exec(MIGRATION_V4);
+
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    try testing.expect(std.mem.eql(u8, rows[0].source_id, "played") or std.mem.eql(u8, rows[1].source_id, "played"));
+    try testing.expect(std.mem.eql(u8, rows[0].source_id, "rated") or std.mem.eql(u8, rows[1].source_id, "rated"));
 }
 
 test "recordPlay promotes hidden row into history" {
