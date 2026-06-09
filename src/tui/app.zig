@@ -990,7 +990,7 @@ const App = struct {
             }
             return;
         }
-        if (key.matches('H', .{ .shift = true }) or key.matches('H', .{})) {
+        if (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))) {
             self.active_view = if (self.active_view == .history) .browse else .history;
             self.active_pane = .list;
             self.list_cursor = 0;
@@ -1020,7 +1020,7 @@ const App = struct {
         }
 
         // h / l pane switching (Browse only) (§10.3c).
-        if (key.matches('h', .{})) {
+        if (self.input_mode == .normal and key.matches('h', .{})) {
             if (self.active_view == .browse and self.active_pane == .detail) {
                 self.active_pane = .list;
             }
@@ -2468,6 +2468,25 @@ test "search mode: char appends and arms debounce, does not fire immediately" {
     try testing.expectEqual(@as(usize, 1), app.search_len);
     try testing.expect(!app.search_loading);
     try testing.expect(app.debounce_deadline_ms > 0);
+}
+
+test "search mode: h and H append to query instead of triggering navigation" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    app.input_mode = .search;
+
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'h', .text = "h" } });
+    try testing.expectEqual(@as(usize, 1), app.search_len);
+    try testing.expectEqualStrings("h", app.search_query[0..app.search_len]);
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'H', .mods = .{ .shift = true }, .text = "H" } });
+    try testing.expectEqual(@as(usize, 2), app.search_len);
+    try testing.expectEqualStrings("hH", app.search_query[0..app.search_len]);
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
 }
 
 test "tick advances spinner frame and wraps at 10" {
