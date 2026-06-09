@@ -1647,31 +1647,32 @@ const App = struct {
 
         const pix_per_col = std.math.divCeil(usize, cover_win.screen.width_pix, cols) catch return;
         const pix_per_row = std.math.divCeil(usize, cover_win.screen.height_pix, rows) catch return;
-        const target_w = pix_per_col * cover_win.width;
-        const target_h = pix_per_row * cover_win.height;
-        if (target_w == 0 or target_h == 0) return;
-
-        var clip_x: u16 = 0;
-        var clip_y: u16 = 0;
-        var clip_w: u16 = img.width;
-        var clip_h: u16 = img.height;
+        const slot_w = pix_per_col * cover_win.width;
+        const slot_h = pix_per_row * cover_win.height;
+        if (slot_w == 0 or slot_h == 0) return;
 
         const img_w = @as(usize, img.width);
         const img_h = @as(usize, img.height);
-        if (img_w * target_h > img_h * target_w) {
-            const crop_w = @max(@as(usize, 1), (img_h * target_w) / target_h);
-            clip_w = @intCast(@min(crop_w, img_w));
-            clip_x = (img.width - clip_w) / 2;
-        } else if (img_w * target_h < img_h * target_w) {
-            const crop_h = @max(@as(usize, 1), (img_w * target_h) / target_w);
-            clip_h = @intCast(@min(crop_h, img_h));
-            clip_y = (img.height - clip_h) / 2;
+        if (img_w == 0 or img_h == 0) return;
+
+        var draw_cols: u16 = cover_win.width;
+        var draw_rows: u16 = cover_win.height;
+
+        if (img_w * slot_h > img_h * slot_w) {
+            const fit_h_px = @max(@as(usize, 1), (img_h * slot_w) / img_w);
+            draw_rows = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.height), fit_h_px / pix_per_row)));
+        } else if (img_w * slot_h < img_h * slot_w) {
+            const fit_w_px = @max(@as(usize, 1), (img_w * slot_h) / img_h);
+            draw_cols = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.width), fit_w_px / pix_per_col)));
         }
 
-        img.draw(cover_win, .{
-            .size = .{ .rows = cover_win.height, .cols = cover_win.width },
-            .clip_region = .{ .x = clip_x, .y = clip_y, .width = clip_w, .height = clip_h },
-        }) catch self.drawFallbackCover(cover_win);
+        const draw_win = cover_win.child(.{
+            .x_off = @intCast((cover_win.width - draw_cols) / 2),
+            .y_off = @intCast((cover_win.height - draw_rows) / 2),
+            .width = draw_cols,
+            .height = draw_rows,
+        });
+        img.draw(draw_win, .{ .scale = .fit }) catch self.drawFallbackCover(cover_win);
     }
 
     fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16) void {
