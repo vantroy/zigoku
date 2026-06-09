@@ -37,7 +37,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, Sche
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 2;
+const SCHEMA_VERSION: c_int = 3;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -100,6 +100,10 @@ const MIGRATION_V2 =
     \\ALTER TABLE anime ADD COLUMN score INTEGER;
 ;
 
+const MIGRATION_V3 =
+    \\ALTER TABLE anime ADD COLUMN history_visible INTEGER NOT NULL DEFAULT 1;
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -124,6 +128,9 @@ pub const AnimeRecord = struct {
     progress: i64 = 0,
     added_at: i64 = 0,
     last_watched_at: ?i64 = null,
+    /// Whether this row should appear in the History view. Search-only metadata
+    /// cache rows stay hidden until the user explicitly tracks or plays them.
+    history_visible: bool = true,
 
     /// Build a row from a freshly-searched show. Only carries what the source
     /// gives us; user state (status/rating/notes/counts) takes table defaults
@@ -218,8 +225,8 @@ pub const Store = struct {
         const sql =
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
             \\    cover_url, year, status, description, score, total_episodes,
-            \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -230,7 +237,8 @@ pub const Store = struct {
             \\    status         = COALESCE(excluded.status, anime.status),
             \\    description    = COALESCE(excluded.description, anime.description),
             \\    score          = COALESCE(excluded.score, anime.score),
-            \\    total_episodes = COALESCE(excluded.total_episodes, anime.total_episodes)
+            \\    total_episodes = COALESCE(excluded.total_episodes, anime.total_episodes),
+            \\    history_visible = MAX(excluded.history_visible, anime.history_visible)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -254,6 +262,7 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int64(stmt, 17, a.progress);
         _ = c.sqlite3_bind_int64(stmt, 18, if (a.added_at != 0) a.added_at else now);
         bindOptI64(stmt, 19, a.last_watched_at);
+        _ = c.sqlite3_bind_int64(stmt, 20, if (a.history_visible) 1 else 0);
 
         try self.stepDone(stmt);
     }
@@ -263,9 +272,10 @@ pub const Store = struct {
     pub fn loadHistory(self: *Store, arena: Allocator) Error![]AnimeRecord {
         const sql =
             \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
-            \\    total_episodes, list_status, user_rating, notes, play_count, progress,
-            \\    added_at, last_watched_at
+            \\    year, status, description, score, total_episodes, list_status,
+            \\    user_rating, notes, play_count, progress, added_at, last_watched_at
             \\FROM anime
+            \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
         ;
         const stmt = try self.prepare(sql);
@@ -281,14 +291,19 @@ pub const Store = struct {
                 .mal_id = colOptI64(stmt, 4),
                 .anilist_id = colOptI64(stmt, 5),
                 .cover_url = try dupeText(arena, stmt, 6),
-                .total_episodes = colOptI64(stmt, 7),
-                .list_status = try dupeText(arena, stmt, 8) orelse "planning",
-                .user_rating = colOptF64(stmt, 9),
-                .notes = try dupeText(arena, stmt, 10),
-                .play_count = c.sqlite3_column_int64(stmt, 11),
-                .progress = c.sqlite3_column_int64(stmt, 12),
-                .added_at = c.sqlite3_column_int64(stmt, 13),
-                .last_watched_at = colOptI64(stmt, 14),
+                .year = colOptI64(stmt, 7),
+                .status = try dupeText(arena, stmt, 8),
+                .description = try dupeText(arena, stmt, 9),
+                .score = colOptI64(stmt, 10),
+                .total_episodes = colOptI64(stmt, 11),
+                .list_status = try dupeText(arena, stmt, 12) orelse "planning",
+                .user_rating = colOptF64(stmt, 13),
+                .notes = try dupeText(arena, stmt, 14),
+                .play_count = c.sqlite3_column_int64(stmt, 15),
+                .progress = c.sqlite3_column_int64(stmt, 16),
+                .added_at = c.sqlite3_column_int64(stmt, 17),
+                .last_watched_at = colOptI64(stmt, 18),
+                .history_visible = true,
             });
         }
         return rows.toOwnedSlice(arena);
@@ -339,7 +354,8 @@ pub const Store = struct {
             \\UPDATE anime
             \\SET play_count = play_count + 1,
             \\    last_watched_at = ?,
-            \\    progress = MAX(progress, ?)
+            \\    progress = MAX(progress, ?),
+            \\    history_visible = 1
             \\WHERE source = ? AND source_id = ?
         ;
         const stmt = try self.prepare(sql);
@@ -520,6 +536,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 2;");
             v = 2;
         }
+        if (v < 3) {
+            try self.exec(MIGRATION_V3);
+            try self.exec("PRAGMA user_version = 3;");
+            v = 3;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -662,6 +683,40 @@ test "upsertAnime + loadHistory round-trips" {
     try testing.expectEqual(@as(?i64, 28), rows[0].total_episodes);
     try testing.expectEqualStrings("planning", rows[0].list_status);
     try testing.expectEqual(@as(i64, 0), rows[0].play_count);
+    try testing.expect(rows[0].history_visible);
+}
+
+test "loadHistory excludes hidden metadata-cache rows" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "Hidden", .history_visible = false }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "Shown", .history_visible = true }, 1001);
+
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("shown", rows[0].source_id);
+}
+
+test "recordPlay promotes hidden row into history" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .history_visible = false }, 1000);
+    try s.recordPlay(T_SOURCE, "x", 2, 2000);
+
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqual(@as(i64, 1), rows[0].play_count);
+    try testing.expectEqual(@as(i64, 2), rows[0].progress);
 }
 
 test "getAnime returns persisted enrichment" {

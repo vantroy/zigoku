@@ -295,9 +295,9 @@ fn enrichTask(
     results: []Anime,
     query: []const u8,
     offset: usize,
-    cancel: *std.atomic.Value(bool),
 ) void {
-    defer if (cancel.load(.acquire)) {
+    var posted = false;
+    defer if (!posted) {
         for (results) |a| freeOwnedAnime(gpa, a);
         gpa.free(results);
         gpa.free(query);
@@ -307,7 +307,6 @@ fn enrichTask(
     defer arena.deinit();
 
     for (results) |*a| {
-        if (cancel.load(.acquire)) return;
         const meta = anilist.enrich(arena.allocator(), io, a.*) catch null orelse continue;
         if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
         if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
@@ -320,11 +319,8 @@ fn enrichTask(
         if (a.score == null) a.score = meta.score;
     }
 
-    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch {
-        for (results) |a| freeOwnedAnime(gpa, a);
-        gpa.free(results);
-        gpa.free(query);
-    };
+    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch return;
+    posted = true;
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
@@ -375,8 +371,7 @@ fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 
 /// Background task: resolve stream and launch mpv.
 /// All string params are GPA-owned by this task and freed before return.
-fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, store: ?*Store, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8) void {
-    _ = store; // resume lookup deferred to M5 (needs source_name in vtable)
+fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, store: ?*Store, source_name: []const u8, id: []const u8, ep_raw: []const u8, episode_index: i64, translation: domain.Translation, title: []const u8) void {
     defer gpa.free(id);
     defer gpa.free(ep_raw);
     defer gpa.free(title);
@@ -390,6 +385,7 @@ fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, s
         return;
     };
     player_mod.play(arena.allocator(), io, link, title, 0) catch {};
+    if (store) |st| st.recordPlay(source_name, id, episode_index, Store.nowSecs()) catch {};
     loop.postEvent(.play_done) catch {};
 }
 
@@ -481,9 +477,10 @@ const App = struct {
     /// preventing use-after-free of `loop` and `gpa` on fast quit.
     search_thread: ?std.Thread = null,
     /// Handle for the most recent AniList enrichment thread.
+    /// At most one joinable AniList enrichment worker is active at a time. A
+    /// later search can queue one follow-up enrich request without blocking the UI.
     enrich_thread: ?std.Thread = null,
-    /// Cooperative cancellation flag for the current enrichment thread.
-    enrich_cancel: std.atomic.Value(bool) = .init(false),
+    pending_enrich: ?struct { offset: usize, count: usize } = null,
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -513,6 +510,8 @@ const App = struct {
     ep_scratch: [512][8]u8 = undefined,
     /// Stable storage for the "no results for…" message in drawBrowseList.
     no_results_buf: [160]u8 = undefined,
+    /// Stable storage for the detail-pane score line.
+    detail_score_buf: [32]u8 = undefined,
     /// Stable storage for the "N eps" metadata line in drawDetailPane.
     detail_meta_buf: [32]u8 = undefined,
     /// Stable storage for the "[N]" result count in drawBottomBar search mode.
@@ -564,25 +563,20 @@ const App = struct {
     /// Free all accumulated search results and reset search state.
     /// Call before a new page-1 search and when Esc clears the query.
     fn clearResults(self: *App) void {
-        self.cancelEnrich();
+        self.pending_enrich = null;
         for (self.results.items) |r| freeOwnedAnime(self.gpa, r);
         self.results.clearRetainingCapacity();
         self.search_page = 0;
     }
 
-    fn cancelEnrich(self: *App) void {
-        self.enrich_cancel.store(true, .release);
-        if (self.enrich_thread) |t| {
-            t.join();
-            self.enrich_thread = null;
-        }
-        self.enrich_cancel.store(false, .release);
-    }
-
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
         if (builtin.is_test) return;
         if (count == 0 or offset >= self.results.items.len) return;
-        self.cancelEnrich();
+
+        if (self.enrich_thread != null) {
+            self.pending_enrich = .{ .offset = offset, .count = count };
+            return;
+        }
 
         const slice = self.results.items[offset..@min(self.results.items.len, offset + count)];
         var unresolved: usize = 0;
@@ -609,8 +603,9 @@ const App = struct {
         };
 
         self.enrich_thread = std.Thread.spawn(.{}, enrichTask, .{
-            loop, self.gpa, io, exact, q_copy, offset, &self.enrich_cancel,
+            loop, self.gpa, io, exact, q_copy, offset,
         }) catch {
+            self.enrich_thread = null;
             for (exact) |a| freeOwnedAnime(self.gpa, a);
             self.gpa.free(exact);
             self.gpa.free(q_copy);
@@ -665,12 +660,14 @@ const App = struct {
         }
     }
 
-    fn persistResults(self: *App, source_name: []const u8, offset: usize, count: usize) void {
+    fn persistResults(self: *App, source_name: []const u8, offset: usize, count: usize, visible: bool) void {
         const st = self.store orelse return;
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            st.upsertAnime(AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation), Store.nowSecs()) catch {};
+            var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation);
+            rec.history_visible = visible;
+            st.upsertAnime(rec, Store.nowSecs()) catch {};
         }
     }
 
@@ -723,7 +720,7 @@ const App = struct {
                 const added = self.results.items.len - offset;
                 const source_name = provider.name();
                 self.hydrateResultsFromStore(source_name, offset, added);
-                self.persistResults(source_name, offset, added);
+                self.persistResults(source_name, offset, added, false);
                 self.fireEnrich(loop, io, offset, added);
             },
             .search_enriched => |ev| {
@@ -731,6 +728,11 @@ const App = struct {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.results);
                     self.gpa.free(ev.for_query);
+                    if (self.enrich_thread) |t| { t.join(); self.enrich_thread = null; }
+                    if (self.pending_enrich) |p| {
+                        self.pending_enrich = null;
+                        self.fireEnrich(loop, io, p.offset, p.count);
+                    }
                     return;
                 }
                 const source_name = provider.name();
@@ -748,7 +750,12 @@ const App = struct {
                 }
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
-                self.persistResults(source_name, ev.offset, ev.results.len);
+                self.persistResults(source_name, ev.offset, ev.results.len, false);
+                if (self.enrich_thread) |t| { t.join(); self.enrich_thread = null; }
+                if (self.pending_enrich) |p| {
+                    self.pending_enrich = null;
+                    self.fireEnrich(loop, io, p.offset, p.count);
+                }
             },
             .episodes_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -868,7 +875,7 @@ const App = struct {
         const title_copy = self.gpa.dupe(u8, title_src) catch { self.gpa.free(id_copy); self.gpa.free(ep_copy); return; };
 
         self.play_thread = std.Thread.spawn(.{}, playTask, .{
-            loop, self.gpa, io, provider, self.store, id_copy, ep_copy, self.translation, title_copy,
+            loop, self.gpa, io, provider, self.store, provider.name(), id_copy, ep_copy, @as(i64, @intCast(self.episode_cursor + 1)), self.translation, title_copy,
         }) catch {
             self.gpa.free(id_copy);
             self.gpa.free(ep_copy);
@@ -1384,14 +1391,25 @@ const App = struct {
         }
         row += 1;
 
-        // Score — placeholder until enrichment lands, then the real AniList score.
+        // Score — placeholder until enrichment lands, then tiered AniList score rendering.
         const score_text: []const u8 = if (anime) |a| blk: {
             if (a.score) |score| {
-                break :blk std.fmt.bufPrint(&self.detail_meta_buf, "[{d}/100]", .{score}) catch "[--/100]";
+                if (score >= 91) {
+                    break :blk std.fmt.bufPrint(&self.detail_score_buf, "✦ [{d}/100]", .{score}) catch "[--/100]";
+                }
+                break :blk std.fmt.bufPrint(&self.detail_score_buf, "[{d}/100]", .{score}) catch "[--/100]";
             }
             break :blk "[--/100]";
         } else "[--/100]";
-        putClipped(win, row, 0, w, score_text, style(colors.fg3, .{}));
+        const score_style = if (anime) |a| blk: {
+            if (a.score) |score| {
+                if (score >= 91) break :blk style(colors.hot, .{ .bold = true });
+                if (score >= 76) break :blk style(colors.fg, .{});
+                if (score >= 51) break :blk style(colors.fg2, .{});
+            }
+            break :blk style(colors.fg3, .{});
+        } else style(colors.fg3, .{});
+        putClipped(win, row, 0, w, score_text, score_style);
         row += 1;
 
         // Hairline.
