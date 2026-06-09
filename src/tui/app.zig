@@ -2828,6 +2828,30 @@ test "q from history-opened detail returns to history" {
     try testing.expect(!app.should_quit);
 }
 
+test "Esc from history-opened detail returns to history" {
+    var app: App = .{};
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.list, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "h from history-opened detail returns to history" {
+    var app: App = .{};
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+
+    try testTick(&app, keyEv('h', .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.list, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
 test "history detail episodes_done seeds cursor from progress" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
