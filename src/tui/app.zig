@@ -16,11 +16,13 @@
 //! detail pane (ROD-74), history filter/progress bars (ROD-75), toasts (ROD-76).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vaxis = @import("vaxis");
 const colors = @import("colors.zig");
 const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
+const anilist = @import("../anilist.zig");
 const player_mod = @import("../player.zig");
 
 const Allocator = std.mem.Allocator;
@@ -47,6 +49,13 @@ const Event = union(enum) {
         results: []Anime,
         for_query: []const u8,
         page: u32,
+    },
+    /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
+    /// app takes ownership and merges fields into the live search results.
+    search_enriched: struct {
+        results: []Anime,
+        for_query: []const u8,
+        offset: usize,
     },
     /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
     /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.
@@ -139,6 +148,7 @@ pub fn run(
     // can't dereference a torn-down loop or gpa. Declared after loop.stop()'s
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
+    defer if (app.enrich_thread) |t| t.join();
     defer if (app.episode_thread) |t| t.join();
     defer if (app.play_thread) |t| t.join();
 
@@ -166,9 +176,56 @@ pub fn run(
     // Teardown: free results strings and the backing allocation.
     // clearResults only calls clearRetainingCapacity (keeps the buffer for
     // mid-session reuse); here we want the full deinit.
-    for (app.results.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(gpa, r);
     app.results.deinit(gpa);
     app.freeEpisodeResults();
+}
+
+fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
+    return if (s) |x| try alloc.dupe(u8, x) else null;
+}
+
+fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
+    var out: Anime = .{
+        .id = try alloc.dupe(u8, a.id),
+        .name = &.{},
+        .mal_id = a.mal_id,
+        .anilist_id = a.anilist_id,
+        .eps_sub = a.eps_sub,
+        .eps_dub = a.eps_dub,
+        .total_episodes = a.total_episodes,
+        .year = a.year,
+        .score = a.score,
+    };
+    errdefer freeOwnedAnime(alloc, out);
+
+    out.name = try alloc.dupe(u8, a.name);
+    out.english_name = try dupeOptText(alloc, a.english_name);
+    out.thumb = try dupeOptText(alloc, a.thumb);
+    out.banner = try dupeOptText(alloc, a.banner);
+    out.status = try dupeOptText(alloc, a.status);
+    out.description = try dupeOptText(alloc, a.description);
+    out.kind = try dupeOptText(alloc, a.kind);
+    return out;
+}
+
+fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
+    alloc.free(a.id);
+    if (a.name.len > 0) alloc.free(a.name);
+    if (a.english_name) |x| alloc.free(x);
+    if (a.thumb) |x| alloc.free(x);
+    if (a.banner) |x| alloc.free(x);
+    if (a.status) |x| alloc.free(x);
+    if (a.description) |x| alloc.free(x);
+    if (a.kind) |x| alloc.free(x);
+    if (a.genres.len > 0) {
+        for (a.genres) |g| alloc.free(g);
+        alloc.free(a.genres);
+    }
+    if (a.studios.len > 0) {
+        for (a.studios) |s| alloc.free(s);
+        alloc.free(a.studios);
+    }
 }
 
 /// Background task: search and post results back to the UI thread.
@@ -190,10 +247,8 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         return;
     };
 
-    // Dupe id+name into GPA so they survive arena teardown.
-    // Other Anime fields (eps_sub, eps_dub, status, thumb…) are value types or
-    // null — copy them as-is. Arena-pointing optional strings (status, thumb…)
-    // are omitted so they default to null rather than dangling after arena teardown.
+    // Dupe every owned string we might thread into the UI so arena teardown
+    // cannot leave dangling references in the event payload.
     var owned = std.ArrayListUnmanaged(Anime).empty;
     owned.ensureTotalCapacity(gpa, raw.len) catch {
         gpa.free(query);
@@ -201,14 +256,8 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         return;
     };
     for (raw) |a| {
-        const id_owned = gpa.dupe(u8, a.id) catch continue;
-        const name_owned = gpa.dupe(u8, a.name) catch { gpa.free(id_owned); continue; };
-        owned.appendAssumeCapacity(.{
-            .id = id_owned,
-            .name = name_owned,
-            .eps_sub = a.eps_sub,
-            .eps_dub = a.eps_dub,
-        });
+        const duped = dupeOwnedAnime(gpa, a) catch continue;
+        owned.appendAssumeCapacity(duped);
     }
 
     // `owned.items` is a sub-slice of an over-allocated backing buffer —
@@ -217,7 +266,7 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
     // `toOwnedSlice` resizes to exact fit (len == capacity), giving a slice
     // safe to pass to gpa.free on either path below.
     const exact = owned.toOwnedSlice(gpa) catch {
-        for (owned.items) |r| { gpa.free(r.id); gpa.free(r.name); }
+        for (owned.items) |r| freeOwnedAnime(gpa, r);
         owned.deinit(gpa);
         gpa.free(query);
         return;
@@ -229,12 +278,53 @@ fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider,
         .page = page,
     }}) catch {
         // Post failed — we still own everything; free it all.
-        for (exact) |r| { gpa.free(r.id); gpa.free(r.name); }
+        for (exact) |r| freeOwnedAnime(gpa, r);
         gpa.free(exact); // exact-fit: len == capacity, free is valid
         gpa.free(query);
     };
     // On success: `exact` and `query` are now owned by the event.
     // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
+}
+
+/// Background task: enrich one page of search results from AniList.
+/// `results` and `query` are GPA-owned by this task and transferred to the event on success.
+fn enrichTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    results: []Anime,
+    query: []const u8,
+    offset: usize,
+    cancel: *std.atomic.Value(bool),
+) void {
+    defer if (cancel.load(.acquire)) {
+        for (results) |a| freeOwnedAnime(gpa, a);
+        gpa.free(results);
+        gpa.free(query);
+    };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    for (results) |*a| {
+        if (cancel.load(.acquire)) return;
+        const meta = anilist.enrich(arena.allocator(), io, a.*) catch null orelse continue;
+        if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
+        if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
+        if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
+        if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
+        if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
+        if (a.mal_id == null) a.mal_id = meta.mal_id;
+        if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
+        if (a.year == null) a.year = meta.year;
+        if (a.score == null) a.score = meta.score;
+    }
+
+    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch {
+        for (results) |a| freeOwnedAnime(gpa, a);
+        gpa.free(results);
+        gpa.free(query);
+    };
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
@@ -390,6 +480,10 @@ const App = struct {
     /// spawn, and in run() teardown. This bounds concurrent search threads to 1,
     /// preventing use-after-free of `loop` and `gpa` on fast quit.
     search_thread: ?std.Thread = null,
+    /// Handle for the most recent AniList enrichment thread.
+    enrich_thread: ?std.Thread = null,
+    /// Cooperative cancellation flag for the current enrichment thread.
+    enrich_cancel: std.atomic.Value(bool) = .init(false),
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -470,12 +564,58 @@ const App = struct {
     /// Free all accumulated search results and reset search state.
     /// Call before a new page-1 search and when Esc clears the query.
     fn clearResults(self: *App) void {
-        for (self.results.items) |r| {
-            self.gpa.free(r.id);
-            self.gpa.free(r.name);
-        }
+        self.cancelEnrich();
+        for (self.results.items) |r| freeOwnedAnime(self.gpa, r);
         self.results.clearRetainingCapacity();
         self.search_page = 0;
+    }
+
+    fn cancelEnrich(self: *App) void {
+        self.enrich_cancel.store(true, .release);
+        if (self.enrich_thread) |t| {
+            t.join();
+            self.enrich_thread = null;
+        }
+        self.enrich_cancel.store(false, .release);
+    }
+
+    fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
+        if (builtin.is_test) return;
+        if (count == 0 or offset >= self.results.items.len) return;
+        self.cancelEnrich();
+
+        const slice = self.results.items[offset..@min(self.results.items.len, offset + count)];
+        var unresolved: usize = 0;
+        for (slice) |a| {
+            if (a.anilist_id == null or a.thumb == null or a.description == null or a.score == null) unresolved += 1;
+        }
+        if (unresolved == 0) return;
+
+        const q_copy = self.gpa.dupe(u8, self.querySlice()) catch return;
+        var copied = std.ArrayListUnmanaged(Anime).empty;
+        copied.ensureTotalCapacity(self.gpa, slice.len) catch {
+            self.gpa.free(q_copy);
+            return;
+        };
+        for (slice) |a| {
+            const duped = dupeOwnedAnime(self.gpa, a) catch continue;
+            copied.appendAssumeCapacity(duped);
+        }
+        const exact = copied.toOwnedSlice(self.gpa) catch {
+            for (copied.items) |a| freeOwnedAnime(self.gpa, a);
+            copied.deinit(self.gpa);
+            self.gpa.free(q_copy);
+            return;
+        };
+
+        self.enrich_thread = std.Thread.spawn(.{}, enrichTask, .{
+            loop, self.gpa, io, exact, q_copy, offset, &self.enrich_cancel,
+        }) catch {
+            for (exact) |a| freeOwnedAnime(self.gpa, a);
+            self.gpa.free(exact);
+            self.gpa.free(q_copy);
+            return;
+        };
     }
 
     fn freeEpisodeResults(self: *App) void {
@@ -499,6 +639,41 @@ const App = struct {
         if (self.list_cursor >= cap) self.list_cursor = if (cap == 0) 0 else cap - 1;
     }
 
+    fn hydrateAnimeFromRecord(self: *App, a: *Anime, rec: AnimeRecord) void {
+        if (a.english_name == null) a.english_name = dupeOptText(self.gpa, rec.title_english) catch a.english_name;
+        if (a.thumb == null) a.thumb = dupeOptText(self.gpa, rec.cover_url) catch a.thumb;
+        if (a.status == null) a.status = dupeOptText(self.gpa, rec.status) catch a.status;
+        if (a.description == null) a.description = dupeOptText(self.gpa, rec.description) catch a.description;
+        if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
+        if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
+        if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
+        if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
+        if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
+    }
+
+    fn hydrateResultsFromStore(self: *App, source_name: []const u8, offset: usize, count: usize) void {
+        const st = self.store orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+
+        const end = @min(self.results.items.len, offset + count);
+        var i = offset;
+        while (i < end) : (i += 1) {
+            const source_id = self.results.items[i].id;
+            const rec = st.getAnime(arena.allocator(), source_name, source_id) catch null orelse continue;
+            self.hydrateAnimeFromRecord(&self.results.items[i], rec);
+        }
+    }
+
+    fn persistResults(self: *App, source_name: []const u8, offset: usize, count: usize) void {
+        const st = self.store orelse return;
+        const end = @min(self.results.items.len, offset + count);
+        var i = offset;
+        while (i < end) : (i += 1) {
+            st.upsertAnime(AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation), Store.nowSecs()) catch {};
+        }
+    }
+
     // ── tick: fold one event into state ──────────────────────────────────────
     fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, provider: SourceProvider) !void {
         switch (event) {
@@ -517,10 +692,8 @@ const App = struct {
             .search_done => |ev| {
                 // Stale check: ignore if query has changed since this search was fired.
                 if (!std.mem.eql(u8, ev.for_query, self.querySlice())) {
-                    for (ev.results) |r| { self.gpa.free(r.id); self.gpa.free(r.name); }
+                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.for_query);
-                    // NOTE: ev.results is a slice into a GPA-allocated backing array.
-                    // We freed each element's strings above; now free the backing array itself.
                     self.gpa.free(ev.results);
                     return;
                 }
@@ -535,11 +708,11 @@ const App = struct {
                 if (ev.page == 1) {
                     self.clearResults(); // free old data
                 }
+                const offset = self.results.items.len;
                 self.search_page = ev.page;
                 // Take ownership: append results into self.results, which already holds
                 // old page(s) for page > 1. The strings are already gpa-owned.
                 self.results.appendSlice(self.gpa, ev.results) catch {};
-                // Free the slice header (but NOT the strings, now owned by self.results).
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
                 // Reset cursor to top on fresh search.
@@ -547,6 +720,35 @@ const App = struct {
                     self.list_cursor = 0;
                     self.list_top = 0;
                 }
+                const added = self.results.items.len - offset;
+                const source_name = provider.name();
+                self.hydrateResultsFromStore(source_name, offset, added);
+                self.persistResults(source_name, offset, added);
+                self.fireEnrich(loop, io, offset, added);
+            },
+            .search_enriched => |ev| {
+                if (!std.mem.eql(u8, ev.for_query, self.querySlice())) {
+                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+                    self.gpa.free(ev.results);
+                    self.gpa.free(ev.for_query);
+                    return;
+                }
+                const source_name = provider.name();
+                for (ev.results) |enriched| {
+                    var replaced = false;
+                    for (self.results.items[ev.offset..@min(self.results.items.len, ev.offset + ev.results.len)]) |*live| {
+                        if (std.mem.eql(u8, live.id, enriched.id)) {
+                            freeOwnedAnime(self.gpa, live.*);
+                            live.* = enriched;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) freeOwnedAnime(self.gpa, enriched);
+                }
+                self.gpa.free(ev.results);
+                self.gpa.free(ev.for_query);
+                self.persistResults(source_name, ev.offset, ev.results.len);
             },
             .episodes_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -1168,11 +1370,13 @@ const App = struct {
             row += cover_h + 1;
         }
 
-        // Title — the selected result's name, or placeholder.
-        const title: []const u8 = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
-            self.results.items[self.list_cursor].name
+        const anime: ?Anime = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
+            self.results.items[self.list_cursor]
         else
-            "";
+            null;
+
+        // Title — the selected result's name, or placeholder.
+        const title: []const u8 = if (anime) |a| a.name else "";
         if (title.len > 0) {
             putClipped(win, row, 0, w, title, style(colors.fg, .{ .bold = true }));
         } else {
@@ -1180,8 +1384,14 @@ const App = struct {
         }
         row += 1;
 
-        // Score — always [--/100] in M3 (score is null).
-        putClipped(win, row, 0, w, "[--/100]", style(colors.fg3, .{}));
+        // Score — placeholder until enrichment lands, then the real AniList score.
+        const score_text: []const u8 = if (anime) |a| blk: {
+            if (a.score) |score| {
+                break :blk std.fmt.bufPrint(&self.detail_meta_buf, "[{d}/100]", .{score}) catch "[--/100]";
+            }
+            break :blk "[--/100]";
+        } else "[--/100]";
+        putClipped(win, row, 0, w, score_text, style(colors.fg3, .{}));
         row += 1;
 
         // Hairline.
@@ -1190,29 +1400,35 @@ const App = struct {
         }
         row += 1;
 
-        // Metadata: episode count.
+        // Metadata: episode count, falling back to AniList total when needed.
         if (row < h) {
-            const anime: ?Anime = if (self.results.items.len > 0 and self.list_cursor < self.results.items.len)
-                self.results.items[self.list_cursor]
-            else
-                null;
             const meta: []const u8 = if (anime) |a| blk: {
                 const eps = a.episodeCount(self.translation);
-                if (eps == 0) break :blk "? eps";
-                break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
+                if (eps > 0) break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
+                if (a.total_episodes) |total| break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{total}) catch "? eps";
+                break :blk "? eps";
             } else "? eps";
             const meta_style = if (anime) |a|
-                if (a.episodeCount(self.translation) > 0) style(colors.fg2, .{}) else style(colors.fg3, .{})
+                if (a.episodeCount(self.translation) > 0 or a.total_episodes != null) style(colors.fg2, .{}) else style(colors.fg3, .{})
             else
                 style(colors.fg3, .{});
             putClipped(win, row, 0, w, meta, meta_style);
             row += 1;
         }
 
-        // Synopsis stub.
+        // Synopsis: real metadata when present, otherwise the existing stub.
         if (row < h) {
-            putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
-            row += 1;
+            if (anime) |a| {
+                if (a.description) |desc| {
+                    row += drawWrappedText(win, row, 0, w, h - row, desc, style(colors.fg2, .{}));
+                } else {
+                    putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
+                    row += 1;
+                }
+            } else {
+                putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
+                row += 1;
+            }
         }
 
         if (row < h) row += 1; // blank line before grid
@@ -1511,6 +1727,31 @@ fn centerText(win: vaxis.Window, row: u16, w: u16, text: []const u8, sty: vaxis.
     putClipped(win, row, col, w, text, sty);
 }
 
+fn drawWrappedText(win: vaxis.Window, start_row: u16, start_col: u16, max_w: u16, max_rows: u16, text: []const u8, sty: vaxis.Style) u16 {
+    if (max_w == 0 or max_rows == 0 or text.len == 0) return 0;
+
+    var row: u16 = 0;
+    var i: usize = 0;
+    while (i < text.len and row < max_rows) {
+        const remaining = text[i..];
+        if (remaining.len <= max_w) {
+            putClipped(win, start_row + row, start_col, max_w, std.mem.trim(u8, remaining, " "), sty);
+            return row + 1;
+        }
+
+        var cut: usize = max_w;
+        while (cut > 0 and remaining[cut - 1] != ' ') : (cut -= 1) {}
+        if (cut == 0) cut = max_w;
+
+        const line = std.mem.trim(u8, remaining[0..cut], " ");
+        putClipped(win, start_row + row, start_col, max_w, line, sty);
+        row += 1;
+        i += cut;
+        while (i < text.len and text[i] == ' ') : (i += 1) {}
+    }
+    return row;
+}
+
 // History-row layout columns. The detail/responsive layout is ROD-72+; this is
 // the fixed two-column (title | meta) skeleton.
 const title_col: u16 = 4;
@@ -1556,7 +1797,12 @@ fn dummyResolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: doma
     return .{ .url = "" };
 }
 
+fn dummyNameFn(_: *anyopaque) []const u8 {
+    return "allanime";
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
+    .name = dummyNameFn,
     .search = dummySearchFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
@@ -1583,6 +1829,7 @@ fn testTick(app: *App, event: Event) !void {
     // loop pointer in the next test and triggers an ABRT.
     if (app.episode_thread) |t| { t.join(); app.episode_thread = null; }
     if (app.search_thread) |t| { t.join(); app.search_thread = null; }
+    if (app.enrich_thread) |t| { t.join(); app.enrich_thread = null; }
     if (app.play_thread) |t| { t.join(); app.play_thread = null; }
     // Drain events the threads may have posted; free their owned payloads so the
     // test allocator doesn't report leaks.
@@ -1594,7 +1841,12 @@ fn testTick(app: *App, event: Event) !void {
                 app.gpa.free(d.for_id);
             },
             .search_done => |d| {
-                for (d.results) |r| { app.gpa.free(r.id); app.gpa.free(r.name); }
+                for (d.results) |r| freeOwnedAnime(app.gpa, r);
+                app.gpa.free(d.results);
+                app.gpa.free(d.for_query);
+            },
+            .search_enriched => |d| {
+                for (d.results) |r| freeOwnedAnime(app.gpa, r);
                 app.gpa.free(d.results);
                 app.gpa.free(d.for_query);
             },
@@ -1847,7 +2099,7 @@ test "l in browse list pane switches to detail pane" {
     });
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
-    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
     app.freeEpisodeResults();
 }
@@ -1970,7 +2222,7 @@ test "search_done page 1 populates results" {
     try testing.expectEqual(@as(u32, 1), app.search_page);
     try testing.expect(!app.search_loading);
 
-    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
 
@@ -2028,7 +2280,45 @@ test "search_done page 2 appends to existing results" {
     try testing.expectEqualStrings("Show One", app.results.items[0].name);
     try testing.expectEqualStrings("Show Two", app.results.items[1].name);
 
-    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+}
+
+test "search_enriched merges metadata into matching live result" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.search_len = 7;
+    @memcpy(app.search_query[0..7], "frieren");
+
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "id1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+    });
+
+    const query_copy = try std.testing.allocator.dupe(u8, "frieren");
+    const enriched = try std.testing.allocator.alloc(Anime, 1);
+    enriched[0] = .{
+        .id = try std.testing.allocator.dupe(u8, "id1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+        .anilist_id = 154587,
+        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
+        .description = try std.testing.allocator.dupe(u8, "Elf mage grief hour"),
+        .score = 91,
+        .total_episodes = 28,
+        .year = 2023,
+        .status = try std.testing.allocator.dupe(u8, "FINISHED"),
+    };
+
+    try testTick(&app, .{ .search_enriched = .{ .results = enriched, .for_query = query_copy, .offset = 0 } });
+    try testing.expectEqual(@as(?u64, 154587), app.results.items[0].anilist_id);
+    try testing.expectEqual(@as(?u32, 91), app.results.items[0].score);
+    try testing.expectEqualStrings("Elf mage grief hour", app.results.items[0].description orelse "");
+
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
 
@@ -2057,7 +2347,7 @@ test "browse j/k navigates results list" {
     try testTick(&app, keyEv('k', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 
-    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
 
@@ -2176,7 +2466,7 @@ test "tick fires debounced search when deadline has passed" {
     try testTick(&app, .tick);
     try testing.expectEqual(@as(i64, 0), app.debounce_deadline_ms);
     try testing.expect(app.search_loading);
-    for (app.results.items) |r| { std.testing.allocator.free(r.id); std.testing.allocator.free(r.name); }
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
 

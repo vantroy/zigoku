@@ -44,6 +44,9 @@ pub const Anime = struct {
     banner: ?[]const u8 = null,
     eps_sub: u32 = 0,
     eps_dub: u32 = 0,
+    /// Total episode count from enrichment when the provider-side per-track count
+    /// is missing or partial.
+    total_episodes: ?u32 = null,
     year: ?u32 = null,
     status: ?[]const u8 = null,
     description: ?[]const u8 = null,

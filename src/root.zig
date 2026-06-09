@@ -13,6 +13,7 @@ pub const domain = @import("domain.zig");
 pub const source = @import("source.zig");
 pub const player = @import("player.zig");
 pub const store = @import("store.zig");
+pub const anilist = @import("anilist.zig");
 
 /// The TUI shell (M3, libvaxis). `zigoku` with no query opens it.
 pub const tui = @import("tui/app.zig");
@@ -58,6 +59,7 @@ test {
     _ = source;
     _ = player;
     _ = store;
+    _ = anilist;
     _ = tui;
     _ = @import("providers/allanime.zig");
 }
