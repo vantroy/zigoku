@@ -52,6 +52,9 @@ pub fn build(b: *std.Build) void {
     const vaxis_mod = vaxis_dep.module("vaxis");
     mod.addImport("vaxis", vaxis_mod);
 
+    const zigimg_dep = b.dependency("zigimg", .{ .target = target, .optimize = optimize });
+    mod.addImport("zigimg", zigimg_dep.module("zigimg"));
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
