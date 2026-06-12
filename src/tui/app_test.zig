@@ -520,6 +520,40 @@ test "history detail episodes_done seeds cursor from progress" {
     app.freeEpisodeResults();
 }
 
+test "history detail resume overrides next-episode cursor" {
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "resume-show", .title = "Resume Show", .progress = 3 }, 1000);
+    try store.saveProgress("allanime", "resume-show", .sub, "3", 91.5, 1440, 1001);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &store;
+    var hist = [_]AnimeRecord{
+        .{ .source = "allanime", .source_id = "resume-show", .title = "Resume Show", .total_episodes = 6, .progress = 3 },
+    };
+    app.setHistory(&hist);
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "resume-show");
+    app.episode_loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 6);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
+    eps[3] = .{ .raw = try std.testing.allocator.dupe(u8, "4") };
+    eps[4] = .{ .raw = try std.testing.allocator.dupe(u8, "5") };
+    eps[5] = .{ .raw = try std.testing.allocator.dupe(u8, "6") };
+    const for_id = try std.testing.allocator.dupe(u8, "resume-show");
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+
+    app.freeEpisodeResults();
+}
+
 test "history detail completed show defaults cursor to episode one" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
