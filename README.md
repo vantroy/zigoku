@@ -3,9 +3,11 @@
 A terminal anime browser & player, built from scratch in [Zig](https://ziglang.org/).
 
 > *Zig + jigoku ("hell").* A ground-up reimagining of the abandoned `ani-nexus-tui`,
-> and — above all — a vehicle for learning Zig the hard (fun) way. This is a
-> personal learning project: expect sharp edges, opinionated choices, and
-> commit messages that double as study notes.
+> and — above all — a vehicle for learning Zig. This is a personal learning
+> project: expect sharp edges, opinionated choices, and commit messages that
+> double as study notes. Most of the code is written by AI agents under human
+> architecture, direction, and review — see
+> [Why this exists](#why-this-exists) for how that works.
 
 ## What it does today
 
@@ -67,16 +69,24 @@ issue IDs in commit messages map back to it.
 
 ## Why this exists
 
-Honestly? I wanted to learn Zig, and reading the language reference only gets
-you so far. A real project — with networking, C interop, threads, a TUI, and a
-database — forces you through the parts a toy exercise never touches. An anime
-terminal player happened to be the itch worth scratching (RIP `ani-nexus-tui`),
-so it became the learning vehicle. Features land at the speed of understanding,
-not the other way around: if a milestone took longer because it was the first
-encounter with `std.Io` or `@cImport`, that was the point.
+The original goal was to learn Zig, and reading the language reference only
+gets you so far. A real project — with networking, C interop, threads, a TUI,
+and a database — forces you through the parts a toy exercise never touches. An
+anime terminal player happened to be the itch worth scratching (RIP
+`ani-nexus-tui`), so it became the learning vehicle.
 
-That philosophy is most visible in the **spikes**. Before any real architecture
-existed, every risky unknown got its own throwaway program in
+What the project actually turned into is worth stating plainly: most of the
+code here is written by AI — a personal agent setup (`pi-code`) driving an
+ensemble of models, organized as a small crew for implementation, review, and
+verification — while the human side of the project owns the architecture, the
+milestone planning, the design decisions, and the review of everything that
+lands. The pace of the commit history
+reflects that division of labor; nobody learned Zig from scratch and shipped
+five milestones in a weekend, and this README won't pretend otherwise. The
+learning still happens — it just moved up a layer: studying the generated
+code, questioning its choices, and understanding every line well enough to
+direct the next one. The clearest artifact of that process is the **spikes**. Before any real
+architecture existed, every risky unknown got its own throwaway program in
 [`src/spikes/`](src/spikes/) — HTTP + JSON, SQLite via C interop, threads + a
 channel, the AllAnime stream resolver, mpv playback, and a TUI smoke test. Each
 is a self-contained `main` with its own `zig build spike-*` step, never imported
