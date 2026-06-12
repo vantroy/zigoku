@@ -471,6 +471,27 @@ pub const App = struct {
         return anime.id;
     }
 
+    fn seedHistoryEpisodeCursor(self: *App, rec: AnimeRecord, episodes: []domain.EpisodeNumber) void {
+        const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
+        if (progress == 0) return;
+
+        const current_idx = progress - 1;
+        if (current_idx < episodes.len) {
+            if (self.store) |st| {
+                if (st.getResume(rec.source, rec.source_id, self.translation, episodes[current_idx].raw) catch null) |saved_resume| {
+                    if (saved_resume.startSeconds() > 0) {
+                        self.episode_cursor = current_idx;
+                        return;
+                    }
+                }
+            }
+        }
+
+        if (progress < episodes.len) {
+            self.episode_cursor = progress;
+        }
+    }
+
     fn clearPlayingSession(self: *App) void {
         if (self.playing_anime_id.len > 0) self.gpa.free(self.playing_anime_id);
         if (self.playing_episode_raw.len > 0) self.gpa.free(self.playing_episode_raw);
@@ -887,10 +908,7 @@ pub const App = struct {
                 self.episode_cursor = 0;
                 if (self.active_view == .detail and self.detail_origin == .history) {
                     if (self.selectedHistoryRecord()) |rec| {
-                        const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
-                        if (progress > 0 and progress < ev.episodes.len) {
-                            self.episode_cursor = progress;
-                        }
+                        self.seedHistoryEpisodeCursor(rec, ev.episodes);
                     }
                 }
             },
