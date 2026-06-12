@@ -76,7 +76,7 @@ anime terminal player happened to be the itch worth scratching (RIP
 `ani-nexus-tui`), so it became the learning vehicle.
 
 What the project actually turned into is worth stating plainly: most of the
-code here is written by AI — a personal agent setup (`pi-code`) driving an
+code here is written by AI — a personal agent setup ([`pi-code`](https://pi.dev/)) driving an
 ensemble of models, organized as a small crew for implementation, review, and
 verification — while the human side of the project owns the architecture, the
 milestone planning, the design decisions, and the review of everything that
