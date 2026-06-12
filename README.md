@@ -48,11 +48,6 @@ with the Kitty graphics protocol (kitty, ghostty, WezTerm).
 - **Source:** AllAnime, behind a swappable `SourceProvider` interface
 - **Catalog:** AniList for metadata & cover art
 
-The foundation was built as five isolated spikes (HTTP, SQLite/C-interop,
-concurrency, the AllAnime resolver, mpv playback). **[SPIKES.md](SPIKES.md)** is
-a guided, annotated tour through them — doubling as a Zig 0.16 crash course.
-They're still runnable: `zig build spike-http -- frieren`, etc.
-
 ## Roadmap
 
 Condensed from the [Linear project](https://linear.app/vantroy/project/zigoku-地獄-2dff2e5d180c);
@@ -69,6 +64,27 @@ issue IDs in commit messages map back to it.
 | **M6** | Config & settings: config file, settings tab, themes | planned |
 | **M7** | Distribution & hardening: error/logging pass, cross-platform paths, release builds | planned |
 | **M8** | Nice-to-haves: wide-terminal history layout & beyond | planned |
+
+## Why this exists
+
+Honestly? I wanted to learn Zig, and reading the language reference only gets
+you so far. A real project — with networking, C interop, threads, a TUI, and a
+database — forces you through the parts a toy exercise never touches. An anime
+terminal player happened to be the itch worth scratching (RIP `ani-nexus-tui`),
+so it became the learning vehicle. Features land at the speed of understanding,
+not the other way around: if a milestone took longer because it was the first
+encounter with `std.Io` or `@cImport`, that was the point.
+
+That philosophy is most visible in the **spikes**. Before any real architecture
+existed, every risky unknown got its own throwaway program in
+[`src/spikes/`](src/spikes/) — HTTP + JSON, SQLite via C interop, threads + a
+channel, the AllAnime stream resolver, mpv playback, and a TUI smoke test. Each
+is a self-contained `main` with its own `zig build spike-*` step, never imported
+by the real app; the ideas got promoted into proper modules, but the spikes stay
+behind as runnable reference. **[SPIKES.md](SPIKES.md)** is a guided, annotated
+tour through them, written as the Zig 0.16 crash course I wish had existed —
+including the "writergate" `Io` story that breaks most pre-0.16 tutorials you'll
+find online.
 
 ## Acknowledgements
 
