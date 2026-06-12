@@ -5,9 +5,8 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 > *Zig + jigoku ("hell").* A ground-up reimagining of the abandoned `ani-nexus-tui`,
 > and — above all — a vehicle for learning Zig. This is a personal learning
 > project: expect sharp edges, opinionated choices, and commit messages that
-> double as study notes. Most of the code is written by AI agents under human
-> architecture, direction, and review — see
-> [Why this exists](#why-this-exists) for how that works.
+> double as study notes — see [Why this exists](#why-this-exists) for the
+> story and how it's built.
 
 ## What it does today
 
