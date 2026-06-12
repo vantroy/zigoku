@@ -99,6 +99,9 @@ pub fn run(
     if (tty.getWinsize()) |ws| try vx.resize(gpa, writer, ws) else |_| {}
 
     var app: App = .{};
+    app.gpa = gpa;
+    app.store = store;
+    defer app.deinitOwnedState(&vx, writer);
 
     // History memory lives in an arena owned here and freed on exit — matching
     // store.loadHistory's arena-in contract. App only reads the slice; in M3
@@ -125,8 +128,6 @@ pub fn run(
         app.history_loading = false;
     }
 
-    app.gpa = gpa;
-    app.store = store;
     // Join the last search thread before loop teardown so in-flight threads
     // can't dereference a torn-down loop or gpa. Declared after loop.stop()'s
     // defer so it executes first (Zig defers are LIFO).
@@ -158,16 +159,6 @@ pub fn run(
         try app.tick(event, &loop, io, provider);
         try app.draw(&vx, writer);
     }
-
-    // Teardown: free results strings and the backing allocation.
-    // clearResults only calls clearRetainingCapacity (keeps the buffer for
-    // mid-session reuse); here we want the full deinit.
-    for (app.results.items) |r| freeOwnedAnime(gpa, r);
-    app.results.deinit(gpa);
-    app.freeEpisodeResults();
-    app.joinCoverThread();
-    app.freeCoverState(&vx, writer);
-    app.deinitCoverCaches();
 }
 
 pub const Toast = struct {
@@ -361,6 +352,18 @@ pub const App = struct {
         self.search_page = 0;
     }
 
+    /// Unified teardown for app-owned runtime state. Thread joins live in
+    /// run() and must execute before this cleanup touches anything workers can
+    /// still reference.
+    pub fn deinitOwnedState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        self.clearResults();
+        self.results.deinit(self.gpa);
+        self.results = .empty;
+        self.freeEpisodeResults();
+        self.freeCoverState(vx, writer);
+        self.deinitCoverCaches();
+    }
+
     fn selectedAnime(self: *const App) ?Anime {
         if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return null;
         return self.results.items[self.list_cursor];
@@ -504,7 +507,9 @@ pub const App = struct {
 
     fn deinitCoverCaches(self: *App) void {
         self.cover_decoded_cache.deinit(self.gpa);
+        self.cover_decoded_cache = .{};
         self.cover_raw_cache.deinit(self.gpa);
+        self.cover_raw_cache = .{};
     }
 
     fn joinCoverThread(self: *App) void {
