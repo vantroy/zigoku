@@ -1,0 +1,63 @@
+//! Zigoku — TUI event types and loop alias.
+
+const std = @import("std");
+const vaxis = @import("vaxis");
+const store_mod = @import("../store.zig");
+const domain = @import("../domain.zig");
+
+const AnimeRecord = store_mod.AnimeRecord;
+const Anime = domain.Anime;
+
+/// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
+/// worker→UI messages, posted from background threads and drained in tick().
+pub const Event = union(enum) {
+    key_press: vaxis.Key,
+    winsize: vaxis.Winsize,
+    focus_in,
+    focus_out,
+    /// History finished loading (owned, gpa-allocated — App takes ownership).
+    history_loaded: []AnimeRecord,
+    /// A background task failed; payload is a human-readable reason.
+    task_error: []const u8,
+    /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
+    /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
+    /// `page` is the page number this result set belongs to.
+    search_done: struct {
+        results: []Anime,
+        for_query: []const u8,
+        page: u32,
+    },
+    /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
+    /// app takes ownership and merges fields into the live search results.
+    search_enriched: struct {
+        results: []Anime,
+        for_query: []const u8,
+        offset: usize,
+    },
+    /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
+    /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.
+    episodes_done: struct {
+        episodes: []domain.EpisodeNumber,
+        for_id: []const u8,
+    },
+    /// Episode fetch failed.
+    episodes_error,
+    /// Cover image bytes were fetched + decoded. `rgba` and `for_id` are
+    /// GPA-owned; App takes ownership on the fresh path.
+    cover_done: struct {
+        rgba: []u8,
+        width: u32,
+        height: u32,
+        for_id: []const u8,
+    },
+    /// Cover fetch/decode failed for this show id.
+    cover_error: []const u8,
+    /// mpv exited (success or failure — we don't distinguish in M3).
+    play_done,
+    /// resolve or mpv spawn failed.
+    play_error,
+    /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
+    tick,
+};
+
+pub const Loop = vaxis.Loop(Event);
