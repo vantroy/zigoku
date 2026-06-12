@@ -21,6 +21,48 @@ const Cli = struct {
     quality: []const u8 = "best",
 };
 
+const PlaybackProgress = struct {
+    time_pos_bits: std.atomic.Value(u64) = .init(0),
+    duration_bits: std.atomic.Value(u64) = .init(0),
+    seen_update: std.atomic.Value(bool) = .init(false),
+
+    fn record(self: *PlaybackProgress, update: zigoku.player.PositionUpdate) void {
+        self.time_pos_bits.store(@bitCast(update.time_pos), .release);
+        self.duration_bits.store(@bitCast(update.duration), .release);
+        self.seen_update.store(true, .release);
+    }
+
+    fn snapshot(self: *PlaybackProgress) ?zigoku.player.PositionUpdate {
+        if (!self.seen_update.load(.acquire)) return null;
+        return .{
+            .time_pos = @bitCast(self.time_pos_bits.load(.acquire)),
+            .duration = @bitCast(self.duration_bits.load(.acquire)),
+        };
+    }
+};
+
+fn recordPlaybackProgress(ctx: *anyopaque, update: zigoku.player.PositionUpdate) void {
+    const progress: *PlaybackProgress = @ptrCast(@alignCast(ctx));
+    progress.record(update);
+}
+
+fn observedPlaybackWasMeaningful(latest: ?zigoku.player.PositionUpdate) bool {
+    const update = latest orelse return false;
+    return std.math.isFinite(update.time_pos) and update.time_pos > 0;
+}
+
+fn persistFinalProgress(
+    st: *zigoku.Store,
+    source: []const u8,
+    source_id: []const u8,
+    tt: zigoku.Translation,
+    episode: []const u8,
+    latest: ?zigoku.player.PositionUpdate,
+) void {
+    const update = latest orelse return;
+    st.saveProgress(source, source_id, tt, episode, update.time_pos, update.duration, zigoku.Store.nowSecs()) catch {};
+}
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -162,14 +204,37 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     try out.print("  ▶ launching mpv…\n", .{});
     try out.flush();
 
-    try zigoku.player.play(arena, io, link, title, start_seconds, null);
+    var progress: PlaybackProgress = .{};
+    zigoku.player.play(arena, io, link, title, start_seconds, .{
+        .ctx = @ptrCast(&progress),
+        .func = recordPlaybackProgress,
+    }) catch |err| {
+        if (store) |st| {
+            const latest = progress.snapshot();
+            if (observedPlaybackWasMeaningful(latest)) {
+                persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
+                if (err == error.MpvFailed) st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+            }
+        }
+        return err;
+    };
 
-    // ROD-69 (write side): record the play at episode granularity. Sub-second
-    // position write lands when M5's mpv IPC feeds saveProgress real numbers;
-    // the read path above is already wired to consume it.
-    if (store) |st| st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+    if (store) |st| {
+        const latest = progress.snapshot();
+        if (observedPlaybackWasMeaningful(latest)) {
+            persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
+        }
+        st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+    }
 
     try out.print("\n✓ done. That was Zigoku, end to end.\n", .{});
+}
+
+test "observedPlaybackWasMeaningful requires positive observed position" {
+    try std.testing.expect(!observedPlaybackWasMeaningful(null));
+    try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = 0, .duration = 1440 }));
+    try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = -1, .duration = 1440 }));
+    try std.testing.expect(observedPlaybackWasMeaningful(.{ .time_pos = 0.5, .duration = 1440 }));
 }
 
 /// Episode list for a show: cache-first (ROD-68), falling back to a live fetch

@@ -286,6 +286,19 @@ pub const App = struct {
     current_position: f64 = 0,
     /// Live mpv duration from IPC.
     current_duration: f64 = 0,
+    /// Last persisted checkpoint position for the current playback.
+    last_checkpoint_pos: f64 = 0,
+    /// Source name for the currently playing episode. Borrowed from either the
+    /// provider vtable or the history arena, both of which outlive App.
+    playing_source: []const u8 = &.{},
+    /// GPA-owned show id for the current playback session.
+    playing_anime_id: []const u8 = &.{},
+    /// GPA-owned raw episode label for the current playback session.
+    playing_episode_raw: []const u8 = &.{},
+    /// 1-based episode index used for recordPlay's high-water mark.
+    playing_episode_index: u32 = 0,
+    /// Translation active when playback started; decoupled from live UI toggles.
+    playing_translation: domain.Translation = .sub,
     /// Store reference — set in run() for getResume in the play thread.
     store: ?*Store = null,
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
@@ -364,6 +377,7 @@ pub const App = struct {
         self.results.deinit(self.gpa);
         self.results = .empty;
         self.freeEpisodeResults();
+        self.clearPlayingSession();
         self.freeCoverState(vx, writer);
         self.deinitCoverCaches();
     }
@@ -455,6 +469,91 @@ pub const App = struct {
     fn currentCoverTargetId(self: *const App) ?[]const u8 {
         const anime = self.currentDetailAnime() orelse return null;
         return anime.id;
+    }
+
+    fn clearPlayingSession(self: *App) void {
+        if (self.playing_anime_id.len > 0) self.gpa.free(self.playing_anime_id);
+        if (self.playing_episode_raw.len > 0) self.gpa.free(self.playing_episode_raw);
+        self.playing_source = &.{};
+        self.playing_anime_id = &.{};
+        self.playing_episode_raw = &.{};
+        self.playing_episode_index = 0;
+        self.playing_translation = .sub;
+        self.last_checkpoint_pos = 0;
+    }
+
+    fn beginPlayingSession(
+        self: *App,
+        source: []const u8,
+        anime_id: []const u8,
+        episode_raw: []const u8,
+        episode_index: u32,
+        start_seconds: u64,
+    ) bool {
+        self.clearPlayingSession();
+        const owned_id = self.gpa.dupe(u8, anime_id) catch return false;
+        const owned_episode = self.gpa.dupe(u8, episode_raw) catch {
+            self.gpa.free(owned_id);
+            return false;
+        };
+
+        self.playing_source = source;
+        self.playing_anime_id = owned_id;
+        self.playing_episode_raw = owned_episode;
+        self.playing_episode_index = episode_index;
+        self.playing_translation = self.translation;
+        self.last_checkpoint_pos = @floatFromInt(start_seconds);
+        return true;
+    }
+
+    fn maybeCheckpointProgress(self: *App, time_pos: f64, duration: f64) void {
+        const st = self.store orelse return;
+        if (self.playing_anime_id.len == 0 or self.playing_episode_raw.len == 0) return;
+        if (time_pos - self.last_checkpoint_pos < 30.0) return;
+
+        st.saveProgress(
+            self.playing_source,
+            self.playing_anime_id,
+            self.playing_translation,
+            self.playing_episode_raw,
+            time_pos,
+            duration,
+            Store.nowSecs(),
+        ) catch {};
+        self.last_checkpoint_pos = time_pos;
+    }
+
+    fn observedPlaybackWasMeaningful(final_update: ?event_mod.PositionUpdate) bool {
+        const update = final_update orelse return false;
+        return std.math.isFinite(update.time_pos) and update.time_pos > 0;
+    }
+
+    fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, record_play: bool) void {
+        if (self.store) |st| {
+            if (self.playing_anime_id.len > 0 and self.playing_episode_raw.len > 0) {
+                if (observedPlaybackWasMeaningful(final_update)) {
+                    const update = final_update.?;
+                    st.saveProgress(
+                        self.playing_source,
+                        self.playing_anime_id,
+                        self.playing_translation,
+                        self.playing_episode_raw,
+                        update.time_pos,
+                        update.duration,
+                        Store.nowSecs(),
+                    ) catch {};
+                }
+                if (record_play and self.playing_episode_index > 0) {
+                    st.recordPlay(self.playing_source, self.playing_anime_id, self.playing_episode_index, Store.nowSecs()) catch {};
+                }
+            }
+        }
+
+        self.playing = false;
+        self.current_position = 0;
+        self.current_duration = 0;
+        self.clearPlayingSession();
+        self.async_start_ms = 0;
     }
 
     fn invalidateCoverImage(self: *App) void {
@@ -836,12 +935,13 @@ pub const App = struct {
             .position_update => |ev| {
                 self.current_position = ev.time_pos;
                 self.current_duration = ev.duration;
+                self.maybeCheckpointProgress(ev.time_pos, ev.duration);
             },
-            .play_done, .play_error => {
-                self.playing = false;
-                self.current_position = 0;
-                self.current_duration = 0;
-                self.async_start_ms = 0;
+            .play_done => |final_update| {
+                self.finishPlayback(final_update, true);
+            },
+            .play_error => |final_update| {
+                self.finishPlayback(final_update, observedPlaybackWasMeaningful(final_update));
             },
             .tick => {
                 const now = nowMs(io);
@@ -942,6 +1042,15 @@ pub const App = struct {
 
         const selected_id = self.detail_for_id orelse return;
         const ep = eps[self.episode_cursor];
+        const source_name = self.currentDetailSourceName(provider);
+        const episode_index: u32 = @intCast(self.episode_cursor + 1);
+
+        var start_seconds: u64 = 0;
+        if (self.store) |st| {
+            if (st.getResume(source_name, selected_id, self.translation, ep.raw) catch null) |saved_resume| {
+                start_seconds = saved_resume.startSeconds();
+            }
+        }
 
         const title_src: []const u8 = if (self.currentDetailAnime()) |anime|
             anime.name
@@ -961,20 +1070,25 @@ pub const App = struct {
 
         self.current_position = 0;
         self.current_duration = 0;
+        if (!self.beginPlayingSession(source_name, selected_id, ep.raw, episode_index, start_seconds)) {
+            self.gpa.free(id_copy);
+            self.gpa.free(ep_copy);
+            self.gpa.free(title_copy);
+            return;
+        }
 
         self.play_thread = std.Thread.spawn(.{}, playTask, .{
             loop,
             self.gpa,
             io,
             provider,
-            self.store,
-            self.currentDetailSourceName(provider),
             id_copy,
             ep_copy,
-            @as(i64, @intCast(self.episode_cursor + 1)),
             self.translation,
             title_copy,
+            start_seconds,
         }) catch {
+            self.clearPlayingSession();
             self.gpa.free(id_copy);
             self.gpa.free(ep_copy);
             self.gpa.free(title_copy);

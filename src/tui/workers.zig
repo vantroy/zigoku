@@ -218,9 +218,52 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     };
 }
 
+const PlaybackProgress = struct {
+    time_pos_bits: std.atomic.Value(u64) = .init(0),
+    duration_bits: std.atomic.Value(u64) = .init(0),
+    seen_update: std.atomic.Value(bool) = .init(false),
+
+    fn record(self: *PlaybackProgress, update: player_mod.PositionUpdate) void {
+        self.time_pos_bits.store(@bitCast(update.time_pos), .release);
+        self.duration_bits.store(@bitCast(update.duration), .release);
+        self.seen_update.store(true, .release);
+    }
+
+    fn snapshot(self: *PlaybackProgress) ?player_mod.PositionUpdate {
+        if (!self.seen_update.load(.acquire)) return null;
+        return .{
+            .time_pos = @bitCast(self.time_pos_bits.load(.acquire)),
+            .duration = @bitCast(self.duration_bits.load(.acquire)),
+        };
+    }
+};
+
+const PlayTaskCallbackCtx = struct {
+    loop: *Loop,
+    progress: *PlaybackProgress,
+};
+
+fn observedPlaybackWasMeaningful(latest: ?player_mod.PositionUpdate) bool {
+    const update = latest orelse return false;
+    return std.math.isFinite(update.time_pos) and update.time_pos > 0;
+}
+
+fn persistFinalProgress(
+    st: *Store,
+    source_name: []const u8,
+    source_id: []const u8,
+    ep_raw: []const u8,
+    translation: domain.Translation,
+    latest: ?player_mod.PositionUpdate,
+) void {
+    const update = latest orelse return;
+    st.saveProgress(source_name, source_id, translation, ep_raw, update.time_pos, update.duration, Store.nowSecs()) catch {};
+}
+
 fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
-    const loop: *Loop = @ptrCast(@alignCast(ctx));
-    loop.postEvent(.{ .position_update = .{
+    const cb: *PlayTaskCallbackCtx = @ptrCast(@alignCast(ctx));
+    cb.progress.record(update);
+    cb.loop.postEvent(.{ .position_update = .{
         .time_pos = update.time_pos,
         .duration = update.duration,
     } }) catch {};
@@ -228,7 +271,7 @@ fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
 
 /// Background task: resolve stream and launch mpv.
 /// All string params are GPA-owned by this task and freed before return.
-pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, store: ?*Store, source_name: []const u8, id: []const u8, ep_raw: []const u8, episode_index: i64, translation: domain.Translation, title: []const u8) void {
+pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64) void {
     defer gpa.free(id);
     defer gpa.free(ep_raw);
     defer gpa.free(title);
@@ -238,18 +281,21 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
     const link = provider.resolve(arena.allocator(), io, id, ep, translation) catch {
-        loop.postEvent(.play_error) catch {};
+        loop.postEvent(.{ .play_error = null }) catch {};
         return;
     };
-    player_mod.play(arena.allocator(), io, link, title, 0, .{
-        .ctx = @ptrCast(loop),
+
+    var progress: PlaybackProgress = .{};
+    var callback_ctx: PlayTaskCallbackCtx = .{ .loop = loop, .progress = &progress };
+    player_mod.play(arena.allocator(), io, link, title, start_seconds, .{
+        .ctx = @ptrCast(&callback_ctx),
         .func = postPositionUpdate,
     }) catch {
-        loop.postEvent(.play_error) catch {};
+        loop.postEvent(.{ .play_error = progress.snapshot() }) catch {};
         return;
     };
-    if (store) |st| st.recordPlay(source_name, id, episode_index, Store.nowSecs()) catch {};
-    loop.postEvent(.play_done) catch {};
+
+    loop.postEvent(.{ .play_done = progress.snapshot() }) catch {};
 }
 
 const max_cover_encoded_bytes = 8 * 1024 * 1024;
@@ -378,4 +424,35 @@ pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+test "observedPlaybackWasMeaningful requires positive observed position" {
+    try std.testing.expect(!observedPlaybackWasMeaningful(null));
+    try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = 0, .duration = 1440 }));
+    try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = -1, .duration = 1440 }));
+    try std.testing.expect(observedPlaybackWasMeaningful(.{ .time_pos = 0.5, .duration = 1440 }));
+}
+
+test "persistFinalProgress writes the latest observed position" {
+    var store = try Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+
+    persistFinalProgress(&store, "allanime", "show1", "7", .sub, .{
+        .time_pos = 91.5,
+        .duration = 1440,
+    });
+
+    const saved_resume = (try store.getResume("allanime", "show1", .sub, "7")).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 91.5), saved_resume.position_secs, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1440), saved_resume.duration_secs, 0.001);
+}
+
+test "persistFinalProgress is a no-op without an observed update" {
+    var store = try Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+
+    persistFinalProgress(&store, "allanime", "show1", "7", .sub, null);
+    try std.testing.expect((try store.getResume("allanime", "show1", .sub, "7")) == null);
 }

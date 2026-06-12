@@ -4,9 +4,11 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
+const player_mod = @import("../player.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
+pub const PositionUpdate = player_mod.PositionUpdate;
 
 /// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
 /// worker→UI messages, posted from background threads and drained in tick().
@@ -57,10 +59,10 @@ pub const Event = union(enum) {
         time_pos: f64,
         duration: f64,
     },
-    /// mpv exited (success or failure — we don't distinguish in M3).
-    play_done,
-    /// resolve or mpv spawn failed.
-    play_error,
+    /// mpv exited cleanly; payload carries the final observed authoritative position, if any.
+    play_done: ?PositionUpdate,
+    /// resolve failed or mpv exited badly; payload carries the final observed position, if any.
+    play_error: ?PositionUpdate,
     /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
     tick,
 };
