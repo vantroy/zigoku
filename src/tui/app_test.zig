@@ -1025,6 +1025,42 @@ test "cover_error clears state so a later revisit can refetch" {
     app.results.deinit(std.testing.allocator);
 }
 
+test "deinitOwnedState releases app-owned runtime resources" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.search_page = 2;
+
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "anime1"),
+        .name = try std.testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+    });
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    app.episode_results = eps;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
+
+    app.cover_pixels = .{ .rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff }), .w = 1, .h = 1 };
+    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover_failed_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover_loading = true;
+
+    var vx: vaxis.Vaxis = undefined;
+    var writer: std.Io.Writer = undefined;
+    app.deinitOwnedState(&vx, &writer);
+
+    try testing.expectEqual(@as(usize, 0), app.results.items.len);
+    try testing.expectEqual(@as(u32, 0), app.search_page);
+    try testing.expect(app.episode_results == null);
+    try testing.expect(app.detail_for_id == null);
+    try testing.expect(app.cover_pixels == null);
+    try testing.expect(app.cover_for_id == null);
+    try testing.expect(app.cover_failed_for_id == null);
+    try testing.expect(!app.cover_loading);
+}
+
 test "search mode: char appends and arms debounce, does not fire immediately" {
     var app: App = .{};
     app.active_view = .browse;
