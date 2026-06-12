@@ -162,7 +162,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     try out.print("  ▶ launching mpv…\n", .{});
     try out.flush();
 
-    try zigoku.player.play(arena, io, link, title, start_seconds);
+    try zigoku.player.play(arena, io, link, title, start_seconds, null);
 
     // ROD-69 (write side): record the play at episode granularity. Sub-second
     // position write lands when M5's mpv IPC feeds saveProgress real numbers;

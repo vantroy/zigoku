@@ -52,6 +52,11 @@ pub const Event = union(enum) {
     },
     /// Cover fetch/decode failed for this show id.
     cover_error: []const u8,
+    /// Live playback position from mpv IPC.
+    position_update: struct {
+        time_pos: f64,
+        duration: f64,
+    },
     /// mpv exited (success or failure — we don't distinguish in M3).
     play_done,
     /// resolve or mpv spawn failed.

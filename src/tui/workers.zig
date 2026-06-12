@@ -218,6 +218,14 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     };
 }
 
+fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
+    const loop: *Loop = @ptrCast(@alignCast(ctx));
+    loop.postEvent(.{ .position_update = .{
+        .time_pos = update.time_pos,
+        .duration = update.duration,
+    } }) catch {};
+}
+
 /// Background task: resolve stream and launch mpv.
 /// All string params are GPA-owned by this task and freed before return.
 pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, store: ?*Store, source_name: []const u8, id: []const u8, ep_raw: []const u8, episode_index: i64, translation: domain.Translation, title: []const u8) void {
@@ -233,7 +241,10 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
         loop.postEvent(.play_error) catch {};
         return;
     };
-    player_mod.play(arena.allocator(), io, link, title, 0) catch {
+    player_mod.play(arena.allocator(), io, link, title, 0, .{
+        .ctx = @ptrCast(loop),
+        .func = postPositionUpdate,
+    }) catch {
         loop.postEvent(.play_error) catch {};
         return;
     };

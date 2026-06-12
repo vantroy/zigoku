@@ -282,6 +282,10 @@ pub const App = struct {
     play_thread: ?std.Thread = null,
     /// Whether mpv is running (play thread in-flight).
     playing: bool = false,
+    /// Live mpv playback position from IPC.
+    current_position: f64 = 0,
+    /// Live mpv duration from IPC.
+    current_duration: f64 = 0,
     /// Store reference — set in run() for getResume in the play thread.
     store: ?*Store = null,
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
@@ -829,8 +833,14 @@ pub const App = struct {
                 self.noteCoverFailure(for_id);
                 std.log.debug("cover fetch/decode failed for {s}", .{for_id});
             },
+            .position_update => |ev| {
+                self.current_position = ev.time_pos;
+                self.current_duration = ev.duration;
+            },
             .play_done, .play_error => {
                 self.playing = false;
+                self.current_position = 0;
+                self.current_duration = 0;
                 self.async_start_ms = 0;
             },
             .tick => {
@@ -948,6 +958,9 @@ pub const App = struct {
             self.gpa.free(ep_copy);
             return;
         };
+
+        self.current_position = 0;
+        self.current_duration = 0;
 
         self.play_thread = std.Thread.spawn(.{}, playTask, .{
             loop,

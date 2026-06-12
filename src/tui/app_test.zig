@@ -1121,6 +1121,28 @@ test "task_error pushes a persistent error toast" {
     try testing.expectEqualStrings("network down", t.text[0..t.text_len]);
 }
 
+test "position_update refreshes live playback fields" {
+    var app: App = .{};
+    app.current_position = 12;
+    app.current_duration = 24;
+
+    try testTick(&app, .{ .position_update = .{ .time_pos = 91.5, .duration = 1440 } });
+    try testing.expectApproxEqAbs(@as(f64, 91.5), app.current_position, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 1440), app.current_duration, 0.001);
+}
+
+test "play_done clears live playback fields" {
+    var app: App = .{};
+    app.playing = true;
+    app.current_position = 91.5;
+    app.current_duration = 1440;
+
+    try testTick(&app, .play_done);
+    try testing.expect(!app.playing);
+    try testing.expectApproxEqAbs(@as(f64, 0), app.current_position, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 0), app.current_duration, 0.001);
+}
+
 test "firePlay: double-play guard is a no-op when playing is true" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
