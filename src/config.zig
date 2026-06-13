@@ -38,6 +38,7 @@ pub const Config = struct {
     image_protocol: []const u8 = "auto", // "auto" | "kitty" | "halfblock" | "off"
     cover_art: bool = true,
     kanji_chips: bool = true,
+    palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord"
 
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
@@ -127,6 +128,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqualStrings(want.image_protocol, got.image_protocol);
     try testing.expectEqual(want.cover_art, got.cover_art);
     try testing.expectEqual(want.kanji_chips, got.kanji_chips);
+    try testing.expectEqualStrings(want.palette, got.palette);
 }
 
 test "empty struct literal yields all defaults" {
@@ -174,6 +176,7 @@ test "serialized config round-trips back through parse" {
         .image_protocol = "kitty",
         .cover_art = false,
         .kanji_chips = false,
+        .palette = "nord",
     };
 
     var aw = std.Io.Writer.Allocating.init(a);

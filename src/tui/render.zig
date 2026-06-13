@@ -21,7 +21,7 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
 /// (bg.surface for the focused entry, bg.base otherwise). `frac_buf` must be
 /// App-owned — vaxis holds a reference until the next render call.
-pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8) void {
+pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
     const is_planning = std.mem.eql(u8, rec.list_status, "planning");
     const is_watching = std.mem.eql(u8, rec.list_status, "watching");
     const is_paused = std.mem.eql(u8, rec.list_status, "paused");
@@ -36,19 +36,19 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: A
         break :blk if (rec.progress > 0) bar_w / 3 else 0;
     };
 
-    const fill_color = if (is_watching or is_paused) colors.focus else colors.fg3;
-    const frac_color = if (is_watching or is_paused) colors.fg2 else colors.fg3;
+    const fill_color = if (is_watching or is_paused) pal.focus else pal.fg3;
+    const frac_color = if (is_watching or is_paused) pal.fg2 else pal.fg3;
 
-    put(win, row, col, "[", style(colors.fg3, .{ .bg = row_bg }));
+    put(win, row, col, "[", style(pal.fg3, .{ .bg = row_bg }));
     var c: u16 = 0;
     while (c < bar_w) : (c += 1) {
         if (c < filled) {
             put(win, row, col + 1 + c, "█", style(fill_color, .{ .bg = row_bg, .dim = is_paused }));
         } else {
-            put(win, row, col + 1 + c, "░", style(colors.chrome, .{ .bg = row_bg }));
+            put(win, row, col + 1 + c, "░", style(pal.chrome, .{ .bg = row_bg }));
         }
     }
-    put(win, row, col + 1 + bar_w, "]", style(colors.fg3, .{ .bg = row_bg }));
+    put(win, row, col + 1 + bar_w, "]", style(pal.fg3, .{ .bg = row_bg }));
 
     const frac: []const u8 = if (rec.total_episodes) |total|
         std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ rec.progress, total }) catch ""
@@ -116,10 +116,10 @@ pub const title_col: u16 = 4;
 pub const meta_col: u16 = 48;
 pub const title_meta_gap: u16 = 2;
 
-// One style constructor for foreground-on-(void|surface) cells. bg defaults to
-// the void so most call sites stay terse; the focused list row passes bg.surface
-// to get §4.1's background shift.
-pub fn style(fg: vaxis.Color, opts: struct {
+// Style helper for drawProgressBar. Always call with an explicit `bg` — the
+// default is pinned to terminal_ghost and is not palette-aware. App draw methods
+// use App.s() instead, which carries the live palette.
+fn style(fg: vaxis.Color, opts: struct {
     bg: vaxis.Color = colors.bg_base,
     bold: bool = false,
     italic: bool = false,

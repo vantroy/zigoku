@@ -46,7 +46,6 @@ const drawWrappedText = render.drawWrappedText;
 const title_col = render.title_col;
 const meta_col = render.meta_col;
 const title_meta_gap = render.title_meta_gap;
-const style = render.style;
 const RawCoverCache = workers.RawCoverCache;
 const DecodedCoverCache = workers.DecodedCoverCache;
 const dupeOptText = workers.dupeOptText;
@@ -107,6 +106,7 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    app.palette = paletteFromConfig(config.palette);
     // The configured sub/dub default seeds the search translation; the user can
     // still toggle it live in-session (ROD-85).
     app.translation = config.translationEnum();
@@ -197,6 +197,7 @@ const SettingId = enum {
     skip_mode,
     cover_art,
     kanji_chips,
+    palette,
 };
 
 const SettingKind = enum { text, cycle, toggle };
@@ -216,6 +217,7 @@ const settings_rows = [_]SettingRow{
     .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "h/l cycle" },
     .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space" },
     .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space" },
+    .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "h/l cycle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not
@@ -223,10 +225,10 @@ const settings_rows = [_]SettingRow{
 pub const settings_row_count = settings_rows.len;
 
 comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..7 = Interface. Pin the
+    // `drawSettings` splits this table 0..5 = Player, 5..8 = Interface. Pin the
     // boundary so inserting/removing a row can't silently misattribute it to the
     // wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 7);
+    std.debug.assert(settings_rows.len == 8);
     std.debug.assert(settings_rows[4].id == .skip_mode);
     std.debug.assert(settings_rows[5].id == .cover_art);
 }
@@ -242,6 +244,7 @@ const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
 const language_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
+const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord" };
 
 /// Step through a preset list to the value after (`dir > 0`) or before the
 /// current one, wrapping. An unrecognized current value starts from index 0.
@@ -268,6 +271,12 @@ fn cyclePresetU32(presets: []const u32, current: u32, dir: i8) u32 {
     }
     const n = presets.len;
     return presets[if (dir > 0) (idx + 1) % n else (idx + n - 1) % n];
+}
+
+fn paletteFromConfig(name: []const u8) *const colors.Palette {
+    if (std.mem.eql(u8, name, "phosphor")) return &colors.phosphor;
+    if (std.mem.eql(u8, name, "nord")) return &colors.nord;
+    return &colors.terminal_ghost;
 }
 
 pub const App = struct {
@@ -410,6 +419,9 @@ pub const App = struct {
     /// run()'s process-lifetime arena. Null when no $HOME/$XDG_CONFIG_HOME — in
     /// which case settings still edit live but can't persist.
     config_path: ?[]const u8 = null,
+    /// Active color palette (ROD-87). Points to one of the Palette presets in
+    /// colors.zig; updated live when the user cycles the palette setting.
+    palette: *const colors.Palette = &colors.terminal_ghost,
 
     /// Settings tab (ROD-86) cursor over the *interactive* rows only (the two
     /// Catalog rows are non-interactive and skipped by navigation).
@@ -458,6 +470,26 @@ pub const App = struct {
     /// Current query as a slice (may be empty).
     fn querySlice(self: *const App) []const u8 {
         return self.search_query[0..self.search_len];
+    }
+
+    /// Palette-aware style: `bg` defaults to `self.palette.bg_base` when null.
+    /// All draw methods use this instead of the plain `style()` import so that
+    /// switching palettes re-colors every cell, not just ones with explicit bg.
+    inline fn s(self: *const App, fg: vaxis.Color, opts: struct {
+        bg: ?vaxis.Color = null,
+        bold: bool = false,
+        italic: bool = false,
+        blink: bool = false,
+        dim: bool = false,
+    }) vaxis.Style {
+        return .{
+            .fg = fg,
+            .bg = opts.bg orelse self.palette.bg_base,
+            .bold = opts.bold,
+            .italic = opts.italic,
+            .blink = opts.blink,
+            .dim = opts.dim,
+        };
     }
 
     const spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"; // 10 × 3 UTF-8 bytes
@@ -1405,6 +1437,10 @@ pub const App = struct {
             },
             .skip_mode => self.config.skip_mode = cyclePreset(&skip_presets, self.config.skip_mode, dir),
             .resume_offset => self.config.resume_offset_sec = cyclePresetU32(&resume_presets, self.config.resume_offset_sec, dir),
+            .palette => {
+                self.config.palette = cyclePreset(&palette_presets, self.config.palette, dir);
+                self.palette = paletteFromConfig(self.config.palette);
+            },
             else => {},
         }
     }
@@ -1462,6 +1498,7 @@ pub const App = struct {
             .resume_offset => std.fmt.bufPrint(buf, "{d}s", .{self.config.resume_offset_sec}) catch "?",
             .cover_art => if (self.config.cover_art) "on" else "off",
             .kanji_chips => if (self.config.kanji_chips) "on" else "off",
+            .palette => self.config.palette,
         };
     }
 
@@ -1670,13 +1707,13 @@ pub const App = struct {
 
         const win = vx.window();
         win.clear();
-        win.fill(.{ .style = .{ .bg = colors.bg_base } });
+        win.fill(.{ .style = .{ .bg = self.palette.bg_base } });
 
         const w = win.width;
         const h = win.height;
         if (h < 4 or w < 16) {
             // Too small to lay out — just say so.
-            put(win, 0, 0, "terminal too small", style(colors.warn, .{}));
+            put(win, 0, 0, "terminal too small", self.s(self.palette.warn, .{}));
             try vx.render(writer);
             return;
         }
@@ -1694,8 +1731,8 @@ pub const App = struct {
     /// system + focus model is ROD-72 and needs a designed home (the active-tab
     /// cyan would collide with the focus color if it lived in this bar).
     fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
-        put(win, 0, 2, "地獄 zigoku", style(colors.fg, .{ .bold = true }));
-        if (w > 16) put(win, 0, 14, "░", style(colors.chrome, .{}));
+        put(win, 0, 2, "地獄 zigoku", self.s(self.palette.fg, .{ .bold = true }));
+        if (w > 16) put(win, 0, 14, "░", self.s(self.palette.chrome, .{}));
 
         // Render the chip after the separator (§10.3b).
         const chip_col: u16 = 16;
@@ -1708,14 +1745,14 @@ pub const App = struct {
             .settings => "Settings",
             .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
         };
-        put(win, 0, chip_col, chip, style(colors.focus, .{}));
+        put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
 
         // Render the · indicator right-aligned (§10.3b).
         const dot_color = switch (self.active_view) {
-            .browse => if (self.active_pane == .detail) colors.focus else colors.fg3,
-            .history, .detail, .settings => colors.focus,
+            .browse => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
+            .history, .detail, .settings => self.palette.focus,
         };
-        if (w > 2) put(win, 0, w - 2, "·", style(dot_color, .{}));
+        if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
     }
 
     fn drawContent(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, h: u16) void {
@@ -1732,25 +1769,25 @@ pub const App = struct {
                 // History view — existing list rendering.
                 if (self.history_loading) {
                     const hist_spin = std.fmt.bufPrint(&self.no_results_buf, "{s} loading history", .{self.spinnerChar()}) catch "⠋ loading history";
-                    putClipped(win, top, 2, body_w, hist_spin, style(colors.focus, .{}));
+                    putClipped(win, top, 2, body_w, hist_spin, self.s(self.palette.focus, .{}));
                     return;
                 }
                 if (self.load_error) |msg| {
                     // Hard failure → magenta (state.error = state.now, §1.1).
-                    put(win, top, 2, "history unavailable", style(colors.hot, .{ .bold = true }));
-                    putClipped(win, top + 1, 2, body_w, msg, style(colors.fg3, .{}));
+                    put(win, top, 2, "history unavailable", self.s(self.palette.hot, .{ .bold = true }));
+                    putClipped(win, top + 1, 2, body_w, msg, self.s(self.palette.fg3, .{}));
                     return;
                 }
                 if (self.history.len == 0) {
                     // First-run empty state (§9.2): the void, one quiet line, one
                     // invitation — both centered. `/` wires up in ROD-73.
                     const mid = top + visible / 2;
-                    centerText(win, mid -| 1, w, "nothing here yet", style(colors.fg3, .{ .italic = true }));
+                    centerText(win, mid -| 1, w, "nothing here yet", self.s(self.palette.fg3, .{ .italic = true }));
                     const action = " to search for a show";
                     const total: u16 = 1 + @as(u16, @intCast(action.len));
                     const start: u16 = if (w > total) (w - total) / 2 else 0;
-                    put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
-                    putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
+                    put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
+                    putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
                     return;
                 }
 
@@ -1786,29 +1823,29 @@ pub const App = struct {
                     // bg.surface (a full-width band), its marker is the ▸ play glyph in
                     // focus cyan, and its title goes cyan+bold. Magenta is reserved for
                     // the one cursor in the status bar — never a list marker (§8).
-                    const row_bg = if (selected) colors.bg_surface else colors.bg_base;
+                    const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
                     if (selected) {
-                        fillRow(win, row, w, colors.bg_surface);
-                        fillRow(win, row + 1, w, colors.bg_surface);
+                        fillRow(win, row, w, self.palette.bg_surface);
+                        fillRow(win, row + 1, w, self.palette.bg_surface);
                     }
 
                     const marker = if (selected) "▸ " else "  ";
-                    put(win, row, 2, marker, style(colors.focus, .{ .bg = row_bg }));
+                    put(win, row, 2, marker, self.s(self.palette.focus, .{ .bg = row_bg }));
 
                     const title_style = if (selected)
-                        style(colors.focus, .{ .bg = row_bg, .bold = true })
+                        self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
                     else
-                        style(colors.fg, .{ .bg = row_bg });
+                        self.s(self.palette.fg, .{ .bg = row_bg });
                     putClipped(win, row, title_col, title_w, rec.title, title_style);
 
                     if (show_meta and slot < self.meta_scratch.len) {
                         const meta = formatMeta(&self.meta_scratch[slot], rec);
-                        putClipped(win, row, meta_col, w - meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
+                        putClipped(win, row, meta_col, w - meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
                     }
 
                     // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
                     if (slot < self.bar_scratch.len) {
-                        drawProgressBar(win, row + 1, title_col, bar_w, rec, row_bg, &self.bar_scratch[slot]);
+                        drawProgressBar(win, row + 1, title_col, bar_w, rec, row_bg, &self.bar_scratch[slot], self.palette);
                     }
 
                     slot += 1;
@@ -1859,7 +1896,7 @@ pub const App = struct {
         var y = top;
 
         // Player — the first five interactive rows.
-        y = drawSettingsHeader(win, y, w, "Player");
+        y = self.drawSettingsHeader(win, y, w, "Player");
         var i: usize = 0;
         while (i < 5) : (i += 1) {
             const r = settings_rows[i];
@@ -1869,15 +1906,15 @@ pub const App = struct {
         y += 1;
 
         // Catalog — read-only system state, never focusable (skipped by nav).
-        y = drawSettingsHeader(win, y, w, "Catalog");
-        drawInertRow(win, y, w, "enrichment sync", "automatic");
+        y = self.drawSettingsHeader(win, y, w, "Catalog");
+        self.drawInertRow(win, y, w, "enrichment sync", "automatic");
         y += 1;
-        drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
+        self.drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
         y += 1;
         y += 1;
 
         // Interface — the remaining toggle rows.
-        y = drawSettingsHeader(win, y, w, "Interface");
+        y = self.drawSettingsHeader(win, y, w, "Interface");
         while (i < settings_rows.len) : (i += 1) {
             const r = settings_rows[i];
             self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
@@ -1885,23 +1922,23 @@ pub const App = struct {
         }
     }
 
-    fn drawSettingsHeader(win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {
-        put(win, y, settings_label_col, title, style(colors.fg, .{ .bold = true }));
+    fn drawSettingsHeader(self: *const App, win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {
+        put(win, y, settings_label_col, title, self.s(self.palette.fg, .{ .bold = true }));
         // Full-width hairline in `chrome` — a deliberate section boundary. The
         // source is a static literal (see settings_hairline): vaxis keeps the
         // slice by reference until render, so a stack buffer would dangle.
-        const cols = @min(w, settings_hairline_cols);
-        put(win, y + 1, 0, settings_hairline[0 .. cols * 3], style(colors.chrome, .{}));
+        const cols: u16 = @min(w, settings_hairline_cols);
+        put(win, y + 1, 0, settings_hairline[0 .. cols * 3], self.s(self.palette.chrome, .{}));
         return y + 2;
     }
 
     fn drawSettingRow(self: *App, win: vaxis.Window, y: u16, w: u16, row: SettingRow, value: []const u8, focused: bool) void {
         const editing = focused and self.settings_editing;
-        const row_bg = if (editing) colors.bg_elevated else if (focused) colors.bg_surface else colors.bg_base;
+        const row_bg = if (editing) self.palette.bg_elevated else if (focused) self.palette.bg_surface else self.palette.bg_base;
         if (editing) {
-            fillRow(win, y, w, colors.bg_elevated);
+            fillRow(win, y, w, self.palette.bg_elevated);
         } else if (focused) {
-            fillRow(win, y, w, colors.bg_surface);
+            fillRow(win, y, w, self.palette.bg_surface);
         }
 
         // ASCII separator on purpose: hint_col is computed from byte length, so a
@@ -1911,13 +1948,13 @@ pub const App = struct {
         const hint_col: u16 = if (w > hint_len + 2) w - 2 - hint_len else 0;
 
         const marker = if (focused) "▸ " else "  ";
-        const marker_color = if (editing) colors.hot else colors.focus;
-        put(win, y, 0, marker, style(marker_color, .{ .bg = row_bg }));
+        const marker_color = if (editing) self.palette.hot else self.palette.focus;
+        put(win, y, 0, marker, self.s(marker_color, .{ .bg = row_bg }));
 
         const label_style = if (focused)
-            style(colors.focus, .{ .bg = row_bg, .bold = true })
+            self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
         else
-            style(colors.fg, .{ .bg = row_bg });
+            self.s(self.palette.fg, .{ .bg = row_bg });
         putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, row.label, label_style);
 
         const value_budget: u16 = if (hint_col > settings_value_col + 2) hint_col - settings_value_col - 2 else 0;
@@ -1925,13 +1962,13 @@ pub const App = struct {
             self.drawSettingsEditField(win, y, settings_value_col, value_budget, row_bg);
         } else {
             const value_style = if (focused)
-                style(colors.fg, .{ .bg = row_bg })
+                self.s(self.palette.fg, .{ .bg = row_bg })
             else
-                style(colors.fg2, .{ .bg = row_bg });
+                self.s(self.palette.fg2, .{ .bg = row_bg });
             putClipped(win, y, settings_value_col, value_budget, value, value_style);
         }
 
-        put(win, y, hint_col, hint, style(colors.fg3, .{ .bg = row_bg }));
+        put(win, y, hint_col, hint, self.s(self.palette.fg3, .{ .bg = row_bg }));
     }
 
     /// Render the live edit buffer with an inverted cursor block at the end
@@ -1939,14 +1976,14 @@ pub const App = struct {
     fn drawSettingsEditField(self: *App, win: vaxis.Window, y: u16, col: u16, budget: u16, row_bg: vaxis.Color) void {
         const buf = self.settings_edit_buf[0..self.settings_edit_len];
         const text_budget: u16 = if (budget > 1) budget - 1 else 0;
-        putClipped(win, y, col, text_budget, buf, style(colors.fg, .{ .bg = row_bg }));
+        putClipped(win, y, col, text_budget, buf, self.s(self.palette.fg, .{ .bg = row_bg }));
         const cursor_off: u16 = @intCast(@min(buf.len, text_budget));
-        if (budget > 0) put(win, y, col + cursor_off, " ", style(colors.fg, .{ .bg = colors.hot }));
+        if (budget > 0) put(win, y, col + cursor_off, " ", self.s(self.palette.fg, .{ .bg = self.palette.hot }));
     }
 
     /// A non-interactive Catalog row: dim+italic, no marker, no hint.
-    fn drawInertRow(win: vaxis.Window, y: u16, w: u16, label: []const u8, value: []const u8) void {
-        const sty = style(colors.fg3, .{ .italic = true });
+    fn drawInertRow(self: *const App, win: vaxis.Window, y: u16, w: u16, label: []const u8, value: []const u8) void {
+        const sty = self.s(self.palette.fg3, .{ .italic = true });
         putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, label, sty);
         putClipped(win, y, settings_value_col, w -| settings_value_col, value, sty);
     }
@@ -1955,24 +1992,24 @@ pub const App = struct {
         const w = pane_w;
         if (self.search_len == 0) {
             const mid = pane_h / 2;
-            centerText(win, mid -| 1, w, "no feed yet", style(colors.fg3, .{ .italic = true }));
+            centerText(win, mid -| 1, w, "no feed yet", self.s(self.palette.fg3, .{ .italic = true }));
             const action = " to start a search";
             const total: u16 = 1 + @as(u16, @intCast(action.len));
             const start: u16 = if (w > total) (w - total) / 2 else 0;
-            put(win, mid + 1, start, "/", style(colors.focus, .{ .bold = true }));
-            putClipped(win, mid + 1, start + 1, w -| (start + 1), action, style(colors.fg2, .{}));
+            put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
+            putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
             return;
         }
         const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
         if (search_pending and self.results.items.len == 0) {
             const spin_msg = std.fmt.bufPrint(&self.no_results_buf, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
-            centerText(win, pane_h / 2, w, spin_msg, style(colors.focus, .{}));
+            centerText(win, pane_h / 2, w, spin_msg, self.s(self.palette.focus, .{}));
             return;
         }
         if (!search_pending and self.results.items.len == 0) {
             const q = self.querySlice();
             const msg = std.fmt.bufPrint(&self.no_results_buf, "no results for \"{s}\"", .{q}) catch "no results";
-            putClipped(win, 0, 0, w, msg, style(colors.fg3, .{ .italic = true }));
+            putClipped(win, 0, 0, w, msg, self.s(self.palette.fg3, .{ .italic = true }));
             return;
         }
 
@@ -1987,16 +2024,16 @@ pub const App = struct {
             const a = self.results.items[i];
             const selected = i == self.list_cursor;
 
-            const row_bg = if (selected) colors.bg_surface else colors.bg_base;
-            if (selected) fillRow(win, row, w, colors.bg_surface);
+            const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
+            if (selected) fillRow(win, row, w, self.palette.bg_surface);
 
             const marker = if (selected) "▸ " else "  ";
-            put(win, row, 0, marker, style(colors.focus, .{ .bg = row_bg }));
+            put(win, row, 0, marker, self.s(self.palette.focus, .{ .bg = row_bg }));
 
             const title_style = if (selected)
-                style(colors.focus, .{ .bg = row_bg, .bold = true })
+                self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
             else
-                style(colors.fg, .{ .bg = row_bg });
+                self.s(self.palette.fg, .{ .bg = row_bg });
             // Meta (eps) if pane is wide enough — rarely true in split view.
             const list_meta_col: u16 = 46;
             const show_list_meta = w >= list_meta_col + 8;
@@ -2013,7 +2050,7 @@ pub const App = struct {
                 const tt = self.translation;
                 const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
                 const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
-                putClipped(win, row, list_meta_col, w - list_meta_col, meta, style(colors.fg3, .{ .bg = row_bg }));
+                putClipped(win, row, list_meta_col, w - list_meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
                 slot += 1;
             }
             row += 1;
@@ -2026,8 +2063,8 @@ pub const App = struct {
             self.results.items.len > 0)
         {
             const footer = if (self.search_loading) "⠋ loading…" else "╌ more ╌";
-            const footer_color = if (self.search_loading) colors.focus else colors.fg3;
-            centerText(win, row, w, footer, style(footer_color, .{}));
+            const footer_color = if (self.search_loading) self.palette.focus else self.palette.fg3;
+            centerText(win, row, w, footer, self.s(footer_color, .{}));
         }
     }
 
@@ -2120,14 +2157,14 @@ pub const App = struct {
         const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
         if (cover_w > 0 and cover_h > 0) {
             const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
-            cover_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
+            cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
             if (anime) |a| {
                 const has_pixels = self.cover_pixels != null and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id);
                 if (a.thumb == null) {
-                    if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+                    if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
                 } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
                     const spin = std.fmt.bufPrint(&self.no_results_buf, "{s}", .{self.spinnerChar()}) catch "⠋";
-                    centerText(cover_win, cover_h / 2, cover_w, spin, style(colors.focus, .{}));
+                    centerText(cover_win, cover_h / 2, cover_w, spin, self.s(self.palette.focus, .{}));
                 } else if (has_pixels) {
                     if (self.ensureCoverImage(vx, writer)) {
                         if (self.cover_image) |img| {
@@ -2139,19 +2176,19 @@ pub const App = struct {
                         self.drawFallbackCover(cover_win);
                     }
                 } else if (cover_h > 1) {
-                    centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+                    centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
                 }
             } else if (cover_h > 1) {
-                centerText(cover_win, cover_h / 2, cover_w, "no art yet", style(colors.fg3, .{ .italic = true }));
+                centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
             }
             row += cover_h + 1;
         }
 
         // Title — the selected result's name, or placeholder.
         if (anime != null and !std.mem.eql(u8, info.title, "—")) {
-            putClipped(win, row, 0, w, info.title, style(colors.fg, .{ .bold = true }));
+            putClipped(win, row, 0, w, info.title, self.s(self.palette.fg, .{ .bold = true }));
         } else {
-            putClipped(win, row, 0, w, info.title, style(colors.fg3, .{}));
+            putClipped(win, row, 0, w, info.title, self.s(self.palette.fg3, .{}));
         }
         row += 1;
 
@@ -2167,24 +2204,24 @@ pub const App = struct {
         } else "[--/100]";
         const score_style = if (anime) |a| blk: {
             if (a.score) |score| {
-                if (score >= 91) break :blk style(colors.hot, .{ .bold = true });
-                if (score >= 76) break :blk style(colors.fg, .{});
-                if (score >= 51) break :blk style(colors.fg2, .{});
+                if (score >= 91) break :blk self.s(self.palette.hot, .{ .bold = true });
+                if (score >= 76) break :blk self.s(self.palette.fg, .{});
+                if (score >= 51) break :blk self.s(self.palette.fg2, .{});
             }
-            break :blk style(colors.fg3, .{});
-        } else style(colors.fg3, .{});
+            break :blk self.s(self.palette.fg3, .{});
+        } else self.s(self.palette.fg3, .{});
         putClipped(win, row, 0, w, score_text, score_style);
         row += 1;
 
         // Hairline.
         if (row < h) {
-            _ = win.printSegment(.{ .text = "─" ** 160, .style = .{ .fg = colors.chrome, .bg = colors.bg_base } }, .{ .row_offset = row });
+            _ = win.printSegment(.{ .text = "─" ** 160, .style = .{ .fg = self.palette.chrome, .bg = self.palette.bg_base } }, .{ .row_offset = row });
         }
         row += 1;
 
         // Metadata: episode count, falling back to AniList total when needed.
         if (row < h) {
-            const meta_style = if (info.has_meta) style(colors.fg2, .{}) else style(colors.fg3, .{});
+            const meta_style = if (info.has_meta) self.s(self.palette.fg2, .{}) else self.s(self.palette.fg3, .{});
             putClipped(win, row, 0, w, info.meta, meta_style);
             row += 1;
         }
@@ -2193,13 +2230,13 @@ pub const App = struct {
         if (row < h) {
             if (anime) |a| {
                 if (a.description) |desc| {
-                    row += drawWrappedText(win, row, 0, w, h - row, desc, style(colors.fg2, .{}));
+                    row += drawWrappedText(win, row, 0, w, h - row, desc, self.s(self.palette.fg2, .{}));
                 } else {
-                    putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
+                    putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
                     row += 1;
                 }
             } else {
-                putClipped(win, row, 0, w, "no synopsis yet", style(colors.fg2, .{ .italic = true }));
+                putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
                 row += 1;
             }
         }
@@ -2215,7 +2252,7 @@ pub const App = struct {
 
     fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         if (self.episode_loading) {
-            centerText(win, 0, w, "⠋ loading episodes…", style(colors.focus, .{}));
+            centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
             return;
         }
         const eps = self.episode_results orelse {
@@ -2223,7 +2260,7 @@ pub const App = struct {
             return;
         };
         if (eps.len == 0) {
-            putClipped(win, 0, 0, w, "no episodes", style(colors.fg3, .{ .italic = true }));
+            putClipped(win, 0, 0, w, "no episodes", self.s(self.palette.fg3, .{ .italic = true }));
             return;
         }
 
@@ -2255,9 +2292,9 @@ pub const App = struct {
                 const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
                 const cell_style = if (focused)
-                    style(colors.focus, .{ .bg = colors.bg_surface, .bold = true })
+                    self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
                 else
-                    style(colors.fg2, .{});
+                    self.s(self.palette.fg2, .{});
 
                 if (focused) {
                     const cell_win = win.child(.{
@@ -2266,7 +2303,7 @@ pub const App = struct {
                         .width = cell_w,
                         .height = 1,
                     });
-                    cell_win.fill(.{ .style = .{ .bg = colors.bg_surface } });
+                    cell_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
                     _ = cell_win.printSegment(.{ .text = cell_text, .style = cell_style }, .{});
                 } else {
                     putClipped(win, grid_row, col_off, cell_w, cell_text, cell_style);
@@ -2285,12 +2322,12 @@ pub const App = struct {
         // Search mode in Browse: suppress ▌, show /query_ + count.
         if (self.active_view == .browse and self.input_mode == .search) {
             const q = self.querySlice();
-            put(win, row, 2, "/", style(colors.focus, .{ .bold = true }));
+            put(win, row, 2, "/", self.s(self.palette.focus, .{ .bold = true }));
             const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
             if (q.len > 0) {
-                putClipped(win, row, 3, cursor_col -| 3, q, style(colors.fg, .{ .bold = true }));
+                putClipped(win, row, 3, cursor_col -| 3, q, self.s(self.palette.fg, .{ .bold = true }));
             }
-            if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
+            if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
             // Right-aligned count (text.muted = fg2 per §3.5).
             const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
                 "…"
@@ -2304,7 +2341,7 @@ pub const App = struct {
                 const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
                 // Overlap guard: suppress count if it would collide with the cursor.
                 if (cnt_col > cursor_col + 1) {
-                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg2, .{}));
+                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, self.s(self.palette.fg2, .{}));
                 }
             }
             return;
@@ -2313,12 +2350,12 @@ pub const App = struct {
         // Search mode in History: suppress ▌, show /filter_ + filtered count.
         if (self.active_view == .history and self.input_mode == .search) {
             const q = self.history_filter[0..self.history_filter_len];
-            put(win, row, 2, "/", style(colors.focus, .{ .bold = true }));
+            put(win, row, 2, "/", self.s(self.palette.focus, .{ .bold = true }));
             const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
             if (q.len > 0) {
-                putClipped(win, row, 3, cursor_col -| 3, q, style(colors.fg, .{ .bold = true }));
+                putClipped(win, row, 3, cursor_col -| 3, q, self.s(self.palette.fg, .{ .bold = true }));
             }
-            if (cursor_col < w) put(win, row, cursor_col, "_", style(colors.focus, .{ .bold = true }));
+            if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
             const n = self.filteredHistoryLen();
             const cnt: []const u8 = if (q.len == 0)
                 ""
@@ -2329,7 +2366,7 @@ pub const App = struct {
             if (cnt.len > 0) {
                 const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
                 if (cnt_col > cursor_col + 1) {
-                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, style(colors.fg2, .{}));
+                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, self.s(self.palette.fg2, .{}));
                 }
             }
             return;
@@ -2341,12 +2378,12 @@ pub const App = struct {
         if (any_loading) {
             const spin_color: vaxis.Color = if (self.async_start_ms > 0 and
                 self.now_ms - self.async_start_ms > 3000)
-                colors.hot
+                self.palette.hot
             else
-                colors.focus;
-            put(win, row, 2, self.spinnerChar(), style(spin_color, .{}));
+                self.palette.focus;
+            put(win, row, 2, self.spinnerChar(), self.s(spin_color, .{}));
         } else {
-            put(win, row, 2, "▌", style(colors.hot, .{ .blink = true }));
+            put(win, row, 2, "▌", self.s(self.palette.hot, .{ .blink = true }));
         }
 
         const help: []const u8 = switch (self.active_view) {
@@ -2364,7 +2401,7 @@ pub const App = struct {
             else
                 "hjkl navigate · space toggle · enter edit · q save & back",
         };
-        putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
+        putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, self.s(self.palette.fg3, .{}));
     }
 
     fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
@@ -2377,9 +2414,9 @@ pub const App = struct {
             const t = self.toast_queue[qi] orelse continue;
             if (row < 1) break;
             const fg_color: vaxis.Color = switch (t.kind) {
-                .@"error" => colors.hot,
-                .warn => colors.warn,
-                .info => colors.focus,
+                .@"error" => self.palette.hot,
+                .warn => self.palette.warn,
+                .info => self.palette.focus,
             };
             const prefix: []const u8 = switch (t.kind) {
                 .@"error" => "[!] ",
@@ -2392,11 +2429,11 @@ pub const App = struct {
             const txt_len: u16 = @intCast(t.text_len);
             const toast_w: u16 = @min(pre_len + txt_len, @min(40, w -| 2));
             const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
-            fillRow(win, row, w, colors.bg_elevated);
-            put(win, row, pre_col, prefix, style(fg_color, .{ .bold = true, .bg = colors.bg_elevated }));
+            fillRow(win, row, w, self.palette.bg_elevated);
+            put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
             const txt_col: u16 = pre_col + pre_len;
             const txt_w: u16 = if (toast_w > pre_len) toast_w - pre_len else 0;
-            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], style(fg_color, .{ .bg = colors.bg_elevated }));
+            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bg = self.palette.bg_elevated }));
             row -|= 1;
         }
     }
@@ -2424,3 +2461,13 @@ pub const App = struct {
         return n;
     }
 };
+
+const testing = std.testing;
+
+test "paletteFromConfig resolves known names and falls back for unknowns" {
+    try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig("terminal_ghost"));
+    try testing.expectEqual(&colors.phosphor, paletteFromConfig("phosphor"));
+    try testing.expectEqual(&colors.nord, paletteFromConfig("nord"));
+    try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig("garbage"));
+    try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig(""));
+}
