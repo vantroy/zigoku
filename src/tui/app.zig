@@ -26,10 +26,12 @@ const cover_mod = @import("../cover.zig");
 const event_mod = @import("event.zig");
 const render = @import("render.zig");
 const workers = @import("workers.zig");
+const config_mod = @import("../config.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
+const Config = config_mod.Config;
 const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Event = event_mod.Event;
@@ -66,6 +68,7 @@ pub fn run(
     environ_map: *std.process.Environ.Map,
     store: ?*Store,
     provider: SourceProvider,
+    config: Config,
 ) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -101,6 +104,10 @@ pub fn run(
     var app: App = .{};
     app.gpa = gpa;
     app.store = store;
+    app.config = config;
+    // The configured sub/dub default seeds the search translation; the user can
+    // still toggle it live in-session (ROD-85).
+    app.translation = config.translationEnum();
     defer app.deinitOwnedState(&vx, writer);
 
     // History memory lives in an arena owned here and freed on exit — matching
@@ -301,6 +308,15 @@ pub const App = struct {
     playing_translation: domain.Translation = .sub,
     /// Store reference — set in run() for getResume in the play thread.
     store: ?*Store = null,
+    /// User config (ROD-85). Set in run(); string fields are arena-borrowed and
+    /// outlive every worker thread.
+    ///
+    /// ROD-86 ownership note: today every string field is either a static
+    /// literal default or a load-time gpa allocation that's never freed. When
+    /// the Settings tab starts mutating these, freeing the old value is only
+    /// correct for gpa-owned strings — never free a default literal. Track
+    /// provenance (or dupe-all-on-load) before wiring in-place edits.
+    config: Config = .{},
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
     /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
@@ -1114,6 +1130,8 @@ pub const App = struct {
             start_seconds,
             mal_id,
             episode_index,
+            self.config.mpv_path,
+            self.config.skip_mode,
         }) catch {
             self.clearPlayingSession();
             self.gpa.free(id_copy);

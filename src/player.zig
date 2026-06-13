@@ -141,14 +141,16 @@ fn positionWatcher(io: Io, socket_path: []const u8, callback: PositionCallback) 
 
 /// Launch mpv on `link` and block until it exits.
 ///
-/// `title` becomes mpv's window/OSD title. `start_seconds` is the resume offset.
-/// When `position_callback` is present, a watcher thread observes mpv's unix
-/// socket IPC and reports live time-pos/duration updates until mpv exits.
-/// When `skip` is present, its Lua script + opts are loaded so mpv auto-skips
-/// the OP/ED (ROD-83).
+/// `mpv_path` is the mpv binary to exec — an absolute path, or a bare `"mpv"`
+/// to resolve via `$PATH` (ROD-85 config). `title` becomes mpv's window/OSD
+/// title. `start_seconds` is the resume offset. When `position_callback` is
+/// present, a watcher thread observes mpv's unix socket IPC and reports live
+/// time-pos/duration updates until mpv exits. When `skip` is present, its Lua
+/// script + opts are loaded so mpv auto-skips the OP/ED (ROD-83).
 pub fn play(
     arena: std.mem.Allocator,
     io: Io,
+    mpv_path: []const u8,
     link: domain.StreamLink,
     title: []const u8,
     start_seconds: u64,
@@ -158,7 +160,7 @@ pub fn play(
     const socket_path = try mpvSocketPath(arena);
 
     var argv: std.ArrayList([]const u8) = .empty;
-    try argv.append(arena, "mpv");
+    try argv.append(arena, mpv_path);
     try argv.append(arena, link.url);
     if (link.referer) |r| {
         // Safe today: referer is a hardcoded constant. When ROD-92 lands and
