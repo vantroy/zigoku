@@ -1070,10 +1070,17 @@ pub const App = struct {
             }
         }
 
-        const title_src: []const u8 = if (self.currentDetailAnime()) |anime|
+        const detail_anime = self.currentDetailAnime();
+        const title_src: []const u8 = if (detail_anime) |anime|
             anime.name
         else
             "zigoku";
+        // ROD-83: MAL id for AniSkip, when enrichment has supplied one. `playTask`
+        // falls back to a Jikan lookup when this is null.
+        const mal_id: ?u32 = if (detail_anime) |anime|
+            (if (anime.mal_id) |m| std.math.cast(u32, m) else null)
+        else
+            null;
 
         const id_copy = self.gpa.dupe(u8, selected_id) catch return;
         const ep_copy = self.gpa.dupe(u8, ep.raw) catch {
@@ -1105,6 +1112,8 @@ pub const App = struct {
             self.translation,
             title_copy,
             start_seconds,
+            mal_id,
+            episode_index,
         }) catch {
             self.clearPlayingSession();
             self.gpa.free(id_copy);

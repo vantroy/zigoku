@@ -24,6 +24,15 @@ pub const PositionUpdate = struct {
     duration: f64,
 };
 
+/// An mpv user-script to load for this playback, with its `--script-opts` value.
+/// AniSkip (ROD-83) builds these; `play` just wires them onto the command line.
+pub const SkipScript = struct {
+    /// Absolute path to the `.lua` script.
+    path: []const u8,
+    /// Value for `--script-opts` (e.g. `aniskip-op_start=12.5,...`).
+    opts: []const u8,
+};
+
 pub const PositionCallback = struct {
     ctx: *anyopaque,
     func: *const fn (ctx: *anyopaque, update: PositionUpdate) void,
@@ -135,6 +144,8 @@ fn positionWatcher(io: Io, socket_path: []const u8, callback: PositionCallback) 
 /// `title` becomes mpv's window/OSD title. `start_seconds` is the resume offset.
 /// When `position_callback` is present, a watcher thread observes mpv's unix
 /// socket IPC and reports live time-pos/duration updates until mpv exits.
+/// When `skip` is present, its Lua script + opts are loaded so mpv auto-skips
+/// the OP/ED (ROD-83).
 pub fn play(
     arena: std.mem.Allocator,
     io: Io,
@@ -142,6 +153,7 @@ pub fn play(
     title: []const u8,
     start_seconds: u64,
     position_callback: ?PositionCallback,
+    skip: ?SkipScript,
 ) !void {
     const socket_path = try mpvSocketPath(arena);
 
@@ -158,6 +170,10 @@ pub fn play(
     try argv.append(arena, try std.fmt.allocPrint(arena, "--input-ipc-server={s}", .{socket_path}));
     if (start_seconds > 0) {
         try argv.append(arena, try std.fmt.allocPrint(arena, "--start={d}", .{start_seconds}));
+    }
+    if (skip) |s| {
+        try argv.append(arena, try std.fmt.allocPrint(arena, "--script={s}", .{s.path}));
+        try argv.append(arena, try std.fmt.allocPrint(arena, "--script-opts={s}", .{s.opts}));
     }
 
     cleanupSocket(io, socket_path);
