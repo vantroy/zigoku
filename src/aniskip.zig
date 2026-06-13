@@ -108,8 +108,13 @@ fn timesFromResults(results: []const ResultItem) SkipTimes {
     return t;
 }
 
+/// Minimum OP/ED length we'll act on. Below this a skip isn't worth announcing,
+/// and — since the script announces then seeks 0.4s later — a sub-second window
+/// could be overrun by natural playback and turn the absolute seek into a rewind.
+const min_interval_secs: f64 = 1.0;
+
 fn validInterval(iv: Interval) bool {
-    return iv.startTime >= 0 and iv.endTime > iv.startTime;
+    return iv.startTime >= 0 and iv.endTime - iv.startTime >= min_interval_secs;
 }
 
 /// Build the `--script-opts` value for `times` under `mode`, or `null` when there
@@ -172,34 +177,55 @@ pub fn prepare(
 /// The mpv user-script. Reads the OP/ED window from `--script-opts` and seeks
 /// past whichever segment the current `time-pos` falls inside. `-1` disables a
 /// segment; `mode` gates intro vs outro.
+///
+/// UX (design: Mira): announce the skip *before* cutting so the jump reads as
+/// intentional, not a glitch. `skip_section` shows a calm OSD line, then seeks a
+/// beat later. The `skipped` flags debounce the high-frequency time-pos observer
+/// so the deferred seek fires exactly once per segment; `file-loaded` resets them
+/// in case episodes are ever chained in one mpv process. To restyle the toast
+/// (dim/top-left), prefix the label with ASS tags, e.g. `{\an7\fs18\alpha&H80&}`.
 const LUA_SCRIPT =
     \\local opts = require("mp.options")
     \\local o = { op_start = -1, op_end = -1, ed_start = -1, ed_end = -1, mode = "both" }
     \\opts.read_options(o, "aniskip")
+    \\
+    \\local skipped = { op = false, ed = false }
+    \\
+    \\local function skip_section(target, label)
+    \\    mp.osd_message(label, 2.0)
+    \\    mp.add_timeout(0.4, function()
+    \\        mp.commandv("seek", target, "absolute")
+    \\    end)
+    \\end
+    \\
     \\mp.observe_property("time-pos", "number", function(_, pos)
     \\    if not pos then return end
     \\    if (o.mode == "intro" or o.mode == "both") and o.op_start >= 0
-    \\        and pos >= o.op_start and pos < o.op_end then
-    \\        mp.commandv("seek", o.op_end, "absolute")
+    \\        and not skipped.op and pos >= o.op_start and pos < o.op_end then
+    \\        skipped.op = true
+    \\        skip_section(o.op_end, "Skipping intro...")
     \\    end
     \\    if (o.mode == "outro" or o.mode == "both") and o.ed_start >= 0
-    \\        and pos >= o.ed_start and pos < o.ed_end then
-    \\        mp.commandv("seek", o.ed_end, "absolute")
+    \\        and not skipped.ed and pos >= o.ed_start and pos < o.ed_end then
+    \\        skipped.ed = true
+    \\        skip_section(o.ed_end, "Skipping ending...")
     \\    end
+    \\end)
+    \\
+    \\mp.register_event("file-loaded", function()
+    \\    skipped.op = false
+    \\    skipped.ed = false
     \\end)
     \\
 ;
 
-/// Ensure `skip.lua` exists in the cache dir and return its absolute path. Writes
-/// the script only when it's missing.
+/// Write `skip.lua` to the cache dir and return its absolute path. Always
+/// rewrites: the script evolves between app versions, and a ~900-byte write once
+/// per playback launch is cheaper than reasoning about staleness.
 fn ensureScript(arena: Allocator, io: Io) ![]const u8 {
     const dir = try cacheDir(arena);
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
     const path = try std.fmt.allocPrint(arena, "{s}/skip.lua", .{dir});
-
-    if (std.Io.Dir.accessAbsolute(io, path, .{})) |_| {
-        return path; // already written
-    } else |_| {}
 
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
@@ -252,6 +278,14 @@ test "timesFromResults drops degenerate intervals" {
     const t = timesFromResults(&results);
     try std.testing.expectEqual(@as(?f64, null), t.op_start);
     try std.testing.expectEqual(@as(?f64, null), t.ed_start);
+}
+
+test "timesFromResults drops sub-second intervals" {
+    const results = [_]ResultItem{
+        .{ .interval = .{ .startTime = 10, .endTime = 10.5 }, .skipType = "op" }, // 0.5s
+    };
+    const t = timesFromResults(&results);
+    try std.testing.expectEqual(@as(?f64, null), t.op_start);
 }
 
 test "timesFromResults parses real API field name (skipType)" {
