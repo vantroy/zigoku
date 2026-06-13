@@ -76,12 +76,22 @@ pub fn main(init: std.process.Init) !void {
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
 
+    // User config (ROD-85). Total: a missing/bad file yields defaults, so this
+    // never blocks startup. Arena-allocated → lives for the whole process. When
+    // neither $XDG_CONFIG_HOME nor $HOME is set there's no path to read — go
+    // straight to defaults rather than hand an empty (non-absolute) path to
+    // openFileAbsolute, whose absolute-path assert would panic in debug builds.
+    const cfg = if (zigoku.config.defaultPath(arena)) |p|
+        zigoku.config.load(arena, io, p)
+    else |_|
+        zigoku.Config{};
+
     const cli = parseArgs(arena, args) catch |err| switch (err) {
         // No positional query → open the TUI, M3's default interface. This also
         // catches a lone flag like `zigoku --dub` (no query): the flag is
         // dropped and the TUI opens. Malformed flags (UnknownFlag/MissingValue)
         // still fall through to usage.
-        error.NoQuery => return runTui(init, arena),
+        error.NoQuery => return runTui(init, arena, cfg),
         else => {
             try usage(out);
             try out.flush();
@@ -102,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (store_opt) |*st| st.close();
 
-    run(arena, io, out, in, cli, if (store_opt) |*st| st else null) catch |err| {
+    run(arena, io, out, in, cli, cfg, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err);
         try out.flush();
         std.process.exit(1);
@@ -118,17 +128,17 @@ fn openStore(arena: std.mem.Allocator) !zigoku.Store {
 
 /// Launch the libvaxis TUI (ROD-71). Persistence is best-effort — if the DB
 /// won't open, the shell just shows an empty history rather than refusing to run.
-fn runTui(init: std.process.Init, arena: std.mem.Allocator) !void {
+fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config) !void {
     var store_opt: ?zigoku.Store = openStore(arena) catch null;
     defer if (store_opt) |*st| st.close();
     var allanime = zigoku.AllAnime.init();
     const provider = allanime.provider();
-    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider);
+    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg);
 }
 
 /// The whole vertical slice, top to bottom. `store` is optional — every
 /// persistence touch is best-effort so a DB hiccup never blocks playback.
-fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, store: ?*zigoku.Store) !void {
+fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, cfg: zigoku.Config, store: ?*zigoku.Store) !void {
     try zigoku.writeBanner(out);
     if (!std.mem.eql(u8, cli.quality, "best")) {
         try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
@@ -216,13 +226,13 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     // on a worker), so tell the user before the Jikan/AniSkip round-trips.
     try out.print("  ⏭ checking skip data…\n", .{});
     try out.flush();
-    const skip = zigoku.aniskip.prepare(arena, io, known_mal, show.name, zigoku.aniskip.episodeNumber(episode.raw, @intCast(ep_idx + 1)), .both);
+    const skip = zigoku.aniskip.prepare(arena, io, known_mal, show.name, zigoku.aniskip.episodeNumber(episode.raw, @intCast(ep_idx + 1)), zigoku.aniskip.SkipMode.fromString(cfg.skip_mode));
 
     try out.print("  ▶ launching mpv…\n", .{});
     try out.flush();
 
     var progress: PlaybackProgress = .{};
-    zigoku.player.play(arena, io, link, title, start_seconds, .{
+    zigoku.player.play(arena, io, cfg.mpv_path, link, title, start_seconds, .{
         .ctx = @ptrCast(&progress),
         .func = recordPlaybackProgress,
     }, skip) catch |err| {

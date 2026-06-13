@@ -272,7 +272,9 @@ fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
 
 /// Background task: resolve stream and launch mpv.
 /// All string params are GPA-owned by this task and freed before return.
-pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64, mal_id: ?u32, episode_ordinal: u32) void {
+/// `mpv_path` and `skip_mode` are borrowed from `App.config` (ROD-85), which
+/// outlives this thread — they must not be freed here.
+pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64, mal_id: ?u32, episode_ordinal: u32, mpv_path: []const u8, skip_mode: []const u8) void {
     defer gpa.free(id);
     defer gpa.free(ep_raw);
     defer gpa.free(title);
@@ -287,11 +289,11 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     };
 
     // ROD-83: fetch OP/ED skip data on this worker thread (never the UI thread).
-    const skip = aniskip.prepare(arena.allocator(), io, mal_id, title, aniskip.episodeNumber(ep_raw, episode_ordinal), .both);
+    const skip = aniskip.prepare(arena.allocator(), io, mal_id, title, aniskip.episodeNumber(ep_raw, episode_ordinal), aniskip.SkipMode.fromString(skip_mode));
 
     var progress: PlaybackProgress = .{};
     var callback_ctx: PlayTaskCallbackCtx = .{ .loop = loop, .progress = &progress };
-    player_mod.play(arena.allocator(), io, link, title, start_seconds, .{
+    player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
         .ctx = @ptrCast(&callback_ctx),
         .func = postPositionUpdate,
     }, skip) catch {

@@ -24,9 +24,19 @@ const c = @cImport({
 
 const ENDPOINT = "https://api.aniskip.com/v2/skip-times";
 
-/// Which segments to auto-skip. Mirrors the future `config.skip_mode` (ROD-85);
-/// until config lands, callers pass `.both`.
-pub const SkipMode = enum { none, intro, outro, both };
+/// Which segments to auto-skip. Mirrors `config.skip_mode` (ROD-85).
+pub const SkipMode = enum {
+    none,
+    intro,
+    outro,
+    both,
+
+    /// Parse the `config.skip_mode` string, defaulting to `.both` for anything
+    /// unrecognized — a typo in the config never silently disables skipping.
+    pub fn fromString(s: []const u8) SkipMode {
+        return std.meta.stringToEnum(SkipMode, s) orelse .both;
+    }
+};
 
 /// Resolved skip window for one episode. Any field left `null` means AniSkip had
 /// no timestamp for that segment.
