@@ -23,6 +23,10 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
   status-aware episode-list cache.
 - **AniList enrichment**: AllAnime results are mapped to AniList entries for
   richer metadata and cover art.
+- **Config & settings**: live-editable settings tab (mpv path, quality, language,
+  AniSkip mode, cover art, themes). Persisted to `~/.config/zigoku/config.zon`.
+  Three built-in color palettes: `terminal_ghost` (default green-on-void),
+  `phosphor` (monochrome phosphor green), and `nord`.
 - **Scriptable CLI** alongside the TUI: `zigoku <query>` runs the original
   prompt-driven search → pick → play flow, headless-friendly.
 
@@ -62,7 +66,7 @@ issue IDs in commit messages map back to it.
 | **M3** | TUI shell: libvaxis, tabs, search/detail/history views | ✅ done |
 | **M4** | Cover art: Kitty graphics, async pipeline, LRU caches, AniList bridge | ✅ done |
 | **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip, full stream resolver & quality select | 🚧 in progress |
-| **M6** | Config & settings: config file, settings tab, themes | planned |
+| **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
 | **M7** | Distribution & hardening: error/logging pass, cross-platform paths, release builds | planned |
 | **M8** | Nice-to-haves: wide-terminal history layout & beyond | planned |
 
