@@ -231,6 +231,13 @@ comptime {
     std.debug.assert(settings_rows[5].id == .cover_art);
 }
 
+/// Static-lifetime hairline source for the Settings headers. vaxis stores
+/// printed text *by reference* (a cell's grapheme points into the passed
+/// slice), so this must outlive vx.render(): a comptime literal lives in
+/// rodata; a stack buffer would dangle and render as garbage.
+const settings_hairline_cols = 256;
+const settings_hairline = "─" ** settings_hairline_cols;
+
 const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
 const language_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
@@ -416,6 +423,10 @@ pub const App = struct {
     /// here on confirm, so the edited value outlives the edit buffer without
     /// touching the original literal/arena slice.
     settings_text_buf: [256]u8 = undefined,
+    /// Scratch for a formatted settings value (e.g. "5s"). App-owned, not a
+    /// draw-local stack buffer, because vaxis keeps the printed slice by
+    /// reference until render — a stack buffer would dangle.
+    settings_value_buf: [16]u8 = undefined,
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
     /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
@@ -1845,7 +1856,6 @@ pub const App = struct {
 
     fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16) void {
         _ = visible; // settings fits; vaxis clips any overflow against the window
-        var vbuf: [32]u8 = undefined;
         var y = top;
 
         // Player — the first five interactive rows.
@@ -1853,7 +1863,7 @@ pub const App = struct {
         var i: usize = 0;
         while (i < 5) : (i += 1) {
             const r = settings_rows[i];
-            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &vbuf), i == self.settings_cursor);
+            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
             y += 1;
         }
         y += 1;
@@ -1870,22 +1880,18 @@ pub const App = struct {
         y = drawSettingsHeader(win, y, w, "Interface");
         while (i < settings_rows.len) : (i += 1) {
             const r = settings_rows[i];
-            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &vbuf), i == self.settings_cursor);
+            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
             y += 1;
         }
     }
 
     fn drawSettingsHeader(win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {
         put(win, y, settings_label_col, title, style(colors.fg, .{ .bold = true }));
-        // Full-width hairline in `chrome` — a deliberate section boundary.
-        var buf: [768]u8 = undefined;
-        var n: usize = 0;
-        var col: u16 = 0;
-        while (col < w and n + 3 <= buf.len) : (col += 1) {
-            @memcpy(buf[n..][0..3], "─");
-            n += 3;
-        }
-        put(win, y + 1, 0, buf[0..n], style(colors.chrome, .{}));
+        // Full-width hairline in `chrome` — a deliberate section boundary. The
+        // source is a static literal (see settings_hairline): vaxis keeps the
+        // slice by reference until render, so a stack buffer would dangle.
+        const cols = @min(w, settings_hairline_cols);
+        put(win, y + 1, 0, settings_hairline[0 .. cols * 3], style(colors.chrome, .{}));
         return y + 2;
     }
 
