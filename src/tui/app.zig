@@ -69,6 +69,7 @@ pub fn run(
     store: ?*Store,
     provider: SourceProvider,
     config: Config,
+    config_path: ?[]const u8,
 ) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -105,6 +106,7 @@ pub fn run(
     app.gpa = gpa;
     app.store = store;
     app.config = config;
+    app.config_path = config_path;
     // The configured sub/dub default seeds the search translation; the user can
     // still toggle it live in-session (ROD-85).
     app.translation = config.translationEnum();
@@ -178,6 +180,88 @@ pub const Toast = struct {
     /// Persistent toasts survive TTL and are only cleared by a recovery path.
     persistent: bool = false,
 };
+
+// ── Settings tab model (ROD-86) ─────────────────────────────────────────────
+//
+// The Settings tab edits `App.config` (ROD-85) in place. Only the *interactive*
+// rows live in this table — Catalog's two read-only rows are rendered separately
+// and skipped by navigation. Cycle/toggle write scalar or preset-literal fields
+// (always safe — presets are static literals); the one editable text field
+// (mpv_path) commits into `App.settings_text_buf`.
+
+const SettingId = enum {
+    mpv_path,
+    default_quality,
+    subtitle_language,
+    resume_offset,
+    skip_mode,
+    cover_art,
+    kanji_chips,
+};
+
+const SettingKind = enum { text, cycle, toggle };
+
+const SettingRow = struct {
+    id: SettingId,
+    label: []const u8,
+    kind: SettingKind,
+    hint: []const u8,
+};
+
+const settings_rows = [_]SettingRow{
+    .{ .id = .mpv_path, .label = "mpv path", .kind = .text, .hint = "enter to edit" },
+    .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "h/l cycle" },
+    .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "h/l cycle" },
+    .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "h/l cycle" },
+    .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "h/l cycle" },
+    .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space" },
+    .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space" },
+};
+
+/// Number of interactive (focusable) settings rows — the Catalog rows are not
+/// in `settings_rows` and are skipped by navigation. Exposed for tests.
+pub const settings_row_count = settings_rows.len;
+
+comptime {
+    // `drawSettings` splits this table 0..5 = Player, 5..7 = Interface. Pin the
+    // boundary so inserting/removing a row can't silently misattribute it to the
+    // wrong group header — this breaks the build instead.
+    std.debug.assert(settings_rows.len == 7);
+    std.debug.assert(settings_rows[4].id == .skip_mode);
+    std.debug.assert(settings_rows[5].id == .cover_art);
+}
+
+const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
+const language_presets = [_][]const u8{ "sub", "dub" };
+const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
+const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
+
+/// Step through a preset list to the value after (`dir > 0`) or before the
+/// current one, wrapping. An unrecognized current value starts from index 0.
+/// Returns a static preset literal — safe to assign into a config string field.
+fn cyclePreset(presets: []const []const u8, current: []const u8, dir: i8) []const u8 {
+    var idx: usize = 0;
+    for (presets, 0..) |p, i| {
+        if (std.mem.eql(u8, p, current)) {
+            idx = i;
+            break;
+        }
+    }
+    const n = presets.len;
+    return presets[if (dir > 0) (idx + 1) % n else (idx + n - 1) % n];
+}
+
+fn cyclePresetU32(presets: []const u32, current: u32, dir: i8) u32 {
+    var idx: usize = 0;
+    for (presets, 0..) |p, i| {
+        if (p == current) {
+            idx = i;
+            break;
+        }
+    }
+    const n = presets.len;
+    return presets[if (dir > 0) (idx + 1) % n else (idx + n - 1) % n];
+}
 
 pub const App = struct {
     should_quit: bool = false,
@@ -309,14 +393,29 @@ pub const App = struct {
     /// Store reference — set in run() for getResume in the play thread.
     store: ?*Store = null,
     /// User config (ROD-85). Set in run(); string fields are arena-borrowed and
-    /// outlive every worker thread.
-    ///
-    /// ROD-86 ownership note: today every string field is either a static
-    /// literal default or a load-time gpa allocation that's never freed. When
-    /// the Settings tab starts mutating these, freeing the old value is only
-    /// correct for gpa-owned strings — never free a default literal. Track
-    /// provenance (or dupe-all-on-load) before wiring in-place edits.
+    /// outlive every worker thread. The Settings tab (ROD-86) mutates this in
+    /// place: cycle/toggle write scalar + preset-literal fields directly; the
+    /// only editable *text* field (mpv_path) is committed into
+    /// `settings_text_buf` below, so we never free a default literal or the
+    /// load arena — we just re-point the slice.
     config: Config = .{},
+    /// Resolved config-file path for `save()` on `q` (ROD-86). Borrowed from
+    /// run()'s process-lifetime arena. Null when no $HOME/$XDG_CONFIG_HOME — in
+    /// which case settings still edit live but can't persist.
+    config_path: ?[]const u8 = null,
+
+    /// Settings tab (ROD-86) cursor over the *interactive* rows only (the two
+    /// Catalog rows are non-interactive and skipped by navigation).
+    settings_cursor: usize = 0,
+    /// Whether the focused text field is in edit mode (captures printable keys).
+    settings_editing: bool = false,
+    /// Live edit buffer while `settings_editing`; seeded from the field's value.
+    settings_edit_buf: [256]u8 = undefined,
+    settings_edit_len: usize = 0,
+    /// Committed home for an edited mpv_path. `config.mpv_path` is re-pointed
+    /// here on confirm, so the edited value outlives the edit buffer without
+    /// touching the original literal/arena slice.
+    settings_text_buf: [256]u8 = undefined,
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
     /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
@@ -1213,15 +1312,165 @@ pub const App = struct {
         }
     }
 
+    // ── Settings tab (ROD-86) ───────────────────────────────────────────────
+
+    /// Handle a key while the Settings tab is active. Returns true if the key
+    /// was consumed; false lets it fall through to the global chain (F-keys to
+    /// switch views, Esc to leave, Ctrl-C to quit).
+    fn onSettingsKey(self: *App, key: vaxis.Key, io: std.Io) bool {
+        if (self.settings_editing) return self.onSettingsEditKey(key);
+
+        const row = settings_rows[self.settings_cursor];
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            if (self.settings_cursor + 1 < settings_rows.len) self.settings_cursor += 1;
+            return true;
+        }
+        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            if (self.settings_cursor > 0) self.settings_cursor -= 1;
+            return true;
+        }
+        if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+            if (row.kind == .cycle) self.settingsCycle(row.id, 1);
+            return true;
+        }
+        if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            if (row.kind == .cycle) self.settingsCycle(row.id, -1);
+            return true;
+        }
+        if (key.matches(vaxis.Key.space, .{})) {
+            if (row.kind == .toggle) self.settingsToggle(row.id);
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (row.kind == .text) self.beginSettingsEdit(row.id);
+            return true;
+        }
+        if (key.matches('q', .{})) {
+            self.saveSettings(io);
+            self.active_view = .browse;
+            self.active_pane = .list;
+            return true;
+        }
+        return false;
+    }
+
+    /// Key handling while a text field is being edited. Swallows every key —
+    /// except the Ctrl-C emergency quit — so a stray F-key can't switch views
+    /// mid-edit; only Esc/Enter resolve the edit itself.
+    fn onSettingsEditKey(self: *App, key: vaxis.Key) bool {
+        // Ctrl-C must hard-quit from anywhere, including a modal text field.
+        if (key.matches('c', .{ .ctrl = true })) return false;
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.settings_editing = false; // cancel — discard the buffer
+            return true;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            self.commitSettingsEdit();
+            return true;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.settings_edit_len > 0) self.settings_edit_len -= 1;
+            return true;
+        }
+        if (key.text) |text| {
+            for (text) |ch| {
+                // Printable ASCII only — paths and presets never need control bytes.
+                if (ch >= 0x20 and ch < 0x7f and self.settings_edit_len < self.settings_edit_buf.len) {
+                    self.settings_edit_buf[self.settings_edit_len] = ch;
+                    self.settings_edit_len += 1;
+                }
+            }
+        }
+        return true;
+    }
+
+    fn settingsCycle(self: *App, id: SettingId, dir: i8) void {
+        switch (id) {
+            .default_quality => self.config.default_quality = cyclePreset(&quality_presets, self.config.default_quality, dir),
+            .subtitle_language => {
+                self.config.translation = cyclePreset(&language_presets, self.config.translation, dir);
+                // Keep the live search translation in lockstep with the setting.
+                self.translation = self.config.translationEnum();
+            },
+            .skip_mode => self.config.skip_mode = cyclePreset(&skip_presets, self.config.skip_mode, dir),
+            .resume_offset => self.config.resume_offset_sec = cyclePresetU32(&resume_presets, self.config.resume_offset_sec, dir),
+            else => {},
+        }
+    }
+
+    fn settingsToggle(self: *App, id: SettingId) void {
+        switch (id) {
+            .cover_art => self.config.cover_art = !self.config.cover_art,
+            .kanji_chips => self.config.kanji_chips = !self.config.kanji_chips,
+            else => {},
+        }
+    }
+
+    fn beginSettingsEdit(self: *App, id: SettingId) void {
+        const cur: []const u8 = switch (id) {
+            .mpv_path => self.config.mpv_path,
+            else => return, // only text fields are editable
+        };
+        const n = @min(cur.len, self.settings_edit_buf.len);
+        @memcpy(self.settings_edit_buf[0..n], cur[0..n]);
+        self.settings_edit_len = n;
+        self.settings_editing = true;
+    }
+
+    /// Commit the edit buffer into the field. mpv_path is the only text field;
+    /// an empty buffer is treated as a no-op so we never hand mpv a blank argv0.
+    fn commitSettingsEdit(self: *App) void {
+        defer self.settings_editing = false;
+        const n = self.settings_edit_len;
+        if (n == 0) return;
+        @memcpy(self.settings_text_buf[0..n], self.settings_edit_buf[0..n]);
+        self.config.mpv_path = self.settings_text_buf[0..n];
+    }
+
+    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
+    fn saveSettings(self: *App, io: std.Io) void {
+        const path = self.config_path orelse {
+            self.pushToast(.warn, "no config dir — not saved", false);
+            return;
+        };
+        config_mod.save(io, self.config, path) catch {
+            self.pushToast(.@"error", "settings save failed", false);
+            return;
+        };
+        self.pushToast(.info, "settings saved", false);
+    }
+
+    /// Display string for a setting's current value. `buf` backs the formatted
+    /// scalar values (resume offset, on/off); string fields return a borrow.
+    fn settingsValue(self: *App, id: SettingId, buf: []u8) []const u8 {
+        return switch (id) {
+            .mpv_path => self.config.mpv_path,
+            .default_quality => self.config.default_quality,
+            .subtitle_language => self.config.translation,
+            .skip_mode => self.config.skip_mode,
+            .resume_offset => std.fmt.bufPrint(buf, "{d}s", .{self.config.resume_offset_sec}) catch "?",
+            .cover_art => if (self.config.cover_art) "on" else "off",
+            .kanji_chips => if (self.config.kanji_chips) "on" else "off",
+        };
+    }
+
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Settings owns its keys first (cycle/toggle/edit/save); anything it
+        // doesn't consume falls through to the global chain below.
+        if (self.active_view == .settings and self.onSettingsKey(key, io)) return;
+
         // q key behavior by view (§10.6).
         if (key.matches('q', .{})) {
             switch (self.active_view) {
                 .browse => self.should_quit = true,
-                .history, .settings => {
+                // Settings never reaches here: onSettingsKey above intercepts q
+                // to save-then-leave. Keep it out of this arm so a future change
+                // can't silently route a settings-q exit past saveSettings.
+                .history => {
                     self.active_view = .browse;
                     self.active_pane = .list;
                 },
+                .settings => unreachable,
                 .detail => {
                     self.active_view = switch (self.detail_origin) {
                         .browse => .browse,
@@ -1266,6 +1515,11 @@ pub const App = struct {
                 self.active_pane = .list;
                 self.list_cursor = 0;
                 self.list_top = 0;
+                // Land on a clean Settings state: top row, not editing, and
+                // never inheriting a stray search mode from the prior view.
+                self.settings_cursor = 0;
+                self.settings_editing = false;
+                self.input_mode = .normal;
             }
             return;
         }
@@ -1576,12 +1830,119 @@ pub const App = struct {
                 self.drawDetailPane(vx, writer, detail_win, body_w, visible, w);
             },
 
-            .settings => {
-                // Settings stub (ROD-75/76 territory).
-                const mid = top + visible / 2;
-                centerText(win, mid, w, "settings — coming soon", style(colors.fg3, .{ .italic = true }));
-            },
+            .settings => self.drawSettings(win, top, visible, w),
         }
+    }
+
+    // ── Settings render (ROD-86, Mira's §5.5 contract) ──────────────────────
+    //
+    // Columns (relative to the body window): marker 0–1, label @4, value @36,
+    // hint right-anchored at w-2-len. Focus matches the Browse list (bg_surface
+    // fill, no loud cyan). Edit mode deepens to bg_elevated + a magenta marker.
+
+    const settings_label_col: u16 = 4;
+    const settings_value_col: u16 = 36;
+
+    fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16) void {
+        _ = visible; // settings fits; vaxis clips any overflow against the window
+        var vbuf: [32]u8 = undefined;
+        var y = top;
+
+        // Player — the first five interactive rows.
+        y = drawSettingsHeader(win, y, w, "Player");
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            const r = settings_rows[i];
+            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &vbuf), i == self.settings_cursor);
+            y += 1;
+        }
+        y += 1;
+
+        // Catalog — read-only system state, never focusable (skipped by nav).
+        y = drawSettingsHeader(win, y, w, "Catalog");
+        drawInertRow(win, y, w, "enrichment sync", "automatic");
+        y += 1;
+        drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
+        y += 1;
+        y += 1;
+
+        // Interface — the remaining toggle rows.
+        y = drawSettingsHeader(win, y, w, "Interface");
+        while (i < settings_rows.len) : (i += 1) {
+            const r = settings_rows[i];
+            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &vbuf), i == self.settings_cursor);
+            y += 1;
+        }
+    }
+
+    fn drawSettingsHeader(win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {
+        put(win, y, settings_label_col, title, style(colors.fg, .{ .bold = true }));
+        // Full-width hairline in `chrome` — a deliberate section boundary.
+        var buf: [768]u8 = undefined;
+        var n: usize = 0;
+        var col: u16 = 0;
+        while (col < w and n + 3 <= buf.len) : (col += 1) {
+            @memcpy(buf[n..][0..3], "─");
+            n += 3;
+        }
+        put(win, y + 1, 0, buf[0..n], style(colors.chrome, .{}));
+        return y + 2;
+    }
+
+    fn drawSettingRow(self: *App, win: vaxis.Window, y: u16, w: u16, row: SettingRow, value: []const u8, focused: bool) void {
+        const editing = focused and self.settings_editing;
+        const row_bg = if (editing) colors.bg_elevated else if (focused) colors.bg_surface else colors.bg_base;
+        if (editing) {
+            fillRow(win, y, w, colors.bg_elevated);
+        } else if (focused) {
+            fillRow(win, y, w, colors.bg_surface);
+        }
+
+        // ASCII separator on purpose: hint_col is computed from byte length, so a
+        // multi-byte glyph (e.g. U+00B7) would misalign the right-anchored hint.
+        const hint: []const u8 = if (editing) "esc  enter" else row.hint;
+        const hint_len: u16 = @intCast(hint.len);
+        const hint_col: u16 = if (w > hint_len + 2) w - 2 - hint_len else 0;
+
+        const marker = if (focused) "▸ " else "  ";
+        const marker_color = if (editing) colors.hot else colors.focus;
+        put(win, y, 0, marker, style(marker_color, .{ .bg = row_bg }));
+
+        const label_style = if (focused)
+            style(colors.focus, .{ .bg = row_bg, .bold = true })
+        else
+            style(colors.fg, .{ .bg = row_bg });
+        putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, row.label, label_style);
+
+        const value_budget: u16 = if (hint_col > settings_value_col + 2) hint_col - settings_value_col - 2 else 0;
+        if (editing) {
+            self.drawSettingsEditField(win, y, settings_value_col, value_budget, row_bg);
+        } else {
+            const value_style = if (focused)
+                style(colors.fg, .{ .bg = row_bg })
+            else
+                style(colors.fg2, .{ .bg = row_bg });
+            putClipped(win, y, settings_value_col, value_budget, value, value_style);
+        }
+
+        put(win, y, hint_col, hint, style(colors.fg3, .{ .bg = row_bg }));
+    }
+
+    /// Render the live edit buffer with an inverted cursor block at the end
+    /// (input is append-only, so the cursor always trails the text).
+    fn drawSettingsEditField(self: *App, win: vaxis.Window, y: u16, col: u16, budget: u16, row_bg: vaxis.Color) void {
+        const buf = self.settings_edit_buf[0..self.settings_edit_len];
+        const text_budget: u16 = if (budget > 1) budget - 1 else 0;
+        putClipped(win, y, col, text_budget, buf, style(colors.fg, .{ .bg = row_bg }));
+        const cursor_off: u16 = @intCast(@min(buf.len, text_budget));
+        if (budget > 0) put(win, y, col + cursor_off, " ", style(colors.fg, .{ .bg = colors.hot }));
+    }
+
+    /// A non-interactive Catalog row: dim+italic, no marker, no hint.
+    fn drawInertRow(win: vaxis.Window, y: u16, w: u16, label: []const u8, value: []const u8) void {
+        const sty = style(colors.fg3, .{ .italic = true });
+        putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, label, sty);
+        putClipped(win, y, settings_value_col, w -| settings_value_col, value, sty);
     }
 
     fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
@@ -1992,7 +2353,10 @@ pub const App = struct {
             else
                 "jk move · enter open · F1 browse · F3 settings · q quit",
             .detail => "jk scroll · h back · enter play · q back",
-            .settings => "jk navigate · space toggle · enter edit · esc cancel · q back",
+            .settings => if (self.settings_editing)
+                "type to edit · enter confirm · esc cancel"
+            else
+                "hjkl navigate · space toggle · enter edit · q save & back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, style(colors.fg3, .{}));
     }

@@ -1362,3 +1362,261 @@ test "history 2-row scroll: scrollIntoView(0) does not corrupt list_top" {
     app.scrollIntoView(@max(1, 1 / 2));
     try testing.expect(app.list_top <= app.list_cursor);
 }
+
+// ── Settings tab (ROD-86) ───────────────────────────────────────────────────
+
+test "settings: l/h cycle a preset field and wrap around" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 1; // default_quality, defaults to "1080"
+
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqualStrings("best", app.config.default_quality); // 1080 -> best
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqualStrings("480", app.config.default_quality); // wrap best -> 480
+    try testTick(&app, keyEv('h', .{}));
+    try testing.expectEqualStrings("best", app.config.default_quality); // wrap back 480 -> best
+}
+
+test "settings: subtitle-language cycle keeps live translation in sync" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 2; // subtitle_language, defaults to "sub"
+
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqualStrings("dub", app.config.translation);
+    try testing.expectEqual(domain.Translation.dub, app.translation);
+}
+
+test "settings: space toggles a bool field" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 5; // cover_art, defaults to true
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(!app.config.cover_art);
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.config.cover_art);
+}
+
+test "settings: enter edits mpv_path; type+confirm commits, esc cancels" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 0; // mpv_path, defaults to "mpv"
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // begin edit (buffer seeded "mpv")
+    try testing.expect(app.settings_editing);
+    try testTick(&app, .{ .key_press = .{ .codepoint = '2', .text = "2" } }); // -> "mpv2"
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // commit
+    try testing.expect(!app.settings_editing);
+    try testing.expectEqualStrings("mpv2", app.config.mpv_path);
+
+    // Esc discards the in-progress edit, leaving the committed value intact.
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'Z', .text = "Z" } });
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expect(!app.settings_editing);
+    try testing.expectEqualStrings("mpv2", app.config.mpv_path);
+}
+
+test "settings: empty edit buffer never commits a blank mpv_path" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // buffer = "mpv"
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{}));
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{}));
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // buffer now empty
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // commit no-op
+    try testing.expectEqualStrings("mpv", app.config.mpv_path);
+}
+
+test "settings: j/k navigation clamps to the interactive rows" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 0;
+
+    try testTick(&app, keyEv('k', .{})); // already at top — stays
+    try testing.expectEqual(@as(usize, 0), app.settings_cursor);
+
+    var n: usize = 0;
+    while (n < 20) : (n += 1) try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, app_mod.settings_row_count - 1), app.settings_cursor);
+}
+
+test "settings: q with no config path warns and returns to browse" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.config_path = null;
+
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expectEqual(.browse, app.active_view);
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.warn, t.kind);
+}
+
+test "settings: cycling an out-of-preset value snaps to a valid preset" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 3; // resume_offset; presets {0,3,5,10,15,30}
+    app.config.resume_offset_sec = 7; // not a preset (e.g. a hand-edited file)
+
+    try testTick(&app, keyEv('l', .{}));
+    // An unrecognized value starts from index 0, so 'l' lands on the second
+    // preset — never panics, always snaps back onto a valid value.
+    try testing.expectEqual(@as(u32, 3), app.config.resume_offset_sec);
+}
+
+// ── Save-to-disk round-trip (originally Astra's verification harness) ────────
+// These exercise the disk-write path the state-machine tests above can't reach
+// (they only cover the null-path branch). Kept as permanent coverage.
+
+const config_mod = @import("../config.zig");
+
+test "astra: settings save round-trip — q writes file, load reads back mutations" {
+    const alloc = testing.allocator;
+
+    // Create a temp dir and derive an absolute config path inside it.
+    // tmpDir places its directory at .zig-cache/tmp/<hash>/ relative to cwd.
+    // We get cwd via std.c.getcwd to construct an absolute path.
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
+    const cwd_str = std.mem.sliceTo(&cwd_buf, 0);
+
+    // tmpDir sub_path is a base64-encoded random string stored in tmp_dir.sub_path
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/config.zon", .{
+        cwd_str,
+        tmp_dir.sub_path,
+    });
+    defer alloc.free(config_path);
+
+    // Build an App with a real config_path and several mutated config fields.
+    var app: App = .{};
+    app.gpa = alloc;
+    app.active_view = .settings;
+    app.config_path = config_path;
+
+    // Mutate cycle/toggle fields directly — these mirror what h/l/space do.
+    app.config.translation = "dub";
+    app.config.cover_art = false;
+    app.config.default_quality = "720";
+    app.config.resume_offset_sec = 10;
+
+    // Drive mpv_path edit through the full UI path: enter → backspace×3 → type → enter.
+    app.settings_cursor = 0; // mpv_path row
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // seeds buffer with "mpv"
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // "mp"
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // "m"
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // ""
+    // Type "/alt/mpv" character by character.
+    inline for ("/alt/mpv") |ch| {
+        try testTick(&app, .{ .key_press = .{ .codepoint = ch, .text = &[_]u8{ch} } });
+    }
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // commit
+
+    try testing.expectEqualStrings("/alt/mpv", app.config.mpv_path);
+
+    // Drive q — this calls saveSettings → config_mod.save().
+    try testTick(&app, keyEv('q', .{}));
+
+    // 1. App returned to browse.
+    try testing.expectEqual(.browse, app.active_view);
+
+    // 2. Toast is .info (success), not .warn (no-path) or .error (write fail).
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.info, t.kind);
+
+    // 3. File actually exists on disk.
+    {
+        const f = try std.Io.Dir.openFileAbsolute(testing.io, config_path, .{});
+        f.close(testing.io);
+    }
+
+    // 4. Load it back and confirm all mutated fields round-tripped.
+    var load_arena = std.heap.ArenaAllocator.init(alloc);
+    defer load_arena.deinit();
+    const loaded = config_mod.load(load_arena.allocator(), testing.io, config_path);
+
+    try testing.expectEqualStrings("dub", loaded.translation);
+    try testing.expect(!loaded.cover_art);
+    try testing.expectEqualStrings("720", loaded.default_quality);
+    try testing.expectEqual(@as(u32, 10), loaded.resume_offset_sec);
+    try testing.expectEqualStrings("/alt/mpv", loaded.mpv_path);
+}
+
+test "astra: entering settings resets cursor, editing state, and input_mode" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    // Dirty state from a prior visit.
+    app.settings_cursor = 5;
+    app.settings_editing = true;
+    app.input_mode = .search;
+    app.active_view = .browse;
+
+    // F3 switches to settings — the onKey F3 handler resets these.
+    try testTick(&app, keyEv(vaxis.Key.f3, .{}));
+    try testing.expectEqual(.settings, app.active_view);
+    try testing.expectEqual(@as(usize, 0), app.settings_cursor);
+    try testing.expect(!app.settings_editing);
+    try testing.expectEqual(.normal, app.input_mode);
+}
+
+test "astra: Esc from settings returns to browse without calling save" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    // config_path is null — if save were called, it would push a warn toast.
+    app.config_path = null;
+
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(.browse, app.active_view);
+    // No toast means save was NOT called.
+    try testing.expect(app.toast_queue[0] == null);
+}
+
+test "astra: edit mode swallows F-keys — cannot switch views mid-edit" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 0; // mpv_path
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // enter edit mode
+    try testing.expect(app.settings_editing);
+
+    // F1 while editing must be swallowed — stay on settings, still editing.
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
+    try testing.expectEqual(.settings, app.active_view);
+    try testing.expect(app.settings_editing);
+
+    // Esc exits edit mode, stays on settings.
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expect(!app.settings_editing);
+    try testing.expectEqual(.settings, app.active_view);
+}
+
+test "settings: Ctrl-C hard-quits even while editing a text field" {
+    // The Ctrl-C emergency quit must work from anywhere, including the modal
+    // mpv_path edit field (onSettingsEditKey lets Ctrl-C fall through).
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings_cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // enter edit mode
+    try testing.expect(app.settings_editing);
+
+    try testTick(&app, keyEv('c', .{ .ctrl = true }));
+    try testing.expect(app.should_quit);
+}

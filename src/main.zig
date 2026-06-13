@@ -78,20 +78,19 @@ pub fn main(init: std.process.Init) !void {
 
     // User config (ROD-85). Total: a missing/bad file yields defaults, so this
     // never blocks startup. Arena-allocated → lives for the whole process. When
-    // neither $XDG_CONFIG_HOME nor $HOME is set there's no path to read — go
-    // straight to defaults rather than hand an empty (non-absolute) path to
-    // openFileAbsolute, whose absolute-path assert would panic in debug builds.
-    const cfg = if (zigoku.config.defaultPath(arena)) |p|
-        zigoku.config.load(arena, io, p)
-    else |_|
-        zigoku.Config{};
+    // neither $XDG_CONFIG_HOME nor $HOME is set there's no path — go straight to
+    // defaults rather than hand an empty (non-absolute) path to openFileAbsolute,
+    // whose absolute-path assert would panic in debug builds. The path is kept
+    // for the Settings tab's save-on-exit (ROD-86).
+    const cfg_path: ?[]const u8 = zigoku.config.defaultPath(arena) catch null;
+    const cfg = if (cfg_path) |p| zigoku.config.load(arena, io, p) else zigoku.Config{};
 
     const cli = parseArgs(arena, args) catch |err| switch (err) {
         // No positional query → open the TUI, M3's default interface. This also
         // catches a lone flag like `zigoku --dub` (no query): the flag is
         // dropped and the TUI opens. Malformed flags (UnknownFlag/MissingValue)
         // still fall through to usage.
-        error.NoQuery => return runTui(init, arena, cfg),
+        error.NoQuery => return runTui(init, arena, cfg, cfg_path),
         else => {
             try usage(out);
             try out.flush();
@@ -128,12 +127,12 @@ fn openStore(arena: std.mem.Allocator) !zigoku.Store {
 
 /// Launch the libvaxis TUI (ROD-71). Persistence is best-effort — if the DB
 /// won't open, the shell just shows an empty history rather than refusing to run.
-fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config) !void {
+fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, cfg_path: ?[]const u8) !void {
     var store_opt: ?zigoku.Store = openStore(arena) catch null;
     defer if (store_opt) |*st| st.close();
     var allanime = zigoku.AllAnime.init();
     const provider = allanime.provider();
-    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg);
+    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg, cfg_path);
 }
 
 /// The whole vertical slice, top to bottom. `store` is optional — every
