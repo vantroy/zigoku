@@ -201,6 +201,23 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
 
     // 4. Play.
     const title = try std.fmt.allocPrint(arena, "{s} — ep {s}", .{ show.name, episode.raw });
+
+    // ROD-83: resolve OP/ED skip data. MAL id comes from enrichment (in-memory or
+    // persisted — ROD-82 cache read), falling back to Jikan inside `prepare`.
+    var known_mal: ?u32 = if (show.mal_id) |m| std.math.cast(u32, m) else null;
+    if (known_mal == null) {
+        if (store) |st| {
+            if (st.getAnime(arena, SOURCE, show.id) catch null) |rec| {
+                if (rec.mal_id) |m| known_mal = std.math.cast(u32, m) orelse null;
+            }
+        }
+    }
+    // This is synchronous on the CLI's only thread (unlike the TUI, which fetches
+    // on a worker), so tell the user before the Jikan/AniSkip round-trips.
+    try out.print("  ⏭ checking skip data…\n", .{});
+    try out.flush();
+    const skip = zigoku.aniskip.prepare(arena, io, known_mal, show.name, zigoku.aniskip.episodeNumber(episode.raw, @intCast(ep_idx + 1)), .both);
+
     try out.print("  ▶ launching mpv…\n", .{});
     try out.flush();
 
@@ -208,7 +225,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     zigoku.player.play(arena, io, link, title, start_seconds, .{
         .ctx = @ptrCast(&progress),
         .func = recordPlaybackProgress,
-    }) catch |err| {
+    }, skip) catch |err| {
         if (store) |st| {
             const latest = progress.snapshot();
             if (observedPlaybackWasMeaningful(latest)) {
