@@ -1824,10 +1824,9 @@ pub const App = struct {
                     // focus cyan, and its title goes cyan+bold. Magenta is reserved for
                     // the one cursor in the status bar — never a list marker (§8).
                     const is_completed = std.mem.eql(u8, rec.list_status, "completed");
-                    const is_dropped   = std.mem.eql(u8, rec.list_status, "dropped");
-                    const is_watching  = std.mem.eql(u8, rec.list_status, "watching");
-                    const is_paused    = std.mem.eql(u8, rec.list_status, "paused");
-                    const de_emphasized = is_completed or is_dropped;
+                    const is_dropped = std.mem.eql(u8, rec.list_status, "dropped");
+                    const is_watching = std.mem.eql(u8, rec.list_status, "watching");
+                    const is_paused = std.mem.eql(u8, rec.list_status, "paused");
 
                     const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
                     if (selected) {
@@ -1835,12 +1834,24 @@ pub const App = struct {
                         fillRow(win, row + 1, w, self.palette.bg_surface);
                     }
 
-                    // §2.4 watchlist status glyphs: focus `▸` overrides when selected.
-                    const marker: []const u8 = if (selected) "▸ " else if (is_watching) "▸ " else if (is_completed) "● " else if (is_paused) "◐ " else if (is_dropped) "· " else "○ ";
-                    const marker_color = if (selected) self.palette.focus else if (is_watching or is_paused) self.palette.focus else if (de_emphasized) self.palette.fg3 else self.palette.fg2;
-                    put(win, row, 2, marker, self.s(marker_color, .{ .bg = row_bg }));
+                    // §2.4 watchlist status glyphs. Focus `▸` overrides when selected.
+                    // Colors: watching/paused=focus(+dim for paused), dropped=fg3, else fg2.
+                    const marker: []const u8 =
+                        if (selected or is_watching) "▸ "
+                        else if (is_completed) "● "
+                        else if (is_paused) "◐ "
+                        else if (is_dropped) "· "
+                        else "○ ";
+                    const marker_color =
+                        if (selected or is_watching or is_paused) self.palette.focus
+                        else if (is_dropped) self.palette.fg3
+                        else self.palette.fg2;
+                    // §2.4: paused = state.focus + dim (SGR 2), but not when focused row.
+                    const marker_dim = is_paused and !selected;
+                    put(win, row, 2, marker, self.s(marker_color, .{ .bg = row_bg, .dim = marker_dim }));
 
-                    // §4.1: completed/dropped rows use text.dim for title.
+                    // §4.1: completed/dropped rows use text.dim for title; watching/planning fg.
+                    const de_emphasized = is_completed or is_dropped;
                     const title_style = if (selected)
                         self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
                     else if (de_emphasized)
@@ -2433,12 +2444,13 @@ pub const App = struct {
             qi -= 1;
             const t = self.toast_queue[qi] orelse continue;
             if (row < 1) break;
-            // §4.7: info=[~] focus, success=[✓] fg (state.success=fg), error=[!] hot, warn=[!] warn.
+            // §4.7 color map: info=[~] fg2(text.muted), success=[✓] fg(state.success),
+            //   error=[!] hot, warn=[!] warn.
             const fg_color: vaxis.Color = switch (t.kind) {
                 .@"error" => self.palette.hot,
                 .warn => self.palette.warn,
                 .success => self.palette.fg,
-                .info => self.palette.focus,
+                .info => self.palette.fg2,
             };
             const prefix: []const u8 = switch (t.kind) {
                 .@"error", .warn => "[!] ",
@@ -2447,14 +2459,16 @@ pub const App = struct {
             };
             const w = win.width;
             // §4.7: right-aligned, max 40 display columns.
-            const pre_len: u16 = @intCast(prefix.len);
+            // All prefixes are exactly 4 display cells regardless of UTF-8 byte length
+            // ([✓] = 6 bytes but 4 cells; ASCII variants are 4 bytes = 4 cells).
+            const pre_w: u16 = 4;
             const txt_len: u16 = @intCast(t.text_len);
-            const toast_w: u16 = @min(pre_len + txt_len, @min(40, w -| 2));
+            const toast_w: u16 = @min(pre_w + txt_len, @min(40, w -| 2));
             const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
             fillRow(win, row, w, self.palette.bg_elevated);
             put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
-            const txt_col: u16 = pre_col + pre_len;
-            const txt_w: u16 = if (toast_w > pre_len) toast_w - pre_len else 0;
+            const txt_col: u16 = pre_col + pre_w;
+            const txt_w: u16 = if (toast_w > pre_w) toast_w - pre_w else 0;
             putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bg = self.palette.bg_elevated }));
             row -|= 1;
         }
