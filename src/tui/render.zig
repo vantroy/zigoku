@@ -35,7 +35,9 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: A
         break :blk if (rec.progress > 0) bar_w / 3 else 0;
     };
 
-    const fill_color = if (is_watching or is_paused) pal.focus else pal.fg3;
+    // §4.5: planning/not-started uses border.hair for fill (chrome), dim uses fg3.
+    const is_planning = std.mem.eql(u8, rec.list_status, "planning");
+    const fill_color = if (is_watching or is_paused) pal.focus else if (is_planning) pal.chrome else pal.fg3;
     const frac_color = if (is_watching or is_paused) pal.fg2 else pal.fg3;
 
     put(win, row, col, "[", style(pal.fg3, .{ .bg = row_bg }));

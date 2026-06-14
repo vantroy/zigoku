@@ -1534,9 +1534,9 @@ test "astra: settings save round-trip — q writes file, load reads back mutatio
     // 1. App returned to browse.
     try testing.expectEqual(.browse, app.active_view);
 
-    // 2. Toast is .info (success), not .warn (no-path) or .error (write fail).
+    // 2. Toast is .success, not .warn (no-path) or .error (write fail).
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
-    try testing.expectEqual(Toast.Kind.info, t.kind);
+    try testing.expectEqual(Toast.Kind.success, t.kind);
 
     // 3. File actually exists on disk.
     {
