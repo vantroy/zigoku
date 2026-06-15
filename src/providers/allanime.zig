@@ -254,6 +254,100 @@ pub const AllAnime = struct {
         return plain;
     }
 
+    // ── ROD-92: long-tail provider coverage ──────────────────────────────────────
+    // Non-fast4speed sources hand back a `--<hex>` path that must be deciphered,
+    // fetched, and parsed into stream variants. Two payload shapes come back: a
+    // wixmp `.urlset` (string-split, no manifest) and real m3u8 master playlists.
+    // These helpers are pure so the protocol stays unit-testable; the network
+    // follow that strings them together lives in `resolve()`.
+
+    /// One resolvable stream variant pulled from a provider payload.
+    const Variant = struct { url: []const u8, resolution: ?u32 = null };
+
+    /// Decipher a `--<hex>` provider path. Every hex pair is one byte, XOR-0x38.
+    /// anipy-cli wraps that XOR in an `oct()`/`int(_, 8)` round-trip that is a
+    /// no-op — verified equal across all 256 byte values — so we drop it. The
+    /// caller strips the leading `--` and applies `clock` → `clock.json` after.
+    fn decipherProviderPath(arena: Allocator, hex: []const u8) ![]u8 {
+        if (hex.len % 2 != 0) return error.BadProviderPath;
+        const out = try arena.alloc(u8, hex.len / 2);
+        for (out, 0..) |*b, i| {
+            const byte = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return error.BadProviderPath;
+            b.* = byte ^ 0x38;
+        }
+        return out;
+    }
+
+    /// Vertical pixel count from a `RESOLUTION=1920x1080` attribute on an
+    /// EXT-X-STREAM-INF line; null if absent or malformed.
+    fn streamInfHeight(inf_line: []const u8) ?u32 {
+        const key = "RESOLUTION=";
+        const at = std.mem.indexOf(u8, inf_line, key) orelse return null;
+        const rest = inf_line[at + key.len ..];
+        const x = std.mem.indexOfScalar(u8, rest, 'x') orelse return null;
+        var end: usize = x + 1;
+        while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+        return std.fmt.parseInt(u32, rest[x + 1 .. end], 10) catch null;
+    }
+
+    /// Parse an m3u8 *master* playlist: each `#EXT-X-STREAM-INF:` (its resolution)
+    /// paired with the URI on the next non-comment line. URIs come back verbatim —
+    /// relative ones are joined against the playlist URL by the network caller. A
+    /// playlist with no STREAM-INF is already a media playlist (no variants) and
+    /// yields an empty slice; the caller then treats the link as one best stream.
+    fn parseMasterPlaylist(arena: Allocator, text: []const u8) ![]Variant {
+        var out: std.ArrayList(Variant) = .empty;
+        var expect_uri = false;
+        var pending_res: ?u32 = null;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "#EXT-X-STREAM-INF")) {
+                expect_uri = true;
+                pending_res = streamInfHeight(line);
+            } else if (line[0] == '#') {
+                continue;
+            } else if (expect_uri) {
+                try out.append(arena, .{ .url = try arena.dupe(u8, line), .resolution = pending_res });
+                expect_uri = false;
+                pending_res = null;
+            }
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Expand a wixmp `repackager` link into its per-quality variants. The link is
+    /// `…repackager.wixmp.com/<base>,480p,720p,1080p,<tail>.urlset/…`: take
+    /// everything before `.urlset`, splice out the `repackager.wixmp.com/` host,
+    /// then comma-split — the first and last parts wrap each middle quality token.
+    /// Returns null when `link` is not a wixmp repackager URL.
+    fn wixmpVariants(arena: Allocator, link: []const u8) !?[]Variant {
+        if (std.mem.indexOf(u8, link, "repackager.wixmp.com") == null) return null;
+        const head = link[0 .. (std.mem.indexOf(u8, link, ".urlset") orelse link.len)];
+        const host = "repackager.wixmp.com/";
+        const body = if (std.mem.indexOf(u8, head, host)) |p|
+            try std.mem.concat(arena, u8, &.{ head[0..p], head[p + host.len ..] })
+        else
+            head;
+
+        var parts: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, body, ',');
+        while (it.next()) |p| try parts.append(arena, p);
+        if (parts.items.len < 3) return error.BadWixmpUrl; // wrap + ≥1 quality + wrap
+
+        const part_one = parts.items[0];
+        const part_two = parts.items[parts.items.len - 1];
+        var out: std.ArrayList(Variant) = .empty;
+        for (parts.items[1 .. parts.items.len - 1]) |qual| {
+            const url = try std.mem.concat(arena, u8, &.{ part_one, qual, part_two });
+            const digits = if (qual.len > 0 and qual[qual.len - 1] == 'p') qual[0 .. qual.len - 1] else qual;
+            const res = std.fmt.parseInt(u32, digits, 10) catch null;
+            try out.append(arena, .{ .url = url, .resolution = res });
+        }
+        return try out.toOwnedSlice(arena);
+    }
+
     // ── ranking ──────────────────────────────────────────────────────────────────
 
     const RankCtx = struct { query: []const u8, tt: domain.Translation };
@@ -449,4 +543,74 @@ test "decryptTobeparsed: known blob round-trips to plaintext" {
     const want = "{\"episode\":{\"sourceUrls\":[{\"sourceName\":\"Default\",\"sourceUrl\":\"tools.fast4speed.rsvp/x\"}]}}";
     const got = try AllAnime.decryptTobeparsed(a, blob);
     try std.testing.expectEqualStrings(want, got);
+}
+
+// ── ROD-92 ───────────────────────────────────────────────────────────────────
+
+// Golden vector generated from anipy-cli's `_decrypt`. The octal round-trip there
+// is a verified no-op (byte^0x38 == anipy across all 256 byte values), so this
+// also pins our simplification. Input is the hex *after* stripping the `--`.
+test "decipherProviderPath: golden vector matches anipy-cli oracle" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const hex = "175948514e4c4f57175b54575b5307515c056a4d0c405901685b500b486075084c09";
+    const want = "/apivtwo/clock?id=Ru4xa9Pch3pXM0t1";
+    try std.testing.expectEqualStrings(want, try AllAnime.decipherProviderPath(a, hex));
+}
+
+test "decipherProviderPath: rejects odd-length and non-hex input" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectError(error.BadProviderPath, AllAnime.decipherProviderPath(a, "abc"));
+    try std.testing.expectError(error.BadProviderPath, AllAnime.decipherProviderPath(a, "zz"));
+}
+
+test "parseMasterPlaylist: extracts variant URIs and resolutions" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const playlist =
+        "#EXTM3U\n" ++
+        "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=842x480\n" ++
+        "480/index.m3u8\n" ++
+        "#EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=1280x720\n" ++
+        "720/index.m3u8\n" ++
+        "#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1920x1080\n" ++
+        "1080/index.m3u8\n";
+    const vs = try AllAnime.parseMasterPlaylist(a, playlist);
+    try std.testing.expectEqual(@as(usize, 3), vs.len);
+    try std.testing.expectEqualStrings("480/index.m3u8", vs[0].url);
+    try std.testing.expectEqual(@as(?u32, 480), vs[0].resolution);
+    try std.testing.expectEqual(@as(?u32, 720), vs[1].resolution);
+    try std.testing.expectEqual(@as(?u32, 1080), vs[2].resolution);
+}
+
+test "parseMasterPlaylist: media playlist (no variants) yields empty" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const media = "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:9.0,\nseg0.ts\n#EXTINF:9.0,\nseg1.ts\n#EXT-X-ENDLIST\n";
+    const vs = try AllAnime.parseMasterPlaylist(a, media);
+    try std.testing.expectEqual(@as(usize, 0), vs.len);
+}
+
+test "wixmpVariants: expands repackager urlset into per-quality streams" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const link = "https://repackager.wixmp.com/video.wixstatic.com/video/abc/,480p,720p,1080p,/mp4/file.mp4.urlset/master.m3u8";
+    const vs = (try AllAnime.wixmpVariants(a, link)).?;
+    try std.testing.expectEqual(@as(usize, 3), vs.len);
+    try std.testing.expectEqualStrings("https://video.wixstatic.com/video/abc/480p/mp4/file.mp4", vs[0].url);
+    try std.testing.expectEqual(@as(?u32, 480), vs[0].resolution);
+    try std.testing.expectEqual(@as(?u32, 1080), vs[2].resolution);
+}
+
+test "wixmpVariants: returns null for non-wixmp links" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqual(@as(?[]AllAnime.Variant, null), try AllAnime.wixmpVariants(a, "https://example.com/x.m3u8"));
 }
