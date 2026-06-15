@@ -32,10 +32,13 @@ const HASH_VIDEO = "d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c0
 // AES-256-GCM key seed for the `tobeparsed` blob (key = sha256(seed)).
 const GCM_SEED = "Xot36i3lK3:v1";
 
+// Site origin: base for deciphered provider GETs (ROD-92) and the CDN referer.
+const SITE = "https://allanime.day";
+
 // Referers the API / CDN gate on, per operation.
-const REFERER_API = "https://allmanga.to/"; // search + episodes
+const REFERER_API = "https://allmanga.to/"; // search + episodes + deciphered clock GET
 const REFERER_VIDEO = "https://youtu-chan.com/"; // get_video
-const STREAM_REFERER = "https://allanime.day"; // mpv → fast4speed CDN
+const STREAM_REFERER = SITE; // mpv → fast4speed CDN
 
 // `extensions` is sent as a JSON *string* whose value is itself JSON, so its
 // inner quotes are backslash-escaped. Built at comptime; only the hash varies.
@@ -194,16 +197,30 @@ pub const AllAnime = struct {
         const plain = try decryptTobeparsed(arena, tbp);
         const decoded = try std.json.parseFromSlice(Dec, arena, plain, .{ .ignore_unknown_fields = true });
 
-        // v0.1: take the direct fast4speed 1080p URL when present. The other
-        // providers hand back `--<hex>` paths that need XOR-0x38 decipher + m3u8
-        // follow — that's ROD-92 (post-v0.1). Until then, clean failure.
-        for (decoded.value.episode.sourceUrls) |s| {
+        const sources = decoded.value.episode.sourceUrls;
+
+        // Fast path: the direct fast4speed CDN URL (no manifest) — the common case
+        // for popular shows. Return immediately; no decipher/follow needed.
+        for (sources) |s| {
             const url = s.sourceUrl orelse continue;
             if (std.mem.indexOf(u8, url, "tools.fast4speed.rsvp") != null) {
                 return .{ .url = url, .resolution = 1080, .referer = STREAM_REFERER };
             }
         }
-        return error.NoDirectStream;
+
+        // Long-tail (ROD-92): less-popular shows only expose `--<hex>` providers.
+        // Decipher each, follow it, and keep the best variant across all of them.
+        // One bad provider doesn't sink the rest — followProvider skips on error.
+        var best: ?domain.StreamLink = null;
+        for (sources) |s| {
+            const url = s.sourceUrl orelse continue;
+            if (!std.mem.startsWith(u8, url, "--")) continue;
+            best = followProvider(arena, io, url[2..], best) catch |e| blk: {
+                log.debug("allanime provider {s}: {s}", .{ url, @errorName(e) });
+                break :blk best;
+            };
+        }
+        return best orelse error.NoDirectStream;
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
@@ -229,6 +246,26 @@ pub const AllAnime = struct {
             // The caller collapses this to HttpNotOk; keep the real status for a
             // --debug session, where "AllAnime rejected the request" isn't enough.
             log.debug("allanime POST {s}: HTTP {d}", .{ referer, @intFromEnum(res.status) });
+            return error.HttpNotOk;
+        }
+        return aw.writer.buffered();
+    }
+
+    /// One GET. Returns the body (lives in `arena`). `HttpNotOk` on non-200.
+    /// Used by the ROD-92 long-tail follow (deciphered clock JSON + m3u8 fetch).
+    fn get(arena: Allocator, io: Io, url: []const u8, referer: []const u8) ![]u8 {
+        var client: std.http.Client = .{ .allocator = arena, .io = io };
+        defer client.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const res = try client.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .response_writer = &aw.writer,
+            .headers = .{ .user_agent = .{ .override = UA } },
+            .extra_headers = &.{.{ .name = "Referer", .value = referer }},
+        });
+        if (res.status != .ok) {
+            log.debug("allanime GET {s}: HTTP {d}", .{ url, @intFromEnum(res.status) });
             return error.HttpNotOk;
         }
         return aw.writer.buffered();
@@ -346,6 +383,82 @@ pub const AllAnime = struct {
             try out.append(arena, .{ .url = url, .resolution = res });
         }
         return try out.toOwnedSlice(arena);
+    }
+
+    // Shape of the deciphered `clock.json` response: a list of playable links,
+    // each optionally carrying the Referer the CDN expects on the follow-up GET.
+    const ClkHdr = struct { Referer: ?[]const u8 = null };
+    const ClkLink = struct { link: ?[]const u8 = null, headers: ?ClkHdr = null };
+    const ClkResp = struct { links: []ClkLink = &.{} };
+
+    /// Insert `.json` after the first `clock` segment of a deciphered path
+    /// (`…/clock?id=…` → `…/clock.json?id=…`). Passthrough if absent.
+    fn clockJson(arena: Allocator, path: []const u8) ![]u8 {
+        const at = std.mem.indexOf(u8, path, "clock") orelse return arena.dupe(u8, path);
+        const cut = at + "clock".len;
+        return std.mem.concat(arena, u8, &.{ path[0..cut], ".json", path[cut..] });
+    }
+
+    /// Resolve a possibly-relative m3u8 URI against the playlist URL it came from.
+    /// Absolute (`http…`) passes through; `/rooted` keeps scheme+host; otherwise
+    /// it's relative to the playlist's directory.
+    fn joinUrl(arena: Allocator, base: []const u8, ref: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, ref, "http")) return arena.dupe(u8, ref);
+        const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.BadBaseUrl) + 3;
+        const host_end = std.mem.indexOfScalarPos(u8, base, scheme_end, '/') orelse base.len;
+        if (std.mem.startsWith(u8, ref, "/")) return std.mem.concat(arena, u8, &.{ base[0..host_end], ref });
+        const last_slash = std.mem.lastIndexOfScalar(u8, base, '/') orelse host_end;
+        const dir_end = if (last_slash >= host_end) last_slash + 1 else host_end;
+        return std.mem.concat(arena, u8, &.{ base[0..dir_end], ref });
+    }
+
+    /// Keep whichever stream has the higher resolution (null counts as 0). This
+    /// is the "default to best" policy — ROD-152's selector layers on top later.
+    fn better(cur: ?domain.StreamLink, cand: domain.StreamLink) domain.StreamLink {
+        const c = cur orelse return cand;
+        return if ((cand.resolution orelse 0) > (c.resolution orelse 0)) cand else c;
+    }
+
+    /// Follow one deciphered `--<hex>` provider to its best stream variant,
+    /// folding into `best_in`. Network-bound; the parsers it calls are the tested
+    /// part. A failed link is logged and skipped, not fatal — another provider or
+    /// link may still yield a stream.
+    fn followProvider(arena: Allocator, io: Io, hex_path: []const u8, best_in: ?domain.StreamLink) !?domain.StreamLink {
+        var best = best_in;
+        const deciphered = try decipherProviderPath(arena, hex_path);
+        const path = try clockJson(arena, deciphered);
+        const raw = try get(arena, io, try std.mem.concat(arena, u8, &.{ SITE, path }), REFERER_API);
+        const parsed = try std.json.parseFromSlice(ClkResp, arena, raw, .{ .ignore_unknown_fields = true });
+
+        for (parsed.value.links) |l| {
+            const link = l.link orelse continue;
+
+            // Shape 1: wixmp repackager — synthetic per-quality URLs, no manifest.
+            if (try wixmpVariants(arena, link)) |vs| {
+                for (vs) |v| best = better(best, .{ .url = v.url, .resolution = v.resolution, .referer = STREAM_REFERER });
+                continue;
+            }
+
+            // Shape 2: a real m3u8. Fetch it (echoing any Referer the link names),
+            // then parse the master playlist for variants.
+            const referer = if (l.headers) |h| (h.Referer orelse SITE) else SITE;
+            const body = get(arena, io, link, referer) catch |e| {
+                log.debug("allanime m3u8 GET {s}: {s}", .{ link, @errorName(e) });
+                continue;
+            };
+            const vs = try parseMasterPlaylist(arena, body);
+            if (vs.len == 0) {
+                // No variants → it's already a media playlist; play it directly.
+                best = better(best, .{ .url = link, .resolution = 1080, .referer = referer });
+            } else {
+                for (vs) |v| best = better(best, .{
+                    .url = try joinUrl(arena, link, v.url),
+                    .resolution = v.resolution,
+                    .referer = referer,
+                });
+            }
+        }
+        return best;
     }
 
     // ── ranking ──────────────────────────────────────────────────────────────────
@@ -613,4 +726,22 @@ test "wixmpVariants: returns null for non-wixmp links" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try std.testing.expectEqual(@as(?[]AllAnime.Variant, null), try AllAnime.wixmpVariants(a, "https://example.com/x.m3u8"));
+}
+
+test "clockJson: inserts .json after the clock segment" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try std.testing.expectEqualStrings("/apivtwo/clock.json?id=abc", try AllAnime.clockJson(a, "/apivtwo/clock?id=abc"));
+    try std.testing.expectEqualStrings("/no/segment/here", try AllAnime.clockJson(a, "/no/segment/here"));
+}
+
+test "joinUrl: absolute, rooted, and relative refs" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const base = "https://h.example/x/y/master.m3u8";
+    try std.testing.expectEqualStrings("https://cdn.other/v.ts", try AllAnime.joinUrl(a, base, "https://cdn.other/v.ts"));
+    try std.testing.expectEqualStrings("https://h.example/a/b.ts", try AllAnime.joinUrl(a, base, "/a/b.ts"));
+    try std.testing.expectEqualStrings("https://h.example/x/y/720/seg.ts", try AllAnime.joinUrl(a, base, "720/seg.ts"));
 }
