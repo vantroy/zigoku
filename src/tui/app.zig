@@ -70,7 +70,7 @@ const slow_path_threshold_ms: i64 = 3000;
 /// the next event — a lightweight backoff instead of permanent sticky
 /// suppression. A changed `thumb` URL clears suppression immediately (recovery
 /// without moving the selection); see `CoverDecision`.
-const cover_retry_cooldown_ms: i64 = 10_000;
+pub const cover_retry_cooldown_ms: i64 = 10_000;
 
 /// What `syncCover` should do for the current selection. Extracted from the
 /// `syncCover` side effects so the fetch/suppress/retry policy is unit-testable
@@ -111,8 +111,19 @@ pub const CoverDecision = struct {
             return if (stale) .clear else .none;
         };
 
+        // Already loading or holding pixels for this exact id → leave it be.
+        // Checked before suppression so a live cover always wins over a stale
+        // failure record, independent of the clearCoverState invariant.
+        if (d.cover_for_id) |id| {
+            if (std.mem.eql(u8, id, target_id) and (d.cover_loading or d.has_pixels)) {
+                return .up_to_date;
+            }
+        }
+
         // Failure suppression: same id + same url, still within cooldown. A
         // changed URL or an elapsed cooldown both fall through to a retry.
+        // Failure records persist across navigation — they are cleared only by
+        // cooldown expiry, a thumb URL change, or a successful fetch.
         if (d.failed_id) |fid| {
             if (std.mem.eql(u8, fid, target_id)) {
                 const same_url = d.failed_url != null and
@@ -122,16 +133,47 @@ pub const CoverDecision = struct {
             }
         }
 
-        // Already loading or holding pixels for this exact id → leave it be.
-        if (d.cover_for_id) |id| {
-            if (std.mem.eql(u8, id, target_id) and (d.cover_loading or d.has_pixels)) {
-                return .up_to_date;
-            }
-        }
-
         return .fetch;
     }
 };
+
+/// Letterboxed placement of an image inside a half-block mosaic grid (ROD-110).
+pub const HalfBlockFit = struct { w: u32, h: u32, off_x: u32, off_y: u32 };
+
+/// Fit `img_w × img_h` into a `grid_w × grid_h` half-pixel grid, preserving
+/// aspect. A half-block cell (`▀`) is full-cell *wide* but half-cell *tall*, so
+/// a half-pixel is `ppc` wide and `pph/2` tall — only square when cells are 2:1.
+/// We therefore compare in physical-pixel space using the terminal's reported
+/// `ppc`/`pph` (pixels per column/row). Pass `ppc == 0` or `pph == 0` when the
+/// terminal won't report pixel metrics, which falls back to assuming square
+/// half-pixels (the pre-fix behavior — correct on 2:1 cells, off elsewhere).
+/// Extracted as a pure helper so the aspect math is unit-testable (Mira S2).
+pub fn halfBlockFit(img_w: u32, img_h: u32, grid_w: u32, grid_h: u32, ppc: u32, pph: u32) HalfBlockFit {
+    var fit_w = grid_w;
+    var fit_h = grid_h;
+    if (img_w != 0 and img_h != 0 and grid_w != 0 and grid_h != 0) {
+        if (ppc != 0 and pph != 0) {
+            // phys_w = grid_w*ppc, phys_h = grid_h*pph/2. Compare aspects:
+            //   img_w*phys_h vs img_h*phys_w  →  img_w*grid_h*pph vs 2*img_h*grid_w*ppc
+            const lhs = @as(u64, img_w) * grid_h * pph;
+            const rhs = @as(u64, img_h) * grid_w * ppc * 2;
+            if (lhs > rhs) {
+                // width-bound: fit_h = 2*img_h*grid_w*ppc / (img_w*pph)
+                fit_h = @intCast(@max(1, @as(u64, img_h) * grid_w * ppc * 2 / (@as(u64, img_w) * pph)));
+            } else {
+                // height-bound: fit_w = img_w*grid_h*pph / (2*img_h*ppc)
+                fit_w = @intCast(@max(1, @as(u64, img_w) * grid_h * pph / (@as(u64, img_h) * ppc * 2)));
+            }
+        } else if (img_w * grid_h > img_h * grid_w) {
+            fit_h = @max(1, img_h * grid_w / img_w); // width-bound, square half-pixel
+        } else {
+            fit_w = @max(1, img_w * grid_h / img_h); // height-bound, square half-pixel
+        }
+    }
+    fit_w = @min(fit_w, grid_w);
+    fit_h = @min(fit_h, grid_h);
+    return .{ .w = fit_w, .h = fit_h, .off_x = (grid_w - fit_w) / 2, .off_y = (grid_h - fit_h) / 2 };
+}
 
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
@@ -1214,6 +1256,7 @@ pub const App = struct {
                 }
 
                 self.clearCoverFailure();
+                self.clearInflightUrl(); // fetch succeeded; in-flight url no longer needed
                 self.invalidateCoverImage();
                 self.freeCoverBuffers();
                 self.cover_pixels = .{ .rgba = ev.rgba, .w = ev.width, .h = ev.height };
@@ -2277,8 +2320,9 @@ pub const App = struct {
     /// Render decoded cover pixels as a half-block mosaic: each cell packs two
     /// vertically-stacked samples via `▀` (upper half = fg, lower half = bg),
     /// doubling vertical resolution over a flat fill. The image is letterboxed
-    /// into the cell grid (treating a half-pixel as roughly square) so the
-    /// poster aspect is preserved on non-Kitty terminals.
+    /// into the cell grid via `halfBlockFit` (aspect-correct using the terminal's
+    /// reported cell pixel metrics) so posters stay poster-shaped on non-Kitty
+    /// terminals regardless of cell aspect ratio.
     fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
         const px = self.cover_pixels orelse return;
         const cols = cover_win.width;
@@ -2288,24 +2332,23 @@ pub const App = struct {
         const grid_w: u32 = cols;
         const grid_h: u32 = @as(u32, rows) * 2;
 
-        // Letterbox the image into grid_w × grid_h half-pixels, preserving aspect.
-        var fit_w = grid_w;
-        var fit_h = grid_h;
-        if (px.w * grid_h > px.h * grid_w) {
-            fit_h = @max(1, px.h * grid_w / px.w); // width-bound
-        } else {
-            fit_w = @max(1, px.w * grid_h / px.h); // height-bound
-        }
-        const off_x = (grid_w - fit_w) / 2;
-        const off_y = (grid_h - fit_h) / 2;
+        // Terminal pixels per cell, if reported — lets halfBlockFit correct for
+        // non-2:1 cells (e.g. gnome-terminal 8x18) instead of squishing posters.
+        // 0/0 → square-half-pixel assumption inside halfBlockFit.
+        const sw = cover_win.screen.width;
+        const sh = cover_win.screen.height;
+        const ppc: u32 = if (sw != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.width_pix), sw) catch 0) else 0;
+        const pph: u32 = if (sh != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.height_pix), sh) catch 0) else 0;
+
+        const fit = halfBlockFit(px.w, px.h, grid_w, grid_h, ppc, pph);
 
         var ry: u16 = 0;
         while (ry < rows) : (ry += 1) {
             const top_y = @as(u32, ry) * 2;
             var cx: u16 = 0;
             while (cx < cols) : (cx += 1) {
-                const top = self.sampleHalfBlock(px, cx, top_y, off_x, off_y, fit_w, fit_h);
-                const bot = self.sampleHalfBlock(px, cx, top_y + 1, off_x, off_y, fit_w, fit_h);
+                const top = self.sampleHalfBlock(px, cx, top_y, fit.off_x, fit.off_y, fit.w, fit.h);
+                const bot = self.sampleHalfBlock(px, cx, top_y + 1, fit.off_x, fit.off_y, fit.w, fit.h);
                 put(cover_win, ry, cx, "▀", .{ .fg = top, .bg = bot });
             }
         }
