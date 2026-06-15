@@ -61,8 +61,11 @@ pub fn writeBanner(w: *std.Io.Writer) !void {
     try w.print("    v{s}\n", .{version});
 }
 
-test "version is set" {
-    try std.testing.expect(version.len > 0);
+test "version matches build.zig.zon" {
+    // Pin the literal so a bump here without the matching `.version` edit in
+    // build.zig.zon (or vice versa) trips CI — the "keep in sync" comment above
+    // otherwise has no teeth.
+    try std.testing.expectEqualStrings("0.1.0", version);
 }
 
 // Pull in the unit tests from every module so `zig build test` covers them all.
