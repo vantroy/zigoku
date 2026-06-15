@@ -201,7 +201,7 @@ pub const Store = struct {
         var db: SqliteDb = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
         if (c.sqlite3_open_v2(path.ptr, &db, flags, null) != c.SQLITE_OK) {
-            std.debug.print("store: open failed: {s}\n", .{c.sqlite3_errmsg(db)});
+            std.log.err("store: open failed: {s}", .{c.sqlite3_errmsg(db)});
             _ = c.sqlite3_close(db);
             return error.Open;
         }
@@ -573,7 +573,7 @@ pub const Store = struct {
     fn exec(self: *Store, sql: [*c]const u8) Error!void {
         var errmsg: [*c]u8 = null;
         if (c.sqlite3_exec(self.db, sql, null, null, &errmsg) != c.SQLITE_OK) {
-            std.debug.print("store: exec failed: {s}\n", .{errmsg});
+            std.log.err("store: exec failed: {s}", .{errmsg});
             c.sqlite3_free(errmsg);
             return error.Exec;
         }
@@ -582,7 +582,7 @@ pub const Store = struct {
     fn prepare(self: *Store, sql: [*c]const u8) Error!Stmt {
         var stmt: Stmt = null;
         if (c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null) != c.SQLITE_OK) {
-            std.debug.print("store: prepare failed: {s}\n", .{c.sqlite3_errmsg(self.db)});
+            std.log.err("store: prepare failed: {s}", .{c.sqlite3_errmsg(self.db)});
             return error.Prepare;
         }
         return stmt;
@@ -590,7 +590,7 @@ pub const Store = struct {
 
     fn stepDone(self: *Store, stmt: Stmt) Error!void {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) {
-            std.debug.print("store: step failed: {s}\n", .{c.sqlite3_errmsg(self.db)});
+            std.log.err("store: step failed: {s}", .{c.sqlite3_errmsg(self.db)});
             return error.Step;
         }
     }
