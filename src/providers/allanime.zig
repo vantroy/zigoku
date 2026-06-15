@@ -178,6 +178,17 @@ pub const AllAnime = struct {
     const DecEp = struct { sourceUrls: []Src };
     const Dec = struct { episode: DecEp };
 
+    // anipy's trusted provider allow-list (allanime_provider.py ~237). Only these
+    // `sourceName`s are followed — the gate applies to both the fast4speed fast
+    // path and the long-tail `--<hex>` providers, exactly as the oracle does.
+    const ALLOWED_SOURCES = [_][]const u8{ "Yt-mp4", "S-Mp4", "Uv-mp4", "Ak", "Default" };
+
+    fn sourceAllowed(name: ?[]const u8) bool {
+        const n = name orelse return false;
+        for (ALLOWED_SOURCES) |a| if (std.mem.eql(u8, n, a)) return true;
+        return false;
+    }
+
     pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation) !domain.StreamLink {
         _ = self;
         // Same two-level escaping as episodes(): `videoInner` escapes show_id and
@@ -200,8 +211,9 @@ pub const AllAnime = struct {
         const sources = decoded.value.episode.sourceUrls;
 
         // Fast path: the direct fast4speed CDN URL (no manifest) — the common case
-        // for popular shows. Return immediately; no decipher/follow needed.
+        // for popular shows (it comes from the "Default" source). Return at once.
         for (sources) |s| {
+            if (!sourceAllowed(s.sourceName)) continue;
             const url = s.sourceUrl orelse continue;
             if (std.mem.indexOf(u8, url, "tools.fast4speed.rsvp") != null) {
                 return .{ .url = url, .resolution = 1080, .referer = STREAM_REFERER };
@@ -211,11 +223,9 @@ pub const AllAnime = struct {
         // Long-tail (ROD-92): less-popular shows only expose `--<hex>` providers.
         // Decipher each, follow it, and keep the best variant across all of them.
         // One bad provider doesn't sink the rest — followProvider skips on error.
-        // We attempt every `--` source rather than anipy's `sourceName` allow-list:
-        // equal-or-better coverage, with unsafe URLs/referers rejected downstream
-        // in `consider`/`safeReferer`.
         var best: ?domain.StreamLink = null;
         for (sources) |s| {
+            if (!sourceAllowed(s.sourceName)) continue;
             const url = s.sourceUrl orelse continue;
             if (!std.mem.startsWith(u8, url, "--")) continue;
             best = followProvider(arena, io, url[2..], best) catch |e| blk: {
@@ -753,6 +763,13 @@ test "wixmpVariants: returns null for non-wixmp links" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try std.testing.expectEqual(@as(?[]AllAnime.Variant, null), try AllAnime.wixmpVariants(a, "https://example.com/x.m3u8"));
+}
+
+test "sourceAllowed: only anipy's trusted provider names pass" {
+    try std.testing.expect(AllAnime.sourceAllowed("Default"));
+    try std.testing.expect(AllAnime.sourceAllowed("Yt-mp4"));
+    try std.testing.expect(!AllAnime.sourceAllowed("Sak")); // not in list
+    try std.testing.expect(!AllAnime.sourceAllowed(null));
 }
 
 test "consider/safeReferer: reject mpv-argv injection (C1)" {
