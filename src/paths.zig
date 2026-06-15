@@ -168,3 +168,30 @@ test "ensureDir tolerates empty and over-long paths" {
     @memset(&huge, 'a');
     ensureDir(&huge); // over-buffer, must bail cleanly
 }
+
+test "ensureDir creates a nested directory tree" {
+    // `ensureDir` is io-free, so the whole test stays io-free: build a unique
+    // scratch path, verify the chain with libc `stat`, tear down with libc
+    // `rmdir` (declared locally to keep `unistd.h` out of the module surface).
+    const libc = struct {
+        extern fn rmdir(path: [*:0]const u8) c_int;
+    };
+    var anchor: u8 = 0; // a stack address is unique-enough; ensureDir is idempotent anyway
+    const root = try std.fmt.allocPrint(testing.allocator, "/tmp/zigoku-ensuredir-{x}", .{@intFromPtr(&anchor)});
+    defer testing.allocator.free(root);
+    const nested = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/a/b/c", .{root}, 0);
+    defer testing.allocator.free(nested);
+
+    ensureDir(nested);
+
+    var st: c.struct_stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), c.stat(nested.ptr, &st));
+    try testing.expect(st.st_mode & c.S_IFMT == c.S_IFDIR); // leaf is a directory
+
+    // Teardown, deepest-first.
+    for ([_][]const u8{ "/a/b/c", "/a/b", "/a", "" }) |sub| {
+        const p = try std.fmt.allocPrintSentinel(testing.allocator, "{s}{s}", .{ root, sub }, 0);
+        defer testing.allocator.free(p);
+        _ = libc.rmdir(p.ptr);
+    }
+}

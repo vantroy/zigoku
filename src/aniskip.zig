@@ -230,6 +230,9 @@ const LUA_SCRIPT =
 /// rewrites: the script evolves between app versions, and a ~900-byte write once
 /// per playback launch is cheaper than reasoning about staleness.
 fn ensureScript(arena: Allocator, io: Io) ![]const u8 {
+    // Pre-ROD-89 this resolver returned `error.NoCacheDir`; `paths.cacheDir` now
+    // reports the same condition as `error.NoHomeDir`. `prepare` swallows either
+    // (`catch return null` → no skip script), so the rename is purely internal.
     const dir = try paths.cacheDir(arena);
     paths.ensureDir(dir);
     const path = try std.fmt.allocPrint(arena, "{s}/skip.lua", .{dir});
