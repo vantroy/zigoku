@@ -57,7 +57,7 @@ fn mpvSocketPath(arena: std.mem.Allocator) ![]const u8 {
     // `runtimeDir` only fails on OOM (or Windows); fall back to a bare `/tmp` so a
     // transient socket always has a home. uid/pid/counter in the filename keep
     // concurrent launches from colliding inside the shared dir.
-    const base_dir = paths.runtimeDir(arena) catch "/tmp";
+    const base_dir = paths.runtimeDir(arena) catch "/tmp/zigoku";
     paths.ensureDir(base_dir);
 
     const uid: u64 = @intCast(c.getuid());

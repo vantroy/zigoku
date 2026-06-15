@@ -104,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
         const why: []const u8 = switch (err) {
             error.SchemaTooNew => "DB was written by a newer Zigoku — delete it to start fresh",
             error.NoHomeDir => "couldn't locate a data directory (no $HOME/$XDG_DATA_HOME)",
+            error.Unsupported => "this platform isn't supported yet (no data directory)",
             else => @errorName(err),
         };
         try out.print("  (note: persistence off — {s})\n", .{why});

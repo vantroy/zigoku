@@ -32,7 +32,11 @@ const c = @cImport({
 });
 const paths = @import("paths.zig");
 
-pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, SchemaTooNew };
+// NoHomeDir/Unsupported are NOT here: `Store` itself only ever sees a
+// pre-resolved path. `defaultDbPath` reaches those through `paths.Error` and
+// carries them via its inferred error set — keeping them out of `Store.Error`
+// stops a reader from writing handlers for errors `Store` can't produce.
+pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, SchemaTooNew };
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
