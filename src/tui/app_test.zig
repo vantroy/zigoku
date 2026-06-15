@@ -963,6 +963,9 @@ test "cover_done fresh result stores decoded cover state" {
     });
     app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
     app.cover_loading = true;
+    // Seed the in-flight url so a regression that stops freeing it on the keep
+    // path is caught — both by the null assertion below and the GPA detector.
+    app.cover_inflight_url = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg");
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
@@ -971,6 +974,7 @@ test "cover_done fresh result stores decoded cover state" {
     try testing.expect(!app.cover_loading);
     try testing.expect(app.cover_pixels != null);
     try testing.expectEqual(@as(u32, 1), app.cover_pixels.?.w);
+    try testing.expect(app.cover_inflight_url == null); // keep path frees the in-flight url
 
     app.clearCoverState();
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
