@@ -7,8 +7,8 @@
 //!
 //! This module is the single place that policy lives. Call sites keep using the
 //! plain `std.log.{debug,info,warn,err}` idiom; `logFn` (installed via
-//! `std_options` in `main.zig` and `root.zig`) decides *where* the bytes land and
-//! *whether* a debug line is emitted at all.
+//! `std_options` in `main.zig`, the exe's compilation root) decides *where* the
+//! bytes land and *whether* a debug line is emitted at all.
 //!
 //! Two deliberate choices:
 //!   * `std_options.log_level` is pinned to `.debug` in every build mode, and the
@@ -17,8 +17,9 @@
 //!     make `--debug` silently do nothing in the shipped ReleaseSafe binary,
 //!     which is exactly when a user reaches for it.
 //!   * Writes go through libc (`O_APPEND` for the file, fd 2 for stderr) rather
-//!     than a `std.Io.Writer`. `logFn` has no `io` handle, append writes under
-//!     `PIPE_BUF` are atomic, and worker threads can log without coordination.
+//!     than a `std.Io.Writer`: `logFn` has no `io` handle. For a regular file
+//!     `O_APPEND` makes each write's seek-to-end + write atomic (POSIX), so
+//!     concurrent worker-thread lines don't interleave — no lock needed.
 
 const std = @import("std");
 
@@ -32,7 +33,10 @@ extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
 
-const open_append_flags: c_int = @bitCast(std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true });
+// NOFOLLOW: if the log path is a pre-existing symlink, fail the open rather than
+// follow it (cheap defense against a planted-symlink redirect). A first run with
+// no file still creates a plain regular file via CREAT.
+const open_append_flags: c_int = @bitCast(std.posix.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true });
 
 /// Gate for `.debug`-level lines. Flipped on by `--debug` / `ZIGOKU_DEBUG`.
 /// Higher levels (info/warn/err) always emit.
@@ -76,10 +80,16 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     std.log.err(fmt, args);
 }
 
-/// True if `ZIGOKU_DEBUG` is set to a non-empty value.
+/// True if `ZIGOKU_DEBUG` is set to a recognized truthy value. Explicit falsy
+/// values ("0", "false", "no", "off") and an unset/empty var all mean off — so
+/// `ZIGOKU_DEBUG=0` does the obvious thing rather than enabling on non-emptiness.
 pub fn envDebug() bool {
     const v = getenv("ZIGOKU_DEBUG") orelse return false;
-    return std.mem.span(v).len > 0;
+    const s = std.mem.span(v);
+    inline for (.{ "1", "true", "yes", "on" }) |truthy| {
+        if (std.ascii.eqlIgnoreCase(s, truthy)) return true;
+    }
+    return false;
 }
 
 fn emit(bytes: []const u8) void {
@@ -91,14 +101,27 @@ fn emit(bytes: []const u8) void {
             const fd = open((pbuf[0..path.len :0]).ptr, open_append_flags, 0o644);
             if (fd >= 0) {
                 defer _ = close(fd);
-                _ = write(fd, bytes.ptr, bytes.len);
-                return;
+                writeAll(fd, bytes);
             }
-            // Couldn't open the log file — fall through to stderr rather than
-            // dropping the line entirely.
         }
+        // file_path set means TUI mode, where stderr is the render surface — if
+        // the open (or path) failed, drop the line rather than corrupt the frame.
+        return;
     }
-    _ = write(2, bytes.ptr, bytes.len); // stderr
+    writeAll(2, bytes); // CLI: stderr is free
+}
+
+/// Write every byte, advancing past short writes. A regular-file `O_APPEND` write
+/// of a sub-buffer line won't fragment in practice, but ignoring the return
+/// entirely would silently truncate one. Best-effort: a hard error (or a 0/-1
+/// return) ends the attempt rather than spinning.
+fn writeAll(fd: c_int, bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = write(fd, bytes.ptr + off, bytes.len - off);
+        if (n <= 0) return; // error or nothing written — give up (logging is best-effort)
+        off += @intCast(n);
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -168,4 +191,24 @@ test "debug is suppressed when the gate is off, but err still emits" {
     const content = readBackAll(path, &buf) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, content, "[error] boom now") != null);
     try testing.expect(std.mem.indexOf(u8, content, "should not appear") == null);
+}
+
+test "envDebug honors truthy values and treats explicit falsy as off" {
+    const libc = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    defer _ = libc.unsetenv("ZIGOKU_DEBUG");
+
+    _ = libc.unsetenv("ZIGOKU_DEBUG");
+    try testing.expect(!envDebug()); // unset → off
+
+    for ([_][:0]const u8{ "1", "true", "YES", "on" }) |truthy| {
+        _ = libc.setenv("ZIGOKU_DEBUG", truthy.ptr, 1);
+        try testing.expect(envDebug());
+    }
+    for ([_][:0]const u8{ "0", "false", "no", "off", "" }) |falsy| {
+        _ = libc.setenv("ZIGOKU_DEBUG", falsy.ptr, 1);
+        try testing.expect(!envDebug());
+    }
 }
