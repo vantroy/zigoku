@@ -264,24 +264,94 @@ pub const AllAnime = struct {
         return aw.writer.buffered();
     }
 
-    /// One GET. Returns the body (lives in `arena`). `HttpNotOk` on non-200.
-    /// Used by the ROD-92 long-tail follow (deciphered clock JSON + m3u8 fetch).
+    /// Hard cap on a long-tail response body. clock JSON and m3u8 manifests are
+    /// kilobytes; this bounds memory against a hostile CDN streaming forever (N1).
+    const MAX_RESP_BYTES = 4 << 20; // 4 MiB
+
+    /// One GET for the ROD-92 long-tail follow (deciphered clock JSON + m3u8).
+    /// Untrusted destination, so: SSRF-guard the URL first, refuse redirects (a
+    /// 3xx must not bounce us past the guard), and cap the body. `HttpNotOk` on
+    /// any failure — the caller skips the link.
     fn get(arena: Allocator, io: Io, url: []const u8, referer: []const u8) ![]u8 {
+        try guardFetchUrl(url);
         var client: std.http.Client = .{ .allocator = arena, .io = io };
         defer client.deinit();
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const res = try client.fetch(.{
+        const buf = try arena.alloc(u8, MAX_RESP_BYTES);
+        var w = std.Io.Writer.fixed(buf);
+        const res = client.fetch(.{
             .location = .{ .url = url },
             .method = .GET,
-            .response_writer = &aw.writer,
+            .response_writer = &w,
+            .redirect_behavior = .not_allowed,
             .headers = .{ .user_agent = .{ .override = UA } },
             .extra_headers = &.{.{ .name = "Referer", .value = referer }},
-        });
+        }) catch |e| {
+            // Covers redirects (refused), oversize body (writer full), and network errors.
+            log.debug("allanime GET {s}: {s}", .{ url, @errorName(e) });
+            return error.HttpNotOk;
+        };
         if (res.status != .ok) {
             log.debug("allanime GET {s}: HTTP {d}", .{ url, @intFromEnum(res.status) });
             return error.HttpNotOk;
         }
-        return aw.writer.buffered();
+        return w.buffered();
+    }
+
+    /// SSRF policy for every long-tail fetch. Only plain http(s); no userinfo
+    /// (defeats `https://allanime.day@evil/…`); and IP-literal or `localhost`
+    /// destinations in private/loopback/link-local space are refused. Paired with
+    /// `redirect_behavior=.not_allowed` so a redirect can't bounce past this.
+    ///
+    /// KNOWN RESIDUAL: a public DNS name whose record points at a private IP
+    /// (rebinding) is NOT caught — std's Io net API exposes no pre-connect
+    /// resolver to inspect, and the OS resolves inside the client. Closing this
+    /// needs resolve-then-connect-to-validated-IP, which the std API doesn't
+    /// cleanly allow today. Tracked for follow-up.
+    fn guardFetchUrl(url: []const u8) !void {
+        const uri = std.Uri.parse(url) catch return error.BadFetchUrl;
+        if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) return error.BadFetchUrl;
+        if (uri.user != null or uri.password != null) return error.BadFetchUrl;
+        const hc = uri.host orelse return error.BadFetchUrl;
+        const host = switch (hc) { inline else => |h| h };
+        if (host.len == 0) return error.BadFetchUrl;
+        if (std.ascii.eqlIgnoreCase(host, "localhost") or
+            (host.len >= 10 and std.ascii.eqlIgnoreCase(host[host.len - 10 ..], ".localhost")))
+            return error.BlockedHost;
+        if (parseHostIp(host)) |ip| if (isPrivateIp(ip)) return error.BlockedHost;
+    }
+
+    /// Parse a bare IPv4/IPv6 literal host (brackets stripped) into an address.
+    /// Null when `host` is a DNS name rather than a literal.
+    fn parseHostIp(host: []const u8) ?Io.net.IpAddress {
+        const h = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host[1 .. host.len - 1] else host;
+        return Io.net.IpAddress.parse(h, 0) catch null;
+    }
+
+    fn isPrivateIp(ip: Io.net.IpAddress) bool {
+        return switch (ip) {
+            .ip4 => |a| isPrivateV4(a.bytes),
+            .ip6 => |a| isPrivateV6(a.bytes),
+        };
+    }
+
+    fn isPrivateV4(b: [4]u8) bool {
+        return switch (b[0]) {
+            0, 10, 127 => true, // this-net, private, loopback
+            100 => b[1] >= 64 and b[1] <= 127, // CGNAT 100.64/10
+            169 => b[1] == 254, // link-local 169.254/16
+            172 => b[1] >= 16 and b[1] <= 31, // private 172.16/12
+            192 => b[1] == 168, // private 192.168/16
+            else => false,
+        };
+    }
+
+    fn isPrivateV6(b: [16]u8) bool {
+        if (std.mem.allEqual(u8, b[0..15], 0)) return true; // :: (unspecified) and ::1 (loopback)
+        if (b[0] == 0xfe and (b[1] & 0xc0) == 0x80) return true; // link-local fe80::/10
+        if ((b[0] & 0xfe) == 0xfc) return true; // ULA fc00::/7
+        if (std.mem.allEqual(u8, b[0..10], 0) and b[10] == 0xff and b[11] == 0xff)
+            return isPrivateV4(.{ b[12], b[13], b[14], b[15] }); // IPv4-mapped ::ffff:a.b.c.d
+        return false;
     }
 
     /// base64-decode then AES-256-GCM-decrypt the `tobeparsed` blob.
@@ -435,10 +505,12 @@ pub const AllAnime = struct {
         return if ((cand.resolution orelse 0) > (c.resolution orelse 0)) cand else c;
     }
 
-    /// True if `s` is safe to place in mpv's argv — no control characters that
-    /// could smuggle an extra HTTP header (CR/LF) through `--http-header-fields`.
+    /// True if `s` is safe to place in mpv's argv. Allowlist, not denylist: only
+    /// printable ASCII (0x21–0x7e). This rejects CR/LF and other C0/DEL controls
+    /// *and* the ≥0x80 line-break-equivalents (NEL, U+2028/9 as UTF-8) and spaces
+    /// that a denylist on `< 0x20` would miss — URLs and Referers are ASCII anyway.
     fn cleanArg(s: []const u8) bool {
-        for (s) |c| if (c < 0x20 or c == 0x7f) return false;
+        for (s) |c| if (c < 0x21 or c > 0x7e) return false;
         return true;
     }
 
@@ -468,6 +540,9 @@ pub const AllAnime = struct {
         var best = best_in;
         const deciphered = try decipherProviderPath(arena, hex_path);
         const path = try clockJson(arena, deciphered);
+        // Defense-in-depth for the userinfo SSRF: a path not starting with `/`
+        // (e.g. `@evil/x`) would make SITE the authority's userinfo, not the host.
+        if (!std.mem.startsWith(u8, path, "/")) return error.BadProviderPath;
         const raw = try get(arena, io, try std.mem.concat(arena, u8, &.{ SITE, path }), REFERER_API);
         const parsed = try std.json.parseFromSlice(ClkResp, arena, raw, .{ .ignore_unknown_fields = true });
 
@@ -785,6 +860,52 @@ test "consider/safeReferer: reject mpv-argv injection (C1)" {
     const ok = AllAnime.consider(null, "https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
     try std.testing.expectEqualStrings("https://cdn.test/v.m3u8", ok.url);
     try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
+}
+
+test "isPrivateV4: private/loopback/link-local ranges blocked, public allowed" {
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 127, 0, 0, 1 }));
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 10, 1, 2, 3 }));
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 169, 254, 169, 254 })); // cloud metadata
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 172, 16, 0, 1 }));
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 192, 168, 1, 1 }));
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 100, 64, 0, 1 }));
+    try std.testing.expect(!AllAnime.isPrivateV4(.{ 8, 8, 8, 8 }));
+    try std.testing.expect(!AllAnime.isPrivateV4(.{ 172, 32, 0, 1 }));
+    try std.testing.expect(!AllAnime.isPrivateV4(.{ 100, 128, 0, 1 }));
+}
+
+test "isPrivateV6: loopback/ULA/link-local/mapped blocked" {
+    const loop = [_]u8{0} ** 15 ++ [_]u8{1};
+    const unspec = [_]u8{0} ** 16;
+    var fe80 = [_]u8{0} ** 16;
+    fe80[0] = 0xfe;
+    fe80[1] = 0x80;
+    var ula = [_]u8{0} ** 16;
+    ula[0] = 0xfd;
+    const mapped = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 };
+    var pub6 = [_]u8{0} ** 16;
+    pub6[0] = 0x20;
+    pub6[1] = 0x01; // 2001::
+    try std.testing.expect(AllAnime.isPrivateV6(loop));
+    try std.testing.expect(AllAnime.isPrivateV6(unspec));
+    try std.testing.expect(AllAnime.isPrivateV6(fe80));
+    try std.testing.expect(AllAnime.isPrivateV6(ula));
+    try std.testing.expect(AllAnime.isPrivateV6(mapped));
+    try std.testing.expect(!AllAnime.isPrivateV6(pub6));
+}
+
+test "guardFetchUrl: blocks SSRF vectors, allows public http(s)" {
+    // userinfo SSRF: allanime.day is userinfo, evil is the real host.
+    try std.testing.expectError(error.BadFetchUrl, AllAnime.guardFetchUrl("https://allanime.day@evil.example/x"));
+    try std.testing.expectError(error.BadFetchUrl, AllAnime.guardFetchUrl("ftp://x/v.ts")); // non-http scheme
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://127.0.0.1/x"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://169.254.169.254/latest/meta-data/"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://localhost:8080/admin"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://[::1]/x"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://10.0.0.5/x"));
+    // public destinations pass.
+    try AllAnime.guardFetchUrl("https://cdn.real.example/v.m3u8");
+    try AllAnime.guardFetchUrl("https://allanime.day/apivtwo/clock.json?id=x");
 }
 
 test "clockJson: inserts .json after the clock segment" {
