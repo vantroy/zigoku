@@ -171,7 +171,7 @@ pub fn run(
 }
 
 pub const Toast = struct {
-    pub const Kind = enum { info, @"error", warn };
+    pub const Kind = enum { info, success, @"error", warn };
     kind: Kind,
     text: [80]u8 = undefined,
     text_len: usize = 0,
@@ -211,13 +211,13 @@ const SettingRow = struct {
 
 const settings_rows = [_]SettingRow{
     .{ .id = .mpv_path, .label = "mpv path", .kind = .text, .hint = "enter to edit" },
-    .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "h/l cycle" },
-    .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "h/l cycle" },
-    .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "h/l cycle" },
-    .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "h/l cycle" },
-    .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space" },
-    .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space" },
-    .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "h/l cycle" },
+    .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space to toggle" },
+    .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
+    .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not
@@ -1484,7 +1484,7 @@ pub const App = struct {
             self.pushToast(.@"error", "settings save failed", false);
             return;
         };
-        self.pushToast(.info, "settings saved", false);
+        self.pushToast(.success, "settings saved", false);
     }
 
     /// Display string for a setting's current value. `buf` backs the formatted
@@ -1740,7 +1740,7 @@ pub const App = struct {
             .history => "Watchlist",
             .detail => switch (self.detail_origin) {
                 .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
-                .history => "▸ Watchlist",
+                .history => "Watchlist",
             },
             .settings => "Settings",
             .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
@@ -1823,17 +1823,39 @@ pub const App = struct {
                     // bg.surface (a full-width band), its marker is the ▸ play glyph in
                     // focus cyan, and its title goes cyan+bold. Magenta is reserved for
                     // the one cursor in the status bar — never a list marker (§8).
+                    const is_completed = std.mem.eql(u8, rec.list_status, "completed");
+                    const is_dropped = std.mem.eql(u8, rec.list_status, "dropped");
+                    const is_watching = std.mem.eql(u8, rec.list_status, "watching");
+                    const is_paused = std.mem.eql(u8, rec.list_status, "paused");
+
                     const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
                     if (selected) {
                         fillRow(win, row, w, self.palette.bg_surface);
                         fillRow(win, row + 1, w, self.palette.bg_surface);
                     }
 
-                    const marker = if (selected) "▸ " else "  ";
-                    put(win, row, 2, marker, self.s(self.palette.focus, .{ .bg = row_bg }));
+                    // §2.4 watchlist status glyphs. Focus `▸` overrides when selected.
+                    // Colors: watching/paused=focus(+dim for paused), dropped=fg3, else fg2.
+                    const marker: []const u8 =
+                        if (selected or is_watching) "▸ "
+                        else if (is_completed) "● "
+                        else if (is_paused) "◐ "
+                        else if (is_dropped) "· "
+                        else "○ ";
+                    const marker_color =
+                        if (selected or is_watching or is_paused) self.palette.focus
+                        else if (is_dropped) self.palette.fg3
+                        else self.palette.fg2;
+                    // §2.4: paused = state.focus + dim (SGR 2), but not when focused row.
+                    const marker_dim = is_paused and !selected;
+                    put(win, row, 2, marker, self.s(marker_color, .{ .bg = row_bg, .dim = marker_dim }));
 
+                    // §4.1: completed/dropped rows use text.dim for title; watching/planning fg.
+                    const de_emphasized = is_completed or is_dropped;
                     const title_style = if (selected)
                         self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
+                    else if (de_emphasized)
+                        self.s(self.palette.fg3, .{ .bg = row_bg })
                     else
                         self.s(self.palette.fg, .{ .bg = row_bg });
                     putClipped(win, row, title_col, title_w, rec.title, title_style);
@@ -1907,7 +1929,7 @@ pub const App = struct {
 
         // Catalog — read-only system state, never focusable (skipped by nav).
         y = self.drawSettingsHeader(win, y, w, "Catalog");
-        self.drawInertRow(win, y, w, "enrichment sync", "automatic");
+        self.drawInertRow(win, y, w, "enrichment sync", "not available until M4");
         y += 1;
         self.drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
         y += 1;
@@ -1960,6 +1982,12 @@ pub const App = struct {
         const value_budget: u16 = if (hint_col > settings_value_col + 2) hint_col - settings_value_col - 2 else 0;
         if (editing) {
             self.drawSettingsEditField(win, y, settings_value_col, value_budget, row_bg);
+        } else if (row.kind == .toggle) {
+            // §5.5: visual toggle widget. ON = focus cyan; OFF = fg3 dim.
+            const is_on = std.mem.eql(u8, value, "on");
+            const toggle_color = if (is_on) self.palette.focus else self.palette.fg3;
+            const toggle_text: []const u8 = if (is_on) "[████ on ████]" else "[████ off ████]";
+            putClipped(win, y, settings_value_col, value_budget, toggle_text, self.s(toggle_color, .{ .bg = row_bg }));
         } else {
             const value_style = if (focused)
                 self.s(self.palette.fg, .{ .bg = row_bg })
@@ -2213,9 +2241,12 @@ pub const App = struct {
         putClipped(win, row, 0, w, score_text, score_style);
         row += 1;
 
-        // Hairline.
+        // Hairline — clipped to window width so it never wraps onto the next row.
+        // "─" is 3 UTF-8 bytes; we need exactly `cols` glyphs = `cols * 3` bytes.
         if (row < h) {
-            _ = win.printSegment(.{ .text = "─" ** 160, .style = .{ .fg = self.palette.chrome, .bg = self.palette.bg_base } }, .{ .row_offset = row });
+            const cols: u16 = @min(w, 160);
+            put(win, row, 0, ("─" ** 160)[0 .. @as(usize, cols) * 3],
+                self.s(self.palette.chrome, .{}));
         }
         row += 1;
 
@@ -2332,7 +2363,7 @@ pub const App = struct {
             const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
                 "…"
             else if (self.results.items.len > 0)
-                std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{self.results.items.len}) catch ""
+                std.fmt.bufPrint(&self.cnt_scratch, "[{d} results]", .{self.results.items.len}) catch ""
             else if (self.search_len > 0)
                 "[0 results]"
             else
@@ -2389,17 +2420,17 @@ pub const App = struct {
         const help: []const u8 = switch (self.active_view) {
             .browse => switch (self.active_pane) {
                 .list => "hjkl · / search · F1/F2/F3 views · q quit",
-                .detail => "jk scroll · h back · enter play · q back",
+                .detail => "hjkl scroll · h back · enter play · q back",
             },
             .history => if (self.history.len == 0)
                 "/ search · F1 browse · q quit"
             else
                 "jk move · enter open · F1 browse · F3 settings · q quit",
-            .detail => "jk scroll · h back · enter play · q back",
+            .detail => "hjkl scroll · h back · enter play · q back",
             .settings => if (self.settings_editing)
                 "type to edit · enter confirm · esc cancel"
             else
-                "hjkl navigate · space toggle · enter edit · q save & back",
+                "hjkl navigate · space toggle · enter edit · esc cancel · q save & back",
         };
         putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, self.s(self.palette.fg3, .{}));
     }
@@ -2413,26 +2444,31 @@ pub const App = struct {
             qi -= 1;
             const t = self.toast_queue[qi] orelse continue;
             if (row < 1) break;
+            // §4.7 color map: info=[~] fg2(text.muted), success=[✓] fg(state.success),
+            //   error=[!] hot, warn=[!] warn.
             const fg_color: vaxis.Color = switch (t.kind) {
                 .@"error" => self.palette.hot,
                 .warn => self.palette.warn,
-                .info => self.palette.focus,
+                .success => self.palette.fg,
+                .info => self.palette.fg2,
             };
             const prefix: []const u8 = switch (t.kind) {
-                .@"error" => "[!] ",
-                .warn => "[~] ",
-                .info => "[·] ",
+                .@"error", .warn => "[!] ",
+                .success => "[✓] ",
+                .info => "[~] ",
             };
             const w = win.width;
             // §4.7: right-aligned, max 40 display columns.
-            const pre_len: u16 = @intCast(prefix.len);
+            // All prefixes are exactly 4 display cells regardless of UTF-8 byte length
+            // ([✓] = 6 bytes but 4 cells; ASCII variants are 4 bytes = 4 cells).
+            const pre_w: u16 = 4;
             const txt_len: u16 = @intCast(t.text_len);
-            const toast_w: u16 = @min(pre_len + txt_len, @min(40, w -| 2));
+            const toast_w: u16 = @min(pre_w + txt_len, @min(40, w -| 2));
             const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
             fillRow(win, row, w, self.palette.bg_elevated);
             put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
-            const txt_col: u16 = pre_col + pre_len;
-            const txt_w: u16 = if (toast_w > pre_len) toast_w - pre_len else 0;
+            const txt_col: u16 = pre_col + pre_w;
+            const txt_w: u16 = if (toast_w > pre_w) toast_w - pre_w else 0;
             putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bg = self.palette.bg_elevated }));
             row -|= 1;
         }
