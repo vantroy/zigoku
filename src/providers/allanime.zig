@@ -211,6 +211,9 @@ pub const AllAnime = struct {
         // Long-tail (ROD-92): less-popular shows only expose `--<hex>` providers.
         // Decipher each, follow it, and keep the best variant across all of them.
         // One bad provider doesn't sink the rest — followProvider skips on error.
+        // We attempt every `--` source rather than anipy's `sourceName` allow-list:
+        // equal-or-better coverage, with unsafe URLs/referers rejected downstream
+        // in `consider`/`safeReferer`.
         var best: ?domain.StreamLink = null;
         for (sources) |s| {
             const url = s.sourceUrl orelse continue;
@@ -362,11 +365,9 @@ pub const AllAnime = struct {
     fn wixmpVariants(arena: Allocator, link: []const u8) !?[]Variant {
         if (std.mem.indexOf(u8, link, "repackager.wixmp.com") == null) return null;
         const head = link[0 .. (std.mem.indexOf(u8, link, ".urlset") orelse link.len)];
-        const host = "repackager.wixmp.com/";
-        const body = if (std.mem.indexOf(u8, head, host)) |p|
-            try std.mem.concat(arena, u8, &.{ head[0..p], head[p + host.len ..] })
-        else
-            head;
+        // Strip the repackager host wherever it appears (global, matching the
+        // oracle's `.replace(...)`); the remaining comma list wraps each quality.
+        const body = try std.mem.replaceOwned(u8, arena, head, "repackager.wixmp.com/", "");
 
         var parts: std.ArrayList([]const u8) = .empty;
         var it = std.mem.splitScalar(u8, body, ',');
@@ -392,7 +393,9 @@ pub const AllAnime = struct {
     const ClkResp = struct { links: []ClkLink = &.{} };
 
     /// Insert `.json` after the first `clock` segment of a deciphered path
-    /// (`…/clock?id=…` → `…/clock.json?id=…`). Passthrough if absent.
+    /// (`…/clock?id=…` → `…/clock.json?id=…`). Passthrough if absent. First-match
+    /// only, like the oracle's `.replace`; real paths are `/apivtwo/clock?…` so
+    /// the substring is unambiguous.
     fn clockJson(arena: Allocator, path: []const u8) ![]u8 {
         const at = std.mem.indexOf(u8, path, "clock") orelse return arena.dupe(u8, path);
         const cut = at + "clock".len;
@@ -403,7 +406,10 @@ pub const AllAnime = struct {
     /// Absolute (`http…`) passes through; `/rooted` keeps scheme+host; otherwise
     /// it's relative to the playlist's directory.
     fn joinUrl(arena: Allocator, base: []const u8, ref: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, ref, "http")) return arena.dupe(u8, ref);
+        // Absolute refs pass through. `./`/`../` segments are left literal — the
+        // URL is handed to mpv, which normalizes them, so we don't resolve here.
+        if (std.mem.startsWith(u8, ref, "http://") or std.mem.startsWith(u8, ref, "https://"))
+            return arena.dupe(u8, ref);
         const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.BadBaseUrl) + 3;
         const host_end = std.mem.indexOfScalarPos(u8, base, scheme_end, '/') orelse base.len;
         if (std.mem.startsWith(u8, ref, "/")) return std.mem.concat(arena, u8, &.{ base[0..host_end], ref });
@@ -419,6 +425,31 @@ pub const AllAnime = struct {
         return if ((cand.resolution orelse 0) > (c.resolution orelse 0)) cand else c;
     }
 
+    /// True if `s` is safe to place in mpv's argv — no control characters that
+    /// could smuggle an extra HTTP header (CR/LF) through `--http-header-fields`.
+    fn cleanArg(s: []const u8) bool {
+        for (s) |c| if (c < 0x20 or c == 0x7f) return false;
+        return true;
+    }
+
+    /// A Referer safe for mpv's argv. The clock.json is fetched from an untrusted
+    /// long-tail CDN, so a hostile `headers.Referer` carrying a newline could
+    /// inject request headers — the exact hazard player.zig's TODO named. Fall
+    /// back to SITE when the value is dirty or absent.
+    fn safeReferer(r: ?[]const u8) []const u8 {
+        const v = r orelse return SITE;
+        return if (cleanArg(v)) v else SITE;
+    }
+
+    /// Fold a candidate variant into `best`, dropping anything unsafe for mpv's
+    /// argv: the URL must be a clean `http(s)` — no control chars, no leading `--`
+    /// that mpv would read as an option. Referer is pre-sanitized by safeReferer.
+    fn consider(best: ?domain.StreamLink, url: []const u8, res: ?u32, referer: []const u8) ?domain.StreamLink {
+        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return best;
+        if (!cleanArg(url)) return best;
+        return better(best, .{ .url = url, .resolution = res, .referer = referer });
+    }
+
     /// Follow one deciphered `--<hex>` provider to its best stream variant,
     /// folding into `best_in`. Network-bound; the parsers it calls are the tested
     /// part. A failed link is logged and skipped, not fatal — another provider or
@@ -432,16 +463,16 @@ pub const AllAnime = struct {
 
         for (parsed.value.links) |l| {
             const link = l.link orelse continue;
+            const referer = safeReferer(if (l.headers) |h| h.Referer else null);
 
             // Shape 1: wixmp repackager — synthetic per-quality URLs, no manifest.
             if (try wixmpVariants(arena, link)) |vs| {
-                for (vs) |v| best = better(best, .{ .url = v.url, .resolution = v.resolution, .referer = STREAM_REFERER });
+                for (vs) |v| best = consider(best, v.url, v.resolution, STREAM_REFERER);
                 continue;
             }
 
             // Shape 2: a real m3u8. Fetch it (echoing any Referer the link names),
             // then parse the master playlist for variants.
-            const referer = if (l.headers) |h| (h.Referer orelse SITE) else SITE;
             const body = get(arena, io, link, referer) catch |e| {
                 log.debug("allanime m3u8 GET {s}: {s}", .{ link, @errorName(e) });
                 continue;
@@ -449,13 +480,9 @@ pub const AllAnime = struct {
             const vs = try parseMasterPlaylist(arena, body);
             if (vs.len == 0) {
                 // No variants → it's already a media playlist; play it directly.
-                best = better(best, .{ .url = link, .resolution = 1080, .referer = referer });
+                best = consider(best, link, 1080, referer);
             } else {
-                for (vs) |v| best = better(best, .{
-                    .url = try joinUrl(arena, link, v.url),
-                    .resolution = v.resolution,
-                    .referer = referer,
-                });
+                for (vs) |v| best = consider(best, try joinUrl(arena, link, v.url), v.resolution, referer);
             }
         }
         return best;
@@ -726,6 +753,21 @@ test "wixmpVariants: returns null for non-wixmp links" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     try std.testing.expectEqual(@as(?[]AllAnime.Variant, null), try AllAnime.wixmpVariants(a, "https://example.com/x.m3u8"));
+}
+
+test "consider/safeReferer: reject mpv-argv injection (C1)" {
+    // A CR/LF-bearing Referer from a hostile clock.json falls back to SITE.
+    try std.testing.expectEqualStrings("https://allanime.day", AllAnime.safeReferer("https://x/\r\nEvil: 1"));
+    try std.testing.expectEqualStrings("https://ok.test/", AllAnime.safeReferer("https://ok.test/"));
+    try std.testing.expectEqualStrings("https://allanime.day", AllAnime.safeReferer(null));
+    // A URL with control chars, or one that mpv would read as an option, is dropped.
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "https://x/a\nb", 1080, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "--script=evil.lua", 720, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "ftp://x/v.ts", 720, "r"));
+    // A clean http(s) URL is accepted.
+    const ok = AllAnime.consider(null, "https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
+    try std.testing.expectEqualStrings("https://cdn.test/v.m3u8", ok.url);
+    try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
 }
 
 test "clockJson: inserts .json after the clock segment" {
