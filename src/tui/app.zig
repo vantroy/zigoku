@@ -27,6 +27,7 @@ const event_mod = @import("event.zig");
 const render = @import("render.zig");
 const workers = @import("workers.zig");
 const config_mod = @import("../config.zig");
+const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
@@ -829,7 +830,7 @@ pub const App = struct {
             time_pos,
             duration,
             Store.nowSecs(),
-        ) catch {};
+        ) catch |e| log.debug("saveProgress (checkpoint) failed: {s}", .{@errorName(e)});
         self.last_checkpoint_pos = time_pos;
     }
 
@@ -851,10 +852,11 @@ pub const App = struct {
                         update.time_pos,
                         update.duration,
                         Store.nowSecs(),
-                    ) catch {};
+                    ) catch |e| log.debug("saveProgress (final) failed: {s}", .{@errorName(e)});
                 }
                 if (record_play and self.playing_episode_index > 0) {
-                    st.recordPlay(self.playing_source, self.playing_anime_id, self.playing_episode_index, Store.nowSecs()) catch {};
+                    st.recordPlay(self.playing_source, self.playing_anime_id, self.playing_episode_index, Store.nowSecs()) catch |e|
+                        log.debug("recordPlay failed: {s}", .{@errorName(e)});
                 }
             }
         }
@@ -1110,7 +1112,7 @@ pub const App = struct {
         while (i < end) : (i += 1) {
             var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation);
             rec.history_visible = visible;
-            st.upsertAnime(rec, Store.nowSecs()) catch {};
+            st.upsertAnime(rec, Store.nowSecs()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
         }
     }
 
@@ -1156,7 +1158,12 @@ pub const App = struct {
                 self.search_page = ev.page;
                 // Take ownership: append results into self.results, which already holds
                 // old page(s) for page > 1. The strings are already gpa-owned.
-                self.results.appendSlice(self.gpa, ev.results) catch {};
+                self.results.appendSlice(self.gpa, ev.results) catch |e| {
+                    // OOM appending this page — the duped Anime in ev.results would
+                    // otherwise leak (we free the outer slice but not the elements).
+                    log.debug("appending search results failed: {s}", .{@errorName(e)});
+                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+                };
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
                 // Reset cursor to top on fresh search.

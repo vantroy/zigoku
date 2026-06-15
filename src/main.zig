@@ -13,6 +13,14 @@ const std = @import("std");
 const Io = std.Io;
 const zigoku = @import("zigoku");
 
+/// Route all logging through Zigoku's handler, and pin the level to `.debug` in
+/// every build so the runtime `--debug` gate works in the shipped binary. See
+/// `src/log.zig`.
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+    .logFn = zigoku.log.logFn,
+};
+
 const Cli = struct {
     query: []const u8,
     translation: zigoku.Translation = .sub,
@@ -60,13 +68,18 @@ fn persistFinalProgress(
     latest: ?zigoku.player.PositionUpdate,
 ) void {
     const update = latest orelse return;
-    st.saveProgress(source, source_id, tt, episode, update.time_pos, update.duration, zigoku.Store.nowSecs()) catch {};
+    st.saveProgress(source, source_id, tt, episode, update.time_pos, update.duration, zigoku.Store.nowSecs()) catch |e|
+        std.log.debug("saveProgress failed: {s}", .{@errorName(e)});
 }
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
+
+    // Debug logging (ROD-88): `--debug` flag or `ZIGOKU_DEBUG=1`. Set before any
+    // worker thread or the TUI spawns, so the gate is stable for the run.
+    if (zigoku.log.envDebug() or hasFlag(args, "--debug")) zigoku.log.debug_enabled = true;
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
@@ -129,6 +142,13 @@ fn openStore(arena: std.mem.Allocator) !zigoku.Store {
 /// Launch the libvaxis TUI (ROD-71). Persistence is best-effort — if the DB
 /// won't open, the shell just shows an empty history rather than refusing to run.
 fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, cfg_path: ?[]const u8) !void {
+    // In the TUI, stderr is the render surface — send diagnostics to a file
+    // instead. Best-effort: a failure here just leaves logging on stderr.
+    if (zigoku.paths.dataDir(arena)) |dir| {
+        zigoku.paths.ensureDir(dir);
+        zigoku.log.file_path = std.fmt.allocPrint(arena, "{s}/zigoku.log", .{dir}) catch null;
+    } else |_| {}
+
     var store_opt: ?zigoku.Store = openStore(arena) catch null;
     defer if (store_opt) |*st| st.close();
     var allanime = zigoku.AllAnime.init();
@@ -172,7 +192,8 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
 
     // ROD-66/97: remember this show. Refreshes source metadata, preserves any
     // existing history (play_count/progress/status).
-    if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs()) catch {};
+    if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs()) catch |e|
+        std.log.debug("upsertAnime failed: {s}", .{@errorName(e)});
 
     // 2. Episodes — ROD-68: serve from cache when warm, else fetch + cache.
     const eps = try loadEpisodes(arena, io, out, provider, store, SOURCE, show, cli.translation);
@@ -240,7 +261,8 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
             const latest = progress.snapshot();
             if (observedPlaybackWasMeaningful(latest)) {
                 persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
-                if (err == error.MpvFailed) st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+                if (err == error.MpvFailed) st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch |e|
+                    std.log.debug("recordPlay failed: {s}", .{@errorName(e)});
             }
         }
         return err;
@@ -251,7 +273,8 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
         if (observedPlaybackWasMeaningful(latest)) {
             persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
         }
-        st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch {};
+        st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch |e|
+            std.log.debug("recordPlay failed: {s}", .{@errorName(e)});
     }
 
     try out.print("\n✓ done. That was Zigoku, end to end.\n", .{});
@@ -289,7 +312,8 @@ fn loadEpisodes(
 
     if (store) |st| {
         if (fetched.len > 0)
-            st.putCachedEpisodes(source, show.id, tt, fetched, show.status, zigoku.Store.nowSecs(), arena) catch {};
+            st.putCachedEpisodes(source, show.id, tt, fetched, show.status, zigoku.Store.nowSecs(), arena) catch |e|
+                std.log.debug("putCachedEpisodes failed: {s}", .{@errorName(e)});
     }
     return fetched;
 }
@@ -343,6 +367,9 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
             cli.quality = args[i];
         } else if (std.mem.startsWith(u8, a, "--quality=")) {
             cli.quality = a["--quality=".len..];
+        } else if (std.mem.eql(u8, a, "--debug")) {
+            // Global logging flag — handled in `main` before parse; consumed here
+            // so it isn't mistaken for a query word or an unknown flag.
         } else if (std.mem.startsWith(u8, a, "--")) {
             return error.UnknownFlag;
         } else {
@@ -355,14 +382,25 @@ fn parseArgs(arena: std.mem.Allocator, args: []const [:0]const u8) !Cli {
     return cli;
 }
 
+/// True if `flag` appears anywhere in `args`.
+fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, flag)) return true;
+    }
+    return false;
+}
+
 fn usage(out: *Io.Writer) !void {
     try zigoku.writeBanner(out);
     try out.writeAll(
         \\
-        \\  usage: zigoku <query> [--dub] [--quality best|1080|720|480|worst]
+        \\  usage: zigoku <query> [--dub] [--quality best|1080|720|480|worst] [--debug]
         \\
         \\    zigoku frieren
         \\    zigoku "cowboy bebop" --dub
+        \\
+        \\  --debug (or ZIGOKU_DEBUG=1) writes diagnostics: stderr in CLI mode,
+        \\  ~/.local/share/zigoku/zigoku.log in the TUI.
         \\
     );
 }
