@@ -160,9 +160,10 @@ pub fn play(
     try argv.append(arena, mpv_path);
     try argv.append(arena, link.url);
     if (link.referer) |r| {
-        // Safe today: referer is a hardcoded constant. When ROD-92 lands and
-        // providers supply their own referer from API data, validate it (no
-        // CR/LF, no header injection) before embedding it in this arg.
+        // Referer may originate from untrusted provider data (ROD-92 long-tail).
+        // It is validated upstream before reaching here: allanime.zig's
+        // `safeReferer`/`cleanArg` reject control chars (no CR/LF header
+        // injection) and `consider` gates the URL. Keep that contract intact.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));
