@@ -33,17 +33,45 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 Known gap: quality selection is parsed but not honoured yet — playback uses the
 1080p direct stream while the full m3u8 resolver is pending (ROD-92).
 
-## Build & run
+## Install
+
+Zigoku is distributed as source — clone it and run the installer:
+
+```sh
+git clone https://github.com/vantroy/zigoku.git
+cd zigoku
+./scripts/install.sh            # builds ReleaseSafe → ~/.local/bin/zigoku
+```
+
+The installer builds in `ReleaseSafe` and drops the binary in your prefix's
+`bin/`. Override the prefix with `--prefix DIR` (or `PREFIX=DIR`), and remove
+the binary later with `./scripts/install.sh --uninstall`. If `~/.local/bin`
+isn't on your `PATH`, the installer tells you how to add it.
+
+**Requirements:** Zig **0.16.0+** and system `sqlite3` (with dev headers) to
+build; `mpv` on `PATH` at runtime. Cover art looks best in a terminal with the
+Kitty graphics protocol (kitty, ghostty, WezTerm).
+
+Once installed:
+
+```sh
+zigoku                        # no args → the TUI
+zigoku frieren                # CLI flow: search → pick → play
+zigoku "cowboy bebop" --dub
+zigoku <query> --debug        # diagnostics to stderr (CLI) or the log file (TUI)
+```
+
+## Build from source
+
+To work on Zigoku without installing, drive it through `zig build`:
 
 ```sh
 zig build run                 # no args → the TUI
 zig build run -- frieren      # CLI flow: search → pick → play
 zig build run -- "cowboy bebop" --dub
-zig build test                # run tests
+zig build test                # run the unit tests
+./scripts/e2e.sh              # end-to-end harness (stubs mpv; offline-safe)
 ```
-
-Requires Zig **0.16.0** and `mpv` on `PATH`. Cover art looks best in a terminal
-with the Kitty graphics protocol (kitty, ghostty, WezTerm).
 
 ## Stack
 
@@ -67,7 +95,7 @@ issue IDs in commit messages map back to it.
 | **M4** | Cover art: Kitty graphics, async pipeline, LRU caches, AniList bridge | ✅ done |
 | **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip, full stream resolver & quality select | 🚧 in progress |
 | **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
-| **M7** | Distribution & hardening: error/logging pass, cross-platform paths, release builds | planned |
+| **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
 | **M8** | Nice-to-haves: wide-terminal history layout & beyond | planned |
 
 ## Why this exists

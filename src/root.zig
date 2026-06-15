@@ -47,7 +47,7 @@ pub const StreamLink = domain.StreamLink;
 pub const Translation = domain.Translation;
 
 /// Zigoku version. Keep in sync with `build.zig.zon`.
-pub const version = "0.0.0";
+pub const version = "0.1.0";
 
 const banner =
     \\  ╋ zigoku · 地獄
