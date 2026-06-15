@@ -17,6 +17,7 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const App = app_mod.App;
 const Toast = app_mod.Toast;
+const CoverDecision = app_mod.CoverDecision;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
 const formatMeta = @import("render.zig").formatMeta;
@@ -1619,4 +1620,96 @@ test "settings: Ctrl-C hard-quits even while editing a text field" {
 
     try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);
+}
+
+// ── cover fetch/suppress/retry decision (ROD-110, Elara #2) ──────────────────
+// `CoverDecision.eval` is the pure core of `syncCover`: it decides whether to
+// fetch, suppress (cooldown), leave an in-flight/loaded cover alone, clear stale
+// state, or do nothing — with no threads or `builtin.is_test` guards.
+
+const cooldown_ms: i64 = 10_000; // mirror app.cover_retry_cooldown_ms
+
+fn coverBase() CoverDecision {
+    return .{
+        .target_id = "a1",
+        .target_url = "http://x/a1.jpg",
+        .cover_for_id = null,
+        .cover_loading = false,
+        .has_pixels = false,
+        .failed_id = null,
+        .failed_url = null,
+        .failed_at_ms = 0,
+        .now_ms = 100_000,
+    };
+}
+
+test "cover decision: no target id → none" {
+    var d = coverBase();
+    d.target_id = null;
+    try testing.expectEqual(.none, d.eval());
+}
+
+test "cover decision: fresh selection with art → fetch" {
+    try testing.expectEqual(.fetch, coverBase().eval());
+}
+
+test "cover decision: no art, stale state for another id → clear" {
+    var d = coverBase();
+    d.target_url = null;
+    d.cover_for_id = "other";
+    try testing.expectEqual(.clear, d.eval());
+}
+
+test "cover decision: no art, no stale state → none" {
+    var d = coverBase();
+    d.target_url = null;
+    d.cover_for_id = "a1"; // same id, nothing to drop
+    try testing.expectEqual(.none, d.eval());
+}
+
+test "cover decision: already loading this id → up_to_date" {
+    var d = coverBase();
+    d.cover_for_id = "a1";
+    d.cover_loading = true;
+    try testing.expectEqual(.up_to_date, d.eval());
+}
+
+test "cover decision: pixels already held for this id → up_to_date" {
+    var d = coverBase();
+    d.cover_for_id = "a1";
+    d.has_pixels = true;
+    try testing.expectEqual(.up_to_date, d.eval());
+}
+
+test "cover decision: recent same-id+url failure within cooldown → suppress" {
+    var d = coverBase();
+    d.failed_id = "a1";
+    d.failed_url = "http://x/a1.jpg";
+    d.failed_at_ms = d.now_ms - (cooldown_ms - 1);
+    try testing.expectEqual(.suppress, d.eval());
+}
+
+test "cover decision: same-id+url failure past cooldown → fetch (auto-retry)" {
+    var d = coverBase();
+    d.failed_id = "a1";
+    d.failed_url = "http://x/a1.jpg";
+    d.failed_at_ms = d.now_ms - (cooldown_ms + 1);
+    try testing.expectEqual(.fetch, d.eval());
+}
+
+test "cover decision: failure but thumb url changed → fetch (recovery)" {
+    var d = coverBase();
+    d.target_url = "http://x/a1-v2.jpg"; // enrichment swapped the art
+    d.failed_id = "a1";
+    d.failed_url = "http://x/a1.jpg";
+    d.failed_at_ms = d.now_ms - 1; // still inside cooldown, but url differs
+    try testing.expectEqual(.fetch, d.eval());
+}
+
+test "cover decision: failure recorded for a different id does not suppress" {
+    var d = coverBase();
+    d.failed_id = "other";
+    d.failed_url = "http://x/other.jpg";
+    d.failed_at_ms = d.now_ms;
+    try testing.expectEqual(.fetch, d.eval());
 }

@@ -59,6 +59,80 @@ const playTask = workers.playTask;
 const coverTask = workers.coverTask;
 const tickTask = workers.tickTask;
 const nowMs = workers.nowMs;
+
+/// §3.6 async feedback: once an in-flight op outlives this many ms, spinners
+/// shift from the focus/cyan colour to the slow-path `hot` emphasis so the user
+/// knows we're waiting on the network, not stuck.
+const slow_path_threshold_ms: i64 = 3000;
+
+/// Cover fetch/decode failure suppression window (ROD-110). After a failure we
+/// suppress refetch of the *same id+url* for this long, then allow one retry on
+/// the next event — a lightweight backoff instead of permanent sticky
+/// suppression. A changed `thumb` URL clears suppression immediately (recovery
+/// without moving the selection); see `CoverDecision`.
+const cover_retry_cooldown_ms: i64 = 10_000;
+
+/// What `syncCover` should do for the current selection. Extracted from the
+/// `syncCover` side effects so the fetch/suppress/retry policy is unit-testable
+/// without spawning threads or relying on `builtin.is_test` (ROD-110, Elara #2).
+pub const CoverAction = enum {
+    /// Nothing to do — no target, or target already matches in-flight/loaded.
+    none,
+    /// Target has no art and stale cover state belongs to a different id; drop it.
+    clear,
+    /// A recent same-id+same-url failure is still inside the cooldown window.
+    suppress,
+    /// We're already loading or holding pixels for this exact id.
+    up_to_date,
+    /// Start a fresh fetch (clears any superseded failure record).
+    fetch,
+};
+
+/// Pure inputs for the cover fetch decision. `now_ms`/`failed_at_ms` drive the
+/// cooldown; `failed_url` vs `target_url` drives URL-change recovery.
+pub const CoverDecision = struct {
+    target_id: ?[]const u8,
+    target_url: ?[]const u8,
+    cover_for_id: ?[]const u8,
+    cover_loading: bool,
+    has_pixels: bool,
+    failed_id: ?[]const u8,
+    failed_url: ?[]const u8,
+    failed_at_ms: i64,
+    now_ms: i64,
+
+    pub fn eval(d: CoverDecision) CoverAction {
+        const target_id = d.target_id orelse return .none;
+
+        const target_url = d.target_url orelse {
+            // No art for this show. Only act if stale state belongs elsewhere.
+            const stale = d.cover_for_id != null and
+                !std.mem.eql(u8, d.cover_for_id.?, target_id);
+            return if (stale) .clear else .none;
+        };
+
+        // Failure suppression: same id + same url, still within cooldown. A
+        // changed URL or an elapsed cooldown both fall through to a retry.
+        if (d.failed_id) |fid| {
+            if (std.mem.eql(u8, fid, target_id)) {
+                const same_url = d.failed_url != null and
+                    std.mem.eql(u8, d.failed_url.?, target_url);
+                const within_cooldown = d.now_ms -% d.failed_at_ms < cover_retry_cooldown_ms;
+                if (same_url and within_cooldown) return .suppress;
+            }
+        }
+
+        // Already loading or holding pixels for this exact id → leave it be.
+        if (d.cover_for_id) |id| {
+            if (std.mem.eql(u8, id, target_id) and (d.cover_loading or d.has_pixels)) {
+                return .up_to_date;
+            }
+        }
+
+        return .fetch;
+    }
+};
+
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -376,9 +450,17 @@ pub const App = struct {
     cover_for_id: ?[]const u8 = null,
     /// Whether a cover fetch/decode is in flight.
     cover_loading: bool = false,
-    /// Last show id whose cover fetch/decode failed; suppresses immediate refetch
-    /// until the selection changes away from that id.
+    /// Last show id whose cover fetch/decode failed. Combined with
+    /// `cover_failed_url` + `cover_failed_at_ms` this drives a cooldown-based
+    /// retry policy (ROD-110) instead of permanent sticky suppression.
     cover_failed_for_id: ?[]const u8 = null,
+    /// GPA-owned copy of the URL that failed, for URL-change recovery.
+    cover_failed_url: ?[]const u8 = null,
+    /// `now_ms` timestamp of the last cover failure; gates the retry cooldown.
+    cover_failed_at_ms: i64 = 0,
+    /// GPA-owned copy of the URL currently being fetched. Recorded so a failure
+    /// can attribute the exact url even if the selection moved mid-flight.
+    cover_inflight_url: ?[]const u8 = null,
     /// Dominant fallback color when Kitty graphics are unavailable.
     cover_fallback_color: vaxis.Color = .default,
     /// Uploaded Kitty image for the current cover, if any.
@@ -496,6 +578,13 @@ pub const App = struct {
     fn spinnerChar(self: *const App) []const u8 {
         const b = @as(usize, self.spinner_frame) * 3;
         return spinner_frames[b .. b + 3];
+    }
+
+    /// §3.6: has the current async op outlived the slow-path threshold? Drives
+    /// the cyan → hot spinner shift in both the bottom bar and the cover block.
+    fn isSlowPath(self: *const App) bool {
+        return self.async_start_ms > 0 and
+            self.now_ms - self.async_start_ms > slow_path_threshold_ms;
     }
 
     fn pushToast(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool) void {
@@ -755,11 +844,28 @@ pub const App = struct {
             self.gpa.free(id);
             self.cover_failed_for_id = null;
         }
+        if (self.cover_failed_url) |u| {
+            self.gpa.free(u);
+            self.cover_failed_url = null;
+        }
+        self.cover_failed_at_ms = 0;
     }
 
-    fn noteCoverFailure(self: *App, id: []const u8) void {
+    /// Record a fetch/decode failure for the cooldown-based retry policy. `url`
+    /// is the URL that failed (borrowed; duped here) so a later selection on the
+    /// same id can detect whether the `thumb` changed and a retry is warranted.
+    fn noteCoverFailure(self: *App, id: []const u8, url: ?[]const u8) void {
         self.clearCoverFailure();
         self.cover_failed_for_id = self.gpa.dupe(u8, id) catch null;
+        self.cover_failed_url = if (url) |u| (self.gpa.dupe(u8, u) catch null) else null;
+        self.cover_failed_at_ms = self.now_ms;
+    }
+
+    fn clearInflightUrl(self: *App) void {
+        if (self.cover_inflight_url) |u| {
+            self.gpa.free(u);
+            self.cover_inflight_url = null;
+        }
     }
 
     pub fn clearCoverState(self: *App) void {
@@ -769,6 +875,7 @@ pub const App = struct {
             self.gpa.free(id);
             self.cover_for_id = null;
         }
+        self.clearInflightUrl();
         self.cover_loading = false;
     }
 
@@ -805,27 +912,41 @@ pub const App = struct {
         if (builtin.is_test) return;
         const anime = self.currentDetailAnime() orelse return;
         const target_id = self.currentCoverTargetId() orelse return;
-        if (self.cover_failed_for_id) |failed_id| {
-            if (std.mem.eql(u8, failed_id, target_id)) return;
-            self.clearCoverFailure();
-        }
-        const target_url = anime.thumb orelse {
-            if (self.cover_for_id == null or !std.mem.eql(u8, self.cover_for_id.?, target_id)) self.clearCoverState();
-            return;
+        const target_url = anime.thumb;
+
+        const decision: CoverDecision = .{
+            .target_id = target_id,
+            .target_url = target_url,
+            .cover_for_id = self.cover_for_id,
+            .cover_loading = self.cover_loading,
+            .has_pixels = self.cover_pixels != null,
+            .failed_id = self.cover_failed_for_id,
+            .failed_url = self.cover_failed_url,
+            .failed_at_ms = self.cover_failed_at_ms,
+            .now_ms = self.now_ms,
         };
-        if (self.cover_for_id) |id| {
-            if (std.mem.eql(u8, id, target_id) and (self.cover_loading or self.cover_pixels != null)) return;
+        switch (decision.eval()) {
+            .none, .suppress, .up_to_date => return,
+            .clear => {
+                self.clearCoverState();
+                return;
+            },
+            .fetch => {},
         }
+        // .fetch implies the prior failure (if any) is superseded.
+        self.clearCoverFailure();
+        const url = target_url.?;
 
         self.joinCoverThread();
 
         self.clearCoverState();
         self.cover_for_id = self.gpa.dupe(u8, target_id) catch return;
+        self.cover_inflight_url = self.gpa.dupe(u8, url) catch null;
         const id_for_event = self.gpa.dupe(u8, target_id) catch {
             self.clearCoverState();
             return;
         };
-        const url_copy = self.gpa.dupe(u8, target_url) catch {
+        const url_copy = self.gpa.dupe(u8, url) catch {
             self.gpa.free(id_for_event);
             self.clearCoverState();
             return;
@@ -1104,8 +1225,9 @@ pub const App = struct {
                 self.cover_loading = false;
                 self.joinCoverThread();
                 if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
+                // Record the failed url *before* clearCoverState frees it.
+                self.noteCoverFailure(for_id, self.cover_inflight_url);
                 self.clearCoverState();
-                self.noteCoverFailure(for_id);
                 std.log.debug("cover fetch/decode failed for {s}", .{for_id});
             },
             .position_update => |ev| {
@@ -2117,8 +2239,76 @@ pub const App = struct {
         return true;
     }
 
+    /// Non-Kitty fallback (§7.5, ROD-110 / Mira #5). With decoded pixels we draw
+    /// a half-block mosaic that preserves the poster's structure; without them
+    /// (decode failed but a dominant colour survived, or the kitty upload faulted)
+    /// we degrade to the flat dominant-colour fill that always worked.
     fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
-        cover_win.fill(.{ .style = .{ .bg = self.cover_fallback_color } });
+        if (self.cover_pixels != null) {
+            self.drawHalfBlockCover(cover_win);
+        } else {
+            cover_win.fill(.{ .style = .{ .bg = self.cover_fallback_color } });
+        }
+    }
+
+    /// Sample one half-pixel of the letterboxed cover. `(gx, gy)` is a half-pixel
+    /// grid coordinate (grid is `cols` wide × `rows*2` tall); cells outside the
+    /// fitted image region return the surface bg so the letterbox stays clean.
+    fn sampleHalfBlock(
+        self: *const App,
+        px: anytype,
+        gx: u32,
+        gy: u32,
+        off_x: u32,
+        off_y: u32,
+        fit_w: u32,
+        fit_h: u32,
+    ) vaxis.Color {
+        if (gx < off_x or gy < off_y) return self.palette.bg_surface;
+        const fx = gx - off_x;
+        const fy = gy - off_y;
+        if (fx >= fit_w or fy >= fit_h) return self.palette.bg_surface;
+        const sx = @min(px.w - 1, fx * px.w / fit_w);
+        const sy = @min(px.h - 1, fy * px.h / fit_h);
+        const idx = (@as(usize, sy) * px.w + sx) * 4;
+        return .{ .rgb = .{ px.rgba[idx], px.rgba[idx + 1], px.rgba[idx + 2] } };
+    }
+
+    /// Render decoded cover pixels as a half-block mosaic: each cell packs two
+    /// vertically-stacked samples via `▀` (upper half = fg, lower half = bg),
+    /// doubling vertical resolution over a flat fill. The image is letterboxed
+    /// into the cell grid (treating a half-pixel as roughly square) so the
+    /// poster aspect is preserved on non-Kitty terminals.
+    fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
+        const px = self.cover_pixels orelse return;
+        const cols = cover_win.width;
+        const rows = cover_win.height;
+        if (cols == 0 or rows == 0 or px.w == 0 or px.h == 0) return;
+
+        const grid_w: u32 = cols;
+        const grid_h: u32 = @as(u32, rows) * 2;
+
+        // Letterbox the image into grid_w × grid_h half-pixels, preserving aspect.
+        var fit_w = grid_w;
+        var fit_h = grid_h;
+        if (px.w * grid_h > px.h * grid_w) {
+            fit_h = @max(1, px.h * grid_w / px.w); // width-bound
+        } else {
+            fit_w = @max(1, px.w * grid_h / px.h); // height-bound
+        }
+        const off_x = (grid_w - fit_w) / 2;
+        const off_y = (grid_h - fit_h) / 2;
+
+        var ry: u16 = 0;
+        while (ry < rows) : (ry += 1) {
+            const top_y = @as(u32, ry) * 2;
+            var cx: u16 = 0;
+            while (cx < cols) : (cx += 1) {
+                const top = self.sampleHalfBlock(px, cx, top_y, off_x, off_y, fit_w, fit_h);
+                const bot = self.sampleHalfBlock(px, cx, top_y + 1, off_x, off_y, fit_w, fit_h);
+                put(cover_win, ry, cx, "▀", .{ .fg = top, .bg = bot });
+            }
+        }
     }
 
     fn drawKittyCover(self: *const App, img: vaxis.Image, cover_win: vaxis.Window) void {
@@ -2192,7 +2382,10 @@ pub const App = struct {
                     if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
                 } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
                     const spin = std.fmt.bufPrint(&self.no_results_buf, "{s}", .{self.spinnerChar()}) catch "⠋";
-                    centerText(cover_win, cover_h / 2, cover_w, spin, self.s(self.palette.focus, .{}));
+                    // §3.6 slow-path: shift cyan → hot once the wait crosses the
+                    // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
+                    const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
+                    centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
                 } else if (has_pixels) {
                     if (self.ensureCoverImage(vx, writer)) {
                         if (self.cover_image) |img| {
@@ -2407,8 +2600,7 @@ pub const App = struct {
         const any_loading = self.search_loading or self.history_loading or
             self.episode_loading or self.cover_loading or self.debounce_deadline_ms > 0;
         if (any_loading) {
-            const spin_color: vaxis.Color = if (self.async_start_ms > 0 and
-                self.now_ms - self.async_start_ms > 3000)
+            const spin_color: vaxis.Color = if (self.isSlowPath())
                 self.palette.hot
             else
                 self.palette.focus;

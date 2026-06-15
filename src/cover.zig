@@ -3,6 +3,17 @@ const vaxis = @import("vaxis");
 
 const Allocator = std.mem.Allocator;
 
+// ── decode-path history (ROD-110, Elara #3) ──────────────────────────────────
+// The original cover pipeline decoded with `zigimg` and had to *gate the real
+// decode/render path out of Debug builds*, because Zig 0.16 blew up codegenning
+// the exe when that path was live in Debug. ReleaseSafe carried the real path.
+//
+// That gate is GONE. Commit 11112d5 replaced the decode path with `stb_image`
+// (C, via `src/c/stb_image_impl.c`), which sidesteps the codegen blowup — Debug,
+// ReleaseSafe and `zig build test` now all run the same real decode. There is no
+// longer a build-mode `if` around decoding; if you ever reintroduce a Zig-native
+// decoder, re-verify Debug codegen before trusting it.
+
 extern fn stbi_load_from_memory(
     buffer: [*c]const u8,
     len: c_int,
