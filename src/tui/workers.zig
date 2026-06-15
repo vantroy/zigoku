@@ -10,6 +10,7 @@ const player_mod = @import("../player.zig");
 const aniskip = @import("../aniskip.zig");
 const lru_mod = @import("../util/lru.zig");
 const event_mod = @import("event.zig");
+const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -91,18 +92,21 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
         .translation = translation,
         .limit = 26,
         .page = page,
-    }) catch {
+    }) catch |e| {
+        log.debug("search failed: {s}", .{@errorName(e)});
         gpa.free(query);
-        loop.postEvent(.{ .task_error = "search failed" }) catch {};
+        // @errorName is a static string (immortal) — safe to thread into the toast.
+        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
     // Dupe every owned string we might thread into the UI so arena teardown
     // cannot leave dangling references in the event payload.
     var owned = std.ArrayListUnmanaged(Anime).empty;
-    owned.ensureTotalCapacity(gpa, raw.len) catch {
+    owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
+        log.debug("search result alloc failed: {s}", .{@errorName(e)});
         gpa.free(query);
-        loop.postEvent(.{ .task_error = "search OOM" }) catch {};
+        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     for (raw) |a| {
@@ -169,7 +173,10 @@ pub fn enrichTask(
         if (a.score == null) a.score = meta.score;
     }
 
-    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch return;
+    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return; // `posted` stays false → the defer frees results/query
+    };
     posted = true;
 }
 
@@ -177,10 +184,11 @@ pub fn enrichTask(
 /// reported as a toast-able message rather than crashing the worker.
 pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     const recs = store.loadHistory(arena) catch |err| {
-        loop.postEvent(.{ .task_error = @errorName(err) }) catch {};
+        log.debug("loadHistory failed: {s}", .{@errorName(err)});
+        loop.postEvent(.{ .task_error = @errorName(err) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
-    loop.postEvent(.{ .history_loaded = recs }) catch {};
+    loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
 /// Background task: fetch episode list and post to UI.
@@ -189,16 +197,18 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const raw = provider.episodes(arena.allocator(), io, id, translation) catch {
+    const raw = provider.episodes(arena.allocator(), io, id, translation) catch |e| {
+        log.debug("episodes fetch failed: {s}", .{@errorName(e)});
         gpa.free(id);
-        loop.postEvent(.episodes_error) catch {};
+        loop.postEvent(.episodes_error) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
     var owned: std.ArrayListUnmanaged(domain.EpisodeNumber) = .empty;
-    owned.ensureTotalCapacity(gpa, raw.len) catch {
+    owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
+        log.debug("episodes alloc failed: {s}", .{@errorName(e)});
         gpa.free(id);
-        loop.postEvent(.episodes_error) catch {};
+        loop.postEvent(.episodes_error) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     for (raw) |ep| {
@@ -258,12 +268,15 @@ fn persistFinalProgress(
     latest: ?player_mod.PositionUpdate,
 ) void {
     const update = latest orelse return;
-    st.saveProgress(source_name, source_id, translation, ep_raw, update.time_pos, update.duration, Store.nowSecs()) catch {};
+    st.saveProgress(source_name, source_id, translation, ep_raw, update.time_pos, update.duration, Store.nowSecs()) catch |e|
+        log.debug("saveProgress failed: {s}", .{@errorName(e)});
 }
 
 fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
     const cb: *PlayTaskCallbackCtx = @ptrCast(@alignCast(ctx));
     cb.progress.record(update);
+    // Heartbeat-frequency event: a failed post means the queue is closing
+    // (shutdown). Not worth a log line on every tick of a teardown.
     cb.loop.postEvent(.{ .position_update = .{
         .time_pos = update.time_pos,
         .duration = update.duration,
@@ -283,8 +296,9 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     defer arena.deinit();
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
-    const link = provider.resolve(arena.allocator(), io, id, ep, translation) catch {
-        loop.postEvent(.{ .play_error = null }) catch {};
+    const link = provider.resolve(arena.allocator(), io, id, ep, translation) catch |e| {
+        log.debug("resolve failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .play_error = null }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
@@ -296,12 +310,13 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
         .ctx = @ptrCast(&callback_ctx),
         .func = postPositionUpdate,
-    }, skip) catch {
-        loop.postEvent(.{ .play_error = progress.snapshot() }) catch {};
+    }, skip) catch |e| {
+        log.debug("mpv playback failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .play_error = progress.snapshot() }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
-    loop.postEvent(.{ .play_done = progress.snapshot() }) catch {};
+    loop.postEvent(.{ .play_done = progress.snapshot() }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
 const max_cover_encoded_bytes = 8 * 1024 * 1024;
@@ -363,7 +378,8 @@ pub fn coverTask(
     }
 
     if (raw_cache.get(url)) |body| {
-        const decoded = decodeCoverBody(gpa, body) catch {
+        const decoded = decodeCoverBody(gpa, body) catch |e| {
+            log.debug("cover decode (cached) failed: {s}", .{@errorName(e)});
             postCoverError(loop, gpa, for_id);
             return;
         };
@@ -392,17 +408,20 @@ pub fn coverTask(
         .extra_headers = &.{
             .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
         },
-    }) catch {
+    }) catch |e| {
+        log.debug("cover fetch failed: {s}", .{@errorName(e)});
         postCoverError(loop, gpa, for_id);
         return;
     };
     if (res.status != .ok) {
+        log.debug("cover fetch HTTP {d}", .{@intFromEnum(res.status)});
         postCoverError(loop, gpa, for_id);
         return;
     }
 
     const body = resp_writer.buffered();
-    const decoded = decodeCoverBody(gpa, body) catch {
+    const decoded = decodeCoverBody(gpa, body) catch |e| {
+        log.debug("cover decode failed: {s}", .{@errorName(e)});
         postCoverError(loop, gpa, for_id);
         return;
     };
@@ -422,6 +441,7 @@ pub fn coverTask(
 pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
     while (!quit.load(.acquire)) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+        // Like position_update: a failed post here is just the queue closing.
         loop.postEvent(.tick) catch {};
     }
 }

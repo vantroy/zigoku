@@ -15,6 +15,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const domain = @import("../domain.zig");
 const source = @import("../source.zig");
+const log = @import("../log.zig");
 
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
@@ -224,7 +225,12 @@ pub const AllAnime = struct {
                 .{ .name = "Referer", .value = referer },
             },
         });
-        if (res.status != .ok) return error.HttpNotOk;
+        if (res.status != .ok) {
+            // The caller collapses this to HttpNotOk; keep the real status for a
+            // --debug session, where "AllAnime rejected the request" isn't enough.
+            log.debug("allanime POST {s}: HTTP {d}", .{ referer, @intFromEnum(res.status) });
+            return error.HttpNotOk;
+        }
         return aw.writer.buffered();
     }
 

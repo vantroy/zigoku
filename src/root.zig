@@ -18,6 +18,11 @@ pub const jikan = @import("providers/jikan.zig");
 pub const aniskip = @import("aniskip.zig");
 pub const config = @import("config.zig");
 pub const paths = @import("paths.zig");
+pub const log = @import("log.zig");
+// NB: the log handler is installed via `std_options` in `main.zig` (the exe's
+// compilation root). Declaring it here would be dead — when std resolves
+// `@import("root")` this file is never the root (the exe roots at main.zig, the
+// test binary at the test runner).
 pub const Config = config.Config;
 const tui_app = @import("tui/app.zig");
 
@@ -72,6 +77,7 @@ test {
     _ = aniskip;
     _ = config;
     _ = paths;
+    _ = log;
     _ = tui;
     _ = @import("tui/app_test.zig");
     _ = @import("providers/allanime.zig");
