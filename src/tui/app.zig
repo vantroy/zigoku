@@ -1929,7 +1929,7 @@ pub const App = struct {
 
         // Catalog — read-only system state, never focusable (skipped by nav).
         y = self.drawSettingsHeader(win, y, w, "Catalog");
-        self.drawInertRow(win, y, w, "enrichment sync", "not available until M4");
+        self.drawInertRow(win, y, w, "enrichment sync", "automatic");
         y += 1;
         self.drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
         y += 1;
@@ -2220,7 +2220,7 @@ pub const App = struct {
         }
         row += 1;
 
-        // Score — placeholder until enrichment lands, then tiered AniList score rendering.
+        // Score — "[--/100]" until AniList enrichment fills `a.score`, then tiered rendering.
         const score_text: []const u8 = if (anime) |a| blk: {
             if (a.score) |score| {
                 if (score >= 91) {
