@@ -302,22 +302,58 @@ pub const AllAnime = struct {
     /// destinations in private/loopback/link-local space are refused. Paired with
     /// `redirect_behavior=.not_allowed` so a redirect can't bounce past this.
     ///
-    /// KNOWN RESIDUAL: a public DNS name whose record points at a private IP
-    /// (rebinding) is NOT caught — std's Io net API exposes no pre-connect
-    /// resolver to inspect, and the OS resolves inside the client. Closing this
-    /// needs resolve-then-connect-to-validated-IP, which the std API doesn't
-    /// cleanly allow today. Tracked for follow-up.
+    /// We validate the *decoded* host (`getHost`/`toRaw`) — the same bytes
+    /// std.http resolves against. Reading the raw component would let
+    /// `127%2e0%2e0%2e1` slip by as a "hostname" while the client decodes it to
+    /// loopback (a guard/client host disagreement — Elara's percent-encode bypass).
+    ///
+    /// KNOWN RESIDUAL: a public DNS *name* whose record points at a private IP
+    /// (DNS rebinding) is still NOT caught — std's Io net API exposes no
+    /// pre-connect resolver to inspect, so we can't vet the resolved address
+    /// before the client connects. Closing it needs resolve-then-connect-to-a-
+    /// validated-IP, which the std API doesn't cleanly allow today. Tracked.
+    /// (The body read has no wall-clock deadline either — a stalled CDN can hang
+    /// one fetch; bounded in memory by MAX_RESP_BYTES, not in time. Also tracked.)
     fn guardFetchUrl(url: []const u8) !void {
         const uri = std.Uri.parse(url) catch return error.BadFetchUrl;
         if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) return error.BadFetchUrl;
         if (uri.user != null or uri.password != null) return error.BadFetchUrl;
-        const hc = uri.host orelse return error.BadFetchUrl;
-        const host = switch (hc) { inline else => |h| h };
+        var host_buf: [Io.net.HostName.max_len]u8 = undefined;
+        const host = (uri.getHost(&host_buf) catch return error.BadFetchUrl).bytes;
         if (host.len == 0) return error.BadFetchUrl;
         if (std.ascii.eqlIgnoreCase(host, "localhost") or
             (host.len >= 10 and std.ascii.eqlIgnoreCase(host[host.len - 10 ..], ".localhost")))
             return error.BlockedHost;
-        if (parseHostIp(host)) |ip| if (isPrivateIp(ip)) return error.BlockedHost;
+        if (parseHostIp(host)) |ip| {
+            if (isPrivateIp(ip)) return error.BlockedHost;
+        } else {
+            // Not a canonical IP literal. std resolves numeric non-canonical forms
+            // strictly today (they fail to parse → go to DNS as a bogus name, never
+            // loopback), but that's one std change away (the getaddrinfo_a TODO in
+            // Threaded.zig). Reject the alternate IP spellings a real host never
+            // uses, so they can't become a bypass: any ':' (malformed/compressed
+            // IPv6 like `::ffff:7f00:1`) or an all-numeric / `0x`-prefixed IPv4
+            // (`2130706433`, `0x7f.0.0.1`, `127.1`). No public hostname looks like
+            // these, so there are no false positives.
+            if (std.mem.indexOfScalar(u8, host, ':') != null) return error.BlockedHost;
+            if (looksNumericHost(host)) return error.BlockedHost;
+        }
+    }
+
+    /// True if `host` is an alternate (non-dotted-quad) spelling of an IPv4
+    /// address: `0x`-prefixed, or every dot-separated label is pure decimal
+    /// digits. Only called after `parseHostIp` already rejected it as a canonical
+    /// literal, so a genuine public IP like `8.8.8.8` never reaches here.
+    fn looksNumericHost(host: []const u8) bool {
+        if (host.len >= 2 and host[0] == '0' and (host[1] == 'x' or host[1] == 'X')) return true;
+        var it = std.mem.splitScalar(u8, host, '.');
+        var any_label = false;
+        while (it.next()) |label| {
+            if (label.len == 0) continue;
+            any_label = true;
+            for (label) |c| if (!std.ascii.isDigit(c)) return false;
+        }
+        return any_label;
     }
 
     /// Parse a bare IPv4/IPv6 literal host (brackets stripped) into an address.
@@ -341,7 +377,7 @@ pub const AllAnime = struct {
             169 => b[1] == 254, // link-local 169.254/16
             172 => b[1] >= 16 and b[1] <= 31, // private 172.16/12
             192 => b[1] == 168, // private 192.168/16
-            else => false,
+            else => b[0] >= 224, // multicast 224/4, reserved 240/4, broadcast 255.255.255.255
         };
     }
 
@@ -906,6 +942,28 @@ test "guardFetchUrl: blocks SSRF vectors, allows public http(s)" {
     // public destinations pass.
     try AllAnime.guardFetchUrl("https://cdn.real.example/v.m3u8");
     try AllAnime.guardFetchUrl("https://allanime.day/apivtwo/clock.json?id=x");
+    try AllAnime.guardFetchUrl("http://8.8.8.8/x"); // public IP literal allowed
+}
+
+test "guardFetchUrl: percent-encoded host bypass blocked (Elara C1)" {
+    // Guard must validate the DECODED host, since std.http resolves the decoded form.
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://127%2e0%2e0%2e1/x"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://%6c%6fcalhost:8080/x"));
+}
+
+test "guardFetchUrl: alternate IP encodings blocked (Nyra defense-in-depth)" {
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://2130706433/x")); // decimal 127.0.0.1
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://2852039166/latest")); // decimal 169.254.169.254
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://0x7f000001/x")); // hex
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://0x7f.0.0.1/x"));
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://127.1/x")); // short-form
+    try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://[::ffff:7f00:1]/x")); // compressed IPv4-mapped
+}
+
+test "isPrivateV4: multicast and broadcast blocked (Elara M1)" {
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 224, 0, 0, 1 })); // multicast
+    try std.testing.expect(AllAnime.isPrivateV4(.{ 255, 255, 255, 255 })); // broadcast
+    try std.testing.expect(!AllAnime.isPrivateV4(.{ 93, 184, 216, 34 })); // public, allowed
 }
 
 test "clockJson: inserts .json after the clock segment" {
