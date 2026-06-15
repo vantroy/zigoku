@@ -1627,7 +1627,7 @@ test "settings: Ctrl-C hard-quits even while editing a text field" {
 // fetch, suppress (cooldown), leave an in-flight/loaded cover alone, clear stale
 // state, or do nothing — with no threads or `builtin.is_test` guards.
 
-const cooldown_ms: i64 = 10_000; // mirror app.cover_retry_cooldown_ms
+const cooldown_ms = app_mod.cover_retry_cooldown_ms;
 
 fn coverBase() CoverDecision {
     return .{
@@ -1712,4 +1712,68 @@ test "cover decision: failure recorded for a different id does not suppress" {
     d.failed_url = "http://x/other.jpg";
     d.failed_at_ms = d.now_ms;
     try testing.expectEqual(.fetch, d.eval());
+}
+
+test "cover decision: failure with null url (OOM dupe) does not suppress" {
+    // noteCoverFailure stores null when the url dupe OOMs; without a url to
+    // compare we can't be sure it's the same fetch, so we retry rather than
+    // suppress silently.
+    var d = coverBase();
+    d.failed_id = "a1";
+    d.failed_url = null;
+    d.failed_at_ms = d.now_ms;
+    try testing.expectEqual(.fetch, d.eval());
+}
+
+test "cover decision: live pixels win over a stale same-id failure record" {
+    // Defensive: even if a failure record and live pixels coexist for one id,
+    // up_to_date must beat suppress so we never blank a good cover.
+    var d = coverBase();
+    d.cover_for_id = "a1";
+    d.has_pixels = true;
+    d.failed_id = "a1";
+    d.failed_url = "http://x/a1.jpg";
+    d.failed_at_ms = d.now_ms;
+    try testing.expectEqual(.up_to_date, d.eval());
+}
+
+// ── half-block letterbox fit (ROD-110, Mira S2) ──────────────────────────────
+// `halfBlockFit` letterboxes an image into a cols × rows*2 half-pixel grid,
+// aspect-correct using the terminal's pixels-per-cell metrics.
+
+const halfBlockFit = app_mod.halfBlockFit;
+
+test "halfBlockFit: square cells (2:1) match the square-half-pixel assumption" {
+    // 8x16 cells → pph == 2*ppc → half-pixels are square → metric path and the
+    // ppc/pph==0 fallback must agree exactly.
+    const portrait_metric = halfBlockFit(225, 319, 20, 30, 8, 16);
+    const portrait_square = halfBlockFit(225, 319, 20, 30, 0, 0);
+    try testing.expectEqual(portrait_square.w, portrait_metric.w);
+    try testing.expectEqual(portrait_square.h, portrait_metric.h);
+}
+
+test "halfBlockFit: poster letterboxes within the grid, centered" {
+    // 225x319 (aspect 0.705) is slightly wider than the 20x30 square-half-pixel
+    // grid (0.667), so it's width-bound: fills width, narrows height, with
+    // vertical letterbox bars.
+    const fit = halfBlockFit(225, 319, 20, 30, 8, 16);
+    try testing.expectEqual(@as(u32, 20), fit.w);
+    try testing.expect(fit.h < 30);
+    try testing.expectEqual(@as(u32, 0), fit.off_x);
+    try testing.expect(fit.off_y > 0); // centered vertically
+}
+
+test "halfBlockFit: non-2:1 cells correct aspect vs the naive square fit" {
+    // gnome-terminal 8x18 cells: a half-pixel is 8 wide x 9 tall (taller than
+    // square). The naive square fit over-allocates height (squishes the poster
+    // tall/narrow); the metric fit uses fewer half-rows to keep aspect true.
+    const square = halfBlockFit(225, 319, 20, 30, 0, 0); // → 20 x 28
+    const corrected = halfBlockFit(225, 319, 20, 30, 8, 18); // → 20 x 25
+    try testing.expect(corrected.h < square.h);
+}
+
+test "halfBlockFit: degenerate inputs clamp to the grid" {
+    const fit = halfBlockFit(0, 0, 20, 30, 8, 16);
+    try testing.expectEqual(@as(u32, 20), fit.w);
+    try testing.expectEqual(@as(u32, 30), fit.h);
 }
