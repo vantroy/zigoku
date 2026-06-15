@@ -29,9 +29,8 @@ const Allocator = std.mem.Allocator;
 const c = @cImport({
     @cInclude("sqlite3.h");
     @cInclude("time.h");
-    @cInclude("sys/stat.h");
-    @cInclude("stdlib.h"); // getenv
 });
+const paths = @import("paths.zig");
 
 pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, NoHomeDir, SchemaTooNew };
 
@@ -596,45 +595,15 @@ pub const Store = struct {
     }
 };
 
-// ── Default DB location (XDG) ─────────────────────────────────────────────────
+// ── Default DB location ───────────────────────────────────────────────────────
 
-/// `$XDG_DATA_HOME/zigoku/zigoku.db`, falling back to `~/.local/share/...`.
-/// Creates the directory (best-effort) and returns a null-terminated path.
-pub fn defaultDbPath(arena: Allocator) Error![:0]const u8 {
-    const dir = try dataDir(arena);
-    mkdirP(dir);
+/// `{dataDir}/zigoku.db` (see `paths.dataDir`). Creates the directory
+/// (best-effort) and returns a null-terminated path. The error set is inferred so
+/// `paths.Error` (incl. `Unsupported` on Windows) propagates to the caller.
+pub fn defaultDbPath(arena: Allocator) ![:0]const u8 {
+    const dir = try paths.dataDir(arena);
+    paths.ensureDir(dir);
     return std.fmt.allocPrintSentinel(arena, "{s}/zigoku.db", .{dir}, 0);
-}
-
-fn dataDir(arena: Allocator) Error![]const u8 {
-    if (c.getenv("XDG_DATA_HOME")) |x| {
-        const base = std.mem.span(x);
-        if (base.len > 0) return std.fmt.allocPrint(arena, "{s}/zigoku", .{base});
-    }
-    if (c.getenv("HOME")) |h| {
-        const home = std.mem.span(h);
-        if (home.len > 0) return std.fmt.allocPrint(arena, "{s}/.local/share/zigoku", .{home});
-    }
-    return error.NoHomeDir;
-}
-
-/// `mkdir -p`, best-effort: walks the path creating each component, ignoring
-/// "already exists". A real failure surfaces later as an open error.
-fn mkdirP(path: []const u8) void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i == path.len or path[i] == '/') {
-            const save = buf[i];
-            buf[i] = 0;
-            _ = c.mkdir(&buf, 0o755); // ignore EEXIST and friends
-            buf[i] = save;
-        }
-    }
 }
 
 // ── C-API binding/reading helpers ─────────────────────────────────────────────

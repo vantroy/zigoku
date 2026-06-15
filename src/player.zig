@@ -7,9 +7,9 @@
 const std = @import("std");
 const Io = std.Io;
 const domain = @import("domain.zig");
+const paths = @import("paths.zig");
 const c = @cImport({
-    @cInclude("stdlib.h");
-    @cInclude("unistd.h");
+    @cInclude("unistd.h"); // getuid, getpid
 });
 
 pub const PlayError = error{
@@ -54,14 +54,11 @@ fn buildSocketPath(arena: std.mem.Allocator, base_dir: []const u8, uid: u64, pid
 }
 
 fn mpvSocketPath(arena: std.mem.Allocator) ![]const u8 {
-    const base_dir = if (c.getenv("XDG_RUNTIME_DIR")) |raw|
-        blk: {
-            const dir = std.mem.span(raw);
-            if (dir.len > 0) break :blk dir;
-            break :blk "/tmp";
-        }
-    else
-        "/tmp";
+    // `runtimeDir` only fails on OOM (or Windows); fall back to a bare `/tmp` so a
+    // transient socket always has a home. uid/pid/counter in the filename keep
+    // concurrent launches from colliding inside the shared dir.
+    const base_dir = paths.runtimeDir(arena) catch "/tmp";
+    paths.ensureDir(base_dir);
 
     const uid: u64 = @intCast(c.getuid());
     const pid: u64 = @intCast(c.getpid());
