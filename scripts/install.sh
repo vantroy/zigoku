@@ -72,6 +72,10 @@ EOF
     esac
 done
 
+# Reject an empty prefix (e.g. `--prefix=`, `--prefix ""`, or `PREFIX=`): it would
+# resolve to /bin/zigoku and let --uninstall rm a path it has no business touching.
+[ -n "$PREFIX" ] || { err "prefix cannot be empty"; exit 2; }
+
 BIN_DIR="$PREFIX/bin"
 BIN_PATH="$BIN_DIR/zigoku"
 
