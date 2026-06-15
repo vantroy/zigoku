@@ -2353,10 +2353,10 @@ pub const App = struct {
         // Search mode in Browse: suppress ▌, show /query_ + count.
         if (self.active_view == .browse and self.input_mode == .search) {
             const q = self.querySlice();
-            put(win, row, 2, "/", self.s(self.palette.focus, .{ .bold = true }));
-            const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
+            put(win, row, 1, "/", self.s(self.palette.focus, .{ .bold = true }));
+            const cursor_col: u16 = 2 + @as(u16, @intCast(q.len));
             if (q.len > 0) {
-                putClipped(win, row, 3, cursor_col -| 3, q, self.s(self.palette.fg, .{ .bold = true }));
+                putClipped(win, row, 2, cursor_col -| 2, q, self.s(self.palette.fg, .{ .bold = true }));
             }
             if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
             // Right-aligned count (text.muted = fg2 per §3.5).
@@ -2381,10 +2381,10 @@ pub const App = struct {
         // Search mode in History: suppress ▌, show /filter_ + filtered count.
         if (self.active_view == .history and self.input_mode == .search) {
             const q = self.history_filter[0..self.history_filter_len];
-            put(win, row, 2, "/", self.s(self.palette.focus, .{ .bold = true }));
-            const cursor_col: u16 = 3 + @as(u16, @intCast(q.len));
+            put(win, row, 1, "/", self.s(self.palette.focus, .{ .bold = true }));
+            const cursor_col: u16 = 2 + @as(u16, @intCast(q.len));
             if (q.len > 0) {
-                putClipped(win, row, 3, cursor_col -| 3, q, self.s(self.palette.fg, .{ .bold = true }));
+                putClipped(win, row, 2, cursor_col -| 2, q, self.s(self.palette.fg, .{ .bold = true }));
             }
             if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
             const n = self.filteredHistoryLen();
@@ -2412,9 +2412,10 @@ pub const App = struct {
                 self.palette.hot
             else
                 self.palette.focus;
-            put(win, row, 2, self.spinnerChar(), self.s(spin_color, .{}));
+            put(win, row, 1, self.spinnerChar(), self.s(spin_color, .{}));
         } else {
-            put(win, row, 2, "▌", self.s(self.palette.hot, .{ .blink = true }));
+            // §3.7: 1-cell left padding within the bar → cursor at col 1.
+            put(win, row, 1, "▌", self.s(self.palette.hot, .{ .blink = true }));
         }
 
         const help: []const u8 = switch (self.active_view) {
@@ -2432,7 +2433,7 @@ pub const App = struct {
             else
                 "hjkl navigate · space toggle · enter edit · esc cancel · q save & back",
         };
-        putClipped(win, row, 4, if (w > 4) w - 4 else 0, help, self.s(self.palette.fg3, .{}));
+        putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
     }
 
     fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
