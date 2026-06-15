@@ -14,9 +14,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const domain = @import("domain.zig");
-const c = @cImport({
-    @cInclude("stdlib.h"); // getenv
-});
+const paths = @import("paths.zig");
 
 /// A config file larger than this is almost certainly not ours — refuse it and
 /// fall back to defaults rather than slurp an arbitrary blob into memory.
@@ -74,9 +72,7 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) Config {
 /// needed. Unlike `load`, this surfaces errors — the Settings tab (ROD-86)
 /// decides how to report a failed write.
 pub fn save(io: Io, config: Config, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| {
-        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
-    }
+    if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
 
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
@@ -87,24 +83,10 @@ pub fn save(io: Io, config: Config, path: []const u8) !void {
     try writer.interface.flush();
 }
 
-/// `$XDG_CONFIG_HOME/zigoku/config.zon`, falling back to `~/.config/zigoku/...`.
-/// Mirrors `store.dataDir` / `aniskip.cacheDir`: every Zigoku path resolver
-/// honors its XDG base dir. ROD-89 may fold these into one paths module.
+/// `{configDir}/config.zon` (see `paths.configDir`).
 pub fn defaultPath(arena: Allocator) ![]const u8 {
-    const dir = try configDir(arena);
+    const dir = try paths.configDir(arena);
     return std.fmt.allocPrint(arena, "{s}/config.zon", .{dir});
-}
-
-fn configDir(arena: Allocator) ![]const u8 {
-    if (c.getenv("XDG_CONFIG_HOME")) |x| {
-        const base = std.mem.span(x);
-        if (base.len > 0) return std.fmt.allocPrint(arena, "{s}/zigoku", .{base});
-    }
-    if (c.getenv("HOME")) |h| {
-        const home = std.mem.span(h);
-        if (home.len > 0) return std.fmt.allocPrint(arena, "{s}/.config/zigoku", .{home});
-    }
-    return error.NoHomeDir;
 }
 
 /// The pure half of `load`: ZON text → `Config`, defaults on any parse failure.

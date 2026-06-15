@@ -17,6 +17,7 @@ pub const anilist = @import("anilist.zig");
 pub const jikan = @import("providers/jikan.zig");
 pub const aniskip = @import("aniskip.zig");
 pub const config = @import("config.zig");
+pub const paths = @import("paths.zig");
 pub const Config = config.Config;
 const tui_app = @import("tui/app.zig");
 
@@ -70,6 +71,7 @@ test {
     _ = jikan;
     _ = aniskip;
     _ = config;
+    _ = paths;
     _ = tui;
     _ = @import("tui/app_test.zig");
     _ = @import("providers/allanime.zig");

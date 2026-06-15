@@ -17,10 +17,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const jikan = @import("providers/jikan.zig");
 const player = @import("player.zig");
-
-const c = @cImport({
-    @cInclude("stdlib.h");
-});
+const paths = @import("paths.zig");
 
 const ENDPOINT = "https://api.aniskip.com/v2/skip-times";
 
@@ -233,27 +230,14 @@ const LUA_SCRIPT =
 /// rewrites: the script evolves between app versions, and a ~900-byte write once
 /// per playback launch is cheaper than reasoning about staleness.
 fn ensureScript(arena: Allocator, io: Io) ![]const u8 {
-    const dir = try cacheDir(arena);
-    std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+    const dir = try paths.cacheDir(arena);
+    paths.ensureDir(dir);
     const path = try std.fmt.allocPrint(arena, "{s}/skip.lua", .{dir});
 
     var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
     defer file.close(io);
     try file.writeStreamingAll(io, LUA_SCRIPT);
     return path;
-}
-
-/// `$XDG_CACHE_HOME/zigoku`, falling back to `$HOME/.cache/zigoku`.
-fn cacheDir(arena: Allocator) ![]const u8 {
-    if (c.getenv("XDG_CACHE_HOME")) |x| {
-        const base = std.mem.span(x);
-        if (base.len > 0) return std.fmt.allocPrint(arena, "{s}/zigoku", .{base});
-    }
-    if (c.getenv("HOME")) |h| {
-        const home = std.mem.span(h);
-        if (home.len > 0) return std.fmt.allocPrint(arena, "{s}/.cache/zigoku", .{home});
-    }
-    return error.NoCacheDir;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
