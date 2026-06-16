@@ -44,7 +44,7 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
-// Only `put` survives in app.zig (the "terminal too small" guard in draw());
+// Only `put` survives in app.zig (the "terminal too small" guard in `draw()`);
 // the rest of the render helpers now live with the per-view passes (ROD-144).
 const put = render.put;
 const RawCoverCache = workers.RawCoverCache;
@@ -306,6 +306,9 @@ pub const Toast = struct {
 // (always safe — presets are static literals); the one editable text field
 // (mpv_path) commits into `App.settings_text_buf`.
 
+// pub (SettingId/SettingKind/SettingRow/settings_rows): the settings data model
+// is shared between the state handlers here and the render pass in
+// view/settings.zig (ROD-144).
 pub const SettingId = enum {
     mpv_path,
     default_quality,
@@ -317,7 +320,7 @@ pub const SettingId = enum {
     palette,
 };
 
-const SettingKind = enum { text, cycle, toggle };
+pub const SettingKind = enum { text, cycle, toggle };
 
 pub const SettingRow = struct {
     id: SettingId,
@@ -593,6 +596,8 @@ pub const App = struct {
     /// Palette-aware style: `bg` defaults to `self.palette.bg_base` when null.
     /// All draw methods use this instead of the plain `style()` import so that
     /// switching palettes re-colors every cell, not just ones with explicit bg.
+    /// pub: part of the cross-module render contract — the view/ passes call
+    /// `self.s(...)` directly (ROD-144).
     pub inline fn s(self: *const App, fg: vaxis.Color, opts: struct {
         bg: ?vaxis.Color = null,
         bold: bool = false,

@@ -1,7 +1,7 @@
 //! Zigoku — History (Watchlist) view list render pass.
 //! Extracted from app.zig along the tick/draw seam (ROD-144). Driven by
-//! app.drawContent's `.history` arm; reads state, mutates nothing but the
-//! scroll viewport via the (still app-owned) scrollIntoView helper.
+//! app.drawContent's `.history` arm; reads state — the only mutation is scroll
+//! viewport adjustment via the (still app-owned) scrollIntoView helper.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
