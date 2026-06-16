@@ -612,10 +612,18 @@ pub fn defaultDbPath(arena: Allocator) ![:0]const u8 {
 
 // ── C-API binding/reading helpers ─────────────────────────────────────────────
 
+// SQLite's text/blob destructor sentinels. `@cImport` can't surface these —
+// they're function-pointer macro casts (`(sqlite3_destructor_type)0` and `-1`),
+// not enum values — so we name them locally. SQLITE_STATIC tells SQLite the
+// buffer outlives the step, so it binds by reference without copying;
+// SQLITE_TRANSIENT makes SQLite copy the bytes for callers whose slice does not.
+const SQLITE_STATIC: c.sqlite3_destructor_type = null;
+const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+
 fn bindText(stmt: Stmt, idx: c_int, s: []const u8) void {
     // SQLITE_STATIC: caller guarantees `s` outlives the step (always true here —
     // bind args live in the calling method's frame across its single step).
-    _ = c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), null);
+    _ = c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), SQLITE_STATIC);
 }
 fn bindOptText(stmt: Stmt, idx: c_int, s: ?[]const u8) void {
     if (s) |x| bindText(stmt, idx, x) else _ = c.sqlite3_bind_null(stmt, idx);
