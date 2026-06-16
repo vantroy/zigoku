@@ -30,9 +30,6 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 - **Scriptable CLI** alongside the TUI: `zigoku <query>` runs the original
   prompt-driven search → pick → play flow, headless-friendly.
 
-Known gap: quality selection is parsed but not honoured yet — playback uses the
-1080p direct stream while the full m3u8 resolver is pending (ROD-92).
-
 ## Install
 
 Zigoku is distributed as source — clone it and run the installer:
@@ -93,10 +90,12 @@ issue IDs in commit messages map back to it.
 | **M2** | Persistence: SQLite history, resume, episode cache | ✅ done |
 | **M3** | TUI shell: libvaxis, tabs, search/detail/history views | ✅ done |
 | **M4** | Cover art: Kitty graphics, async pipeline, LRU caches, AniList bridge | ✅ done |
-| **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip, full stream resolver & quality select | 🚧 in progress |
+| **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip ✅, broader stream coverage ✅ | ✅ done |
 | **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
 | **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
-| **M8** | Nice-to-haves: wide-terminal history layout & beyond | planned |
+| **M8** | Nice-to-haves: quality selector, wide-terminal history layout, detail/episode caching, post-playback state sync | 📋 planned |
+| **M9** | Polish: DESIGN.md reconciliation, `:` command mode, richer detail metadata, grouped watch-state history, code-quality refactors | 📋 planned |
+| **M10** | Release: tag-driven builds + GitHub Releases, AUR & Homebrew, macOS CI, README badges & media | 📋 planned |
 
 ## Why this exists
 
