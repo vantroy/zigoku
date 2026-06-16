@@ -29,6 +29,13 @@ const workers = @import("workers.zig");
 const config_mod = @import("../config.zig");
 const log = @import("../log.zig");
 
+// Per-view render passes, extracted along the tick/draw seam (ROD-144).
+const chrome = @import("view/chrome.zig");
+const history = @import("view/history.zig");
+const browse = @import("view/browse.zig");
+const detail = @import("view/detail.zig");
+const settings = @import("view/settings.zig");
+
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
@@ -37,16 +44,9 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
-const formatMeta = render.formatMeta;
-const drawProgressBar = render.drawProgressBar;
+// Only `put` survives in app.zig (the "terminal too small" guard in draw());
+// the rest of the render helpers now live with the per-view passes (ROD-144).
 const put = render.put;
-const putClipped = render.putClipped;
-const fillRow = render.fillRow;
-const centerText = render.centerText;
-const drawWrappedText = render.drawWrappedText;
-const title_col = render.title_col;
-const meta_col = render.meta_col;
-const title_meta_gap = render.title_meta_gap;
 const RawCoverCache = workers.RawCoverCache;
 const DecodedCoverCache = workers.DecodedCoverCache;
 const dupeOptText = workers.dupeOptText;
@@ -306,7 +306,7 @@ pub const Toast = struct {
 // (always safe — presets are static literals); the one editable text field
 // (mpv_path) commits into `App.settings_text_buf`.
 
-const SettingId = enum {
+pub const SettingId = enum {
     mpv_path,
     default_quality,
     subtitle_language,
@@ -319,14 +319,14 @@ const SettingId = enum {
 
 const SettingKind = enum { text, cycle, toggle };
 
-const SettingRow = struct {
+pub const SettingRow = struct {
     id: SettingId,
     label: []const u8,
     kind: SettingKind,
     hint: []const u8,
 };
 
-const settings_rows = [_]SettingRow{
+pub const settings_rows = [_]SettingRow{
     .{ .id = .mpv_path, .label = "mpv path", .kind = .text, .hint = "enter to edit" },
     .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "hjkl to cycle" },
@@ -349,13 +349,6 @@ comptime {
     std.debug.assert(settings_rows[4].id == .skip_mode);
     std.debug.assert(settings_rows[5].id == .cover_art);
 }
-
-/// Static-lifetime hairline source for the Settings headers. vaxis stores
-/// printed text *by reference* (a cell's grapheme points into the passed
-/// slice), so this must outlive vx.render(): a comptime literal lives in
-/// rodata; a stack buffer would dangle and render as garbage.
-const settings_hairline_cols = 256;
-const settings_hairline = "─" ** settings_hairline_cols;
 
 const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
 const language_presets = [_][]const u8{ "sub", "dub" };
@@ -593,14 +586,14 @@ pub const App = struct {
     toast_queue: [3]?Toast = .{ null, null, null },
 
     /// Current query as a slice (may be empty).
-    fn querySlice(self: *const App) []const u8 {
+    pub fn querySlice(self: *const App) []const u8 {
         return self.search_query[0..self.search_len];
     }
 
     /// Palette-aware style: `bg` defaults to `self.palette.bg_base` when null.
     /// All draw methods use this instead of the plain `style()` import so that
     /// switching palettes re-colors every cell, not just ones with explicit bg.
-    inline fn s(self: *const App, fg: vaxis.Color, opts: struct {
+    pub inline fn s(self: *const App, fg: vaxis.Color, opts: struct {
         bg: ?vaxis.Color = null,
         bold: bool = false,
         italic: bool = false,
@@ -618,14 +611,14 @@ pub const App = struct {
     }
 
     const spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"; // 10 × 3 UTF-8 bytes
-    fn spinnerChar(self: *const App) []const u8 {
+    pub fn spinnerChar(self: *const App) []const u8 {
         const b = @as(usize, self.spinner_frame) * 3;
         return spinner_frames[b .. b + 3];
     }
 
     /// §3.6: has the current async op outlived the slow-path threshold? Drives
     /// the cyan → hot spinner shift in both the bottom bar and the cover block.
-    fn isSlowPath(self: *const App) bool {
+    pub fn isSlowPath(self: *const App) bool {
         return self.async_start_ms > 0 and
             self.now_ms - self.async_start_ms > slow_path_threshold_ms;
     }
@@ -1661,7 +1654,7 @@ pub const App = struct {
 
     /// Display string for a setting's current value. `buf` backs the formatted
     /// scalar values (resume offset, on/off); string fields return a borrow.
-    fn settingsValue(self: *App, id: SettingId, buf: []u8) []const u8 {
+    pub fn settingsValue(self: *App, id: SettingId, buf: []u8) []const u8 {
         return switch (id) {
             .mpv_path => self.config.mpv_path,
             .default_quality => self.config.default_quality,
@@ -1890,41 +1883,12 @@ pub const App = struct {
             return;
         }
 
-        self.drawTopBar(win, w);
+        chrome.drawTopBar(self, win, w);
         self.drawContent(vx, writer, win, h);
-        self.drawToasts(win, h);
-        self.drawBottomBar(win, h);
+        chrome.drawToasts(self, win, h);
+        chrome.drawBottomBar(self, win, h);
 
         try vx.render(writer);
-    }
-
-    /// §3.4: the top bar is read-only context, not navigation — `地獄 zigoku`
-    /// as one primary H1 unit, then a hairline separator. No tabs here: the tab
-    /// system + focus model is ROD-72 and needs a designed home (the active-tab
-    /// cyan would collide with the focus color if it lived in this bar).
-    fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
-        put(win, 0, 2, "地獄 zigoku", self.s(self.palette.fg, .{ .bold = true }));
-        if (w > 16) put(win, 0, 14, "░", self.s(self.palette.chrome, .{}));
-
-        // Render the chip after the separator (§10.3b).
-        const chip_col: u16 = 16;
-        const chip: []const u8 = switch (self.active_view) {
-            .history => "Watchlist",
-            .detail => switch (self.detail_origin) {
-                .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
-                .history => "Watchlist",
-            },
-            .settings => "Settings",
-            .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
-        };
-        put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
-
-        // Render the · indicator right-aligned (§10.3b).
-        const dot_color = switch (self.active_view) {
-            .browse => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
-            .history, .detail, .settings => self.palette.focus,
-        };
-        if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
     }
 
     fn drawContent(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, h: u16) void {
@@ -1937,122 +1901,13 @@ pub const App = struct {
         const w = win.width;
 
         switch (self.active_view) {
-            .history => {
-                // History view — existing list rendering.
-                if (self.history_loading) {
-                    const hist_spin = std.fmt.bufPrint(&self.no_results_buf, "{s} loading history", .{self.spinnerChar()}) catch "⠋ loading history";
-                    putClipped(win, top, 2, body_w, hist_spin, self.s(self.palette.focus, .{}));
-                    return;
-                }
-                if (self.load_error) |msg| {
-                    // Hard failure → magenta (state.error = state.now, §1.1).
-                    put(win, top, 2, "history unavailable", self.s(self.palette.hot, .{ .bold = true }));
-                    putClipped(win, top + 1, 2, body_w, msg, self.s(self.palette.fg3, .{}));
-                    return;
-                }
-                if (self.history.len == 0) {
-                    // First-run empty state (§9.2): the void, one quiet line, one
-                    // invitation — both centered. `/` wires up in ROD-73.
-                    const mid = top + visible / 2;
-                    centerText(win, mid -| 1, w, "nothing here yet", self.s(self.palette.fg3, .{ .italic = true }));
-                    const action = " to search for a show";
-                    const total: u16 = 1 + @as(u16, @intCast(action.len));
-                    const start: u16 = if (w > total) (w - total) / 2 else 0;
-                    put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
-                    putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
-                    return;
-                }
-
-                // Each history entry occupies 2 rows (title + progress bar).
-                // @max(1, ...) guards against visible=1 producing a zero slot count
-                // which would corrupt list_top via scrollIntoView's arithmetic.
-                self.scrollIntoView(@max(1, visible / 2));
-
-                // Meta only earns its column when the terminal is wide enough to hold it
-                // without colliding the title — otherwise the title takes the full width.
-                const show_meta = w >= meta_col + 12;
-                const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
-                const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
-                // Bar width: clamp to [16, 24] columns — saturating sub avoids underflow.
-                const bar_w: u16 = @min(24, @max(16, w -| 20));
-
-                var row: u16 = top;
-                var slot: usize = 0;
-                var visible_i: usize = 0;
-                var i: usize = 0;
-                while (i < self.history.len) : (i += 1) {
-                    const rec = self.history[i];
-                    if (!self.historyEntryVisible(rec.title)) continue;
-                    if (visible_i < self.list_top) {
-                        visible_i += 1;
-                        continue;
-                    }
-                    if (row + 1 >= top + visible) break;
-
-                    const selected = visible_i == self.list_cursor;
-
-                    // §4.1 focus affordance: the focused row's background shifts to
-                    // bg.surface (a full-width band), its marker is the ▸ play glyph in
-                    // focus cyan, and its title goes cyan+bold. Magenta is reserved for
-                    // the one cursor in the status bar — never a list marker (§8).
-                    const is_completed = std.mem.eql(u8, rec.list_status, "completed");
-                    const is_dropped = std.mem.eql(u8, rec.list_status, "dropped");
-                    const is_watching = std.mem.eql(u8, rec.list_status, "watching");
-                    const is_paused = std.mem.eql(u8, rec.list_status, "paused");
-
-                    const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
-                    if (selected) {
-                        fillRow(win, row, w, self.palette.bg_surface);
-                        fillRow(win, row + 1, w, self.palette.bg_surface);
-                    }
-
-                    // §2.4 watchlist status glyphs. Focus `▸` overrides when selected.
-                    // Colors: watching/paused=focus(+dim for paused), dropped=fg3, else fg2.
-                    const marker: []const u8 =
-                        if (selected or is_watching) "▸ "
-                        else if (is_completed) "● "
-                        else if (is_paused) "◐ "
-                        else if (is_dropped) "· "
-                        else "○ ";
-                    const marker_color =
-                        if (selected or is_watching or is_paused) self.palette.focus
-                        else if (is_dropped) self.palette.fg3
-                        else self.palette.fg2;
-                    // §2.4: paused = state.focus + dim (SGR 2), but not when focused row.
-                    const marker_dim = is_paused and !selected;
-                    put(win, row, 2, marker, self.s(marker_color, .{ .bg = row_bg, .dim = marker_dim }));
-
-                    // §4.1: completed/dropped rows use text.dim for title; watching/planning fg.
-                    const de_emphasized = is_completed or is_dropped;
-                    const title_style = if (selected)
-                        self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
-                    else if (de_emphasized)
-                        self.s(self.palette.fg3, .{ .bg = row_bg })
-                    else
-                        self.s(self.palette.fg, .{ .bg = row_bg });
-                    putClipped(win, row, title_col, title_w, rec.title, title_style);
-
-                    if (show_meta and slot < self.meta_scratch.len) {
-                        const meta = formatMeta(&self.meta_scratch[slot], rec);
-                        putClipped(win, row, meta_col, w - meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
-                    }
-
-                    // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
-                    if (slot < self.bar_scratch.len) {
-                        drawProgressBar(win, row + 1, title_col, bar_w, rec, row_bg, &self.bar_scratch[slot], self.palette);
-                    }
-
-                    slot += 1;
-                    row += 2;
-                    visible_i += 1;
-                }
-            },
+            .history => history.draw(self, win, top, visible, w, body_w),
 
             .browse => {
                 const pane_h: u16 = visible;
                 if (w < 60) {
                     const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = pane_h });
-                    self.drawBrowseList(list_win, pane_h, body_w);
+                    browse.drawBrowseList(self, list_win, pane_h, body_w);
                     return;
                 }
 
@@ -2063,657 +1918,16 @@ pub const App = struct {
                 const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = list_w, .height = pane_h });
                 const detail_win = win.child(.{ .x_off = @intCast(detail_x), .y_off = top, .width = detail_w, .height = pane_h });
 
-                self.drawBrowseList(list_win, pane_h, list_w);
-                self.drawDetailPane(vx, writer, detail_win, detail_w, pane_h, w);
+                browse.drawBrowseList(self, list_win, pane_h, list_w);
+                detail.drawDetailPane(self, vx, writer, detail_win, detail_w, pane_h, w);
             },
 
             .detail => {
                 const detail_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = visible });
-                self.drawDetailPane(vx, writer, detail_win, body_w, visible, w);
+                detail.drawDetailPane(self, vx, writer, detail_win, body_w, visible, w);
             },
 
-            .settings => self.drawSettings(win, top, visible, w),
-        }
-    }
-
-    // ── Settings render (ROD-86, Mira's §5.5 contract) ──────────────────────
-    //
-    // Columns (relative to the body window): marker 0–1, label @4, value @36,
-    // hint right-anchored at w-2-len. Focus matches the Browse list (bg_surface
-    // fill, no loud cyan). Edit mode deepens to bg_elevated + a magenta marker.
-
-    const settings_label_col: u16 = 4;
-    const settings_value_col: u16 = 36;
-
-    fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16) void {
-        _ = visible; // settings fits; vaxis clips any overflow against the window
-        var y = top;
-
-        // Player — the first five interactive rows.
-        y = self.drawSettingsHeader(win, y, w, "Player");
-        var i: usize = 0;
-        while (i < 5) : (i += 1) {
-            const r = settings_rows[i];
-            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
-            y += 1;
-        }
-        y += 1;
-
-        // Catalog — read-only system state, never focusable (skipped by nav).
-        y = self.drawSettingsHeader(win, y, w, "Catalog");
-        self.drawInertRow(win, y, w, "enrichment sync", "automatic");
-        y += 1;
-        self.drawInertRow(win, y, w, "cover art cache", "~/.cache/zigoku/covers");
-        y += 1;
-        y += 1;
-
-        // Interface — the remaining toggle rows.
-        y = self.drawSettingsHeader(win, y, w, "Interface");
-        while (i < settings_rows.len) : (i += 1) {
-            const r = settings_rows[i];
-            self.drawSettingRow(win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
-            y += 1;
-        }
-    }
-
-    fn drawSettingsHeader(self: *const App, win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {
-        put(win, y, settings_label_col, title, self.s(self.palette.fg, .{ .bold = true }));
-        // Full-width hairline in `chrome` — a deliberate section boundary. The
-        // source is a static literal (see settings_hairline): vaxis keeps the
-        // slice by reference until render, so a stack buffer would dangle.
-        const cols: u16 = @min(w, settings_hairline_cols);
-        put(win, y + 1, 0, settings_hairline[0 .. cols * 3], self.s(self.palette.chrome, .{}));
-        return y + 2;
-    }
-
-    fn drawSettingRow(self: *App, win: vaxis.Window, y: u16, w: u16, row: SettingRow, value: []const u8, focused: bool) void {
-        const editing = focused and self.settings_editing;
-        const row_bg = if (editing) self.palette.bg_elevated else if (focused) self.palette.bg_surface else self.palette.bg_base;
-        if (editing) {
-            fillRow(win, y, w, self.palette.bg_elevated);
-        } else if (focused) {
-            fillRow(win, y, w, self.palette.bg_surface);
-        }
-
-        // ASCII separator on purpose: hint_col is computed from byte length, so a
-        // multi-byte glyph (e.g. U+00B7) would misalign the right-anchored hint.
-        const hint: []const u8 = if (editing) "esc  enter" else row.hint;
-        const hint_len: u16 = @intCast(hint.len);
-        const hint_col: u16 = if (w > hint_len + 2) w - 2 - hint_len else 0;
-
-        const marker = if (focused) "▸ " else "  ";
-        const marker_color = if (editing) self.palette.hot else self.palette.focus;
-        put(win, y, 0, marker, self.s(marker_color, .{ .bg = row_bg }));
-
-        const label_style = if (focused)
-            self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
-        else
-            self.s(self.palette.fg, .{ .bg = row_bg });
-        putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, row.label, label_style);
-
-        const value_budget: u16 = if (hint_col > settings_value_col + 2) hint_col - settings_value_col - 2 else 0;
-        if (editing) {
-            self.drawSettingsEditField(win, y, settings_value_col, value_budget, row_bg);
-        } else if (row.kind == .toggle) {
-            // §5.5: visual toggle widget. ON = focus cyan; OFF = fg3 dim.
-            const is_on = std.mem.eql(u8, value, "on");
-            const toggle_color = if (is_on) self.palette.focus else self.palette.fg3;
-            const toggle_text: []const u8 = if (is_on) "[████ on ████]" else "[████ off ████]";
-            putClipped(win, y, settings_value_col, value_budget, toggle_text, self.s(toggle_color, .{ .bg = row_bg }));
-        } else {
-            const value_style = if (focused)
-                self.s(self.palette.fg, .{ .bg = row_bg })
-            else
-                self.s(self.palette.fg2, .{ .bg = row_bg });
-            putClipped(win, y, settings_value_col, value_budget, value, value_style);
-        }
-
-        put(win, y, hint_col, hint, self.s(self.palette.fg3, .{ .bg = row_bg }));
-    }
-
-    /// Render the live edit buffer with an inverted cursor block at the end
-    /// (input is append-only, so the cursor always trails the text).
-    fn drawSettingsEditField(self: *App, win: vaxis.Window, y: u16, col: u16, budget: u16, row_bg: vaxis.Color) void {
-        const buf = self.settings_edit_buf[0..self.settings_edit_len];
-        const text_budget: u16 = if (budget > 1) budget - 1 else 0;
-        putClipped(win, y, col, text_budget, buf, self.s(self.palette.fg, .{ .bg = row_bg }));
-        const cursor_off: u16 = @intCast(@min(buf.len, text_budget));
-        if (budget > 0) put(win, y, col + cursor_off, " ", self.s(self.palette.fg, .{ .bg = self.palette.hot }));
-    }
-
-    /// A non-interactive Catalog row: dim+italic, no marker, no hint.
-    fn drawInertRow(self: *const App, win: vaxis.Window, y: u16, w: u16, label: []const u8, value: []const u8) void {
-        const sty = self.s(self.palette.fg3, .{ .italic = true });
-        putClipped(win, y, settings_label_col, settings_value_col -| settings_label_col -| 2, label, sty);
-        putClipped(win, y, settings_value_col, w -| settings_value_col, value, sty);
-    }
-
-    fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
-        const w = pane_w;
-        if (self.search_len == 0) {
-            const mid = pane_h / 2;
-            centerText(win, mid -| 1, w, "no feed yet", self.s(self.palette.fg3, .{ .italic = true }));
-            const action = " to start a search";
-            const total: u16 = 1 + @as(u16, @intCast(action.len));
-            const start: u16 = if (w > total) (w - total) / 2 else 0;
-            put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
-            putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
-            return;
-        }
-        const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
-        if (search_pending and self.results.items.len == 0) {
-            const spin_msg = std.fmt.bufPrint(&self.no_results_buf, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
-            centerText(win, pane_h / 2, w, spin_msg, self.s(self.palette.focus, .{}));
-            return;
-        }
-        if (!search_pending and self.results.items.len == 0) {
-            const q = self.querySlice();
-            const msg = std.fmt.bufPrint(&self.no_results_buf, "no results for \"{s}\"", .{q}) catch "no results";
-            putClipped(win, 0, 0, w, msg, self.s(self.palette.fg3, .{ .italic = true }));
-            return;
-        }
-
-        // Results list — col offsets relative to list_win (no x=2 leading margin).
-        const list_title_col: u16 = 2; // marker is col 0–1, title starts at 2
-        self.scrollIntoView(pane_h);
-
-        var row: u16 = 0;
-        var slot: usize = 0;
-        var i: usize = self.list_top;
-        while (i < self.results.items.len and row < pane_h) : (i += 1) {
-            const a = self.results.items[i];
-            const selected = i == self.list_cursor;
-
-            const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
-            if (selected) fillRow(win, row, w, self.palette.bg_surface);
-
-            const marker = if (selected) "▸ " else "  ";
-            put(win, row, 0, marker, self.s(self.palette.focus, .{ .bg = row_bg }));
-
-            const title_style = if (selected)
-                self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
-            else
-                self.s(self.palette.fg, .{ .bg = row_bg });
-            // Meta (eps) if pane is wide enough — rarely true in split view.
-            const list_meta_col: u16 = 46;
-            const show_list_meta = w >= list_meta_col + 8;
-            // Title clips short enough to leave room for the meta column. The 2-char
-            // gap (title_meta_gap) prevents the last title char from touching the first
-            // meta char. Without this guard the title fills the full pane width and
-            // its tail bleeds through the meta text (vaxis writes cells; later write wins).
-            const title_w: u16 = if (show_list_meta)
-                list_meta_col -| list_title_col -| 2
-            else if (w > list_title_col) w - list_title_col else 0;
-            putClipped(win, row, list_title_col, title_w, a.name, title_style);
-
-            if (show_list_meta and slot < self.meta_scratch.len) {
-                const tt = self.translation;
-                const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
-                const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
-                putClipped(win, row, list_meta_col, w - list_meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
-                slot += 1;
-            }
-            row += 1;
-        }
-
-        // Load-more footer.
-        if (row < pane_h and
-            self.search_page > 0 and
-            self.results.items.len % 26 == 0 and
-            self.results.items.len > 0)
-        {
-            const footer = if (self.search_loading) "⠋ loading…" else "╌ more ╌";
-            const footer_color = if (self.search_loading) self.palette.focus else self.palette.fg3;
-            centerText(win, row, w, footer, self.s(footer_color, .{}));
-        }
-    }
-
-    fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
-        if (!vx.caps.kitty_graphics) return false;
-        if (self.cover_image != null) return true;
-        const px = self.cover_pixels orelse return false;
-        if (px.w == 0 or px.h == 0 or px.w > std.math.maxInt(u16) or px.h > std.math.maxInt(u16)) return false;
-
-        const enc_len = std.base64.standard.Encoder.calcSize(px.rgba.len);
-        const b64 = self.gpa.alloc(u8, enc_len) catch return false;
-        defer self.gpa.free(b64);
-        const encoded = std.base64.standard.Encoder.encode(b64, px.rgba);
-
-        self.cover_image = vx.transmitPreEncodedImage(
-            writer,
-            encoded,
-            @intCast(px.w),
-            @intCast(px.h),
-            .rgba,
-        ) catch return false;
-        return true;
-    }
-
-    /// Non-Kitty fallback (§7.5, ROD-110 / Mira #5). With decoded pixels we draw
-    /// a half-block mosaic that preserves the poster's structure; without them
-    /// (decode failed but a dominant colour survived, or the kitty upload faulted)
-    /// we degrade to the flat dominant-colour fill that always worked.
-    fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
-        if (self.cover_pixels != null) {
-            self.drawHalfBlockCover(cover_win);
-        } else {
-            cover_win.fill(.{ .style = .{ .bg = self.cover_fallback_color } });
-        }
-    }
-
-    /// Sample one half-pixel of the letterboxed cover. `(gx, gy)` is a half-pixel
-    /// grid coordinate (grid is `cols` wide × `rows*2` tall); cells outside the
-    /// fitted image region return the surface bg so the letterbox stays clean.
-    fn sampleHalfBlock(
-        self: *const App,
-        px: anytype,
-        gx: u32,
-        gy: u32,
-        off_x: u32,
-        off_y: u32,
-        fit_w: u32,
-        fit_h: u32,
-    ) vaxis.Color {
-        if (gx < off_x or gy < off_y) return self.palette.bg_surface;
-        const fx = gx - off_x;
-        const fy = gy - off_y;
-        if (fx >= fit_w or fy >= fit_h) return self.palette.bg_surface;
-        const sx = @min(px.w - 1, fx * px.w / fit_w);
-        const sy = @min(px.h - 1, fy * px.h / fit_h);
-        const idx = (@as(usize, sy) * px.w + sx) * 4;
-        return .{ .rgb = .{ px.rgba[idx], px.rgba[idx + 1], px.rgba[idx + 2] } };
-    }
-
-    /// Render decoded cover pixels as a half-block mosaic: each cell packs two
-    /// vertically-stacked samples via `▀` (upper half = fg, lower half = bg),
-    /// doubling vertical resolution over a flat fill. The image is letterboxed
-    /// into the cell grid via `halfBlockFit` (aspect-correct using the terminal's
-    /// reported cell pixel metrics) so posters stay poster-shaped on non-Kitty
-    /// terminals regardless of cell aspect ratio.
-    fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
-        const px = self.cover_pixels orelse return;
-        const cols = cover_win.width;
-        const rows = cover_win.height;
-        if (cols == 0 or rows == 0 or px.w == 0 or px.h == 0) return;
-
-        const grid_w: u32 = cols;
-        const grid_h: u32 = @as(u32, rows) * 2;
-
-        // Terminal pixels per cell, if reported — lets halfBlockFit correct for
-        // non-2:1 cells (e.g. gnome-terminal 8x18) instead of squishing posters.
-        // 0/0 → square-half-pixel assumption inside halfBlockFit.
-        const sw = cover_win.screen.width;
-        const sh = cover_win.screen.height;
-        const ppc: u32 = if (sw != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.width_pix), sw) catch 0) else 0;
-        const pph: u32 = if (sh != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.height_pix), sh) catch 0) else 0;
-
-        const fit = halfBlockFit(px.w, px.h, grid_w, grid_h, ppc, pph);
-
-        var ry: u16 = 0;
-        while (ry < rows) : (ry += 1) {
-            const top_y = @as(u32, ry) * 2;
-            var cx: u16 = 0;
-            while (cx < cols) : (cx += 1) {
-                const top = self.sampleHalfBlock(px, cx, top_y, fit.off_x, fit.off_y, fit.w, fit.h);
-                const bot = self.sampleHalfBlock(px, cx, top_y + 1, fit.off_x, fit.off_y, fit.w, fit.h);
-                put(cover_win, ry, cx, "▀", .{ .fg = top, .bg = bot });
-            }
-        }
-    }
-
-    fn drawKittyCover(self: *const App, img: vaxis.Image, cover_win: vaxis.Window) void {
-        const cols = cover_win.screen.width;
-        const rows = cover_win.screen.height;
-        if (cols == 0 or rows == 0 or cover_win.width == 0 or cover_win.height == 0) return;
-
-        const pix_per_col = std.math.divCeil(usize, cover_win.screen.width_pix, cols) catch return;
-        const pix_per_row = std.math.divCeil(usize, cover_win.screen.height_pix, rows) catch return;
-        const slot_w = pix_per_col * cover_win.width;
-        const slot_h = pix_per_row * cover_win.height;
-        if (slot_w == 0 or slot_h == 0) return;
-
-        const img_w = @as(usize, img.width);
-        const img_h = @as(usize, img.height);
-        if (img_w == 0 or img_h == 0) return;
-
-        var draw_cols: u16 = cover_win.width;
-        var draw_rows: u16 = cover_win.height;
-
-        if (img_w * slot_h > img_h * slot_w) {
-            const fit_h_px = @max(@as(usize, 1), (img_h * slot_w) / img_w);
-            draw_rows = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.height), fit_h_px / pix_per_row)));
-        } else if (img_w * slot_h < img_h * slot_w) {
-            const fit_w_px = @max(@as(usize, 1), (img_w * slot_h) / img_h);
-            draw_cols = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.width), fit_w_px / pix_per_col)));
-        }
-
-        const draw_win = cover_win.child(.{
-            .x_off = @intCast((cover_win.width - draw_cols) / 2),
-            .y_off = @intCast((cover_win.height - draw_rows) / 2),
-            .width = draw_cols,
-            .height = draw_rows,
-        });
-        img.draw(draw_win, .{ .scale = .fit }) catch self.drawFallbackCover(cover_win);
-    }
-
-    fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {
-        if (cover_w == 0 or max_h == 0) return 0;
-        if (win.screen.width == 0 or win.screen.height == 0) return max_h;
-
-        const pix_per_col = std.math.divCeil(u32, win.screen.width_pix, win.screen.width) catch return max_h;
-        const pix_per_row = std.math.divCeil(u32, win.screen.height_pix, win.screen.height) catch return max_h;
-        if (pix_per_col == 0 or pix_per_row == 0) return max_h;
-
-        const slot_w_px = @as(u32, cover_w) * pix_per_col;
-        const desired_h_px = std.math.divCeil(u32, slot_w_px * 3, 2) catch return max_h;
-        const cover_h = std.math.divCeil(u32, desired_h_px, pix_per_row) catch return max_h;
-        return @intCast(@max(@as(u32, 1), @min(@as(u32, max_h), cover_h)));
-    }
-
-    fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16) void {
-        if (w < 10) return;
-
-        var row: u16 = 0;
-
-        const info = self.detailRenderInfo();
-        const anime = info.anime;
-
-        // Cover art block (§3.3 + §7.3/§7.5).
-        // Width stays fixed by layout tier; height is derived from terminal pixel
-        // geometry so the panel itself stays poster-shaped instead of cell-tall.
-        const cover_w: u16 = if (term_w >= 100) 20 else if (term_w >= 80) 14 else 0;
-        const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
-        if (cover_w > 0 and cover_h > 0) {
-            const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
-            cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
-            if (anime) |a| {
-                const has_pixels = self.cover_pixels != null and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id);
-                if (a.thumb == null) {
-                    if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-                } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
-                    const spin = std.fmt.bufPrint(&self.no_results_buf, "{s}", .{self.spinnerChar()}) catch "⠋";
-                    // §3.6 slow-path: shift cyan → hot once the wait crosses the
-                    // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
-                    const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
-                    centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
-                } else if (has_pixels) {
-                    if (self.ensureCoverImage(vx, writer)) {
-                        if (self.cover_image) |img| {
-                            self.drawKittyCover(img, cover_win);
-                        } else {
-                            self.drawFallbackCover(cover_win);
-                        }
-                    } else {
-                        self.drawFallbackCover(cover_win);
-                    }
-                } else if (cover_h > 1) {
-                    centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-                }
-            } else if (cover_h > 1) {
-                centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-            }
-            row += cover_h + 1;
-        }
-
-        // Title — the selected result's name, or placeholder.
-        if (anime != null and !std.mem.eql(u8, info.title, "—")) {
-            putClipped(win, row, 0, w, info.title, self.s(self.palette.fg, .{ .bold = true }));
-        } else {
-            putClipped(win, row, 0, w, info.title, self.s(self.palette.fg3, .{}));
-        }
-        row += 1;
-
-        // Score — "[--/100]" until AniList enrichment fills `a.score`, then tiered rendering.
-        const score_text: []const u8 = if (anime) |a| blk: {
-            if (a.score) |score| {
-                if (score >= 91) {
-                    break :blk std.fmt.bufPrint(&self.detail_score_buf, "✦ [{d}/100]", .{score}) catch "[--/100]";
-                }
-                break :blk std.fmt.bufPrint(&self.detail_score_buf, "[{d}/100]", .{score}) catch "[--/100]";
-            }
-            break :blk "[--/100]";
-        } else "[--/100]";
-        const score_style = if (anime) |a| blk: {
-            if (a.score) |score| {
-                if (score >= 91) break :blk self.s(self.palette.hot, .{ .bold = true });
-                if (score >= 76) break :blk self.s(self.palette.fg, .{});
-                if (score >= 51) break :blk self.s(self.palette.fg2, .{});
-            }
-            break :blk self.s(self.palette.fg3, .{});
-        } else self.s(self.palette.fg3, .{});
-        putClipped(win, row, 0, w, score_text, score_style);
-        row += 1;
-
-        // Hairline — clipped to window width so it never wraps onto the next row.
-        // "─" is 3 UTF-8 bytes; we need exactly `cols` glyphs = `cols * 3` bytes.
-        if (row < h) {
-            const cols: u16 = @min(w, 160);
-            put(win, row, 0, ("─" ** 160)[0 .. @as(usize, cols) * 3],
-                self.s(self.palette.chrome, .{}));
-        }
-        row += 1;
-
-        // Metadata: episode count, falling back to AniList total when needed.
-        if (row < h) {
-            const meta_style = if (info.has_meta) self.s(self.palette.fg2, .{}) else self.s(self.palette.fg3, .{});
-            putClipped(win, row, 0, w, info.meta, meta_style);
-            row += 1;
-        }
-
-        // Synopsis: real metadata when present, otherwise the existing stub.
-        if (row < h) {
-            if (anime) |a| {
-                if (a.description) |desc| {
-                    row += drawWrappedText(win, row, 0, w, h - row, desc, self.s(self.palette.fg2, .{}));
-                } else {
-                    putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
-                    row += 1;
-                }
-            } else {
-                putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
-                row += 1;
-            }
-        }
-
-        if (row < h) row += 1; // blank line before grid
-
-        // Episode grid.
-        if (row >= h) return;
-        const grid_h: u16 = h - row;
-        const grid_win = win.child(.{ .x_off = 0, .y_off = row, .width = w, .height = grid_h });
-        self.drawEpisodeGrid(grid_win, w, grid_h);
-    }
-
-    fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
-        if (self.episode_loading) {
-            centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
-            return;
-        }
-        const eps = self.episode_results orelse {
-            // No fetch fired yet (detail pane opened but no item selected).
-            return;
-        };
-        if (eps.len == 0) {
-            putClipped(win, 0, 0, w, "no episodes", self.s(self.palette.fg3, .{ .italic = true }));
-            return;
-        }
-
-        // Each cell is 5 chars wide: "[NN] " or "[NNN]" — allocate 5 per cell.
-        const cell_w: u16 = 5;
-        const cols: u16 = @max(1, w / cell_w);
-
-        // Scroll so that episode_cursor is in view.
-        const cursor_row: usize = self.episode_cursor / cols;
-        const viewport_rows: usize = h;
-        const view_top: usize = if (cursor_row >= viewport_rows)
-            cursor_row + 1 - viewport_rows
-        else
-            0;
-
-        var grid_row: u16 = 0;
-        var ep_idx: usize = view_top * cols;
-        while (grid_row < h and ep_idx < eps.len) : (grid_row += 1) {
-            var col_off: u16 = 0;
-            var c: u16 = 0;
-            while (c < cols and ep_idx < eps.len) : (c += 1) {
-                const ep = eps[ep_idx];
-                const focused = ep_idx == self.episode_cursor and self.active_pane == .detail;
-
-                // Use ep_scratch to avoid dangling stack buffers. Index relative
-                // to the viewport start so we never alias two live cells.
-                const slot = (ep_idx - view_top * cols) % 512;
-                const cell_buf = &self.ep_scratch[slot];
-                const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
-
-                const cell_style = if (focused)
-                    self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
-                else
-                    self.s(self.palette.fg2, .{});
-
-                if (focused) {
-                    const cell_win = win.child(.{
-                        .x_off = @intCast(col_off),
-                        .y_off = @intCast(grid_row),
-                        .width = cell_w,
-                        .height = 1,
-                    });
-                    cell_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
-                    _ = cell_win.printSegment(.{ .text = cell_text, .style = cell_style }, .{});
-                } else {
-                    putClipped(win, grid_row, col_off, cell_w, cell_text, cell_style);
-                }
-
-                col_off += cell_w;
-                ep_idx += 1;
-            }
-        }
-    }
-
-    fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
-        const w = win.width;
-        const row = h - 1;
-
-        // Search mode in Browse: suppress ▌, show /query_ + count.
-        if (self.active_view == .browse and self.input_mode == .search) {
-            const q = self.querySlice();
-            put(win, row, 1, "/", self.s(self.palette.focus, .{ .bold = true }));
-            const cursor_col: u16 = 2 + @as(u16, @intCast(q.len));
-            if (q.len > 0) {
-                putClipped(win, row, 2, cursor_col -| 2, q, self.s(self.palette.fg, .{ .bold = true }));
-            }
-            if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
-            // Right-aligned count (text.muted = fg2 per §3.5).
-            const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
-                "…"
-            else if (self.results.items.len > 0)
-                std.fmt.bufPrint(&self.cnt_scratch, "[{d} results]", .{self.results.items.len}) catch ""
-            else if (self.search_len > 0)
-                "[0 results]"
-            else
-                "";
-            if (cnt.len > 0) {
-                const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
-                // Overlap guard: suppress count if it would collide with the cursor.
-                if (cnt_col > cursor_col + 1) {
-                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, self.s(self.palette.fg2, .{}));
-                }
-            }
-            return;
-        }
-
-        // Search mode in History: suppress ▌, show /filter_ + filtered count.
-        if (self.active_view == .history and self.input_mode == .search) {
-            const q = self.history_filter[0..self.history_filter_len];
-            put(win, row, 1, "/", self.s(self.palette.focus, .{ .bold = true }));
-            const cursor_col: u16 = 2 + @as(u16, @intCast(q.len));
-            if (q.len > 0) {
-                putClipped(win, row, 2, cursor_col -| 2, q, self.s(self.palette.fg, .{ .bold = true }));
-            }
-            if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
-            const n = self.filteredHistoryLen();
-            const cnt: []const u8 = if (q.len == 0)
-                ""
-            else if (n > 0)
-                std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{n}) catch ""
-            else
-                "[0]";
-            if (cnt.len > 0) {
-                const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
-                if (cnt_col > cursor_col + 1) {
-                    putClipped(win, row, cnt_col, @as(u16, @intCast(cnt.len)), cnt, self.s(self.palette.fg2, .{}));
-                }
-            }
-            return;
-        }
-
-        // When anything is loading, replace the ▌ with an animated spinner.
-        const any_loading = self.search_loading or self.history_loading or
-            self.episode_loading or self.cover_loading or self.debounce_deadline_ms > 0;
-        if (any_loading) {
-            const spin_color: vaxis.Color = if (self.isSlowPath())
-                self.palette.hot
-            else
-                self.palette.focus;
-            put(win, row, 1, self.spinnerChar(), self.s(spin_color, .{}));
-        } else {
-            // §3.7: 1-cell left padding within the bar → cursor at col 1.
-            put(win, row, 1, "▌", self.s(self.palette.hot, .{ .blink = true }));
-        }
-
-        const help: []const u8 = switch (self.active_view) {
-            .browse => switch (self.active_pane) {
-                .list => "hjkl · / search · F1/F2/F3 views · q quit",
-                .detail => "hjkl scroll · h back · enter play · q back",
-            },
-            .history => if (self.history.len == 0)
-                "/ search · F1 browse · q quit"
-            else
-                "jk move · enter open · F1 browse · F3 settings · q quit",
-            .detail => "hjkl scroll · h back · enter play · q back",
-            .settings => if (self.settings_editing)
-                "type to edit · enter confirm · esc cancel"
-            else
-                "hjkl navigate · space toggle · enter edit · esc cancel · q save & back",
-        };
-        putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
-    }
-
-    fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
-        if (h < 4) return;
-        var row: u16 = h -| 2;
-        // Iterate newest-first (index 2→0) so the most recent toast anchors at h-2.
-        var qi: usize = self.toast_queue.len;
-        while (qi > 0) {
-            qi -= 1;
-            const t = self.toast_queue[qi] orelse continue;
-            if (row < 1) break;
-            // §4.7 color map: info=[~] fg2(text.muted), success=[✓] fg(state.success),
-            //   error=[!] hot, warn=[!] warn.
-            const fg_color: vaxis.Color = switch (t.kind) {
-                .@"error" => self.palette.hot,
-                .warn => self.palette.warn,
-                .success => self.palette.fg,
-                .info => self.palette.fg2,
-            };
-            const prefix: []const u8 = switch (t.kind) {
-                .@"error", .warn => "[!] ",
-                .success => "[✓] ",
-                .info => "[~] ",
-            };
-            const w = win.width;
-            // §4.7: right-aligned, max 40 display columns.
-            // All prefixes are exactly 4 display cells regardless of UTF-8 byte length
-            // ([✓] = 6 bytes but 4 cells; ASCII variants are 4 bytes = 4 cells).
-            const pre_w: u16 = 4;
-            const txt_len: u16 = @intCast(t.text_len);
-            const toast_w: u16 = @min(pre_w + txt_len, @min(40, w -| 2));
-            const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
-            fillRow(win, row, w, self.palette.bg_elevated);
-            put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
-            const txt_col: u16 = pre_col + pre_w;
-            const txt_w: u16 = if (toast_w > pre_w) toast_w - pre_w else 0;
-            putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bg = self.palette.bg_elevated }));
-            row -|= 1;
+            .settings => settings.drawSettings(self, win, top, visible, w),
         }
     }
 
@@ -2726,7 +1940,7 @@ pub const App = struct {
         }
     }
 
-    fn historyEntryVisible(self: *const App, title: []const u8) bool {
+    pub fn historyEntryVisible(self: *const App, title: []const u8) bool {
         if (self.history_filter_len == 0) return true;
         return std.ascii.indexOfIgnoreCase(title, self.history_filter[0..self.history_filter_len]) != null;
     }
