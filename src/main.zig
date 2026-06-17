@@ -59,6 +59,13 @@ fn observedPlaybackWasMeaningful(latest: ?zigoku.player.PositionUpdate) bool {
     return update.isMeaningful();
 }
 
+/// ROD-168: did the watch reach the store's completion bar? Gates the progress
+/// high-water bump in recordPlay so a short watch doesn't mark the episode done.
+fn observedPlaybackCompleted(latest: ?zigoku.player.PositionUpdate) bool {
+    const update = latest orelse return false;
+    return update.reachedCompletion(zigoku.store.NATURAL_END_RATIO);
+}
+
 fn persistFinalProgress(
     st: *zigoku.Store,
     source: []const u8,
@@ -261,7 +268,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
             const latest = progress.snapshot();
             if (observedPlaybackWasMeaningful(latest)) {
                 persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
-                if (err == error.MpvFailed) st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch |e|
+                if (err == error.MpvFailed) st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs(), observedPlaybackCompleted(latest)) catch |e|
                     std.log.debug("recordPlay failed: {s}", .{@errorName(e)});
             }
         }
@@ -273,7 +280,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
         if (observedPlaybackWasMeaningful(latest)) {
             persistFinalProgress(st, SOURCE, show.id, cli.translation, episode.raw, latest);
         }
-        st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs()) catch |e|
+        st.recordPlay(SOURCE, show.id, @intCast(ep_idx + 1), zigoku.Store.nowSecs(), observedPlaybackCompleted(latest)) catch |e|
             std.log.debug("recordPlay failed: {s}", .{@errorName(e)});
     }
 
@@ -285,6 +292,13 @@ test "observedPlaybackWasMeaningful requires positive observed position" {
     try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = 0, .duration = 1440 }));
     try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = -1, .duration = 1440 }));
     try std.testing.expect(observedPlaybackWasMeaningful(.{ .time_pos = 0.5, .duration = 1440 }));
+}
+
+test "observedPlaybackCompleted requires reaching the completion bar" {
+    try std.testing.expect(!observedPlaybackCompleted(null));
+    try std.testing.expect(!observedPlaybackCompleted(.{ .time_pos = 5, .duration = 1440 })); // short watch
+    try std.testing.expect(!observedPlaybackCompleted(.{ .time_pos = 1200, .duration = 0 })); // unknown duration
+    try std.testing.expect(observedPlaybackCompleted(.{ .time_pos = 1300, .duration = 1440 })); // ~90%
 }
 
 /// Episode list for a show: cache-first (ROD-68), falling back to a live fetch
