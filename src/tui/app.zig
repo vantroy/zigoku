@@ -401,6 +401,32 @@ fn paletteFromConfig(name: []const u8) *const colors.Palette {
     return &colors.terminal_ghost;
 }
 
+/// Per-frame render scratch, owned by App so it outlives the draw→render cycle.
+///
+/// vaxis stores printed text by *reference*, not by copy, so every formatted
+/// string must stay alive until vx.render() runs; a loop-local stack buffer
+/// would dangle. Kept as a struct distinct from application state so the list
+/// render passes can take `*const App` and write only here — the compiler then
+/// proves they never touch cursor/viewport/results state (ROD-155).
+pub const RenderScratch = struct {
+    /// Per-row formatted meta strings. Soft cap of 256 slots: a terminal with
+    /// more than 256 visible rows renders the overflow rows without the meta
+    /// column (no crash, just no meta).
+    meta: [256][48]u8 = undefined,
+    /// Per-row progress-bar fraction strings ("N / M eps"). Same lifetime
+    /// contract as `meta` — must outlive vx.render().
+    bar: [256][32]u8 = undefined,
+    /// Single-line scratch for the list passes' spinners and empty-state
+    /// messages. Safe to share between Browse and History because only one view
+    /// is active per frame. NOT for the detail pane: detail co-renders with
+    /// Browse in split layout, so it has its own `detail_msg` to avoid clobbering
+    /// a slice vaxis still holds by reference.
+    msg: [160]u8 = undefined,
+    /// Detail-pane cover spinner glyph. Separate from `msg` so the split-pane
+    /// frame (Browse list + detail) never aliases one buffer (ROD-155 review).
+    detail_msg: [32]u8 = undefined,
+};
+
 pub const App = struct {
     should_quit: bool = false,
 
@@ -417,16 +443,10 @@ pub const App = struct {
     /// Topmost visible row index — the viewport offset for scrolling.
     list_top: usize = 0,
 
-    /// Per-row scratch for formatted meta strings. vaxis stores printed text by
-    /// *reference*, not by copy, so anything we print must outlive the matching
-    /// vx.render() call. A loop-local stack buffer dangles by render time; this
-    /// App-owned buffer persists across the draw→render cycle. Soft cap of 256
-    /// slots: a terminal with more than 256 visible history rows renders titles
-    /// for the overflow rows without the meta column (no crash, just no meta).
-    meta_scratch: [256][48]u8 = undefined,
-    /// Per-row scratch for progress bar fraction strings ("N / M eps"). Same
-    /// lifetime contract as meta_scratch — must outlive vx.render().
-    bar_scratch: [256][32]u8 = undefined,
+    /// Per-frame render scratch (formatted meta/bar/message strings). Grouped
+    /// off application state so the list passes can take `*const App` (ROD-155);
+    /// see RenderScratch for the vaxis by-reference lifetime contract.
+    scratch: RenderScratch = .{},
 
     /// Which top-level view is currently displayed.
     /// Defaults to .history — the M3 landing (§9.2).
@@ -574,8 +594,6 @@ pub const App = struct {
     /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
     /// for labels like "1000a" — silently fell back to "[?]".
     ep_scratch: [512][8]u8 = undefined,
-    /// Stable storage for the "no results for…" message in drawBrowseList.
-    no_results_buf: [160]u8 = undefined,
     /// Stable storage for the detail-pane score line.
     detail_score_buf: [32]u8 = undefined,
     /// Stable storage for the "N eps" metadata line in drawDetailPane.
@@ -1915,13 +1933,13 @@ pub const App = struct {
         const w = win.width;
 
         switch (self.active_view) {
-            .history => history.draw(self, win, top, visible, w, body_w),
+            .history => history.draw(self, &self.scratch, win, top, visible, w, body_w),
 
             .browse => {
                 const pane_h: u16 = visible;
                 if (w < 60) {
                     const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = pane_h });
-                    browse.drawBrowseList(self, list_win, pane_h, body_w);
+                    browse.drawBrowseList(self, &self.scratch, list_win, pane_h, body_w);
                     return;
                 }
 
@@ -1932,7 +1950,7 @@ pub const App = struct {
                 const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = list_w, .height = pane_h });
                 const detail_win = win.child(.{ .x_off = @intCast(detail_x), .y_off = top, .width = detail_w, .height = pane_h });
 
-                browse.drawBrowseList(self, list_win, pane_h, list_w);
+                browse.drawBrowseList(self, &self.scratch, list_win, pane_h, list_w);
                 detail.drawDetailPane(self, vx, writer, detail_win, detail_w, pane_h, w);
             },
 

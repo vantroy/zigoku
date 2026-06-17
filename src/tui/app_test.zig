@@ -236,10 +236,11 @@ test "layout settles the browse viewport from terminal geometry (ROD-155)" {
     app.active_view = .browse;
     app.list_cursor = 30;
     app.list_top = 0;
-    // h=20 → content budget = h-3 = 17 visible rows. Cursor must be pulled in.
+    // h=20 → content budget = h-3 = 17 visible rows. The full budget must be
+    // used: list_top = cursor + 1 - 17 = 14. Pinning the exact value (not just
+    // "cursor visible") is what catches a wrong budget, e.g. a halved visible/2.
     app.layout(20, 80);
-    try testing.expect(app.list_cursor >= app.list_top);
-    try testing.expect(app.list_cursor < app.list_top + 17);
+    try testing.expectEqual(@as(usize, 14), app.list_top);
 }
 
 test "layout uses History's 2-rows-per-entry budget (ROD-155)" {
@@ -248,18 +249,45 @@ test "layout uses History's 2-rows-per-entry budget (ROD-155)" {
     app.list_cursor = 10;
     app.list_top = 0;
     // h=11 → visible = 8 terminal rows → 4 entry slots (visible/2).
+    // list_top = cursor + 1 - 4 = 7. Pinned so the full-budget (visible, not
+    // visible/2) mutation is caught.
     app.layout(11, 80);
-    try testing.expect(app.list_cursor >= app.list_top);
-    try testing.expect(app.list_cursor < app.list_top + 4);
+    try testing.expectEqual(@as(usize, 7), app.list_top);
 }
 
-test "layout is a no-op below the too-small threshold (ROD-155)" {
-    var app: App = .{};
-    app.active_view = .history;
-    app.list_cursor = 5;
-    app.list_top = 3;
-    app.layout(3, 10); // h<4 and w<16 → draw bails, so layout must too
-    try testing.expectEqual(@as(usize, 3), app.list_top);
+test "layout bails when EITHER too-small arm trips (ROD-155)" {
+    // The guard is `h < 4 or w < 16` — either arm alone must no-op, so layout()
+    // never settles a viewport for a frame draw() would skip. Each case is set
+    // up so a non-bailing layout() WOULD move list_top, proving the guard fired.
+    {
+        // Both arms.
+        var app: App = .{};
+        app.active_view = .history;
+        app.list_cursor = 5;
+        app.list_top = 3;
+        app.layout(3, 10);
+        try testing.expectEqual(@as(usize, 3), app.list_top);
+    }
+    {
+        // Height-only: h=3 (<4), w fine. visible would be 0 → scrollIntoView(1)
+        // would push list_top to 5; the guard must keep it at 3.
+        var app: App = .{};
+        app.active_view = .history;
+        app.list_cursor = 5;
+        app.list_top = 3;
+        app.layout(3, 80);
+        try testing.expectEqual(@as(usize, 3), app.list_top);
+    }
+    {
+        // Width-only: w=10 (<16), h fine. visible would be 17 → scrollIntoView
+        // would pull list_top to 14; the guard must keep it at 0.
+        var app: App = .{};
+        app.active_view = .browse;
+        app.list_cursor = 30;
+        app.list_top = 0;
+        app.layout(20, 10);
+        try testing.expectEqual(@as(usize, 0), app.list_top);
+    }
 }
 
 test "formatMeta degrades when total episodes is unknown" {
