@@ -498,8 +498,8 @@ state.now` escalation.
 
 | Event | Condition | Kind | Copy | Persistent |
 |---|---|---|---|---|
-| `play_done` / `play_error` | counted watch, not finale | success | `episode N done` | no |
-| `play_done` / `play_error` | counted watch, finale | success | `all caught up` | no |
+| `play_done` / `play_error` | counted watch, not finale (`play_error` only if the position is meaningful) | success | `episode N done` | no |
+| `play_done` / `play_error` | counted watch, finale (as above) | success | `all caught up` | no |
 | `play_error` | no observed position (resolve failed / mpv died) | error | `playback failed` | no |
 | `episodes_error` | always | error | `couldn't load episodes` | no |
 | `task_error` | background task failed | error | (payload) | yes |
