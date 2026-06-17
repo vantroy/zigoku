@@ -49,7 +49,8 @@ fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
 
 /// Sample one half-pixel of the letterboxed cover. `(gx, gy)` is a half-pixel
 /// grid coordinate (grid is `cols` wide × `rows*2` tall); cells outside the
-/// fitted image region return the surface bg so the letterbox stays clean.
+/// fitted image region return `bg_base` so the letterbox matte matches the pane
+/// (ROD-164 / DESIGN.md §8 footprint fill).
 fn sampleHalfBlock(
     self: *const App,
     px: anytype,
@@ -60,10 +61,10 @@ fn sampleHalfBlock(
     fit_w: u32,
     fit_h: u32,
 ) vaxis.Color {
-    if (gx < off_x or gy < off_y) return self.palette.bg_surface;
+    if (gx < off_x or gy < off_y) return self.palette.bg_base;
     const fx = gx - off_x;
     const fy = gy - off_y;
-    if (fx >= fit_w or fy >= fit_h) return self.palette.bg_surface;
+    if (fx >= fit_w or fy >= fit_h) return self.palette.bg_base;
     const sx = @min(px.w - 1, fx * px.w / fit_w);
     const sy = @min(px.h - 1, fy * px.h / fit_h);
     const idx = (@as(usize, sy) * px.w + sx) * 4;
@@ -171,12 +172,19 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
     if (cover_w > 0 and cover_h > 0) {
         const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
-        cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
         if (anime) |a| {
-            const has_pixels = self.cover.pixels != null and self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id);
+            const same_id = self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id);
+            const has_pixels = self.cover.pixels != null and same_id;
+            const showing_spinner = self.cover.loading and same_id;
+            // §8 footprint fill (ROD-164): a rendered poster's slot is bg_base so
+            // the fit-matte matches the pane; placeholders keep the bg_surface
+            // panel. `drawing_poster` mirrors the exact condition for the
+            // has_pixels poster branch below, so the fill matches the branch taken.
+            const drawing_poster = a.thumb != null and !showing_spinner and has_pixels;
+            cover_win.fill(.{ .style = .{ .bg = if (drawing_poster) self.palette.bg_base else self.palette.bg_surface } });
             if (a.thumb == null) {
                 if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-            } else if (self.cover.loading and self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id)) {
+            } else if (showing_spinner) {
                 const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
                 // §3.6 slow-path: shift cyan → hot once the wait crosses the
                 // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
@@ -195,8 +203,9 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
             } else if (cover_h > 1) {
                 centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
             }
-        } else if (cover_h > 1) {
-            centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
+        } else {
+            cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
+            if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
         }
         row += cover_h + 1;
     }
