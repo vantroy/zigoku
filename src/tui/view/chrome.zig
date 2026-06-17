@@ -99,8 +99,12 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     }
 
     // When anything is loading, replace the ▌ with an animated spinner.
+    // §4.10: `playing` is the secondary signal — the episode-cell spinner (§4.6)
+    // is the primary affordance — but folding it in keeps the ▌ from sitting idle
+    // while playback resolves, and gives the bar one coherent busy story.
     const any_loading = self.search_loading or self.history_loading or
-        self.episode_loading or self.cover.loading or self.debounce_deadline_ms > 0;
+        self.episode_loading or self.cover.loading or self.debounce_deadline_ms > 0 or
+        self.playing;
     if (any_loading) {
         const spin_color: vaxis.Color = if (self.isSlowPath())
             self.palette.hot

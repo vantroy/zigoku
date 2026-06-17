@@ -873,6 +873,10 @@ pub const App = struct {
             .episodes_error => {
                 self.episode_loading = false;
                 self.async_start_ms = 0;
+                // §4.10: an empty grid with no explanation is indistinguishable
+                // from a show that genuinely has no episodes — surface the fetch
+                // failure so the blank pane isn't a silent dead end.
+                self.pushToast(.@"error", "couldn't load episodes", false);
             },
             .cover_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -918,7 +922,12 @@ pub const App = struct {
             .play_error => |final_update| {
                 // On error, only count the play if mpv observed a real position
                 // (clean exits use play_done with record_play=true unconditionally).
-                self.finishPlayback(final_update, if (final_update) |u| u.isMeaningful() else false);
+                const counted = if (final_update) |u| u.isMeaningful() else false;
+                self.finishPlayback(final_update, counted);
+                // §4.10: a genuine failure (resolve failed, or mpv exited without
+                // ever producing a position) is otherwise silent — surface it. A
+                // counted error already advanced + toasted success in finishPlayback.
+                if (!counted) self.pushToast(.@"error", "playback failed", false);
             },
             .tick => {
                 const now = nowMs(io);
