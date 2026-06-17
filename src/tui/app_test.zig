@@ -1362,6 +1362,9 @@ test "play_error with a completed position persists final and records the play" 
     try testing.expectEqual(@as(i64, 1), rec.play_count); // recordPlay fired
     try testing.expectEqual(@as(i64, 3), rec.progress);
 
+    // A completed play_error must NOT fire the failure toast (it took the
+    // success path; no episode grid here so no success toast either).
+    try testing.expect(app.toast_queue[0] == null);
     try testing.expect(!app.playing); // transport reset
 }
 
@@ -1393,6 +1396,47 @@ test "play_done with a partial watch records the play but not the progress (ROD-
     const rec = (try store.getAnime(arena.allocator(), "allanime", "show1")).?;
     try testing.expectEqual(@as(i64, 1), rec.play_count); // counted as a play
     try testing.expectEqual(@as(i64, 0), rec.progress); // but NOT watched-through
+}
+
+test "play_error mid-episode is a real play but not watched, and surfaces failure (ROD-168)" {
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &store;
+    app.episode_results = try allocEpisodes(10);
+    app.episode_cursor = 7; // on episode 8
+    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "8");
+    app.session.episode_index = 8;
+    app.session.translation = .sub;
+
+    // mpv crashed ~8% in: meaningful (resume + play recorded) but far below the
+    // completion bar — not watched-through, cursor holds, and the crash surfaces
+    // as a failure toast (not silent, not a false success).
+    try testTick(&app, .{ .play_error = .{ .time_pos = 120, .duration = 1440 } });
+
+    const saved = (try store.getResume("allanime", "show1", .sub, "8")).?;
+    try testing.expectApproxEqAbs(@as(f64, 120), saved.position_secs, 0.001); // resume saved
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rec = (try store.getAnime(arena.allocator(), "allanime", "show1")).?;
+    try testing.expectEqual(@as(i64, 1), rec.play_count); // counted as a play
+    try testing.expectEqual(@as(i64, 0), rec.progress); // but NOT watched-through
+
+    try testing.expectEqual(@as(usize, 7), app.episode_cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.@"error", t.kind);
+    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
+
+    app.freeEpisodeResults();
 }
 
 test "play_error with no observed position skips recordPlay and preserves checkpoint" {
@@ -1485,6 +1529,7 @@ test "play_error with a completed position still advances the detail cursor" {
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
+    try testing.expect(app.toast_queue[1] == null); // success only, no false failure toast
 
     app.freeEpisodeResults();
 }
