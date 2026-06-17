@@ -29,6 +29,18 @@ pub const PositionUpdate = struct {
     pub fn isMeaningful(self: PositionUpdate) bool {
         return std.math.isFinite(self.time_pos) and self.time_pos > 0;
     }
+
+    /// Whether the watch reached `ratio` of the runtime — the bar for counting
+    /// the episode as *watched* (bump the progress high-water mark, advance the
+    /// detail cursor). Distinct from `isMeaningful`: a real position worth
+    /// resuming from (5s in) is not the same as a watched episode. Requires a
+    /// known finite duration; an unknown/zero duration cannot prove completion,
+    /// so it conservatively returns false. `ratio` is the caller's policy (the
+    /// store's NATURAL_END_RATIO) — player.zig stays free of store concerns.
+    pub fn reachedCompletion(self: PositionUpdate, ratio: f64) bool {
+        return std.math.isFinite(self.time_pos) and std.math.isFinite(self.duration) and
+            self.duration > 0 and self.time_pos / self.duration >= ratio;
+    }
 };
 
 /// An mpv user-script to load for this playback, with its `--script-opts` value.
@@ -258,4 +270,20 @@ test "parsePositionLine tracks time-pos and duration events" {
         &time_pos,
         &duration,
     ) == null);
+}
+
+test "reachedCompletion is a >= ratio gate that needs a known duration" {
+    const r: f64 = 0.80;
+    // Below / at / above the bar. 1152/1440 == 0.8 exactly (IEEE-correct).
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1151, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect((PositionUpdate{ .time_pos = 1152, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect((PositionUpdate{ .time_pos = 1400, .duration = 1440 }).reachedCompletion(r));
+    // A 5s test-quit of a 24min episode (the ROD-168 repro): nowhere near done.
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 5, .duration = 1440 }).reachedCompletion(r));
+    // Unknown/degenerate duration can't prove completion → conservative false.
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = 0 }).reachedCompletion(r));
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = -1 }).reachedCompletion(r));
+    const nan = std.math.nan(f64);
+    try std.testing.expect(!(PositionUpdate{ .time_pos = nan, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = nan }).reachedCompletion(r));
 }
