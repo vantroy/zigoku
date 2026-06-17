@@ -1,7 +1,7 @@
 //! Zigoku — Settings view render pass (ROD-86, Mira's §5.5 contract).
 //! Extracted from app.zig along the tick/draw seam (ROD-144). The settings
-//! *state* (cursor, edit buffer, cycle/toggle handlers) stays in app.zig; this
-//! module is the pure render of that state.
+//! *state* (cursor, edit buffer, cycle/toggle handlers) lives in `SettingsState`
+//! (settings_state.zig, ROD-161); this module is the pure render of that state.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -40,7 +40,7 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     var i: usize = 0;
     while (i < 5) : (i += 1) {
         const r = settings_rows[i];
-        drawSettingRow(self, win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
         y += 1;
     }
     y += 1;
@@ -57,7 +57,7 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y = drawSettingsHeader(self, win, y, w, "Interface");
     while (i < settings_rows.len) : (i += 1) {
         const r = settings_rows[i];
-        drawSettingRow(self, win, y, w, r, self.settingsValue(r.id, &self.settings_value_buf), i == self.settings_cursor);
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
         y += 1;
     }
 }
@@ -73,7 +73,7 @@ fn drawSettingsHeader(self: *const App, win: vaxis.Window, y: u16, w: u16, title
 }
 
 fn drawSettingRow(self: *App, win: vaxis.Window, y: u16, w: u16, row: SettingRow, value: []const u8, focused: bool) void {
-    const editing = focused and self.settings_editing;
+    const editing = focused and self.settings.editing;
     const row_bg = if (editing) self.palette.bg_elevated else if (focused) self.palette.bg_surface else self.palette.bg_base;
     if (editing) {
         fillRow(win, y, w, self.palette.bg_elevated);
@@ -120,7 +120,7 @@ fn drawSettingRow(self: *App, win: vaxis.Window, y: u16, w: u16, row: SettingRow
 /// Render the live edit buffer with an inverted cursor block at the end
 /// (input is append-only, so the cursor always trails the text).
 fn drawSettingsEditField(self: *App, win: vaxis.Window, y: u16, col: u16, budget: u16, row_bg: vaxis.Color) void {
-    const buf = self.settings_edit_buf[0..self.settings_edit_len];
+    const buf = self.settings.edit_buf[0..self.settings.edit_len];
     const text_budget: u16 = if (budget > 1) budget - 1 else 0;
     putClipped(win, y, col, text_budget, buf, self.s(self.palette.fg, .{ .bg = row_bg }));
     const cursor_off: u16 = @intCast(@min(buf.len, text_budget));
