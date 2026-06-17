@@ -7,12 +7,15 @@ const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
 
 const App = app_mod.App;
+const RenderScratch = app_mod.RenderScratch;
 const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
 const centerText = render.centerText;
 
-pub fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
+// `self` is `*const App`: this pass reads list state (cursor/viewport/results)
+// and writes only `scratch` — the compiler proves it mutates no app state (ROD-155).
+pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
     const w = pane_w;
     if (self.search_len == 0) {
         const mid = pane_h / 2;
@@ -26,20 +29,21 @@ pub fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) v
     }
     const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
     if (search_pending and self.results.items.len == 0) {
-        const spin_msg = std.fmt.bufPrint(&self.no_results_buf, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
+        const spin_msg = std.fmt.bufPrint(&scratch.msg, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
         centerText(win, pane_h / 2, w, spin_msg, self.s(self.palette.focus, .{}));
         return;
     }
     if (!search_pending and self.results.items.len == 0) {
         const q = self.querySlice();
-        const msg = std.fmt.bufPrint(&self.no_results_buf, "no results for \"{s}\"", .{q}) catch "no results";
+        const msg = std.fmt.bufPrint(&scratch.msg, "no results for \"{s}\"", .{q}) catch "no results";
         putClipped(win, 0, 0, w, msg, self.s(self.palette.fg3, .{ .italic = true }));
         return;
     }
 
     // Results list — col offsets relative to list_win (no x=2 leading margin).
+    // The viewport (list_top) is settled by app.layout() before this draw pass
+    // (ROD-155); here we only read it.
     const list_title_col: u16 = 2; // marker is col 0–1, title starts at 2
-    self.scrollIntoView(pane_h);
 
     var row: u16 = 0;
     var slot: usize = 0;
@@ -70,10 +74,10 @@ pub fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) v
         else if (w > list_title_col) w - list_title_col else 0;
         putClipped(win, row, list_title_col, title_w, a.name, title_style);
 
-        if (show_list_meta and slot < self.meta_scratch.len) {
+        if (show_list_meta and slot < scratch.meta.len) {
             const tt = self.translation;
             const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
-            const meta = std.fmt.bufPrint(&self.meta_scratch[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
+            const meta = std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
             putClipped(win, row, list_meta_col, w - list_meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
             slot += 1;
         }

@@ -177,7 +177,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
             if (a.thumb == null) {
                 if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
             } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
-                const spin = std.fmt.bufPrint(&self.no_results_buf, "{s}", .{self.spinnerChar()}) catch "⠋";
+                const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
                 // §3.6 slow-path: shift cyan → hot once the wait crosses the
                 // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
                 const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
