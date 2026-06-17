@@ -304,6 +304,19 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
     else
         0;
 
+    // §4.6 launching cell: the episode currently resolving/playing renders a
+    // spinner in its grid slot. It tracks the SESSION, not episode_cursor — the
+    // grid stays navigable during play (you can browse while mpv loads), so the
+    // spinner stays pinned to the played episode, and only on the show actually
+    // on screen (same_show, mirroring finishPlayback's guard).
+    const launching_idx: usize = blk: {
+        const here = self.playing and self.session.episode_index > 0 and
+            self.detail_for_id != null and self.session.anime_id.len > 0 and
+            std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
+        // sentinel: no real episode index can reach maxInt(usize), so no cell matches.
+        break :blk if (here) self.session.episode_index - 1 else std.math.maxInt(usize);
+    };
+
     var grid_row: u16 = 0;
     var ep_idx: usize = view_top * cols;
     while (grid_row < h and ep_idx < eps.len) : (grid_row += 1) {
@@ -312,27 +325,37 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         while (c < cols and ep_idx < eps.len) : (c += 1) {
             const ep = eps[ep_idx];
             const focused = ep_idx == self.episode_cursor and self.active_pane == .detail;
+            const launching = ep_idx == launching_idx;
 
             // Use ep_scratch to avoid dangling stack buffers. Index relative
             // to the viewport start so we never alias two live cells.
             const slot = (ep_idx - view_top * cols) % 512;
             const cell_buf = &self.ep_scratch[slot];
-            const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
+            // §4.6: a launching cell shows the current spinner frame in place of
+            // its number, in the same `[ ]` shell so it reads as that cell working.
+            const cell_text = if (launching)
+                std.fmt.bufPrint(cell_buf, "[{s}]", .{self.spinnerChar()}) catch "[?]"
+            else
+                std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
             // §4.6: watched cells (index below the high-water mark) recede to
             // text.dim; unwatched stay text.muted; the cursor always wins
             // (ROD-131). text.dim is `fg3` alone — matching the completed/dropped
             // convention in history.zig; the `.dim` SGR attr is reserved for the
-            // paused semantic (§2.4), so it is deliberately not used here.
+            // paused semantic (§2.4), so it is deliberately not used here. A
+            // launching cell escalates focus→hot past isSlowPath (§4.8), same as
+            // every other slow-path spinner; it outranks focus/watched.
             const watched = ep_idx < @as(usize, self.detail_progress);
-            const cell_style = if (focused)
+            const cell_style = if (launching)
+                self.s(if (self.isSlowPath()) self.palette.hot else self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
+            else if (focused)
                 self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
             else if (watched)
                 self.s(self.palette.fg3, .{})
             else
                 self.s(self.palette.fg2, .{});
 
-            if (focused) {
+            if (focused or launching) {
                 const cell_win = win.child(.{
                     .x_off = @intCast(col_off),
                     .y_off = @intCast(grid_row),

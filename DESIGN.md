@@ -393,10 +393,26 @@ available column width.
 | Currently watching (resume) | `[NN]` | `bg.surface` | `state.focus` + bold |
 | Resume point | `[▸N]` | `bg.surface` | `state.now` + bold |
 | Focused (cursor on grid) | `[NN]` | `bg.surface` | `state.focus` + bold |
+| Launching (resolving / playing) | `[⠋]` | `bg.surface` | `state.focus` + bold → `state.now` + bold at >3s |
 | Airing/not-yet-released | `[NN]` | `bg.base` | `text.dim` + italic |
 
 The resume point cell (`[▸N]`) is always the most visually prominent cell in the
 grid — `state.now` is only ever earned by one cell at a time.
+
+**Launching cell state.** When playback is resolving (`self.playing`, the 2-3s
+resolve→mpv-launch window), the played episode's cell renders the current braille
+spinner frame (`spinnerChar()`) in place of its number, inside the same `[ ]`
+shell so it reads as *that cell* working rather than a free-floating glyph.
+Background and bold match the focused state; colour follows the `isSlowPath()`
+rule — `state.focus` for the first 3s, `state.now` beyond — identical to the
+bottom-bar and cover-block spinners (§4.8). This is the **primary** in-progress
+affordance for playback: it sits at the user's attention locus (the cell they
+just pressed Enter on), not the bottom-left corner. It tracks the *session*, not
+the cursor — the grid stays navigable during play (mpv is a separate window), so
+the spinner stays pinned to the playing episode on its own show. It outranks the
+focus and watched states. On a counted watch it resolves directly to watched (no
+intermediate frame) as the cursor advances; on a failed play it returns to focus
+and the `playback failed` toast fires (§4.10).
 
 ### 4.7 Toast Notifications
 
@@ -420,10 +436,15 @@ Toasts appear at row `terminal_height - 2` (one row above the bottom bar).
 No animation — they appear and disappear on the cell grid with no transition.
 If multiple toasts queue, they stack upward (row -3, -4, etc.), max 3 visible.
 
+See §4.10 for the canonical event→feedback mapping — which actions earn a toast,
+which kind, persistent vs transient, and which are deliberately silent.
+
 ### 4.8 Loading / Spinner
 
 Used when: cover art is fetching, search results are loading, AniList sync is
-in progress.
+in progress, or playback is resolving (mpv launch in flight — surfaced as the
+§4.6 launching cell, with the bottom bar as a secondary signal). See §4.10 for
+the in-progress vs. terminal-outcome decision rule.
 
 Spinner frame sequence (cycles at ~100ms per frame):
 ```
@@ -449,6 +470,67 @@ active in search or command state.
 
 This is the only blinking element in the entire UI. If something else seems like it
 should blink — it should not. Use color weight change instead.
+
+### 4.10 Toast Event Matrix
+
+**Design rule:** in-progress state = §4.8 spinner; terminal outcome (done or
+failed) = §4.7 toast. These two channels are not interchangeable. A spinner mid-
+operation is not a promise of a toast when it resolves — only outcomes the user
+must be aware of earn a toast. Deliberate silences are documented here; unlisted
+events are silent by design. The spinner must also land at the user's attention
+locus — see the §4.6 launching cell for why playback resolves *in the grid*, not
+only the bottom-left corner.
+
+**In-progress (spinner, §4.8) — bottom-bar spinner active while in flight:**
+
+| Async operation | State flag | Primary locus |
+|---|---|---|
+| Search (debounce + AllAnime fetch) | `search_loading` / `debounce_deadline_ms` | bottom bar |
+| History load (startup DB read) | `history_loading` | bottom bar |
+| Episode grid fetch | `episode_loading` | bottom bar |
+| Cover art fetch + decode | `cover.loading` | cover block + bottom bar |
+| Playback resolving (resolve → mpv launch) | `playing` | **episode cell (§4.6)**; bottom bar secondary |
+
+All five share `async_start_ms` + `isSlowPath()` for the >3s `state.focus →
+state.now` escalation.
+
+**Terminal outcome (toast, §4.7) — fires on a resolving event:**
+
+| Event | Condition | Kind | Copy | Persistent |
+|---|---|---|---|---|
+| `play_done` / `play_error` | counted watch, not finale (`play_error` only if the position is meaningful) | success | `episode N done` | no |
+| `play_done` / `play_error` | counted watch, finale (as above) | success | `all caught up` | no |
+| `play_error` | no observed position (resolve failed / mpv died) | error | `playback failed` | no |
+| `episodes_error` | always | error | `couldn't load episodes` | no |
+| `task_error` | background task failed | error | (payload) | yes |
+| Search source unreachable | non-200 / network fail | error | `can't reach AllAnime` | yes |
+| Settings saved | write succeeded | success | `settings saved` | no |
+| Settings — no config dir | dir missing, skipped | warn | `no config dir — not saved` | no |
+| Settings save failed | write error | error | `settings save failed` | no |
+
+Copy: ≤40 chars, single line, lowercase, no terminal punctuation — status, not
+prose. **Persistence** is reserved for *ongoing* conditions still true while the
+toast is visible (source unreachable). Point-in-time failures (play, episodes)
+are transient — the condition is already over and the user can retry.
+
+A `play_error` carrying a meaningful position counts the watch and takes the
+success path above; only a position-less `play_error` fires `playback failed`.
+The two are mutually exclusive in `finishPlayback`.
+
+**Deliberate silences** (no toast, no spinner — documented intent, not oversight):
+
+| Event | Why silent |
+|---|---|
+| `search_done` | The result count in the list is the feedback; a count toast mid-type is noise. |
+| `search_enriched` | Enrichment folds into visible items; the UI change is the signal. |
+| `episodes_done` | The grid appearing in the detail pane is the feedback. |
+| `history_loaded` | The watchlist populating on startup is the feedback. |
+| `cover_done` | Image appears in-pane. |
+| `cover_error` | Cover is supplementary; the "no art yet" absent state (§9.5) handles the gap, no user action needed. |
+| `play_done` (uncounted) | mpv exited clean with nothing observed — a cancel. No advance, no feedback. |
+| `position_update` | Live telemetry. |
+| `focus_in` / `focus_out` / `winsize` | Terminal lifecycle; layout reflows silently. |
+| `tick` | Internal heartbeat. |
 
 ---
 
