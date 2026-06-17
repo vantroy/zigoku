@@ -256,7 +256,7 @@ const PlayTaskCallbackCtx = struct {
 
 fn observedPlaybackWasMeaningful(latest: ?player_mod.PositionUpdate) bool {
     const update = latest orelse return false;
-    return std.math.isFinite(update.time_pos) and update.time_pos > 0;
+    return update.isMeaningful();
 }
 
 fn persistFinalProgress(
