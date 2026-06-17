@@ -232,7 +232,8 @@ test "parsePositionLine tracks time-pos and duration events" {
     var time_pos: f64 = 0;
     var duration: f64 = 0;
 
-    const first = parsePositionLine(arena.allocator(),
+    const first = parsePositionLine(
+        arena.allocator(),
         "{\"event\":\"property-change\",\"name\":\"time-pos\",\"data\":91.5}",
         &time_pos,
         &duration,
@@ -241,7 +242,8 @@ test "parsePositionLine tracks time-pos and duration events" {
     try std.testing.expectApproxEqAbs(@as(f64, 0), first.duration, 0.001);
 
     _ = arena.reset(.retain_capacity);
-    const second = parsePositionLine(arena.allocator(),
+    const second = parsePositionLine(
+        arena.allocator(),
         "{\"event\":\"property-change\",\"name\":\"duration\",\"data\":1440}",
         &time_pos,
         &duration,

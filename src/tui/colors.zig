@@ -61,16 +61,16 @@ pub const phosphor: Palette = .{
 /// Nord adaptation. Semantic tokens mapped to Nord's polar night + snow storm
 /// + aurora palette (https://www.nordtheme.com/docs/colors-and-palettes).
 pub const nord: Palette = .{
-    .bg_base = Color{ .rgb = .{ 0x2e, 0x34, 0x40 } },     // nord0
-    .bg_surface = Color{ .rgb = .{ 0x3b, 0x42, 0x52 } },   // nord1
-    .bg_elevated = Color{ .rgb = .{ 0x43, 0x4c, 0x5e } },  // nord2
-    .chrome = Color{ .rgb = .{ 0x4c, 0x56, 0x6a } },       // nord3
-    .fg = Color{ .rgb = .{ 0xd8, 0xde, 0xe9 } },           // nord4
-    .fg2 = Color{ .rgb = .{ 0x81, 0xa1, 0xc1 } },          // nord9
-    .fg3 = Color{ .rgb = .{ 0x4c, 0x56, 0x6a } },          // nord3 (dim text)
-    .focus = Color{ .rgb = .{ 0x88, 0xc0, 0xd0 } },        // nord8
-    .hot = Color{ .rgb = .{ 0xd0, 0x87, 0x70 } },          // nord12 (aurora orange — more urgency than nord15 purple)
-    .warn = Color{ .rgb = .{ 0xeb, 0xcb, 0x8b } },         // nord13
+    .bg_base = Color{ .rgb = .{ 0x2e, 0x34, 0x40 } }, // nord0
+    .bg_surface = Color{ .rgb = .{ 0x3b, 0x42, 0x52 } }, // nord1
+    .bg_elevated = Color{ .rgb = .{ 0x43, 0x4c, 0x5e } }, // nord2
+    .chrome = Color{ .rgb = .{ 0x4c, 0x56, 0x6a } }, // nord3
+    .fg = Color{ .rgb = .{ 0xd8, 0xde, 0xe9 } }, // nord4
+    .fg2 = Color{ .rgb = .{ 0x81, 0xa1, 0xc1 } }, // nord9
+    .fg3 = Color{ .rgb = .{ 0x4c, 0x56, 0x6a } }, // nord3 (dim text)
+    .focus = Color{ .rgb = .{ 0x88, 0xc0, 0xd0 } }, // nord8
+    .hot = Color{ .rgb = .{ 0xd0, 0x87, 0x70 } }, // nord12 (aurora orange — more urgency than nord15 purple)
+    .warn = Color{ .rgb = .{ 0xeb, 0xcb, 0x8b } }, // nord13
 };
 
 // ── Backgrounds ─────────────────────────────────────────────────────────────
