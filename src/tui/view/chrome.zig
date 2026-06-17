@@ -137,7 +137,16 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
     var qi: usize = self.toast_queue.len;
     while (qi > 0) {
         qi -= 1;
-        const t = self.toast_queue[qi] orelse continue;
+        // Borrow the queue slot by pointer, never a value copy: vaxis stores the
+        // grapheme as a *slice* into the text we hand `printSegment` (Cell.char
+        // is []const u8, not an owned buffer), and the tty flush dereferences it
+        // after every draw pass has returned. A `const t = slot.* orelse …` copy
+        // would back those cells with this function's stack frame, which is dead
+        // (and partially overwritten — "epi" survives, the tail rots) by flush.
+        // `text` is an inline [80]u8 in the App-owned toast_queue, so the grapheme
+        // sub-slices stay valid until the next tick() nils the slot — well after
+        // vx.render() consumes them in this same draw().
+        const t = if (self.toast_queue[qi]) |*slot| slot else continue;
         if (row < 1) break;
         // §4.7 color map: info=[~] fg2(text.muted), success=[✓] fg(state.success),
         //   error=[!] hot, warn=[!] warn.
