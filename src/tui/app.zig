@@ -275,6 +275,10 @@ pub fn run(
     }
 
     // First paint, then the event loop.
+    {
+        const win = vx.window();
+        app.layout(win.height, win.width);
+    }
     try app.draw(&vx, writer);
     while (!app.should_quit) {
         const event = try loop.nextEvent();
@@ -283,6 +287,11 @@ pub fn run(
         // a tty. tick() still sees the event; it just doesn't touch the screen.
         if (event == .winsize) try vx.resize(gpa, writer, event.winsize);
         try app.tick(event, &loop, io, provider);
+        // Settle the list viewport before drawing: layout() is the state half
+        // of the scroll seam, so draw() reads list_top without writing it
+        // (ROD-155). run() owns geometry, so it feeds the terminal size in.
+        const win = vx.window();
+        app.layout(win.height, win.width);
         try app.draw(&vx, writer);
     }
 }
@@ -1933,6 +1942,28 @@ pub const App = struct {
             },
 
             .settings => settings.drawSettings(self, win, top, visible, w),
+        }
+    }
+
+    /// Settle the list viewport against the current terminal geometry.
+    ///
+    /// This is the *state* half of the scroll seam (ROD-155): it used to live
+    /// inside the `view/` draw passes, which made a render pass mutate
+    /// `list_top` and quietly broke the "draw is a pure function of state"
+    /// contract. run() now calls it between tick() and draw(), so the viewport
+    /// settles as an explicit state transition and draw() only ever *reads*
+    /// `list_top`. `h`/`w` are the full terminal size; the per-view budget math
+    /// mirrors drawContent's (content rows = h-3; History packs 2 rows/entry).
+    pub fn layout(self: *App, h: u16, w: u16) void {
+        // Match draw()'s too-small guard: below this there's no viewport to settle.
+        if (h < 4 or w < 16) return;
+        const visible: u16 = h - 3;
+        switch (self.active_view) {
+            // @max(1, …) guards visible=1 producing a zero slot count, which
+            // would corrupt list_top via scrollIntoView's arithmetic.
+            .history => self.scrollIntoView(@max(1, visible / 2)),
+            .browse => self.scrollIntoView(visible),
+            .detail, .settings => {},
         }
     }
 

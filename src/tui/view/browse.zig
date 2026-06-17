@@ -38,8 +38,9 @@ pub fn drawBrowseList(self: *App, win: vaxis.Window, pane_h: u16, pane_w: u16) v
     }
 
     // Results list — col offsets relative to list_win (no x=2 leading margin).
+    // The viewport (list_top) is settled by app.layout() before this draw pass
+    // (ROD-155); here we only read it.
     const list_title_col: u16 = 2; // marker is col 0–1, title starts at 2
-    self.scrollIntoView(pane_h);
 
     var row: u16 = 0;
     var slot: usize = 0;

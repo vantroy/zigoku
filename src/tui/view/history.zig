@@ -1,7 +1,8 @@
 //! Zigoku — History (Watchlist) view list render pass.
 //! Extracted from app.zig along the tick/draw seam (ROD-144). Driven by
-//! app.drawContent's `.history` arm; reads state — the only mutation is scroll
-//! viewport adjustment via the (still app-owned) scrollIntoView helper.
+//! app.drawContent's `.history` arm; reads list state (the viewport is settled
+//! by app.layout() before the draw pass — ROD-155). Its only writes are to
+//! per-frame render scratch (meta_scratch/bar_scratch/no_results_buf).
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -47,10 +48,9 @@ pub fn draw(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16, body_
         return;
     }
 
-    // Each history entry occupies 2 rows (title + progress bar).
-    // @max(1, ...) guards against visible=1 producing a zero slot count
-    // which would corrupt list_top via scrollIntoView's arithmetic.
-    self.scrollIntoView(@max(1, visible / 2));
+    // Each history entry occupies 2 rows (title + progress bar). The viewport
+    // (list_top) is settled by app.layout() before this draw pass (ROD-155);
+    // here we only read it.
 
     // Meta only earns its column when the terminal is wide enough to hold it
     // without colliding the title — otherwise the title takes the full width.
