@@ -56,7 +56,7 @@ fn recordPlaybackProgress(ctx: *anyopaque, update: zigoku.player.PositionUpdate)
 
 fn observedPlaybackWasMeaningful(latest: ?zigoku.player.PositionUpdate) bool {
     const update = latest orelse return false;
-    return std.math.isFinite(update.time_pos) and update.time_pos > 0;
+    return update.isMeaningful();
 }
 
 fn persistFinalProgress(
