@@ -78,6 +78,11 @@ pub const SettingRow = settings_state.SettingRow;
 pub const settings_rows = settings_state.settings_rows;
 pub const settings_row_count = settings_state.settings_row_count;
 
+/// mpv playback session subsystem (ROD-162). Owns the playing-episode record +
+/// progress/watched-state persistence in its own module; re-exported here so
+/// existing `app_mod.PlaybackSession` references keep resolving.
+pub const PlaybackSession = @import("playback_session.zig").PlaybackSession;
+
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -335,19 +340,12 @@ pub const App = struct {
     current_position: f64 = 0,
     /// Live mpv duration from IPC.
     current_duration: f64 = 0,
-    /// Last persisted checkpoint position for the current playback.
-    last_checkpoint_pos: f64 = 0,
-    /// Source name for the currently playing episode. Borrowed from either the
-    /// provider vtable or the history arena, both of which outlive App.
-    playing_source: []const u8 = &.{},
-    /// GPA-owned show id for the current playback session.
-    playing_anime_id: []const u8 = &.{},
-    /// GPA-owned raw episode label for the current playback session.
-    playing_episode_raw: []const u8 = &.{},
-    /// 1-based episode index used for recordPlay's high-water mark.
-    playing_episode_index: u32 = 0,
-    /// Translation active when playback started; decoupled from live UI toggles.
-    playing_translation: domain.Translation = .sub,
+    /// mpv playback session record (ROD-162): the playing show/episode/source,
+    /// the checkpoint mark, and the progress/watched-state persistence. Transport
+    /// (playing/play_thread/current_*) stays on App; the session owns only the
+    /// record. Embedded by value so `App{}` stays trivially constructible. See
+    /// `PlaybackSession`.
+    session: PlaybackSession = .{},
     /// Store reference — set in run() for getResume in the play thread.
     store: ?*Store = null,
     /// User config (ROD-85). Set in run(); string fields are arena-borrowed and
@@ -473,7 +471,7 @@ pub const App = struct {
         self.results.deinit(self.gpa);
         self.results = .empty;
         self.freeEpisodeResults();
-        self.clearPlayingSession();
+        self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
         self.cover.deinitCaches(self.gpa);
     }
@@ -583,89 +581,14 @@ pub const App = struct {
         }
     }
 
-    fn clearPlayingSession(self: *App) void {
-        if (self.playing_anime_id.len > 0) self.gpa.free(self.playing_anime_id);
-        if (self.playing_episode_raw.len > 0) self.gpa.free(self.playing_episode_raw);
-        self.playing_source = &.{};
-        self.playing_anime_id = &.{};
-        self.playing_episode_raw = &.{};
-        self.playing_episode_index = 0;
-        self.playing_translation = .sub;
-        self.last_checkpoint_pos = 0;
-    }
-
-    fn beginPlayingSession(
-        self: *App,
-        source: []const u8,
-        anime_id: []const u8,
-        episode_raw: []const u8,
-        episode_index: u32,
-        start_seconds: u64,
-    ) bool {
-        self.clearPlayingSession();
-        const owned_id = self.gpa.dupe(u8, anime_id) catch return false;
-        const owned_episode = self.gpa.dupe(u8, episode_raw) catch {
-            self.gpa.free(owned_id);
-            return false;
-        };
-
-        self.playing_source = source;
-        self.playing_anime_id = owned_id;
-        self.playing_episode_raw = owned_episode;
-        self.playing_episode_index = episode_index;
-        self.playing_translation = self.translation;
-        self.last_checkpoint_pos = @floatFromInt(start_seconds);
-        return true;
-    }
-
-    fn maybeCheckpointProgress(self: *App, time_pos: f64, duration: f64) void {
-        const st = self.store orelse return;
-        if (self.playing_anime_id.len == 0 or self.playing_episode_raw.len == 0) return;
-        if (time_pos - self.last_checkpoint_pos < 30.0) return;
-
-        st.saveProgress(
-            self.playing_source,
-            self.playing_anime_id,
-            self.playing_translation,
-            self.playing_episode_raw,
-            time_pos,
-            duration,
-            Store.nowSecs(),
-        ) catch |e| log.debug("saveProgress (checkpoint) failed: {s}", .{@errorName(e)});
-        self.last_checkpoint_pos = time_pos;
-    }
-
-    fn observedPlaybackWasMeaningful(final_update: ?event_mod.PositionUpdate) bool {
-        const update = final_update orelse return false;
-        return std.math.isFinite(update.time_pos) and update.time_pos > 0;
-    }
-
+    /// Controller glue for the playback-event handlers (ROD-162): hand the final
+    /// state to the session for persistence + clear, then reset the App-owned
+    /// transport. The session owns the record; the shell owns playing/current_*.
     fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, record_play: bool) void {
-        if (self.store) |st| {
-            if (self.playing_anime_id.len > 0 and self.playing_episode_raw.len > 0) {
-                if (observedPlaybackWasMeaningful(final_update)) {
-                    const update = final_update.?;
-                    st.saveProgress(
-                        self.playing_source,
-                        self.playing_anime_id,
-                        self.playing_translation,
-                        self.playing_episode_raw,
-                        update.time_pos,
-                        update.duration,
-                        Store.nowSecs(),
-                    ) catch |e| log.debug("saveProgress (final) failed: {s}", .{@errorName(e)});
-                }
-                if (record_play and self.playing_episode_index > 0) {
-                    st.recordPlay(self.playing_source, self.playing_anime_id, self.playing_episode_index, Store.nowSecs()) catch |e|
-                        log.debug("recordPlay failed: {s}", .{@errorName(e)});
-                }
-            }
-        }
-
+        self.session.finish(self.gpa, self.store, final_update, record_play);
         self.playing = false;
         self.current_position = 0;
         self.current_duration = 0;
-        self.clearPlayingSession();
         self.async_start_ms = 0;
     }
 
@@ -935,13 +858,15 @@ pub const App = struct {
             .position_update => |ev| {
                 self.current_position = ev.time_pos;
                 self.current_duration = ev.duration;
-                self.maybeCheckpointProgress(ev.time_pos, ev.duration);
+                self.session.maybeCheckpoint(self.store, ev.time_pos, ev.duration);
             },
             .play_done => |final_update| {
                 self.finishPlayback(final_update, true);
             },
             .play_error => |final_update| {
-                self.finishPlayback(final_update, observedPlaybackWasMeaningful(final_update));
+                // On error, only count the play if mpv observed a real position
+                // (clean exits use play_done with record_play=true unconditionally).
+                self.finishPlayback(final_update, if (final_update) |u| u.isMeaningful() else false);
             },
             .tick => {
                 const now = nowMs(io);
@@ -1091,7 +1016,7 @@ pub const App = struct {
 
         self.current_position = 0;
         self.current_duration = 0;
-        if (!self.beginPlayingSession(source_name, selected_id, ep.raw, episode_index, start_seconds)) {
+        if (!self.session.begin(self.gpa, source_name, selected_id, ep.raw, episode_index, self.translation, start_seconds)) {
             self.gpa.free(id_copy);
             self.gpa.free(ep_copy);
             self.gpa.free(title_copy);
@@ -1113,7 +1038,7 @@ pub const App = struct {
             self.config.mpv_path,
             self.config.skip_mode,
         }) catch {
-            self.clearPlayingSession();
+            self.session.clear(self.gpa);
             self.gpa.free(id_copy);
             self.gpa.free(ep_copy);
             self.gpa.free(title_copy);

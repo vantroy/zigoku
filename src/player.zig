@@ -22,6 +22,13 @@ pub const PlayError = error{
 pub const PositionUpdate = struct {
     time_pos: f64,
     duration: f64,
+
+    /// Whether this is a real observed position worth persisting — a finite,
+    /// positive time. mpv can emit 0 or NaN on an abrupt exit, which must not
+    /// clobber a good checkpoint or record a play that never meaningfully ran.
+    pub fn isMeaningful(self: PositionUpdate) bool {
+        return std.math.isFinite(self.time_pos) and self.time_pos > 0;
+    }
 };
 
 /// An mpv user-script to load for this playback, with its `--script-opts` value.

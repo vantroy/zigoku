@@ -1240,10 +1240,10 @@ test "position_update checkpoints playback progress every 30 seconds" {
     app.gpa = testing.allocator;
     app.store = &store;
     app.playing = true;
-    app.playing_source = "allanime";
-    app.playing_anime_id = try testing.allocator.dupe(u8, "show1");
-    app.playing_episode_raw = try testing.allocator.dupe(u8, "3");
-    app.playing_translation = .sub;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.translation = .sub;
 
     try testTick(&app, .{ .position_update = .{ .time_pos = 29.0, .duration = 1440 } });
     try testing.expect((try store.getResume("allanime", "show1", .sub, "3")) == null);
@@ -1252,7 +1252,7 @@ test "position_update checkpoints playback progress every 30 seconds" {
     const first = (try store.getResume("allanime", "show1", .sub, "3")).?;
     try testing.expectApproxEqAbs(@as(f64, 30.0), first.position_secs, 0.001);
     try testing.expectApproxEqAbs(@as(f64, 1440), first.duration_secs, 0.001);
-    try testing.expectApproxEqAbs(@as(f64, 30.0), app.last_checkpoint_pos, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 30.0), app.session.last_checkpoint_pos, 0.001);
 
     try testTick(&app, .{ .position_update = .{ .time_pos = 59.0, .duration = 1440 } });
     const second = (try store.getResume("allanime", "show1", .sub, "3")).?;
@@ -1261,7 +1261,7 @@ test "position_update checkpoints playback progress every 30 seconds" {
     try testTick(&app, .{ .position_update = .{ .time_pos = 60.5, .duration = 1440 } });
     const third = (try store.getResume("allanime", "show1", .sub, "3")).?;
     try testing.expectApproxEqAbs(@as(f64, 60.5), third.position_secs, 0.001);
-    try testing.expectApproxEqAbs(@as(f64, 60.5), app.last_checkpoint_pos, 0.001);
+    try testing.expectApproxEqAbs(@as(f64, 60.5), app.session.last_checkpoint_pos, 0.001);
 
     try testTick(&app, .{ .play_done = null });
 }
@@ -1275,12 +1275,12 @@ test "play_done persists final observed position after checkpoints" {
     app.gpa = testing.allocator;
     app.store = &store;
     app.playing = true;
-    app.playing_source = "allanime";
-    app.playing_anime_id = try testing.allocator.dupe(u8, "show1");
-    app.playing_episode_raw = try testing.allocator.dupe(u8, "3");
-    app.playing_episode_index = 3;
-    app.playing_translation = .sub;
-    app.last_checkpoint_pos = 90;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
 
     try store.saveProgress("allanime", "show1", .sub, "3", 90, 1440, 1001);
     try testTick(&app, .{ .play_done = .{ .time_pos = 100, .duration = 1440 } });
@@ -1298,12 +1298,12 @@ test "play_done ignores non-meaningful final position and preserves checkpoint" 
     app.gpa = testing.allocator;
     app.store = &store;
     app.playing = true;
-    app.playing_source = "allanime";
-    app.playing_anime_id = try testing.allocator.dupe(u8, "show1");
-    app.playing_episode_raw = try testing.allocator.dupe(u8, "3");
-    app.playing_episode_index = 3;
-    app.playing_translation = .sub;
-    app.last_checkpoint_pos = 90;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
 
     try store.saveProgress("allanime", "show1", .sub, "3", 90, 1440, 1001);
     try testTick(&app, .{ .play_done = .{ .time_pos = 0, .duration = 1440 } });
@@ -1318,19 +1318,81 @@ test "play_done clears live playback fields" {
     app.playing = true;
     app.current_position = 91.5;
     app.current_duration = 1440;
-    app.last_checkpoint_pos = 60;
-    app.playing_source = "allanime";
-    app.playing_anime_id = try testing.allocator.dupe(u8, "show1");
-    app.playing_episode_raw = try testing.allocator.dupe(u8, "3");
-    app.playing_episode_index = 3;
+    app.session.last_checkpoint_pos = 60;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
 
     try testTick(&app, .{ .play_done = null });
     try testing.expect(!app.playing);
     try testing.expectApproxEqAbs(@as(f64, 0), app.current_position, 0.001);
     try testing.expectApproxEqAbs(@as(f64, 0), app.current_duration, 0.001);
-    try testing.expectApproxEqAbs(@as(f64, 0), app.last_checkpoint_pos, 0.001);
-    try testing.expectEqual(@as(usize, 0), app.playing_anime_id.len);
-    try testing.expectEqual(@as(usize, 0), app.playing_episode_raw.len);
+    try testing.expectApproxEqAbs(@as(f64, 0), app.session.last_checkpoint_pos, 0.001);
+    try testing.expectEqual(@as(usize, 0), app.session.anime_id.len);
+    try testing.expectEqual(@as(usize, 0), app.session.episode_raw.len);
+}
+
+test "play_error with a meaningful position persists final and records the play" {
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &store;
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
+
+    // mpv died but reported a real position: record_play is derived true.
+    try testTick(&app, .{ .play_error = .{ .time_pos = 120, .duration = 1440 } });
+
+    const saved = (try store.getResume("allanime", "show1", .sub, "3")).?;
+    try testing.expectApproxEqAbs(@as(f64, 120), saved.position_secs, 0.001);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rec = (try store.getAnime(arena.allocator(), "allanime", "show1")).?;
+    try testing.expectEqual(@as(i64, 1), rec.play_count); // recordPlay fired
+    try testing.expectEqual(@as(i64, 3), rec.progress);
+
+    try testing.expect(!app.playing); // transport reset
+}
+
+test "play_error with no observed position skips recordPlay and preserves checkpoint" {
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.saveProgress("allanime", "show1", .sub, "3", 90, 1440, 1001);
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &store;
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
+
+    // mpv died at position 0: non-meaningful, so record_play is derived false.
+    try testTick(&app, .{ .play_error = .{ .time_pos = 0, .duration = 1440 } });
+
+    const saved = (try store.getResume("allanime", "show1", .sub, "3")).?;
+    try testing.expectApproxEqAbs(@as(f64, 90), saved.position_secs, 0.001); // checkpoint preserved
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const rec = (try store.getAnime(arena.allocator(), "allanime", "show1")).?;
+    try testing.expectEqual(@as(i64, 0), rec.play_count); // recordPlay did NOT fire
+
+    try testing.expect(!app.playing); // transport still reset
 }
 
 test "firePlay: double-play guard is a no-op when playing is true" {
