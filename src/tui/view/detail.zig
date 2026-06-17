@@ -310,8 +310,16 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             const cell_buf = &self.ep_scratch[slot];
             const cell_text = std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
+            // §4.6: watched cells (index below the high-water mark) recede to
+            // text.dim; unwatched stay text.muted; the cursor always wins
+            // (ROD-131). text.dim is `fg3` alone — matching the completed/dropped
+            // convention in history.zig; the `.dim` SGR attr is reserved for the
+            // paused semantic (§2.4), so it is deliberately not used here.
+            const watched = ep_idx < @as(usize, self.detail_progress);
             const cell_style = if (focused)
                 self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
+            else if (watched)
+                self.s(self.palette.fg3, .{})
             else
                 self.s(self.palette.fg2, .{});
 
