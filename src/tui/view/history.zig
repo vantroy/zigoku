@@ -1,8 +1,8 @@
 //! Zigoku — History (Watchlist) view list render pass.
 //! Extracted from app.zig along the tick/draw seam (ROD-144). Driven by
 //! app.drawContent's `.history` arm; reads list state (the viewport is settled
-//! by app.layout() before the draw pass — ROD-155). Its only writes are to
-//! per-frame render scratch (meta_scratch/bar_scratch/no_results_buf).
+//! by app.layout() before the draw pass — ROD-155). Takes `*const App`; its
+//! only writes are to the passed-in RenderScratch.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -10,6 +10,7 @@ const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
 
 const App = app_mod.App;
+const RenderScratch = app_mod.RenderScratch;
 const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
@@ -21,11 +22,13 @@ const meta_col = render.meta_col;
 const title_meta_gap = render.title_meta_gap;
 
 /// Render the Watchlist list body. `top`/`visible`/`w`/`body_w` are the
-/// content-area geometry computed by app.drawContent.
-pub fn draw(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16, body_w: u16) void {
+/// content-area geometry computed by app.drawContent. `self` is `*const App`:
+/// this pass reads list state and writes only `scratch`, so the compiler proves
+/// it mutates no app state (ROD-155).
+pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u16, visible: u16, w: u16, body_w: u16) void {
     // History view — existing list rendering.
     if (self.history_loading) {
-        const hist_spin = std.fmt.bufPrint(&self.no_results_buf, "{s} loading history", .{self.spinnerChar()}) catch "⠋ loading history";
+        const hist_spin = std.fmt.bufPrint(&scratch.msg, "{s} loading history", .{self.spinnerChar()}) catch "⠋ loading history";
         putClipped(win, top, 2, body_w, hist_spin, self.s(self.palette.focus, .{}));
         return;
     }
@@ -110,14 +113,14 @@ pub fn draw(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u16, body_
             self.s(self.palette.fg, .{ .bg = row_bg });
         putClipped(win, row, title_col, title_w, rec.title, title_style);
 
-        if (show_meta and slot < self.meta_scratch.len) {
-            const meta = formatMeta(&self.meta_scratch[slot], rec);
+        if (show_meta and slot < scratch.meta.len) {
+            const meta = formatMeta(&scratch.meta[slot], rec);
             putClipped(win, row, meta_col, w - meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
         }
 
         // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
-        if (slot < self.bar_scratch.len) {
-            drawProgressBar(win, row + 1, title_col, bar_w, rec, row_bg, &self.bar_scratch[slot], self.palette);
+        if (slot < scratch.bar.len) {
+            drawProgressBar(win, row + 1, title_col, bar_w, rec, row_bg, &scratch.bar[slot], self.palette);
         }
 
         slot += 1;
