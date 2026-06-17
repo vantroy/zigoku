@@ -1,3 +1,6 @@
 zig-out/
 .zig-cache/
 zig-pkg/
+
+# compiled binary (zig build-exe emits ./main)
+/main
