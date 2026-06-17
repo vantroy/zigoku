@@ -452,7 +452,11 @@ pub const App = struct {
             self.toast_queue[1] = self.toast_queue[2];
             idx = 2;
         }
-        var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 2500 };
+        // 4000ms (not 2500): a state-change toast (e.g. "episode N done") is
+        // posted the instant mpv exits, but on a tiling WM focus is still
+        // returning from mpv's window, eating the first ~1s. Matches the
+        // Toast.ttl_ms struct default.
+        var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000 };
         const n = @min(text.len, 79);
         @memcpy(t.text[0..n], text[0..n]);
         t.text_len = n;
