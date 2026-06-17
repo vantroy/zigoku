@@ -22,7 +22,6 @@ const colors = @import("colors.zig");
 const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
-const cover_mod = @import("../cover.zig");
 const event_mod = @import("event.zig");
 const render = @import("render.zig");
 const workers = @import("workers.zig");
@@ -47,8 +46,6 @@ const Loop = event_mod.Loop;
 // Only `put` survives in app.zig (the "terminal too small" guard in `draw()`);
 // the rest of the render helpers now live with the per-view passes (ROD-144).
 const put = render.put;
-const RawCoverCache = workers.RawCoverCache;
-const DecodedCoverCache = workers.DecodedCoverCache;
 const dupeOptText = workers.dupeOptText;
 const dupeOwnedAnime = workers.dupeOwnedAnime;
 const freeOwnedAnime = workers.freeOwnedAnime;
@@ -57,7 +54,6 @@ const enrichTask = workers.enrichTask;
 const loadHistoryTask = workers.loadHistoryTask;
 const episodesTask = workers.episodesTask;
 const playTask = workers.playTask;
-const coverTask = workers.coverTask;
 const tickTask = workers.tickTask;
 const nowMs = workers.nowMs;
 
@@ -66,115 +62,10 @@ const nowMs = workers.nowMs;
 /// knows we're waiting on the network, not stuck.
 const slow_path_threshold_ms: i64 = 3000;
 
-/// Cover fetch/decode failure suppression window (ROD-110). After a failure we
-/// suppress refetch of the *same id+url* for this long, then allow one retry on
-/// the next event — a lightweight backoff instead of permanent sticky
-/// suppression. A changed `thumb` URL clears suppression immediately (recovery
-/// without moving the selection); see `CoverDecision`.
-pub const cover_retry_cooldown_ms: i64 = 10_000;
-
-/// What `syncCover` should do for the current selection. Extracted from the
-/// `syncCover` side effects so the fetch/suppress/retry policy is unit-testable
-/// without spawning threads or relying on `builtin.is_test` (ROD-110, Elara #2).
-pub const CoverAction = enum {
-    /// Nothing to do — no target, or target already matches in-flight/loaded.
-    none,
-    /// Target has no art and stale cover state belongs to a different id; drop it.
-    clear,
-    /// A recent same-id+same-url failure is still inside the cooldown window.
-    suppress,
-    /// We're already loading or holding pixels for this exact id.
-    up_to_date,
-    /// Start a fresh fetch (clears any superseded failure record).
-    fetch,
-};
-
-/// Pure inputs for the cover fetch decision. `now_ms`/`failed_at_ms` drive the
-/// cooldown; `failed_url` vs `target_url` drives URL-change recovery.
-pub const CoverDecision = struct {
-    target_id: ?[]const u8,
-    target_url: ?[]const u8,
-    cover_for_id: ?[]const u8,
-    cover_loading: bool,
-    has_pixels: bool,
-    failed_id: ?[]const u8,
-    failed_url: ?[]const u8,
-    failed_at_ms: i64,
-    now_ms: i64,
-
-    pub fn eval(d: CoverDecision) CoverAction {
-        const target_id = d.target_id orelse return .none;
-
-        const target_url = d.target_url orelse {
-            // No art for this show. Only act if stale state belongs elsewhere.
-            const stale = d.cover_for_id != null and
-                !std.mem.eql(u8, d.cover_for_id.?, target_id);
-            return if (stale) .clear else .none;
-        };
-
-        // Already loading or holding pixels for this exact id → leave it be.
-        // Checked before suppression so a live cover always wins over a stale
-        // failure record, independent of the clearCoverState invariant.
-        if (d.cover_for_id) |id| {
-            if (std.mem.eql(u8, id, target_id) and (d.cover_loading or d.has_pixels)) {
-                return .up_to_date;
-            }
-        }
-
-        // Failure suppression: same id + same url, still within cooldown. A
-        // changed URL or an elapsed cooldown both fall through to a retry.
-        // Failure records persist across navigation — they are cleared only by
-        // cooldown expiry, a thumb URL change, or a successful fetch.
-        if (d.failed_id) |fid| {
-            if (std.mem.eql(u8, fid, target_id)) {
-                const same_url = d.failed_url != null and
-                    std.mem.eql(u8, d.failed_url.?, target_url);
-                const within_cooldown = d.now_ms -% d.failed_at_ms < cover_retry_cooldown_ms;
-                if (same_url and within_cooldown) return .suppress;
-            }
-        }
-
-        return .fetch;
-    }
-};
-
-/// Letterboxed placement of an image inside a half-block mosaic grid (ROD-110).
-pub const HalfBlockFit = struct { w: u32, h: u32, off_x: u32, off_y: u32 };
-
-/// Fit `img_w × img_h` into a `grid_w × grid_h` half-pixel grid, preserving
-/// aspect. A half-block cell (`▀`) is full-cell *wide* but half-cell *tall*, so
-/// a half-pixel is `ppc` wide and `pph/2` tall — only square when cells are 2:1.
-/// We therefore compare in physical-pixel space using the terminal's reported
-/// `ppc`/`pph` (pixels per column/row). Pass `ppc == 0` or `pph == 0` when the
-/// terminal won't report pixel metrics, which falls back to assuming square
-/// half-pixels (the pre-fix behavior — correct on 2:1 cells, off elsewhere).
-/// Extracted as a pure helper so the aspect math is unit-testable (Mira S2).
-pub fn halfBlockFit(img_w: u32, img_h: u32, grid_w: u32, grid_h: u32, ppc: u32, pph: u32) HalfBlockFit {
-    var fit_w = grid_w;
-    var fit_h = grid_h;
-    if (img_w != 0 and img_h != 0 and grid_w != 0 and grid_h != 0) {
-        if (ppc != 0 and pph != 0) {
-            // phys_w = grid_w*ppc, phys_h = grid_h*pph/2. Compare aspects:
-            //   img_w*phys_h vs img_h*phys_w  →  img_w*grid_h*pph vs 2*img_h*grid_w*ppc
-            const lhs = @as(u64, img_w) * grid_h * pph;
-            const rhs = @as(u64, img_h) * grid_w * ppc * 2;
-            if (lhs > rhs) {
-                // width-bound: fit_h = 2*img_h*grid_w*ppc / (img_w*pph)
-                fit_h = @intCast(@max(1, @as(u64, img_h) * grid_w * ppc * 2 / (@as(u64, img_w) * pph)));
-            } else {
-                // height-bound: fit_w = img_w*grid_h*pph / (2*img_h*ppc)
-                fit_w = @intCast(@max(1, @as(u64, img_w) * grid_h * pph / (@as(u64, img_h) * ppc * 2)));
-            }
-        } else if (img_w * grid_h > img_h * grid_w) {
-            fit_h = @max(1, img_h * grid_w / img_w); // width-bound, square half-pixel
-        } else {
-            fit_w = @max(1, img_w * grid_h / img_h); // height-bound, square half-pixel
-        }
-    }
-    fit_w = @min(fit_w, grid_w);
-    fit_h = @min(fit_h, grid_h);
-    return .{ .w = fit_w, .h = fit_h, .off_x = (grid_w - fit_w) / 2, .off_y = (grid_h - fit_h) / 2 };
-}
+/// Cover/image subsystem (ROD-160). Lives in its own module now that it's a
+/// self-contained unit with no dependency on App; re-exported here so existing
+/// `app_mod.CoverState` references (views, tests) keep resolving.
+pub const CoverState = @import("cover_state.zig").CoverState;
 
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
@@ -262,7 +153,7 @@ pub fn run(
     defer if (app.episode_thread) |t| t.join();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
-    defer app.joinCoverThread();
+    defer app.cover.joinThread();
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -506,35 +397,9 @@ pub const App = struct {
     episode_loading: bool = false,
     /// Cursor position within the episode grid (0-based index into episode_results).
     episode_cursor: usize = 0,
-    /// Handle for the most recent cover-fetch thread. Joined before a new spawn.
-    cover_thread: ?std.Thread = null,
-    /// Worker-thread raw-image cache (avoids refetch by URL).
-    cover_raw_cache: RawCoverCache = .{},
-    /// Worker-thread decoded-pixel cache (avoids re-decode by URL).
-    cover_decoded_cache: DecodedCoverCache = .{},
-    /// Decoded cover pixels for the currently tracked show id.
-    cover_pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
-    /// Which show id the current cover state belongs to.
-    cover_for_id: ?[]const u8 = null,
-    /// Whether a cover fetch/decode is in flight.
-    cover_loading: bool = false,
-    /// Last show id whose cover fetch/decode failed. Combined with
-    /// `cover_failed_url` + `cover_failed_at_ms` this drives a cooldown-based
-    /// retry policy (ROD-110) instead of permanent sticky suppression.
-    cover_failed_for_id: ?[]const u8 = null,
-    /// GPA-owned copy of the URL that failed, for URL-change recovery.
-    cover_failed_url: ?[]const u8 = null,
-    /// `now_ms` timestamp of the last cover failure; gates the retry cooldown.
-    cover_failed_at_ms: i64 = 0,
-    /// GPA-owned copy of the URL currently being fetched. Recorded so a failure
-    /// can attribute the exact url even if the selection moved mid-flight.
-    cover_inflight_url: ?[]const u8 = null,
-    /// Dominant fallback color when Kitty graphics are unavailable.
-    cover_fallback_color: vaxis.Color = .default,
-    /// Uploaded Kitty image for the current cover, if any.
-    cover_image: ?vaxis.Image = null,
-    /// Old Kitty image id to delete on the next draw pass.
-    pending_cover_free_id: ?u32 = null,
+    /// Cover/image subsystem — fetch policy, decoded-pixel + Kitty-image state,
+    /// and the cover worker-thread lifecycle. See `CoverState` (ROD-160).
+    cover: CoverState = .{},
     /// Handle for the most recent play thread. Joined before a new spawn.
     play_thread: ?std.Thread = null,
     /// Whether mpv is running (play thread in-flight).
@@ -693,8 +558,8 @@ pub const App = struct {
         self.results = .empty;
         self.freeEpisodeResults();
         self.clearPlayingSession();
-        self.freeCoverState(vx, writer);
-        self.deinitCoverCaches();
+        self.cover.freeAll(self.gpa, vx, writer);
+        self.cover.deinitCaches(self.gpa);
     }
 
     fn selectedAnime(self: *const App) ?Anime {
@@ -779,11 +644,6 @@ pub const App = struct {
             if (self.selectedHistoryRecord()) |rec| return rec.source;
         }
         return provider.name();
-    }
-
-    fn currentCoverTargetId(self: *const App) ?[]const u8 {
-        const anime = self.currentDetailAnime() orelse return null;
-        return anime.id;
     }
 
     fn seedHistoryEpisodeCursor(self: *App, rec: AnimeRecord, episodes: []domain.EpisodeNumber) void {
@@ -893,151 +753,6 @@ pub const App = struct {
         self.async_start_ms = 0;
     }
 
-    fn invalidateCoverImage(self: *App) void {
-        if (self.cover_image) |img| {
-            self.pending_cover_free_id = img.id;
-            self.cover_image = null;
-        }
-    }
-
-    fn freeCoverBuffers(self: *App) void {
-        if (self.cover_pixels) |px| {
-            self.gpa.free(px.rgba);
-            self.cover_pixels = null;
-        }
-        self.cover_fallback_color = .default;
-    }
-
-    pub fn clearCoverFailure(self: *App) void {
-        if (self.cover_failed_for_id) |id| {
-            self.gpa.free(id);
-            self.cover_failed_for_id = null;
-        }
-        if (self.cover_failed_url) |u| {
-            self.gpa.free(u);
-            self.cover_failed_url = null;
-        }
-        self.cover_failed_at_ms = 0;
-    }
-
-    /// Record a fetch/decode failure for the cooldown-based retry policy. `url`
-    /// is the URL that failed (borrowed; duped here) so a later selection on the
-    /// same id can detect whether the `thumb` changed and a retry is warranted.
-    fn noteCoverFailure(self: *App, id: []const u8, url: ?[]const u8) void {
-        self.clearCoverFailure();
-        self.cover_failed_for_id = self.gpa.dupe(u8, id) catch null;
-        self.cover_failed_url = if (url) |u| (self.gpa.dupe(u8, u) catch null) else null;
-        self.cover_failed_at_ms = self.now_ms;
-    }
-
-    fn clearInflightUrl(self: *App) void {
-        if (self.cover_inflight_url) |u| {
-            self.gpa.free(u);
-            self.cover_inflight_url = null;
-        }
-    }
-
-    pub fn clearCoverState(self: *App) void {
-        self.invalidateCoverImage();
-        self.freeCoverBuffers();
-        if (self.cover_for_id) |id| {
-            self.gpa.free(id);
-            self.cover_for_id = null;
-        }
-        self.clearInflightUrl();
-        self.cover_loading = false;
-    }
-
-    fn flushPendingCoverFree(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
-        if (self.pending_cover_free_id) |id| {
-            vx.freeImage(writer, id);
-            self.pending_cover_free_id = null;
-        }
-    }
-
-    fn freeCoverState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
-        self.flushPendingCoverFree(vx, writer);
-        if (self.cover_image) |img| vx.freeImage(writer, img.id);
-        self.cover_image = null;
-        self.clearCoverState();
-        self.clearCoverFailure();
-    }
-
-    fn deinitCoverCaches(self: *App) void {
-        self.cover_decoded_cache.deinit(self.gpa);
-        self.cover_decoded_cache = .{};
-        self.cover_raw_cache.deinit(self.gpa);
-        self.cover_raw_cache = .{};
-    }
-
-    fn joinCoverThread(self: *App) void {
-        if (self.cover_thread) |t| {
-            t.join();
-            self.cover_thread = null;
-        }
-    }
-
-    fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
-        if (builtin.is_test) return;
-        const anime = self.currentDetailAnime() orelse return;
-        const target_id = self.currentCoverTargetId() orelse return;
-        const target_url = anime.thumb;
-
-        const decision: CoverDecision = .{
-            .target_id = target_id,
-            .target_url = target_url,
-            .cover_for_id = self.cover_for_id,
-            .cover_loading = self.cover_loading,
-            .has_pixels = self.cover_pixels != null,
-            .failed_id = self.cover_failed_for_id,
-            .failed_url = self.cover_failed_url,
-            .failed_at_ms = self.cover_failed_at_ms,
-            .now_ms = self.now_ms,
-        };
-        switch (decision.eval()) {
-            .none, .suppress, .up_to_date => return,
-            .clear => {
-                self.clearCoverState();
-                return;
-            },
-            .fetch => {},
-        }
-        // .fetch implies the prior failure (if any) is superseded.
-        self.clearCoverFailure();
-        const url = target_url.?;
-
-        self.joinCoverThread();
-
-        self.clearCoverState();
-        self.cover_for_id = self.gpa.dupe(u8, target_id) catch return;
-        self.cover_inflight_url = self.gpa.dupe(u8, url) catch null;
-        const id_for_event = self.gpa.dupe(u8, target_id) catch {
-            self.clearCoverState();
-            return;
-        };
-        const url_copy = self.gpa.dupe(u8, url) catch {
-            self.gpa.free(id_for_event);
-            self.clearCoverState();
-            return;
-        };
-
-        self.cover_thread = std.Thread.spawn(.{}, coverTask, .{
-            loop,
-            self.gpa,
-            io,
-            url_copy,
-            id_for_event,
-            &self.cover_raw_cache,
-            &self.cover_decoded_cache,
-        }) catch {
-            self.gpa.free(url_copy);
-            self.gpa.free(id_for_event);
-            self.clearCoverState();
-            return;
-        };
-        self.cover_loading = true;
-        self.async_start_ms = self.now_ms;
-    }
 
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
         if (builtin.is_test) return;
@@ -1271,38 +986,35 @@ pub const App = struct {
             },
             .cover_done => |ev| {
                 defer self.gpa.free(ev.for_id);
-                if (self.cover_for_id == null or !std.mem.eql(u8, ev.for_id, self.cover_for_id.?)) {
+                if (self.cover.for_id == null or !std.mem.eql(u8, ev.for_id, self.cover.for_id.?)) {
                     self.gpa.free(ev.rgba);
                     return;
                 }
-                self.cover_loading = false;
-                self.joinCoverThread();
+                self.cover.loading = false;
+                self.cover.joinThread();
                 if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
 
-                const target_id = self.currentCoverTargetId();
+                // The result is stale if the selection moved off this id while
+                // the fetch was in flight; the controller owns that nav check.
+                const target_id = if (self.currentDetailAnime()) |a| a.id else null;
                 const keep = target_id != null and std.mem.eql(u8, target_id.?, ev.for_id);
                 if (!keep) {
-                    self.clearCoverState();
+                    self.cover.clear(self.gpa);
                     self.gpa.free(ev.rgba);
                     return;
                 }
 
-                self.clearCoverFailure();
-                self.clearInflightUrl(); // fetch succeeded; in-flight url no longer needed
-                self.invalidateCoverImage();
-                self.freeCoverBuffers();
-                self.cover_pixels = .{ .rgba = ev.rgba, .w = ev.width, .h = ev.height };
-                self.cover_fallback_color = cover_mod.dominantColor(.{ .rgba = ev.rgba, .w = ev.width, .h = ev.height });
+                self.cover.acceptPixels(self.gpa, ev.rgba, ev.width, ev.height);
             },
             .cover_error => |for_id| {
                 defer self.gpa.free(for_id);
-                if (self.cover_for_id == null or !std.mem.eql(u8, for_id, self.cover_for_id.?)) return;
-                self.cover_loading = false;
-                self.joinCoverThread();
+                if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return;
+                self.cover.loading = false;
+                self.cover.joinThread();
                 if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
-                // Record the failed url *before* clearCoverState frees it.
-                self.noteCoverFailure(for_id, self.cover_inflight_url);
-                self.clearCoverState();
+                // Record the failed url *before* clear() frees it.
+                self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
+                self.cover.clear(self.gpa);
                 std.log.debug("cover fetch/decode failed for {s}", .{for_id});
             },
             .position_update => |ev| {
@@ -1336,7 +1048,21 @@ pub const App = struct {
             },
         }
 
-        if (event != .tick) self.syncCover(loop, io);
+        if (event != .tick) {
+            // Resolve the cover target from navigation state here (the controller's
+            // job) and hand the primitives to the subsystem — CoverState never
+            // reaches into selection state itself (ROD-160).
+            const anime = self.currentDetailAnime();
+            const started = self.cover.sync(
+                self.gpa,
+                loop,
+                io,
+                self.now_ms,
+                if (anime) |a| a.id else null,
+                if (anime) |a| a.thumb else null,
+            );
+            if (started) self.async_start_ms = self.now_ms;
+        }
     }
 
     fn fireSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, page: u32) void {
@@ -1900,7 +1626,7 @@ pub const App = struct {
 
     // ── draw: pure render from state ─────────────────────────────────────────
     fn draw(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
-        self.flushPendingCoverFree(vx, writer);
+        self.cover.flushPendingFree(vx, writer);
 
         const win = vx.window();
         win.clear();

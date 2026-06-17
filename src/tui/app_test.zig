@@ -17,7 +17,8 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const App = app_mod.App;
 const Toast = app_mod.Toast;
-const CoverDecision = app_mod.CoverDecision;
+const CoverState = app_mod.CoverState;
+const CoverDecision = app_mod.CoverState.Decision;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
 const formatMeta = @import("render.zig").formatMeta;
@@ -1020,22 +1021,22 @@ test "cover_done fresh result stores decoded cover state" {
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
         .eps_sub = 28,
     });
-    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.cover_loading = true;
+    app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover.loading = true;
     // Seed the in-flight url so a regression that stops freeing it on the keep
     // path is caught — both by the null assertion below and the GPA detector.
-    app.cover_inflight_url = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg");
+    app.cover.inflight_url = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg");
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
     try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
-    try testing.expect(!app.cover_loading);
-    try testing.expect(app.cover_pixels != null);
-    try testing.expectEqual(@as(u32, 1), app.cover_pixels.?.w);
-    try testing.expect(app.cover_inflight_url == null); // keep path frees the in-flight url
+    try testing.expect(!app.cover.loading);
+    try testing.expect(app.cover.pixels != null);
+    try testing.expectEqual(@as(u32, 1), app.cover.pixels.?.w);
+    try testing.expect(app.cover.inflight_url == null); // keep path frees the in-flight url
 
-    app.clearCoverState();
+    app.cover.clear(app.gpa);
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
@@ -1052,17 +1053,17 @@ test "cover_done stale result is discarded" {
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/bebop.jpg"),
         .eps_sub = 26,
     });
-    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime2");
-    app.cover_loading = true;
+    app.cover.for_id = try std.testing.allocator.dupe(u8, "anime2");
+    app.cover.loading = true;
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
     try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
-    try testing.expect(app.cover_pixels == null);
-    try testing.expect(app.cover_loading);
+    try testing.expect(app.cover.pixels == null);
+    try testing.expect(app.cover.loading);
 
-    app.clearCoverState();
+    app.cover.clear(app.gpa);
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
 }
@@ -1079,16 +1080,16 @@ test "cover_done while not in detail clears stale loading state" {
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
         .eps_sub = 28,
     });
-    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.cover_loading = true;
+    app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover.loading = true;
 
     const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff });
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
 
     try testTick(&app, .{ .cover_done = .{ .rgba = rgba, .width = 1, .height = 1, .for_id = for_id } });
-    try testing.expect(!app.cover_loading);
-    try testing.expect(app.cover_for_id == null);
-    try testing.expect(app.cover_pixels == null);
+    try testing.expect(!app.cover.loading);
+    try testing.expect(app.cover.for_id == null);
+    try testing.expect(app.cover.pixels == null);
 
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
@@ -1106,18 +1107,18 @@ test "cover_error clears state so a later revisit can refetch" {
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
         .eps_sub = 28,
     });
-    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.cover_loading = true;
+    app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover.loading = true;
 
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
     try testTick(&app, .{ .cover_error = for_id });
-    try testing.expect(!app.cover_loading);
-    try testing.expect(app.cover_for_id == null);
-    try testing.expect(app.cover_pixels == null);
-    try testing.expect(app.cover_failed_for_id != null);
-    try testing.expectEqualStrings("anime1", app.cover_failed_for_id.?);
+    try testing.expect(!app.cover.loading);
+    try testing.expect(app.cover.for_id == null);
+    try testing.expect(app.cover.pixels == null);
+    try testing.expect(app.cover.failed_for_id != null);
+    try testing.expectEqualStrings("anime1", app.cover.failed_for_id.?);
 
-    app.clearCoverFailure();
+    app.cover.clearFailure(app.gpa);
 
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
@@ -1140,10 +1141,10 @@ test "deinitOwnedState releases app-owned runtime resources" {
     app.episode_results = eps;
     app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
 
-    app.cover_pixels = .{ .rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff }), .w = 1, .h = 1 };
-    app.cover_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.cover_failed_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.cover_loading = true;
+    app.cover.pixels = .{ .rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff }), .w = 1, .h = 1 };
+    app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover.failed_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.cover.loading = true;
 
     var vx: vaxis.Vaxis = undefined;
     var writer: std.Io.Writer = undefined;
@@ -1153,10 +1154,10 @@ test "deinitOwnedState releases app-owned runtime resources" {
     try testing.expectEqual(@as(u32, 0), app.search_page);
     try testing.expect(app.episode_results == null);
     try testing.expect(app.detail_for_id == null);
-    try testing.expect(app.cover_pixels == null);
-    try testing.expect(app.cover_for_id == null);
-    try testing.expect(app.cover_failed_for_id == null);
-    try testing.expect(!app.cover_loading);
+    try testing.expect(app.cover.pixels == null);
+    try testing.expect(app.cover.for_id == null);
+    try testing.expect(app.cover.failed_for_id == null);
+    try testing.expect(!app.cover.loading);
 }
 
 test "search mode: char appends and arms debounce, does not fire immediately" {
@@ -1686,11 +1687,11 @@ test "settings: Ctrl-C hard-quits even while editing a text field" {
 }
 
 // ── cover fetch/suppress/retry decision (ROD-110, Elara #2) ──────────────────
-// `CoverDecision.eval` is the pure core of `syncCover`: it decides whether to
-// fetch, suppress (cooldown), leave an in-flight/loaded cover alone, clear stale
-// state, or do nothing — with no threads or `builtin.is_test` guards.
+// `CoverState.Decision.eval` is the pure core of `CoverState.sync`: it decides
+// whether to fetch, suppress (cooldown), leave an in-flight/loaded cover alone,
+// clear stale state, or do nothing — with no threads or `builtin.is_test` guards.
 
-const cooldown_ms = app_mod.cover_retry_cooldown_ms;
+const cooldown_ms = app_mod.CoverState.retry_cooldown_ms;
 
 fn coverBase() CoverDecision {
     return .{
@@ -1778,7 +1779,7 @@ test "cover decision: failure recorded for a different id does not suppress" {
 }
 
 test "cover decision: failure with null url (OOM dupe) does not suppress" {
-    // noteCoverFailure stores null when the url dupe OOMs; without a url to
+    // noteFailure stores null when the url dupe OOMs; without a url to
     // compare we can't be sure it's the same fetch, so we retry rather than
     // suppress silently.
     var d = coverBase();
@@ -1804,7 +1805,7 @@ test "cover decision: live pixels win over a stale same-id failure record" {
 // `halfBlockFit` letterboxes an image into a cols × rows*2 half-pixel grid,
 // aspect-correct using the terminal's pixels-per-cell metrics.
 
-const halfBlockFit = app_mod.halfBlockFit;
+const halfBlockFit = app_mod.CoverState.halfBlockFit;
 
 test "halfBlockFit: square cells (2:1) match the square-half-pixel assumption" {
     // 8x16 cells → pph == 2*ppc → half-pixels are square → metric path and the
