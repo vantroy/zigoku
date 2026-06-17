@@ -1395,6 +1395,133 @@ test "play_error with no observed position skips recordPlay and preserves checkp
     try testing.expect(!app.playing); // transport still reset
 }
 
+// --- ROD-131: detail cursor + watched-state reaction after playback ---
+
+/// Allocate `n` 1-based episode cells ("1".."n") for the detail grid. Caller
+/// owns them via `app.freeEpisodeResults()`.
+fn allocEpisodes(n: usize) ![]domain.EpisodeNumber {
+    const eps = try testing.allocator.alloc(domain.EpisodeNumber, n);
+    errdefer testing.allocator.free(eps);
+    var made: usize = 0;
+    errdefer for (eps[0..made]) |ep| testing.allocator.free(ep.raw);
+    var buf: [8]u8 = undefined;
+    while (made < n) : (made += 1) {
+        const raw = std.fmt.bufPrint(&buf, "{d}", .{made + 1}) catch unreachable;
+        eps[made] = .{ .raw = try testing.allocator.dupe(u8, raw) };
+    }
+    return eps;
+}
+
+test "play_done advances detail cursor to next episode and dims watched" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 2; // on episode 3
+    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+
+    try testTick(&app, .{ .play_done = null });
+
+    try testing.expectEqual(@as(usize, 3), app.episode_cursor); // advanced to episode 4
+    try testing.expectEqual(@as(u32, 3), app.detail_progress); // 1..3 now dim
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.success, t.kind);
+    try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
+
+    app.freeEpisodeResults();
+}
+
+test "play_error with a meaningful position still advances the detail cursor" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 2; // on episode 3
+    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+
+    // mpv died but reported a real position → record_play is derived true, so
+    // the watch counts and the detail pane reacts just like a clean exit.
+    try testTick(&app, .{ .play_error = .{ .time_pos = 120, .duration = 1440 } });
+
+    try testing.expectEqual(@as(usize, 3), app.episode_cursor); // advanced to episode 4
+    try testing.expectEqual(@as(u32, 3), app.detail_progress);
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.success, t.kind);
+    try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
+
+    app.freeEpisodeResults();
+}
+
+test "play_done on the final episode stays put and toasts all caught up" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 5; // on the last episode
+    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "6");
+    app.session.episode_index = 6;
+
+    try testTick(&app, .{ .play_done = null });
+
+    try testing.expectEqual(@as(usize, 5), app.episode_cursor); // no N+1 to move to
+    try testing.expectEqual(@as(u32, 6), app.detail_progress); // whole grid dim
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.success, t.kind);
+    try testing.expectEqualStrings("all caught up", t.text[0..t.text_len]);
+
+    app.freeEpisodeResults();
+}
+
+test "play_error with no observed position does not advance the cursor" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 2;
+    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+
+    // mpv died at position 0: record_play is derived false — nothing counted.
+    try testTick(&app, .{ .play_error = .{ .time_pos = 0, .duration = 1440 } });
+
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    try testing.expect(app.toast_queue[0] == null); // no toast
+
+    app.freeEpisodeResults();
+}
+
+test "playback for a different show than the detail pane does not advance it" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 2;
+    // The detail pane moved to a different show while mpv was backgrounded.
+    app.detail_for_id = try testing.allocator.dupe(u8, "other-show");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+
+    try testTick(&app, .{ .play_done = null });
+
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // detail pane untouched
+    try testing.expectEqual(@as(u32, 0), app.detail_progress);
+    try testing.expect(app.toast_queue[0] == null);
+
+    app.freeEpisodeResults();
+}
+
 test "firePlay: double-play guard is a no-op when playing is true" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
