@@ -1496,9 +1496,26 @@ test "play_error with no observed position does not advance the cursor" {
 
     try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
     try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
-    try testing.expect(app.toast_queue[0] == null); // no toast
+    // §4.10: a failed play no longer advances/dims, but is no longer silent —
+    // it surfaces an error toast so the dead playback isn't a mystery.
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.@"error", t.kind);
+    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
 
     app.freeEpisodeResults();
+}
+
+test "episodes_error surfaces an error toast" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_loading = true;
+
+    try testTick(&app, .episodes_error);
+
+    try testing.expect(!app.episode_loading);
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.@"error", t.kind);
+    try testing.expectEqualStrings("couldn't load episodes", t.text[0..t.text_len]);
 }
 
 test "playback for a different show than the detail pane does not advance it" {
@@ -1518,6 +1535,32 @@ test "playback for a different show than the detail pane does not advance it" {
     try testing.expectEqual(@as(usize, 2), app.episode_cursor); // detail pane untouched
     try testing.expectEqual(@as(u32, 0), app.detail_progress);
     try testing.expect(app.toast_queue[0] == null);
+
+    app.freeEpisodeResults();
+}
+
+test "play_error on a different show still surfaces the failure toast" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.episode_results = try allocEpisodes(6);
+    app.episode_cursor = 2;
+    // The detail pane moved to a different show before mpv failed.
+    app.detail_for_id = try testing.allocator.dupe(u8, "other-show");
+    app.playing = true;
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+
+    // No observed position → not counted: no advance/dim (and same_show is
+    // false anyway), but the failure is still surfaced regardless of which show
+    // the pane is on — the user deserves to know mpv died.
+    try testTick(&app, .{ .play_error = null });
+
+    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    const t = &app.toast_queue[0].?;
+    try testing.expectEqual(Toast.Kind.@"error", t.kind);
+    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
 
     app.freeEpisodeResults();
 }
