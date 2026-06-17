@@ -16,8 +16,8 @@ const drawWrappedText = render.drawWrappedText;
 
 fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
     if (!vx.caps.kitty_graphics) return false;
-    if (self.cover_image != null) return true;
-    const px = self.cover_pixels orelse return false;
+    if (self.cover.image != null) return true;
+    const px = self.cover.pixels orelse return false;
     if (px.w == 0 or px.h == 0 or px.w > std.math.maxInt(u16) or px.h > std.math.maxInt(u16)) return false;
 
     const enc_len = std.base64.standard.Encoder.calcSize(px.rgba.len);
@@ -25,7 +25,7 @@ fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
     defer self.gpa.free(b64);
     const encoded = std.base64.standard.Encoder.encode(b64, px.rgba);
 
-    self.cover_image = vx.transmitPreEncodedImage(
+    self.cover.image = vx.transmitPreEncodedImage(
         writer,
         encoded,
         @intCast(px.w),
@@ -40,10 +40,10 @@ fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
 /// (decode failed but a dominant colour survived, or the kitty upload faulted)
 /// we degrade to the flat dominant-colour fill that always worked.
 fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
-    if (self.cover_pixels != null) {
+    if (self.cover.pixels != null) {
         drawHalfBlockCover(self, cover_win);
     } else {
-        cover_win.fill(.{ .style = .{ .bg = self.cover_fallback_color } });
+        cover_win.fill(.{ .style = .{ .bg = self.cover.fallback_color } });
     }
 }
 
@@ -77,7 +77,7 @@ fn sampleHalfBlock(
 /// reported cell pixel metrics) so posters stay poster-shaped on non-Kitty
 /// terminals regardless of cell aspect ratio.
 fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
-    const px = self.cover_pixels orelse return;
+    const px = self.cover.pixels orelse return;
     const cols = cover_win.width;
     const rows = cover_win.height;
     if (cols == 0 or rows == 0 or px.w == 0 or px.h == 0) return;
@@ -93,7 +93,7 @@ fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
     const ppc: u32 = if (sw != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.width_pix), sw) catch 0) else 0;
     const pph: u32 = if (sh != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.height_pix), sh) catch 0) else 0;
 
-    const fit = app_mod.halfBlockFit(px.w, px.h, grid_w, grid_h, ppc, pph);
+    const fit = app_mod.CoverState.halfBlockFit(px.w, px.h, grid_w, grid_h, ppc, pph);
 
     var ry: u16 = 0;
     while (ry < rows) : (ry += 1) {
@@ -173,10 +173,10 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
         cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
         if (anime) |a| {
-            const has_pixels = self.cover_pixels != null and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id);
+            const has_pixels = self.cover.pixels != null and self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id);
             if (a.thumb == null) {
                 if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-            } else if (self.cover_loading and self.cover_for_id != null and std.mem.eql(u8, self.cover_for_id.?, a.id)) {
+            } else if (self.cover.loading and self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id)) {
                 const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
                 // §3.6 slow-path: shift cyan → hot once the wait crosses the
                 // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
@@ -184,7 +184,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
                 centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
             } else if (has_pixels) {
                 if (ensureCoverImage(self, vx, writer)) {
-                    if (self.cover_image) |img| {
+                    if (self.cover.image) |img| {
                         drawKittyCover(self, img, cover_win);
                     } else {
                         drawFallbackCover(self, cover_win);
