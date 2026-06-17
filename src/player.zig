@@ -29,6 +29,18 @@ pub const PositionUpdate = struct {
     pub fn isMeaningful(self: PositionUpdate) bool {
         return std.math.isFinite(self.time_pos) and self.time_pos > 0;
     }
+
+    /// Whether the watch reached `ratio` of the runtime — the bar for counting
+    /// the episode as *watched* (bump the progress high-water mark, advance the
+    /// detail cursor). Distinct from `isMeaningful`: a real position worth
+    /// resuming from (5s in) is not the same as a watched episode. Requires a
+    /// known finite duration; an unknown/zero duration cannot prove completion,
+    /// so it conservatively returns false. `ratio` is the caller's policy (the
+    /// store's NATURAL_END_RATIO) — player.zig stays free of store concerns.
+    pub fn reachedCompletion(self: PositionUpdate, ratio: f64) bool {
+        return std.math.isFinite(self.time_pos) and std.math.isFinite(self.duration) and
+            self.duration > 0 and self.time_pos / self.duration >= ratio;
+    }
 };
 
 /// An mpv user-script to load for this playback, with its `--script-opts` value.

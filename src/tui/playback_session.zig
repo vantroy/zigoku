@@ -116,23 +116,31 @@ pub const PlaybackSession = struct {
     /// session's — this only touches the store and its own record. Whether the
     /// final position is meaningful is a `PositionUpdate` concern — see
     /// `PositionUpdate.isMeaningful`.
-    pub fn finish(self: *PlaybackSession, gpa: Allocator, store: ?*Store, final_update: ?PositionUpdate, record_play: bool) void {
+    pub fn finish(self: *PlaybackSession, gpa: Allocator, store: ?*Store, final_update: ?PositionUpdate, completed: bool) void {
         if (store) |st| {
             if (self.anime_id.len > 0 and self.episode_raw.len > 0) {
                 if (final_update) |update| {
-                    if (update.isMeaningful()) st.saveProgress(
-                        self.source,
-                        self.anime_id,
-                        self.translation,
-                        self.episode_raw,
-                        update.time_pos,
-                        update.duration,
-                        Store.nowSecs(),
-                    ) catch |e| log.debug("saveProgress (final) failed: {s}", .{@errorName(e)});
-                }
-                if (record_play and self.episode_index > 0) {
-                    st.recordPlay(self.source, self.anime_id, self.episode_index, Store.nowSecs()) catch |e|
-                        log.debug("recordPlay failed: {s}", .{@errorName(e)});
+                    // A meaningful position is a real play: persist the resume
+                    // checkpoint and touch history (recordPlay bumps count /
+                    // last_watched / visibility). `completed` (ROD-168) gates
+                    // only the progress high-water mark inside recordPlay — a
+                    // partial watch shows up in history but does not advance N.
+                    if (update.isMeaningful()) {
+                        st.saveProgress(
+                            self.source,
+                            self.anime_id,
+                            self.translation,
+                            self.episode_raw,
+                            update.time_pos,
+                            update.duration,
+                            Store.nowSecs(),
+                        ) catch |e| log.debug("saveProgress (final) failed: {s}", .{@errorName(e)});
+
+                        if (self.episode_index > 0) {
+                            st.recordPlay(self.source, self.anime_id, self.episode_index, Store.nowSecs(), completed) catch |e|
+                                log.debug("recordPlay failed: {s}", .{@errorName(e)});
+                        }
+                    }
                 }
             }
         }

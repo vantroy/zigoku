@@ -366,7 +366,13 @@ pub const Store = struct {
     /// Mark a play: bump play_count + last_watched_at, and advance `progress` to
     /// at least `episode_index` (1-based). Episode-level half of ROD-69; the
     /// sub-second position lands via `saveProgress` once M5's IPC feeds it.
-    pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64) Error!void {
+    /// Record a play of `episode_index` (1-based): always bumps play_count,
+    /// last_watched_at and history visibility — a play is a play. The `progress`
+    /// high-water mark only advances when `completed` (ROD-168): a partial watch
+    /// belongs in history but must not mark the episode watched-through. When
+    /// `completed` is false the bind is a 0 floor, so `MAX(progress, 0)` is a
+    /// no-op (progress is never negative).
+    pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64, completed: bool) Error!void {
         const sql =
             \\UPDATE anime
             \\SET play_count = play_count + 1,
@@ -378,7 +384,7 @@ pub const Store = struct {
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, now);
-        _ = c.sqlite3_bind_int64(stmt, 2, episode_index);
+        _ = c.sqlite3_bind_int64(stmt, 2, if (completed) episode_index else 0);
         bindText(stmt, 3, source);
         bindText(stmt, 4, source_id);
         try self.stepDone(stmt);
@@ -731,7 +737,7 @@ test "recordPlay promotes hidden row into history" {
     defer s.close();
 
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .history_visible = false }, 1000);
-    try s.recordPlay(T_SOURCE, "x", 2, 2000);
+    try s.recordPlay(T_SOURCE, "x", 2, 2000, true);
 
     const rows = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -780,7 +786,7 @@ test "upsertAnime preserves user state on re-search" {
     defer s.close();
 
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Old Title" }, 1000);
-    try s.recordPlay(T_SOURCE, "x", 3, 2000); // play_count=1, progress=3
+    try s.recordPlay(T_SOURCE, "x", 3, 2000, true); // play_count=1, progress=3
 
     // A later search refreshes the title but must NOT reset play_count/progress.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "New Title", .total_episodes = 12 }, 3000);
@@ -847,14 +853,40 @@ test "recordPlay bumps count, progress, last_watched and reorders history" {
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001);
 
     // Play B → it should jump to the top of history.
-    try s.recordPlay(T_SOURCE, "b", 5, 2000);
-    try s.recordPlay(T_SOURCE, "b", 2, 2001); // progress is a high-water mark
+    try s.recordPlay(T_SOURCE, "b", 5, 2000, true);
+    try s.recordPlay(T_SOURCE, "b", 2, 2001, true); // progress is a high-water mark
 
     const rows = try s.loadHistory(arena);
     try testing.expectEqualStrings("b", rows[0].source_id);
     try testing.expectEqual(@as(i64, 2), rows[0].play_count);
     try testing.expectEqual(@as(i64, 5), rows[0].progress); // MAX, not last
     try testing.expectEqual(@as(?i64, 2001), rows[0].last_watched_at);
+}
+
+test "recordPlay with completed=false records the play but not the progress" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
+
+    // A short watch of episode 4: it's a real play (count/last_watched/visible)
+    // but must NOT bump the progress high-water mark (ROD-168).
+    try s.recordPlay(T_SOURCE, "x", 4, 2000, false);
+
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len); // promoted into history
+    try testing.expectEqual(@as(i64, 1), rows[0].play_count); // play counted
+    try testing.expectEqual(@as(?i64, 2000), rows[0].last_watched_at);
+    try testing.expectEqual(@as(i64, 0), rows[0].progress); // NOT advanced
+
+    // A subsequent completed watch of episode 4 does advance it.
+    try s.recordPlay(T_SOURCE, "x", 4, 2100, true);
+    const rows2 = try s.loadHistory(arena);
+    try testing.expectEqual(@as(i64, 4), rows2[0].progress);
+    try testing.expectEqual(@as(i64, 2), rows2[0].play_count);
 }
 
 test "episode cache: hit, expiry, sub/dub separation" {
@@ -916,6 +948,6 @@ test "recordPlay on an unknown show is a silent no-op" {
     defer s.close();
     // No upsertAnime first: the UPDATE matches zero rows and must not error or
     // conjure a row.
-    try s.recordPlay(T_SOURCE, "ghost", 1, 1000);
+    try s.recordPlay(T_SOURCE, "ghost", 1, 1000, true);
     try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
 }

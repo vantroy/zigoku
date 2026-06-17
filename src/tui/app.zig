@@ -597,7 +597,18 @@ pub const App = struct {
     /// Controller glue for the playback-event handlers (ROD-162): hand the final
     /// state to the session for persistence + clear, then reset the App-owned
     /// transport. The session owns the record; the shell owns playing/current_*.
-    fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, record_play: bool) void {
+    /// Whether the final observed position counts the episode as watched — the
+    /// store's NATURAL_END_RATIO completion bar (ROD-168). One coherent signal
+    /// for both play_done and play_error: a clean mpv quit is no longer treated
+    /// as a watch (you can quit at any second), and the bar matches the store's
+    /// resume "done" notion so the progress high-water mark, the §4.6 dim, and
+    /// the cursor advance never disagree.
+    fn watchCompleted(final_update: ?event_mod.PositionUpdate) bool {
+        const u = final_update orelse return false;
+        return u.reachedCompletion(store_mod.NATURAL_END_RATIO);
+    }
+
+    fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, completed: bool) void {
         // Capture the session facts ROD-131 needs *before* finish() clears them:
         // the played episode (1-based) and whether the detail pane still shows
         // that show. `session.finish` calls `clear`, which zeroes both.
@@ -605,17 +616,17 @@ pub const App = struct {
         const same_show = self.detail_for_id != null and self.session.anime_id.len > 0 and
             std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
 
-        self.session.finish(self.gpa, self.store, final_update, record_play);
+        self.session.finish(self.gpa, self.store, final_update, completed);
         self.playing = false;
         self.current_position = 0;
         self.current_duration = 0;
         self.async_start_ms = 0;
 
-        // Reflect a counted watch in the detail pane (ROD-131). `record_play`
-        // is the single coherent signal — true for any clean exit and for an
-        // errored exit that still observed a meaningful position; false for an
-        // abrupt quit that watched nothing (which must not advance past N).
-        if (record_play and played_index > 0 and same_show) self.advanceAfterWatch(played_index);
+        // Reflect a *completed* watch in the detail pane (ROD-131 / ROD-168):
+        // advance + dim only when the watch cleared NATURAL_END_RATIO, matching
+        // the progress high-water mark the store records. A partial watch is
+        // still in history (session.finish touches it) but must not advance N.
+        if (completed and played_index > 0 and same_show) self.advanceAfterWatch(played_index);
     }
 
     /// Project a counted watch of 1-based `played_index` onto the detail pane:
@@ -917,17 +928,19 @@ pub const App = struct {
                 self.session.maybeCheckpoint(self.store, ev.time_pos, ev.duration);
             },
             .play_done => |final_update| {
-                self.finishPlayback(final_update, true);
+                // ROD-168: a clean exit is no longer proof of a watch — you can
+                // quit mpv at any second. Count it only if the final position
+                // cleared the completion bar.
+                self.finishPlayback(final_update, watchCompleted(final_update));
             },
             .play_error => |final_update| {
-                // On error, only count the play if mpv observed a real position
-                // (clean exits use play_done with record_play=true unconditionally).
-                const counted = if (final_update) |u| u.isMeaningful() else false;
-                self.finishPlayback(final_update, counted);
-                // §4.10: a genuine failure (resolve failed, or mpv exited without
-                // ever producing a position) is otherwise silent — surface it. A
-                // counted error already advanced + toasted success in finishPlayback.
-                if (!counted) self.pushToast(.@"error", "playback failed", false);
+                const completed = watchCompleted(final_update);
+                self.finishPlayback(final_update, completed);
+                // §4.10: a play that errored without reaching the watched bar is a
+                // genuine failure (resolve failed, or mpv died mid-episode) —
+                // surface it. A completed watch that errored at the very end took
+                // the success path in finishPlayback instead.
+                if (!completed) self.pushToast(.@"error", "playback failed", false);
             },
             .tick => {
                 const now = nowMs(io);
