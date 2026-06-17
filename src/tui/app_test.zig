@@ -231,6 +231,37 @@ test "scrollIntoView keeps the cursor within the viewport" {
     try testing.expectEqual(@as(usize, 2), app.list_top);
 }
 
+test "layout settles the browse viewport from terminal geometry (ROD-155)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.list_cursor = 30;
+    app.list_top = 0;
+    // h=20 → content budget = h-3 = 17 visible rows. Cursor must be pulled in.
+    app.layout(20, 80);
+    try testing.expect(app.list_cursor >= app.list_top);
+    try testing.expect(app.list_cursor < app.list_top + 17);
+}
+
+test "layout uses History's 2-rows-per-entry budget (ROD-155)" {
+    var app: App = .{};
+    app.active_view = .history;
+    app.list_cursor = 10;
+    app.list_top = 0;
+    // h=11 → visible = 8 terminal rows → 4 entry slots (visible/2).
+    app.layout(11, 80);
+    try testing.expect(app.list_cursor >= app.list_top);
+    try testing.expect(app.list_cursor < app.list_top + 4);
+}
+
+test "layout is a no-op below the too-small threshold (ROD-155)" {
+    var app: App = .{};
+    app.active_view = .history;
+    app.list_cursor = 5;
+    app.list_top = 3;
+    app.layout(3, 10); // h<4 and w<16 → draw bails, so layout must too
+    try testing.expectEqual(@as(usize, 3), app.list_top);
+}
+
 test "formatMeta degrades when total episodes is unknown" {
     var buf: [48]u8 = undefined;
     const known = formatMeta(&buf, .{ .source = "s", .source_id = "i", .title = "T", .total_episodes = 12, .progress = 3, .list_status = "watching" });
