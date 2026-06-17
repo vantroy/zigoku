@@ -480,7 +480,7 @@ pub const AllAnime = struct {
     /// Returns null when `link` is not a wixmp repackager URL.
     fn wixmpVariants(arena: Allocator, link: []const u8) !?[]Variant {
         if (std.mem.indexOf(u8, link, "repackager.wixmp.com") == null) return null;
-        const head = link[0 .. (std.mem.indexOf(u8, link, ".urlset") orelse link.len)];
+        const head = link[0..(std.mem.indexOf(u8, link, ".urlset") orelse link.len)];
         // Strip the repackager host wherever it appears (global, matching the
         // oracle's `.replace(...)`); the remaining comma list wraps each quality.
         const body = try std.mem.replaceOwned(u8, arena, head, "repackager.wixmp.com/", "");
