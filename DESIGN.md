@@ -410,9 +410,9 @@ affordance for playback: it sits at the user's attention locus (the cell they
 just pressed Enter on), not the bottom-left corner. It tracks the *session*, not
 the cursor — the grid stays navigable during play (mpv is a separate window), so
 the spinner stays pinned to the playing episode on its own show. It outranks the
-focus and watched states. On a counted watch it resolves directly to watched (no
-intermediate frame) as the cursor advances; on a failed play it returns to focus
-and the `playback failed` toast fires (§4.10).
+focus and watched states. On a completed watch it resolves directly to watched
+(no intermediate frame) as the cursor advances; on a partial or failed play it
+returns to focus and the cursor holds (§4.10).
 
 ### 4.7 Toast Notifications
 
@@ -498,8 +498,8 @@ state.now` escalation.
 
 | Event | Condition | Kind | Copy | Persistent |
 |---|---|---|---|---|
-| `play_done` / `play_error` | counted watch, not finale (`play_error` only if the position is meaningful) | success | `episode N done` | no |
-| `play_done` / `play_error` | counted watch, finale (as above) | success | `all caught up` | no |
+| `play_done` / `play_error` | completed watch (final position ≥ `NATURAL_END_RATIO`), not finale | success | `episode N done` | no |
+| `play_done` / `play_error` | completed watch, finale | success | `all caught up` | no |
 | `play_error` | no observed position (resolve failed / mpv died) | error | `playback failed` | no |
 | `episodes_error` | always | error | `couldn't load episodes` | no |
 | `task_error` | background task failed | error | (payload) | yes |
@@ -513,9 +513,15 @@ prose. **Persistence** is reserved for *ongoing* conditions still true while the
 toast is visible (source unreachable). Point-in-time failures (play, episodes)
 are transient — the condition is already over and the user can retry.
 
-A `play_error` carrying a meaningful position counts the watch and takes the
-success path above; only a position-less `play_error` fires `playback failed`.
-The two are mutually exclusive in `finishPlayback`.
+A watch counts as *watched* — bumps the progress high-water mark, dims the cell,
+advances the cursor — only when the final position reaches `NATURAL_END_RATIO`
+(0.80) of the runtime; a clean mpv quit is not proof of a watch (you can quit at
+any second). This is the same bar the store uses for resume "done," so the
+progress count, the §4.6 dim, and the cursor advance never disagree. A *partial*
+watch is still a real play (it lands in history with a resume point) but does not
+advance N. Accordingly a completed `play_error` (errored at the very end) takes
+the success path; any non-completed `play_error` fires `playback failed`. The two
+are mutually exclusive in `finishPlayback`.
 
 **Deliberate silences** (no toast, no spinner — documented intent, not oversight):
 
