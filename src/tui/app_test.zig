@@ -9,6 +9,7 @@ const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
 const cover_mod = @import("../cover.zig");
+const colors = @import("colors.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -1434,7 +1435,7 @@ test "settings: l/h cycle a preset field and wrap around" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 1; // default_quality, defaults to "1080"
+    app.settings.cursor = 1; // default_quality, defaults to "1080"
 
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqualStrings("best", app.config.default_quality); // 1080 -> best
@@ -1448,18 +1449,34 @@ test "settings: subtitle-language cycle keeps live translation in sync" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 2; // subtitle_language, defaults to "sub"
+    app.settings.cursor = 2; // subtitle_language, defaults to "sub"
 
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqualStrings("dub", app.config.translation);
     try testing.expectEqual(domain.Translation.dub, app.translation);
 }
 
+test "settings: palette cycle re-points the live app palette" {
+    // Guards the `config_changed` → palette re-sync the controller now owns
+    // (the old code set app.palette inside settingsCycle; ROD-161 moved the
+    // projection out). Without this, a broken re-sync would leave the live
+    // palette stale until restart and no test would notice.
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = 7; // palette, defaults to "terminal_ghost"
+    try testing.expectEqual(&colors.terminal_ghost, app.palette);
+
+    try testTick(&app, keyEv('l', .{})); // terminal_ghost -> phosphor
+    try testing.expectEqualStrings("phosphor", app.config.palette);
+    try testing.expectEqual(&colors.phosphor, app.palette);
+}
+
 test "settings: space toggles a bool field" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 5; // cover_art, defaults to true
+    app.settings.cursor = 5; // cover_art, defaults to true
 
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(!app.config.cover_art);
@@ -1471,20 +1488,20 @@ test "settings: enter edits mpv_path; type+confirm commits, esc cancels" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 0; // mpv_path, defaults to "mpv"
+    app.settings.cursor = 0; // mpv_path, defaults to "mpv"
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // begin edit (buffer seeded "mpv")
-    try testing.expect(app.settings_editing);
+    try testing.expect(app.settings.editing);
     try testTick(&app, .{ .key_press = .{ .codepoint = '2', .text = "2" } }); // -> "mpv2"
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // commit
-    try testing.expect(!app.settings_editing);
+    try testing.expect(!app.settings.editing);
     try testing.expectEqualStrings("mpv2", app.config.mpv_path);
 
     // Esc discards the in-progress edit, leaving the committed value intact.
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
     try testTick(&app, .{ .key_press = .{ .codepoint = 'Z', .text = "Z" } });
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
-    try testing.expect(!app.settings_editing);
+    try testing.expect(!app.settings.editing);
     try testing.expectEqualStrings("mpv2", app.config.mpv_path);
 }
 
@@ -1492,7 +1509,7 @@ test "settings: empty edit buffer never commits a blank mpv_path" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 0;
+    app.settings.cursor = 0;
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // buffer = "mpv"
     try testTick(&app, keyEv(vaxis.Key.backspace, .{}));
@@ -1506,14 +1523,14 @@ test "settings: j/k navigation clamps to the interactive rows" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 0;
+    app.settings.cursor = 0;
 
     try testTick(&app, keyEv('k', .{})); // already at top — stays
-    try testing.expectEqual(@as(usize, 0), app.settings_cursor);
+    try testing.expectEqual(@as(usize, 0), app.settings.cursor);
 
     var n: usize = 0;
     while (n < 20) : (n += 1) try testTick(&app, keyEv('j', .{}));
-    try testing.expectEqual(@as(usize, app_mod.settings_row_count - 1), app.settings_cursor);
+    try testing.expectEqual(@as(usize, app_mod.settings_row_count - 1), app.settings.cursor);
 }
 
 test "settings: q with no config path warns and returns to browse" {
@@ -1532,7 +1549,7 @@ test "settings: cycling an out-of-preset value snaps to a valid preset" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 3; // resume_offset; presets {0,3,5,10,15,30}
+    app.settings.cursor = 3; // resume_offset; presets {0,3,5,10,15,30}
     app.config.resume_offset_sec = 7; // not a preset (e.g. a hand-edited file)
 
     try testTick(&app, keyEv('l', .{}));
@@ -1580,7 +1597,7 @@ test "astra: settings save round-trip — q writes file, load reads back mutatio
     app.config.resume_offset_sec = 10;
 
     // Drive mpv_path edit through the full UI path: enter → backspace×3 → type → enter.
-    app.settings_cursor = 0; // mpv_path row
+    app.settings.cursor = 0; // mpv_path row
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // seeds buffer with "mpv"
     try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // "mp"
     try testTick(&app, keyEv(vaxis.Key.backspace, .{})); // "m"
@@ -1625,16 +1642,16 @@ test "astra: entering settings resets cursor, editing state, and input_mode" {
     var app: App = .{};
     app.gpa = testing.allocator;
     // Dirty state from a prior visit.
-    app.settings_cursor = 5;
-    app.settings_editing = true;
+    app.settings.cursor = 5;
+    app.settings.editing = true;
     app.input_mode = .search;
     app.active_view = .browse;
 
     // F3 switches to settings — the onKey F3 handler resets these.
     try testTick(&app, keyEv(vaxis.Key.f3, .{}));
     try testing.expectEqual(.settings, app.active_view);
-    try testing.expectEqual(@as(usize, 0), app.settings_cursor);
-    try testing.expect(!app.settings_editing);
+    try testing.expectEqual(@as(usize, 0), app.settings.cursor);
+    try testing.expect(!app.settings.editing);
     try testing.expectEqual(.normal, app.input_mode);
 }
 
@@ -1655,32 +1672,32 @@ test "astra: edit mode swallows F-keys — cannot switch views mid-edit" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 0; // mpv_path
+    app.settings.cursor = 0; // mpv_path
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // enter edit mode
-    try testing.expect(app.settings_editing);
+    try testing.expect(app.settings.editing);
 
     // F1 while editing must be swallowed — stay on settings, still editing.
     try testTick(&app, keyEv(vaxis.Key.f1, .{}));
     try testing.expectEqual(.settings, app.active_view);
-    try testing.expect(app.settings_editing);
+    try testing.expect(app.settings.editing);
 
     // Esc exits edit mode, stays on settings.
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
-    try testing.expect(!app.settings_editing);
+    try testing.expect(!app.settings.editing);
     try testing.expectEqual(.settings, app.active_view);
 }
 
 test "settings: Ctrl-C hard-quits even while editing a text field" {
     // The Ctrl-C emergency quit must work from anywhere, including the modal
-    // mpv_path edit field (onSettingsEditKey lets Ctrl-C fall through).
+    // mpv_path edit field (SettingsState.editKey lets Ctrl-C fall through).
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings_cursor = 0;
+    app.settings.cursor = 0;
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // enter edit mode
-    try testing.expect(app.settings_editing);
+    try testing.expect(app.settings.editing);
 
     try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);

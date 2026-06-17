@@ -67,6 +67,17 @@ const slow_path_threshold_ms: i64 = 3000;
 /// `app_mod.CoverState` references (views, tests) keep resolving.
 pub const CoverState = @import("cover_state.zig").CoverState;
 
+/// Settings controller subsystem (ROD-161). Owns the Settings tab data model +
+/// edit state in its own module; re-exported here (along with the row table the
+/// view renders) so existing `app_mod.*` references keep resolving.
+const settings_state = @import("settings_state.zig");
+pub const SettingsState = settings_state.SettingsState;
+pub const SettingId = settings_state.SettingId;
+pub const SettingKind = settings_state.SettingKind;
+pub const SettingRow = settings_state.SettingRow;
+pub const settings_rows = settings_state.settings_rows;
+pub const settings_row_count = settings_state.settings_row_count;
+
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -198,94 +209,10 @@ pub const Toast = struct {
     persistent: bool = false,
 };
 
-// ── Settings tab model (ROD-86) ─────────────────────────────────────────────
-//
-// The Settings tab edits `App.config` (ROD-85) in place. Only the *interactive*
-// rows live in this table — Catalog's two read-only rows are rendered separately
-// and skipped by navigation. Cycle/toggle write scalar or preset-literal fields
-// (always safe — presets are static literals); the one editable text field
-// (mpv_path) commits into `App.settings_text_buf`.
-
-// pub (SettingId/SettingKind/SettingRow/settings_rows): the settings data model
-// is shared between the state handlers here and the render pass in
-// view/settings.zig (ROD-144).
-pub const SettingId = enum {
-    mpv_path,
-    default_quality,
-    subtitle_language,
-    resume_offset,
-    skip_mode,
-    cover_art,
-    kanji_chips,
-    palette,
-};
-
-pub const SettingKind = enum { text, cycle, toggle };
-
-pub const SettingRow = struct {
-    id: SettingId,
-    label: []const u8,
-    kind: SettingKind,
-    hint: []const u8,
-};
-
-pub const settings_rows = [_]SettingRow{
-    .{ .id = .mpv_path, .label = "mpv path", .kind = .text, .hint = "enter to edit" },
-    .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "hjkl to cycle" },
-    .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "hjkl to cycle" },
-    .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "hjkl to cycle" },
-    .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "hjkl to cycle" },
-    .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space to toggle" },
-    .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
-    .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
-};
-
-/// Number of interactive (focusable) settings rows — the Catalog rows are not
-/// in `settings_rows` and are skipped by navigation. Exposed for tests.
-pub const settings_row_count = settings_rows.len;
-
-comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..8 = Interface. Pin the
-    // boundary so inserting/removing a row can't silently misattribute it to the
-    // wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 8);
-    std.debug.assert(settings_rows[4].id == .skip_mode);
-    std.debug.assert(settings_rows[5].id == .cover_art);
-}
-
-const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
-const language_presets = [_][]const u8{ "sub", "dub" };
-const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
-const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
-const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord" };
-
-/// Step through a preset list to the value after (`dir > 0`) or before the
-/// current one, wrapping. An unrecognized current value starts from index 0.
-/// Returns a static preset literal — safe to assign into a config string field.
-fn cyclePreset(presets: []const []const u8, current: []const u8, dir: i8) []const u8 {
-    var idx: usize = 0;
-    for (presets, 0..) |p, i| {
-        if (std.mem.eql(u8, p, current)) {
-            idx = i;
-            break;
-        }
-    }
-    const n = presets.len;
-    return presets[if (dir > 0) (idx + 1) % n else (idx + n - 1) % n];
-}
-
-fn cyclePresetU32(presets: []const u32, current: u32, dir: i8) u32 {
-    var idx: usize = 0;
-    for (presets, 0..) |p, i| {
-        if (p == current) {
-            idx = i;
-            break;
-        }
-    }
-    const n = presets.len;
-    return presets[if (dir > 0) (idx + 1) % n else (idx + n - 1) % n];
-}
-
+/// Resolve a config palette name to its static `colors.Palette`, falling back
+/// to the default for anything unrecognized. Stays on App (not in
+/// `SettingsState`): it's an App-live projection the controller re-derives after
+/// a settings change, and `run()` also calls it at startup.
 fn paletteFromConfig(name: []const u8) *const colors.Palette {
     if (std.mem.eql(u8, name, "phosphor")) return &colors.phosphor;
     if (std.mem.eql(u8, name, "nord")) return &colors.nord;
@@ -426,9 +353,9 @@ pub const App = struct {
     /// User config (ROD-85). Set in run(); string fields are arena-borrowed and
     /// outlive every worker thread. The Settings tab (ROD-86) mutates this in
     /// place: cycle/toggle write scalar + preset-literal fields directly; the
-    /// only editable *text* field (mpv_path) is committed into
-    /// `settings_text_buf` below, so we never free a default literal or the
-    /// load arena — we just re-point the slice.
+    /// only editable *text* field (mpv_path) is committed into the settings
+    /// subsystem's `text_buf`, so we never free a default literal or the load
+    /// arena — we just re-point the slice.
     config: Config = .{},
     /// Resolved config-file path for `save()` on `q` (ROD-86). Borrowed from
     /// run()'s process-lifetime arena. Null when no $HOME/$XDG_CONFIG_HOME — in
@@ -438,22 +365,11 @@ pub const App = struct {
     /// colors.zig; updated live when the user cycles the palette setting.
     palette: *const colors.Palette = &colors.terminal_ghost,
 
-    /// Settings tab (ROD-86) cursor over the *interactive* rows only (the two
-    /// Catalog rows are non-interactive and skipped by navigation).
-    settings_cursor: usize = 0,
-    /// Whether the focused text field is in edit mode (captures printable keys).
-    settings_editing: bool = false,
-    /// Live edit buffer while `settings_editing`; seeded from the field's value.
-    settings_edit_buf: [256]u8 = undefined,
-    settings_edit_len: usize = 0,
-    /// Committed home for an edited mpv_path. `config.mpv_path` is re-pointed
-    /// here on confirm, so the edited value outlives the edit buffer without
-    /// touching the original literal/arena slice.
-    settings_text_buf: [256]u8 = undefined,
-    /// Scratch for a formatted settings value (e.g. "5s"). App-owned, not a
-    /// draw-local stack buffer, because vaxis keeps the printed slice by
-    /// reference until render — a stack buffer would dangle.
-    settings_value_buf: [16]u8 = undefined,
+    /// Settings tab controller (ROD-161): row cursor, text-edit buffer, and the
+    /// cycle/toggle/edit handlers over `config`. Extracted from App following the
+    /// ROD-160 `CoverState` pattern; embedded by value so `App{}` stays trivially
+    /// constructible. See `SettingsState`.
+    settings: SettingsState = .{},
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
     /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
@@ -752,7 +668,6 @@ pub const App = struct {
         self.clearPlayingSession();
         self.async_start_ms = 0;
     }
-
 
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
         if (builtin.is_test) return;
@@ -1278,126 +1193,39 @@ pub const App = struct {
         }
     }
 
-    // ── Settings tab (ROD-86) ───────────────────────────────────────────────
+    // ── Settings tab (ROD-86, controller glue for ROD-161 SettingsState) ─────
 
-    /// Handle a key while the Settings tab is active. Returns true if the key
-    /// was consumed; false lets it fall through to the global chain (F-keys to
-    /// switch views, Esc to leave, Ctrl-C to quit).
+    /// Drive a key into the Settings subsystem and project its verdict onto
+    /// App-live state. Returns true if the key was consumed; false lets it fall
+    /// through to the global chain (F-keys to switch views, Esc to leave, Ctrl-C
+    /// to quit). The subsystem never touches nav/palette/translation/toasts — it
+    /// reports *what changed* and the projection lives here, in the controller.
     fn onSettingsKey(self: *App, key: vaxis.Key, io: std.Io) bool {
-        if (self.settings_editing) return self.onSettingsEditKey(key);
-
-        const row = settings_rows[self.settings_cursor];
-        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-            if (self.settings_cursor + 1 < settings_rows.len) self.settings_cursor += 1;
-            return true;
-        }
-        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-            if (self.settings_cursor > 0) self.settings_cursor -= 1;
-            return true;
-        }
-        if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
-            if (row.kind == .cycle) self.settingsCycle(row.id, 1);
-            return true;
-        }
-        if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
-            if (row.kind == .cycle) self.settingsCycle(row.id, -1);
-            return true;
-        }
-        if (key.matches(vaxis.Key.space, .{})) {
-            if (row.kind == .toggle) self.settingsToggle(row.id);
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (row.kind == .text) self.beginSettingsEdit(row.id);
-            return true;
-        }
-        if (key.matches('q', .{})) {
-            self.saveSettings(io);
-            self.active_view = .browse;
-            self.active_pane = .list;
-            return true;
-        }
-        return false;
-    }
-
-    /// Key handling while a text field is being edited. Swallows every key —
-    /// except the Ctrl-C emergency quit — so a stray F-key can't switch views
-    /// mid-edit; only Esc/Enter resolve the edit itself.
-    fn onSettingsEditKey(self: *App, key: vaxis.Key) bool {
-        // Ctrl-C must hard-quit from anywhere, including a modal text field.
-        if (key.matches('c', .{ .ctrl = true })) return false;
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.settings_editing = false; // cancel — discard the buffer
-            return true;
-        }
-        if (key.matches(vaxis.Key.enter, .{})) {
-            self.commitSettingsEdit();
-            return true;
-        }
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.settings_edit_len > 0) self.settings_edit_len -= 1;
-            return true;
-        }
-        if (key.text) |text| {
-            for (text) |ch| {
-                // Printable ASCII only — paths and presets never need control bytes.
-                if (ch >= 0x20 and ch < 0x7f and self.settings_edit_len < self.settings_edit_buf.len) {
-                    self.settings_edit_buf[self.settings_edit_len] = ch;
-                    self.settings_edit_len += 1;
-                }
-            }
-        }
-        return true;
-    }
-
-    fn settingsCycle(self: *App, id: SettingId, dir: i8) void {
-        switch (id) {
-            .default_quality => self.config.default_quality = cyclePreset(&quality_presets, self.config.default_quality, dir),
-            .subtitle_language => {
-                self.config.translation = cyclePreset(&language_presets, self.config.translation, dir);
-                // Keep the live search translation in lockstep with the setting.
+        switch (self.settings.onKey(key, &self.config)) {
+            .ignored => return false,
+            .consumed => return true,
+            .config_changed => {
+                // Re-derive the App-live values the settings change projects to.
+                // Idempotent for non-projecting fields; the source of truth is
+                // `config`, which the subsystem just mutated.
                 self.translation = self.config.translationEnum();
-            },
-            .skip_mode => self.config.skip_mode = cyclePreset(&skip_presets, self.config.skip_mode, dir),
-            .resume_offset => self.config.resume_offset_sec = cyclePresetU32(&resume_presets, self.config.resume_offset_sec, dir),
-            .palette => {
-                self.config.palette = cyclePreset(&palette_presets, self.config.palette, dir);
                 self.palette = paletteFromConfig(self.config.palette);
+                return true;
             },
-            else => {},
+            .save_and_exit => {
+                // `q` saves-then-leaves. Persistence + the nav writes stay in the
+                // controller; the subsystem only signals the intent.
+                self.saveSettings(io);
+                self.active_view = .browse;
+                self.active_pane = .list;
+                return true;
+            },
         }
-    }
-
-    fn settingsToggle(self: *App, id: SettingId) void {
-        switch (id) {
-            .cover_art => self.config.cover_art = !self.config.cover_art,
-            .kanji_chips => self.config.kanji_chips = !self.config.kanji_chips,
-            else => {},
-        }
-    }
-
-    fn beginSettingsEdit(self: *App, id: SettingId) void {
-        const cur: []const u8 = switch (id) {
-            .mpv_path => self.config.mpv_path,
-            else => return, // only text fields are editable
-        };
-        const n = @min(cur.len, self.settings_edit_buf.len);
-        @memcpy(self.settings_edit_buf[0..n], cur[0..n]);
-        self.settings_edit_len = n;
-        self.settings_editing = true;
-    }
-
-    /// Commit the edit buffer into the field. mpv_path is the only text field;
-    /// an empty buffer is treated as a no-op so we never hand mpv a blank argv0.
-    fn commitSettingsEdit(self: *App) void {
-        defer self.settings_editing = false;
-        const n = self.settings_edit_len;
-        if (n == 0) return;
-        @memcpy(self.settings_text_buf[0..n], self.settings_edit_buf[0..n]);
-        self.config.mpv_path = self.settings_text_buf[0..n];
     }
 
     /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
+    /// Stays on App: it owns `config_path` and the toast queue, neither of which
+    /// belongs in the settings edit subsystem.
     fn saveSettings(self: *App, io: std.Io) void {
         const path = self.config_path orelse {
             self.pushToast(.warn, "no config dir — not saved", false);
@@ -1408,21 +1236,6 @@ pub const App = struct {
             return;
         };
         self.pushToast(.success, "settings saved", false);
-    }
-
-    /// Display string for a setting's current value. `buf` backs the formatted
-    /// scalar values (resume offset, on/off); string fields return a borrow.
-    pub fn settingsValue(self: *App, id: SettingId, buf: []u8) []const u8 {
-        return switch (id) {
-            .mpv_path => self.config.mpv_path,
-            .default_quality => self.config.default_quality,
-            .subtitle_language => self.config.translation,
-            .skip_mode => self.config.skip_mode,
-            .resume_offset => std.fmt.bufPrint(buf, "{d}s", .{self.config.resume_offset_sec}) catch "?",
-            .cover_art => if (self.config.cover_art) "on" else "off",
-            .kanji_chips => if (self.config.kanji_chips) "on" else "off",
-            .palette => self.config.palette,
-        };
     }
 
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1488,8 +1301,7 @@ pub const App = struct {
                 self.list_top = 0;
                 // Land on a clean Settings state: top row, not editing, and
                 // never inheriting a stray search mode from the prior view.
-                self.settings_cursor = 0;
-                self.settings_editing = false;
+                self.settings.reset();
                 self.input_mode = .normal;
             }
             return;

@@ -122,7 +122,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         else
             "jk move · enter open · F1 browse · F3 settings · q quit",
         .detail => "hjkl scroll · h back · enter play · q back",
-        .settings => if (self.settings_editing)
+        .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
             "hjkl navigate · space toggle · enter edit · esc cancel · q save & back",
