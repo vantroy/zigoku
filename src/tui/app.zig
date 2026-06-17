@@ -329,6 +329,11 @@ pub const App = struct {
     episode_loading: bool = false,
     /// Cursor position within the episode grid (0-based index into episode_results).
     episode_cursor: usize = 0,
+    /// Watched high-water mark (1-based) for the detail show: episodes with a
+    /// 0-based index < this render dimmed as "done" (ROD-131). Seeded from the
+    /// store's `progress` on a history-origin load and bumped by `finishPlayback`
+    /// after a counted watch. 0 = nothing watched / unknown.
+    detail_progress: u32 = 0,
     /// Cover/image subsystem — fetch policy, decoded-pixel + Kitty-image state,
     /// and the cover worker-thread lifecycle. See `CoverState` (ROD-160).
     cover: CoverState = .{},
@@ -562,6 +567,10 @@ pub const App = struct {
 
     fn seedHistoryEpisodeCursor(self: *App, rec: AnimeRecord, episodes: []domain.EpisodeNumber) void {
         const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
+        // Dim already-watched cells on open, consistent with the post-playback
+        // treatment (ROD-131). Browse-origin detail does not seed progress today
+        // — same scope line as the resume-cursor seed below.
+        self.detail_progress = std.math.cast(u32, progress) orelse 0;
         if (progress == 0) return;
 
         const current_idx = progress - 1;
@@ -585,11 +594,49 @@ pub const App = struct {
     /// state to the session for persistence + clear, then reset the App-owned
     /// transport. The session owns the record; the shell owns playing/current_*.
     fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, record_play: bool) void {
+        // Capture the session facts ROD-131 needs *before* finish() clears them:
+        // the played episode (1-based) and whether the detail pane still shows
+        // that show. `session.finish` calls `clear`, which zeroes both.
+        const played_index = self.session.episode_index;
+        const same_show = self.detail_for_id != null and self.session.anime_id.len > 0 and
+            std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
+
         self.session.finish(self.gpa, self.store, final_update, record_play);
         self.playing = false;
         self.current_position = 0;
         self.current_duration = 0;
         self.async_start_ms = 0;
+
+        // Reflect a counted watch in the detail pane (ROD-131). `record_play`
+        // is the single coherent signal — true for any clean exit and for an
+        // errored exit that still observed a meaningful position; false for an
+        // abrupt quit that watched nothing (which must not advance past N).
+        if (record_play and played_index > 0 and same_show) self.advanceAfterWatch(played_index);
+    }
+
+    /// Project a counted watch of 1-based `played_index` onto the detail pane:
+    /// bump the watched high-water mark, advance the cursor to the next episode
+    /// if one exists, and toast the outcome (ROD-131). The caller guarantees the
+    /// detail pane still shows the played show.
+    fn advanceAfterWatch(self: *App, played_index: u32) void {
+        // Bail before touching anything if the grid isn't loaded (a contrived
+        // navigate-away-and-back-mid-play case): `episodes_done` re-seeds
+        // `detail_progress` from the store, so a bump here would be dropped.
+        const eps = self.episode_results orelse return;
+        self.detail_progress = @max(self.detail_progress, played_index);
+        // played_index is 1-based, so the next episode is at 0-based index
+        // played_index. When that is past the end, N was the finale.
+        const next: usize = played_index;
+        if (next < eps.len) {
+            self.episode_cursor = next;
+            var buf: [32]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "episode {d} done", .{played_index}) catch "episode done";
+            self.pushToast(.success, msg, false);
+        } else {
+            // Finale: deliberately leave the cursor where it is (on the last
+            // cell the user played from) — there is no N+1 to move to.
+            self.pushToast(.success, "all caught up", false);
+        }
     }
 
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
@@ -812,6 +859,7 @@ pub const App = struct {
                 }
                 self.episode_results = ev.episodes;
                 self.episode_cursor = 0;
+                self.detail_progress = 0;
                 if (self.active_view == .detail and self.detail_origin == .history) {
                     if (self.selectedHistoryRecord()) |rec| {
                         self.seedHistoryEpisodeCursor(rec, ev.episodes);
