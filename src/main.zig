@@ -294,6 +294,13 @@ test "observedPlaybackWasMeaningful requires positive observed position" {
     try std.testing.expect(observedPlaybackWasMeaningful(.{ .time_pos = 0.5, .duration = 1440 }));
 }
 
+test "observedPlaybackCompleted requires reaching the completion bar" {
+    try std.testing.expect(!observedPlaybackCompleted(null));
+    try std.testing.expect(!observedPlaybackCompleted(.{ .time_pos = 5, .duration = 1440 })); // short watch
+    try std.testing.expect(!observedPlaybackCompleted(.{ .time_pos = 1200, .duration = 0 })); // unknown duration
+    try std.testing.expect(observedPlaybackCompleted(.{ .time_pos = 1300, .duration = 1440 })); // ~90%
+}
+
 /// Episode list for a show: cache-first (ROD-68), falling back to a live fetch
 /// that then warms the cache. All store access is best-effort.
 fn loadEpisodes(

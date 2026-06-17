@@ -271,3 +271,19 @@ test "parsePositionLine tracks time-pos and duration events" {
         &duration,
     ) == null);
 }
+
+test "reachedCompletion is a >= ratio gate that needs a known duration" {
+    const r: f64 = 0.80;
+    // Below / at / above the bar. 1152/1440 == 0.8 exactly (IEEE-correct).
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1151, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect((PositionUpdate{ .time_pos = 1152, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect((PositionUpdate{ .time_pos = 1400, .duration = 1440 }).reachedCompletion(r));
+    // A 5s test-quit of a 24min episode (the ROD-168 repro): nowhere near done.
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 5, .duration = 1440 }).reachedCompletion(r));
+    // Unknown/degenerate duration can't prove completion → conservative false.
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = 0 }).reachedCompletion(r));
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = -1 }).reachedCompletion(r));
+    const nan = std.math.nan(f64);
+    try std.testing.expect(!(PositionUpdate{ .time_pos = nan, .duration = 1440 }).reachedCompletion(r));
+    try std.testing.expect(!(PositionUpdate{ .time_pos = 1200, .duration = nan }).reachedCompletion(r));
+}

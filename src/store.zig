@@ -363,9 +363,6 @@ pub const Store = struct {
         };
     }
 
-    /// Mark a play: bump play_count + last_watched_at, and advance `progress` to
-    /// at least `episode_index` (1-based). Episode-level half of ROD-69; the
-    /// sub-second position lands via `saveProgress` once M5's IPC feeds it.
     /// Record a play of `episode_index` (1-based): always bumps play_count,
     /// last_watched_at and history visibility — a play is a play. The `progress`
     /// high-water mark only advances when `completed` (ROD-168): a partial watch

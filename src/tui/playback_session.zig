@@ -110,12 +110,12 @@ pub const PlaybackSession = struct {
         self.last_checkpoint_pos = time_pos;
     }
 
-    /// Persist the session's final state (a meaningful final position, plus the
-    /// watched-state high-water mark when `record_play`) and clear it. The
-    /// transport reset (`playing`/`current_*`) is the controller's job, not the
-    /// session's — this only touches the store and its own record. Whether the
-    /// final position is meaningful is a `PositionUpdate` concern — see
-    /// `PositionUpdate.isMeaningful`.
+    /// Persist the session's final state (a meaningful final position records the
+    /// play; the progress high-water mark advances only when `completed`) and
+    /// clear it. The transport reset (`playing`/`current_*`) is the controller's
+    /// job, not the session's — this only touches the store and its own record.
+    /// See `PositionUpdate.isMeaningful` (worth-persisting) and
+    /// `PositionUpdate.reachedCompletion` (watched bar).
     pub fn finish(self: *PlaybackSession, gpa: Allocator, store: ?*Store, final_update: ?PositionUpdate, completed: bool) void {
         if (store) |st| {
             if (self.anime_id.len > 0 and self.episode_raw.len > 0) {
