@@ -313,6 +313,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         const here = self.playing and self.session.episode_index > 0 and
             self.detail_for_id != null and self.session.anime_id.len > 0 and
             std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
+        // sentinel: no real episode index can reach maxInt(usize), so no cell matches.
         break :blk if (here) self.session.episode_index - 1 else std.math.maxInt(usize);
     };
 
