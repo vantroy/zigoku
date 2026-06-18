@@ -1076,6 +1076,43 @@ test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
     app.episode_lru.deinit(app.gpa);
 }
 
+test "episode cache: evicting displayed show A keeps episode_results valid (ROD-130)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history; // cursor 0 → Frieren, source_id "a"
+
+    const cached = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    });
+    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+        .episodes = cached,
+        .expires_at = std.math.maxInt(i64),
+    });
+
+    // Sync hit → episode_results is an INDEPENDENT dup of show A's episodes.
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
+
+    // Flood the cache past capacity so A's LRU entry is evicted + freed.
+    var i: usize = 0;
+    while (i < workers.episode_lru_cap) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "filler\x00{d}\x00sub", .{i});
+        const fill = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "x" }});
+        try app.episode_lru.putOwned(app.gpa, k, .{ .episodes = fill, .expires_at = std.math.maxInt(i64) });
+    }
+    try testing.expect(app.episode_lru.get("allanime\x00a\x00sub") == null); // A evicted
+
+    // The view copy survives eviction intact (Option-B invariant).
+    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
+    try testing.expectEqualStrings("2", app.episode_results.?[1].raw);
+
+    app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
+}
+
 test "episodes_done stale result is discarded" {
     var app: App = .{};
     app.gpa = std.testing.allocator;

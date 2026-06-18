@@ -82,6 +82,18 @@ pub fn LruCache(comptime K: type, comptime V: type, comptime cap: usize, comptim
             return self.total_bytes;
         }
 
+        /// Drop an entry by key if present, freeing its key and value. Remaining
+        /// entries keep their recency order (the gap is closed by shifting the
+        /// tail down). A no-op when the key is absent.
+        pub fn remove(self: *Self, alloc: Allocator, key: K) void {
+            const idx = self.indexOf(key) orelse return;
+            self.total_bytes -= self.entries[idx].bytes;
+            freeEntry(alloc, &self.entries[idx]);
+            var i = idx;
+            while (i + 1 < self.len) : (i += 1) self.entries[i] = self.entries[i + 1];
+            self.len -= 1;
+        }
+
         pub fn deinit(self: *Self, alloc: Allocator) void {
             while (self.len > 0) self.evictTail(alloc);
         }
@@ -253,6 +265,23 @@ test "lru bounded insert evicts to stay within byte budget" {
     try std.testing.expect(cache.get("a") == null);
     try std.testing.expectEqualStrings("222", cache.get("b") orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("333", cache.get("c") orelse return error.TestUnexpectedResult);
+}
+
+test "lru remove drops an entry and frees it, keeping others" {
+    const Cache = LruCache([]const u8, []u8, 3, SliceValueOps([]u8));
+    var cache: Cache = .{};
+    defer cache.deinit(std.testing.allocator);
+
+    try cache.putOwned(std.testing.allocator, "a", try std.testing.allocator.dupe(u8, "1"));
+    try cache.putOwned(std.testing.allocator, "b", try std.testing.allocator.dupe(u8, "2"));
+    try cache.putOwned(std.testing.allocator, "c", try std.testing.allocator.dupe(u8, "3"));
+
+    cache.remove(std.testing.allocator, "b");
+    try std.testing.expect(cache.get("b") == null);
+    try std.testing.expectEqualStrings("1", cache.get("a") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("3", cache.get("c") orelse return error.TestUnexpectedResult);
+
+    cache.remove(std.testing.allocator, "absent"); // no-op, no crash
 }
 
 test "lru bounded insert rejects oversize value without taking ownership" {

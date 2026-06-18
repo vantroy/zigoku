@@ -45,7 +45,9 @@ const EpisodeListOps = struct {
         alloc.free(value.episodes);
     }
     pub fn valueBytes(value: EpisodeLruEntry) usize {
-        return value.episodes.len * @sizeOf(domain.EpisodeNumber);
+        var total = value.episodes.len * @sizeOf(domain.EpisodeNumber);
+        for (value.episodes) |ep| total += ep.raw.len; // each .raw is its own alloc
+        return total;
     }
 };
 pub const episode_lru_cap = 8;

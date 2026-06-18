@@ -1022,13 +1022,17 @@ pub const App = struct {
     /// no thread, no loading spinner. `view` is canonical GPA-owned; ownership
     /// transfers to `episode_results`. Mirrors the state the `episodes_done`
     /// handler leaves behind so the two write sites stay consistent.
-    fn applyCachedEpisodes(self: *App, source_id: []const u8, view: []domain.EpisodeNumber) void {
+    /// `id` and `view` are both GPA-owned; ownership transfers to
+    /// `detail_for_id` / `episode_results`. Infallible by contract — the caller
+    /// pre-allocates both, so a hit can never leave `episode_results` set with a
+    /// null `detail_for_id` (which would silently block playback — Elara C1).
+    fn applyCachedEpisodes(self: *App, id: []const u8, view: []domain.EpisodeNumber) void {
         self.episode_results = view;
+        self.detail_for_id = id;
         self.episode_cursor = 0;
         self.detail_progress = 0;
         self.episode_loading = false;
         self.async_start_ms = 0;
-        self.detail_for_id = self.gpa.dupe(u8, source_id) catch null;
         if (self.active_view == .detail and self.detail_origin == .history) {
             if (self.selectedHistoryRecord()) |rec| self.seedHistoryEpisodeCursor(rec, view);
         }
@@ -1048,20 +1052,36 @@ pub const App = struct {
         // 1) Hot LRU mirror.
         if (self.episode_lru.get(key)) |entry| {
             if (now < entry.expires_at) {
-                const view = workers.dupEpisodesOwned(self.gpa, entry.episodes) catch return false;
-                self.applyCachedEpisodes(source_id, view);
+                // detail_for_id first (small): on OOM bail before touching
+                // episode_results, so a hit never half-installs (Elara C1).
+                const id = self.gpa.dupe(u8, source_id) catch return false;
+                const view = workers.dupEpisodesOwned(self.gpa, entry.episodes) catch {
+                    self.gpa.free(id);
+                    return false;
+                };
+                self.applyCachedEpisodes(id, view);
                 return true;
             }
+            // Stale: drop it so a repeatedly-visited stale entry can't squat in
+            // the MRU slot (get() just promoted it) and evict fresher entries
+            // during the refetch window (Elara H1). The refetch re-populates it.
+            self.episode_lru.remove(self.gpa, key);
         }
 
-        // 2) DB cache — getCachedEpisodes returns null for stale/missing rows.
+        // 2) DB cache — getCachedEpisodes returns null for stale/missing rows. An
+        // empty list is never stored (cacheEpisodes guards eps.len==0), so a
+        // zero-length result here is treated as a miss (Elara M2).
         const st = self.store orelse return false;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const cached = (st.getCachedEpisodes(arena.allocator(), source, source_id, self.translation, now) catch null) orelse return false;
         if (cached.len == 0) return false;
 
-        const view = workers.dupEpisodesOwned(self.gpa, cached) catch return false;
+        const id = self.gpa.dupe(u8, source_id) catch return false;
+        const view = workers.dupEpisodesOwned(self.gpa, cached) catch {
+            self.gpa.free(id);
+            return false;
+        };
         // Promote into the hot LRU (best-effort; on failure the next visit just
         // re-reads the DB). The status drives a fresh TTL, matching putCachedEpisodes.
         const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
@@ -1072,7 +1092,7 @@ pub const App = struct {
             };
         } else |_| {}
 
-        self.applyCachedEpisodes(source_id, view);
+        self.applyCachedEpisodes(id, view);
         return true;
     }
 
@@ -1080,6 +1100,12 @@ pub const App = struct {
     /// Best-effort: a cache write failure never disrupts navigation/playback.
     fn cacheEpisodes(self: *App, provider: SourceProvider, source_id: []const u8, eps: []const domain.EpisodeNumber) void {
         if (eps.len == 0) return;
+        // NOTE (Elara H2): currentDetailSourceName reads live UI state. If the
+        // user returned to the History list before this async result arrived, it
+        // falls back to provider.name(), which can mis-key a non-default-source
+        // history show. Harmless today (a mis-keyed entry is simply never served
+        // and ages out), to be fixed by ROD-170, which captures the fetch's
+        // source at fire time rather than re-deriving it here.
         const source = self.currentDetailSourceName(provider);
         const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
         const now = Store.nowSecs();
