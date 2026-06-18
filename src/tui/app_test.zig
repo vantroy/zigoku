@@ -10,6 +10,7 @@ const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
 const cover_mod = @import("../cover.zig");
 const colors = @import("colors.zig");
+const detail_view = @import("view/detail.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -299,6 +300,65 @@ test "formatMeta degrades when total episodes is unknown" {
     var buf2: [48]u8 = undefined;
     const unknown = formatMeta(&buf2, .{ .source = "s", .source_id = "i", .title = "T", .progress = 0, .list_status = "planning" });
     try testing.expectEqualStrings("ep 0 · planning", unknown);
+}
+
+test "paneSplit holds the §3.2 38% list / remainder detail geometry (ROD-113)" {
+    // The split is shared by the Browse and wide-History arms, so History's
+    // preview column lands exactly where Browse's does at the same width.
+    inline for (.{
+        .{ .w = 100, .list_w = 38 },
+        .{ .w = 120, .list_w = 45 },
+        .{ .w = 160, .list_w = 60 },
+    }) |c| {
+        const sp = App.paneSplit(c.w);
+        try testing.expectEqual(@as(u16, c.list_w), sp.list_w);
+        // 2-cell left margin + list + 2-cell gap.
+        try testing.expectEqual(@as(u16, 2 + c.list_w + 2), sp.detail_x);
+        // Detail fills the remainder and never overruns the terminal width.
+        try testing.expect(sp.detail_w > 0);
+        try testing.expect(sp.detail_x + sp.detail_w < c.w);
+    }
+}
+
+test "paneSplit clamps the list column to a 30-col floor at narrow widths" {
+    const sp = App.paneSplit(60);
+    try testing.expectEqual(@as(u16, 30), sp.list_w); // 60*38/100 = 22 → floored to 30
+}
+
+test "history preview engages only at the split threshold (ROD-113)" {
+    try testing.expectEqual(@as(u16, 100), App.history_split_min);
+    // The gating predicate the .history arm uses: w >= history_split_min.
+    try testing.expect(99 < App.history_split_min);
+    try testing.expect(100 >= App.history_split_min);
+}
+
+test "detail two-column gate trips at 100 cols and falls back below (ROD-113)" {
+    try testing.expectEqual(@as(u16, 100), detail_view.detail_two_col_min);
+    try testing.expect(!detail_view.isTwoColumn(99));
+    try testing.expect(detail_view.isTwoColumn(100));
+    try testing.expect(detail_view.isTwoColumn(160));
+}
+
+test "history preview split engages only with a focused record (ROD-113)" {
+    // The wide-History split is gated on `selectedHistoryRecord() != null`, so
+    // empty/loading/error states (no focused record) keep the single column.
+    var app: App = .{};
+
+    // Empty history → no record to preview.
+    try testing.expect(app.selectedHistoryRecord() == null);
+
+    // Loading: data hasn't drained yet, so history.len == 0 → still null.
+    app.history_loading = true;
+    try testing.expect(app.selectedHistoryRecord() == null);
+
+    // Loaded with a valid cursor → a record is focused, split may engage.
+    app.history_loading = false;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.list_cursor = 1;
+    const rec = app.selectedHistoryRecord();
+    try testing.expect(rec != null);
+    try testing.expectEqualStrings("K-On!", rec.?.title);
 }
 
 test "F2 from browse goes to history" {

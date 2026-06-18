@@ -7,12 +7,27 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
+const domain = @import("../../domain.zig");
+const store_mod = @import("../../store.zig");
 
 const App = app_mod.App;
+const Anime = domain.Anime;
+const AnimeRecord = store_mod.AnimeRecord;
+const DetailRenderInfo = App.DetailRenderInfo;
 const put = render.put;
 const putClipped = render.putClipped;
 const centerText = render.centerText;
 const drawWrappedText = render.drawWrappedText;
+
+/// Width (in cols) at and above which a History-opened detail pane splits into
+/// two columns (cover + header left, synopsis + grid right) — ROD-113. Aligns
+/// with the §3.2 cover-art tier so the right column is always ≥ ~34 cols.
+pub const detail_two_col_min: u16 = 100;
+
+/// Pure predicate for the two-column gate, exposed for tests.
+pub fn isTwoColumn(w: u16) bool {
+    return w >= detail_two_col_min;
+}
 
 fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
     if (!vx.caps.kitty_graphics) return false;
@@ -157,68 +172,68 @@ fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {
     return @intCast(@max(@as(u32, 1), @min(@as(u32, max_h), cover_h)));
 }
 
-pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16) void {
-    if (w < 10) return;
-
-    var row: u16 = 0;
-
-    const info = self.detailRenderInfo();
-    const anime = info.anime;
-
-    // Cover art block (§3.3 + §7.3/§7.5).
-    // Width stays fixed by layout tier; height is derived from terminal pixel
-    // geometry so the panel itself stays poster-shaped instead of cell-tall.
+/// Cover-art block (§3.3 + §7.3/§7.5), drawn at the top of `win`. Returns the
+/// rows consumed (cover height + 1 blank spacer), or 0 when the width tier has
+/// no cover slot. Shared by the single-/two-column detail layouts and the
+/// History preview pane (ROD-113). Width stays fixed by tier; height derives
+/// from terminal pixel geometry so the panel stays poster-shaped, not cell-tall.
+fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, anime: ?Anime, term_w: u16) u16 {
     const cover_w: u16 = if (term_w >= 100) 20 else if (term_w >= 80) 14 else 0;
     const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
-    if (cover_w > 0 and cover_h > 0) {
-        const cover_win = win.child(.{ .x_off = 0, .y_off = row, .width = cover_w, .height = cover_h });
-        if (anime) |a| {
-            const same_id = self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id);
-            const has_pixels = self.cover.pixels != null and same_id;
-            const showing_spinner = self.cover.loading and same_id;
-            // §8 footprint fill (ROD-164): a rendered poster's slot is bg_base so
-            // the fit-matte matches the pane; placeholders keep the bg_surface
-            // panel. `drawing_poster` mirrors the exact condition for the
-            // has_pixels poster branch below, so the fill matches the branch taken.
-            const drawing_poster = a.thumb != null and !showing_spinner and has_pixels;
-            cover_win.fill(.{ .style = .{ .bg = if (drawing_poster) self.palette.bg_base else self.palette.bg_surface } });
-            if (a.thumb == null) {
-                if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
-            } else if (showing_spinner) {
-                const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
-                // §3.6 slow-path: shift cyan → hot once the wait crosses the
-                // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
-                const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
-                centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
-            } else if (has_pixels) {
-                if (ensureCoverImage(self, vx, writer)) {
-                    if (self.cover.image) |img| {
-                        drawKittyCover(self, img, cover_win);
-                    } else {
-                        drawFallbackCover(self, cover_win);
-                    }
+    if (cover_w == 0 or cover_h == 0) return 0;
+
+    const cover_win = win.child(.{ .x_off = 0, .y_off = 0, .width = cover_w, .height = cover_h });
+    if (anime) |a| {
+        const same_id = self.cover.for_id != null and std.mem.eql(u8, self.cover.for_id.?, a.id);
+        const has_pixels = self.cover.pixels != null and same_id;
+        const showing_spinner = self.cover.loading and same_id;
+        // §8 footprint fill (ROD-164): a rendered poster's slot is bg_base so
+        // the fit-matte matches the pane; placeholders keep the bg_surface
+        // panel. `drawing_poster` mirrors the exact condition for the
+        // has_pixels poster branch below, so the fill matches the branch taken.
+        const drawing_poster = a.thumb != null and !showing_spinner and has_pixels;
+        cover_win.fill(.{ .style = .{ .bg = if (drawing_poster) self.palette.bg_base else self.palette.bg_surface } });
+        if (a.thumb == null) {
+            if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
+        } else if (showing_spinner) {
+            const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
+            // §3.6 slow-path: shift cyan → hot once the wait crosses the
+            // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
+            const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
+            centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
+        } else if (has_pixels) {
+            if (ensureCoverImage(self, vx, writer)) {
+                if (self.cover.image) |img| {
+                    drawKittyCover(self, img, cover_win);
                 } else {
                     drawFallbackCover(self, cover_win);
                 }
-            } else if (cover_h > 1) {
-                centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
+            } else {
+                drawFallbackCover(self, cover_win);
             }
-        } else {
-            cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
-            if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
+        } else if (cover_h > 1) {
+            centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
         }
-        row += cover_h + 1;
-    }
-
-    // Title — the selected result's name, or placeholder.
-    if (anime != null and !std.mem.eql(u8, info.title, "—")) {
-        putClipped(win, row, 0, w, info.title, self.s(self.palette.fg, .{ .bold = true }));
     } else {
-        putClipped(win, row, 0, w, info.title, self.s(self.palette.fg3, .{}));
+        cover_win.fill(.{ .style = .{ .bg = self.palette.bg_surface } });
+        if (cover_h > 1) centerText(cover_win, cover_h / 2, cover_w, "no art yet", self.s(self.palette.fg3, .{ .italic = true }));
     }
-    row += 1;
+    return cover_h + 1;
+}
 
-    // Score — "[--/100]" until AniList enrichment fills `a.score`, then tiered rendering.
+/// Title (bold name or "—" placeholder). Returns the next free row.
+fn drawTitle(self: *App, win: vaxis.Window, w: u16, info: DetailRenderInfo, start_row: u16) u16 {
+    if (info.anime != null and !std.mem.eql(u8, info.title, "—")) {
+        putClipped(win, start_row, 0, w, info.title, self.s(self.palette.fg, .{ .bold = true }));
+    } else {
+        putClipped(win, start_row, 0, w, info.title, self.s(self.palette.fg3, .{}));
+    }
+    return start_row + 1;
+}
+
+/// Score line — "[--/100]" until AniList enrichment fills `a.score`, then tiered
+/// rendering. Returns the next free row.
+fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u16) u16 {
     const score_text: []const u8 = if (anime) |a| blk: {
         if (a.score) |score| {
             if (score >= 91) {
@@ -236,16 +251,31 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         }
         break :blk self.s(self.palette.fg3, .{});
     } else self.s(self.palette.fg3, .{});
-    putClipped(win, row, 0, w, score_text, score_style);
-    row += 1;
+    putClipped(win, start_row, 0, w, score_text, score_style);
+    return start_row + 1;
+}
 
-    // Hairline — clipped to window width so it never wraps onto the next row.
-    // "─" is 3 UTF-8 bytes; we need exactly `cols` glyphs = `cols * 3` bytes.
+/// Hairline divider — clipped to width so it never wraps onto the next row.
+/// "─" is 3 UTF-8 bytes; we need exactly `cols` glyphs = `cols * 3` bytes.
+fn drawHairline(self: *App, win: vaxis.Window, w: u16, row: u16) void {
+    const cols: u16 = @min(w, 160);
+    put(win, row, 0, ("─" ** 160)[0 .. @as(usize, cols) * 3], self.s(self.palette.chrome, .{}));
+}
+
+/// Title + score + hairline + episode-count metadata stack. Returns the next
+/// free row. `h` bounds each step so a short pane never overdraws.
+fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderInfo, start_row: u16) u16 {
+    var row = drawTitle(self, win, w, info, start_row);
+    row = drawScore(self, win, w, info.anime, row);
+
+    // Hairline. The row advance sits inside the height guard (the original inline
+    // code advanced unconditionally) — only divergent at pane h≤2, which
+    // layout()'s h<4 guard already rules out, so this is a tidy-up, not a
+    // behavior change. Elara ROD-113 N2.
     if (row < h) {
-        const cols: u16 = @min(w, 160);
-        put(win, row, 0, ("─" ** 160)[0 .. @as(usize, cols) * 3], self.s(self.palette.chrome, .{}));
+        drawHairline(self, win, w, row);
+        row += 1;
     }
-    row += 1;
 
     // Metadata: episode count, falling back to AniList total when needed.
     if (row < h) {
@@ -253,29 +283,117 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         putClipped(win, row, 0, w, info.meta, meta_style);
         row += 1;
     }
+    return row;
+}
 
-    // Synopsis: real metadata when present, otherwise the existing stub.
-    if (row < h) {
-        if (anime) |a| {
-            if (a.description) |desc| {
-                row += drawWrappedText(win, row, 0, w, h - row, desc, self.s(self.palette.fg2, .{}));
-            } else {
-                putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
-                row += 1;
-            }
+/// Synopsis — the real description when present, otherwise the null-degrade
+/// stub. Word-wraps within `w`. Returns the next free row.
+fn drawSynopsis(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, start_row: u16) u16 {
+    var row = start_row;
+    if (row >= h) return row;
+    if (anime) |a| {
+        if (a.description) |desc| {
+            row += drawWrappedText(win, row, 0, w, h - row, desc, self.s(self.palette.fg2, .{}));
         } else {
             putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
             row += 1;
         }
+    } else {
+        putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
+        row += 1;
     }
+    return row;
+}
 
+/// Episode grid placement: a blank spacer row, then the grid filling the rest
+/// of `win` below `start_row`.
+fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16) void {
+    var row = start_row;
     if (row < h) row += 1; // blank line before grid
-
-    // Episode grid.
     if (row >= h) return;
     const grid_h: u16 = h - row;
     const grid_win = win.child(.{ .x_off = 0, .y_off = row, .width = w, .height = grid_h });
     drawEpisodeGrid(self, grid_win, w, grid_h);
+}
+
+pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16, two_col: bool) void {
+    if (w < 10) return;
+
+    const info = self.detailRenderInfo();
+
+    // Two-column layout (ROD-113): cover + header on the left (~38%), synopsis +
+    // episode grid on the right. Only engaged for History-opened detail at wide
+    // widths; the narrow Browse preview and sub-100-col terminals keep the
+    // single vertical stack. Mirrors the §3.2 list/detail split grammar.
+    // Gate on terminal width, not the pane width `w`: the pane is `term_w - 2`,
+    // so a `w`-based gate would lag the History list preview's ≥100 boundary by
+    // 2 cols (you'd get a preview but a single-column detail at 100–101 cols).
+    // Elara/Astra ROD-113 review.
+    if (two_col and isTwoColumn(term_w)) {
+        // Floor of 20 keeps the 20-col cover block fitting the left column even
+        // when the gate drops (ROD-170's persistent-pane threshold). Dead at the
+        // current ≥100 gate (38-col min) but load-bearing once the gate lowers.
+        const left_w: u16 = @max(20, (w * 38) / 100);
+        const right_x: u16 = left_w + 2; // 2-cell gap, no border (§3.1)
+        const right_w: u16 = if (w > right_x) w - right_x else 0;
+        const left_win = win.child(.{ .x_off = 0, .y_off = 0, .width = left_w, .height = h });
+        const right_win = win.child(.{ .x_off = @intCast(right_x), .y_off = 0, .width = right_w, .height = h });
+
+        const lrow = drawCover(self, vx, writer, left_win, info.anime, term_w);
+        _ = drawHeader(self, left_win, left_w, h, info, lrow);
+
+        const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
+        drawGrid(self, right_win, right_w, h, rrow);
+        return;
+    }
+
+    var row: u16 = drawCover(self, vx, writer, win, info.anime, term_w);
+    row = drawHeader(self, win, w, h, info, row);
+    row = drawSynopsis(self, win, w, h, info.anime, row);
+    drawGrid(self, win, w, h, row);
+}
+
+/// History list preview pane (ROD-113): cover + title + score + status +
+/// synopsis for the focused history entry, in a single narrow column. No
+/// episode grid — that is a detail-view affordance, not a preview one. Fed an
+/// explicit record because `detailRenderInfo` resolves to null in the History
+/// list view (active_view == .history), so the pane cannot read it from state.
+pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16, rec: AnimeRecord) void {
+    if (w < 10) return;
+    const anime = App.animeFromHistoryRecord(rec);
+
+    var row: u16 = drawCover(self, vx, writer, win, anime, term_w);
+
+    if (row < h) {
+        if (anime.name.len > 0) {
+            putClipped(win, row, 0, w, anime.name, self.s(self.palette.fg, .{ .bold = true }));
+        } else {
+            putClipped(win, row, 0, w, "—", self.s(self.palette.fg3, .{}));
+        }
+        row += 1;
+    }
+
+    if (row < h) row = drawScore(self, win, w, anime, row);
+
+    if (row < h) {
+        drawHairline(self, win, w, row);
+        row += 1;
+    }
+
+    // Status — the airing status when the source gave one, else the watchlist
+    // status (which always has a value; defaults to "planning"). The history
+    // row itself already shows progress + list_status, so airing status is the
+    // complementary fact worth surfacing here.
+    if (row < h) {
+        const status_text: []const u8 = if (anime.status) |st|
+            (if (st.len > 0) st else rec.list_status)
+        else
+            rec.list_status;
+        putClipped(win, row, 0, w, status_text, self.s(self.palette.fg2, .{}));
+        row += 1;
+    }
+
+    _ = drawSynopsis(self, win, w, h, anime, row);
 }
 
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
