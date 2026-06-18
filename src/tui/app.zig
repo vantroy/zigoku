@@ -329,6 +329,11 @@ pub const App = struct {
     episode_loading: bool = false,
     /// Cursor position within the episode grid (0-based index into episode_results).
     episode_cursor: usize = 0,
+    /// Hot in-memory LRU mirror of the DB episode cache (ROD-130): a synchronous
+    /// hit here (or in the DB) opens the detail pane instantly on a repeat visit,
+    /// bypassing the async fetch. Owns canonical episode copies; the view dups on
+    /// hit, so eviction never touches displayed memory.
+    episode_lru: workers.EpisodeLruCache = .{},
     /// Watched high-water mark (1-based) for the detail show: episodes with a
     /// 0-based index < this render dimmed as "done" (ROD-131). Seeded from the
     /// store's `progress` on a history-origin load and bumped by `finishPlayback`
@@ -480,6 +485,7 @@ pub const App = struct {
         self.results.deinit(self.gpa);
         self.results = .empty;
         self.freeEpisodeResults();
+        self.episode_lru.deinit(self.gpa);
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
         self.cover.deinitCaches(self.gpa);
@@ -880,6 +886,9 @@ pub const App = struct {
                         self.seedHistoryEpisodeCursor(rec, ev.episodes);
                     }
                 }
+                // ROD-130: mirror the fresh fetch into the DB + hot LRU so the
+                // next visit to this show is a synchronous cache hit.
+                self.cacheEpisodes(provider, ev.for_id, ev.episodes);
             },
             .episodes_error => {
                 self.episode_loading = false;
@@ -1002,6 +1011,121 @@ pub const App = struct {
         };
     }
 
+    /// Build the "source\x00source_id\x00translation" episode cache key into
+    /// `buf`. Null bytes never appear in any component, so the separator is
+    /// collision-safe. Returns null if it doesn't fit (caller skips the cache).
+    fn episodeCacheKey(buf: []u8, source: []const u8, source_id: []const u8, tt: domain.Translation) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}\x00{s}\x00{s}", .{ source, source_id, tt.str() }) catch null;
+    }
+
+    /// Install a cache-sourced episode list as the live detail state (ROD-130):
+    /// no thread, no loading spinner. `view` is canonical GPA-owned; ownership
+    /// transfers to `episode_results`. Mirrors the state the `episodes_done`
+    /// handler leaves behind so the two write sites stay consistent.
+    /// `id` and `view` are both GPA-owned; ownership transfers to
+    /// `detail_for_id` / `episode_results`. Infallible by contract — the caller
+    /// pre-allocates both, so a hit can never leave `episode_results` set with a
+    /// null `detail_for_id` (which would silently block playback — Elara C1).
+    fn applyCachedEpisodes(self: *App, id: []const u8, view: []domain.EpisodeNumber) void {
+        self.episode_results = view;
+        self.detail_for_id = id;
+        self.episode_cursor = 0;
+        self.detail_progress = 0;
+        self.episode_loading = false;
+        self.async_start_ms = 0;
+        if (self.active_view == .detail and self.detail_origin == .history) {
+            if (self.selectedHistoryRecord()) |rec| self.seedHistoryEpisodeCursor(rec, view);
+        }
+    }
+
+    /// Synchronous episode cache fast-path (ROD-130): on an LRU hit (fresh) or a
+    /// fresh DB hit, populate `episode_results` directly and return true; the
+    /// caller then skips the async fetch. A miss returns false. Reads stay on the
+    /// main thread (no sqlite-from-worker concern). Caller must have already
+    /// cleared prior `episode_results` via `freeEpisodeResults`.
+    fn tryEpisodeCacheHit(self: *App, provider: SourceProvider, source_id: []const u8) bool {
+        const source = self.currentDetailSourceName(provider);
+        var key_buf: [256]u8 = undefined;
+        const key = episodeCacheKey(&key_buf, source, source_id, self.translation) orelse return false;
+        const now = Store.nowSecs();
+
+        // 1) Hot LRU mirror.
+        if (self.episode_lru.get(key)) |entry| {
+            if (now < entry.expires_at) {
+                // detail_for_id first (small): on OOM bail before touching
+                // episode_results, so a hit never half-installs (Elara C1).
+                const id = self.gpa.dupe(u8, source_id) catch return false;
+                const view = workers.dupEpisodesOwned(self.gpa, entry.episodes) catch {
+                    self.gpa.free(id);
+                    return false;
+                };
+                self.applyCachedEpisodes(id, view);
+                return true;
+            }
+            // Stale: drop it so a repeatedly-visited stale entry can't squat in
+            // the MRU slot (get() just promoted it) and evict fresher entries
+            // during the refetch window (Elara H1). The refetch re-populates it.
+            self.episode_lru.remove(self.gpa, key);
+        }
+
+        // 2) DB cache — getCachedEpisodes returns null for stale/missing rows. An
+        // empty list is never stored (cacheEpisodes guards eps.len==0), so a
+        // zero-length result here is treated as a miss (Elara M2).
+        const st = self.store orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const cached = (st.getCachedEpisodes(arena.allocator(), source, source_id, self.translation, now) catch null) orelse return false;
+        if (cached.len == 0) return false;
+
+        const id = self.gpa.dupe(u8, source_id) catch return false;
+        const view = workers.dupEpisodesOwned(self.gpa, cached) catch {
+            self.gpa.free(id);
+            return false;
+        };
+        // Promote into the hot LRU (best-effort; on failure the next visit just
+        // re-reads the DB). The status drives a fresh TTL, matching putCachedEpisodes.
+        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
+        if (workers.dupEpisodesOwned(self.gpa, cached)) |lru_copy| {
+            self.episode_lru.putOwned(self.gpa, key, .{ .episodes = lru_copy, .expires_at = now + Store.cacheTtl(status) }) catch {
+                for (lru_copy) |ep| self.gpa.free(ep.raw);
+                self.gpa.free(lru_copy);
+            };
+        } else |_| {}
+
+        self.applyCachedEpisodes(id, view);
+        return true;
+    }
+
+    /// Mirror a freshly-fetched episode list into the DB + hot LRU (ROD-130).
+    /// Best-effort: a cache write failure never disrupts navigation/playback.
+    fn cacheEpisodes(self: *App, provider: SourceProvider, source_id: []const u8, eps: []const domain.EpisodeNumber) void {
+        if (eps.len == 0) return;
+        // NOTE (Elara H2): currentDetailSourceName reads live UI state. If the
+        // user returned to the History list before this async result arrived, it
+        // falls back to provider.name(), which can mis-key a non-default-source
+        // history show. Harmless today (a mis-keyed entry is simply never served
+        // and ages out), to be fixed by ROD-170, which captures the fetch's
+        // source at fire time rather than re-deriving it here.
+        const source = self.currentDetailSourceName(provider);
+        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
+        const now = Store.nowSecs();
+
+        if (self.store) |st| {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            st.putCachedEpisodes(source, source_id, self.translation, eps, status, now, arena.allocator()) catch |e|
+                log.debug("putCachedEpisodes failed: {s}", .{@errorName(e)});
+        }
+
+        var key_buf: [256]u8 = undefined;
+        const key = episodeCacheKey(&key_buf, source, source_id, self.translation) orelse return;
+        const lru_copy = workers.dupEpisodesOwned(self.gpa, eps) catch return;
+        self.episode_lru.putOwned(self.gpa, key, .{ .episodes = lru_copy, .expires_at = now + Store.cacheTtl(status) }) catch {
+            for (lru_copy) |ep| self.gpa.free(ep.raw);
+            self.gpa.free(lru_copy);
+        };
+    }
+
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
         if (self.episode_thread) |t| {
             t.join();
@@ -1009,8 +1133,12 @@ pub const App = struct {
         }
 
         self.freeEpisodeResults();
-        self.episode_loading = true;
         self.episode_cursor = 0;
+
+        // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
+        if (self.tryEpisodeCacheHit(provider, source_id)) return;
+
+        self.episode_loading = true;
         self.async_start_ms = self.now_ms;
 
         // Two GPA-duped copies: one for App.detail_for_id, one for the task (→ event).
