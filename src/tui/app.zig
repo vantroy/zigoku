@@ -490,7 +490,7 @@ pub const App = struct {
         return self.results.items[self.list_cursor];
     }
 
-    fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
+    pub fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
         if (self.history.len == 0) return null;
         var visible_i: usize = 0;
         for (self.history) |rec| {
@@ -501,7 +501,7 @@ pub const App = struct {
         return null;
     }
 
-    fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
+    pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
         return .{
             .id = rec.source_id,
             .name = rec.title,
@@ -539,7 +539,7 @@ pub const App = struct {
         };
     }
 
-    const DetailRenderInfo = struct {
+    pub const DetailRenderInfo = struct {
         anime: ?Anime,
         title: []const u8,
         meta: []const u8,
@@ -1460,6 +1460,22 @@ pub const App = struct {
         try vx.render(writer);
     }
 
+    /// Width (in cols) at and above which the History list grows a right-side
+    /// preview panel, mirroring the Browse split (ROD-113).
+    pub const history_split_min: u16 = 100;
+
+    pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
+
+    /// The §3.2 list/detail column split: a 38% list column (min 30 cols), a
+    /// 2-cell gap after a 2-cell left margin, and the detail pane taking the
+    /// remainder. Shared by the Browse and (wide) History arms of drawContent.
+    pub fn paneSplit(w: u16) PaneSplit {
+        const list_w: u16 = @max(30, (w * 38) / 100);
+        const detail_x: u16 = 2 + list_w + 2;
+        const detail_w: u16 = if (w > detail_x + 1) w - detail_x - 1 else 0;
+        return .{ .list_w = list_w, .detail_x = detail_x, .detail_w = detail_w };
+    }
+
     fn drawContent(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, h: u16) void {
         // Row 0 is the top bar; row 1 is intentional breathing room; content
         // starts at row 2 and runs to h-2; the bottom bar owns h-1.
@@ -1470,7 +1486,25 @@ pub const App = struct {
         const w = win.width;
 
         switch (self.active_view) {
-            .history => history.draw(self, &self.scratch, win, top, visible, w, body_w),
+            .history => {
+                // At wide widths, grow a Browse-style right-side preview for the
+                // focused entry (ROD-113). Only when a record is actually focused
+                // — empty/loading/error states keep the full-width single column,
+                // which also sidesteps the empty-state centering edge case.
+                const rec_opt = if (w >= history_split_min) self.selectedHistoryRecord() else null;
+                if (rec_opt) |rec| {
+                    const sp = paneSplit(w);
+                    // List draws into the full window (absolute coords, 2-col left
+                    // margin), but with the narrowed list_w as its effective width
+                    // so the meta column / focus band / centering stay inside the
+                    // list pane instead of bleeding under the preview.
+                    history.draw(self, &self.scratch, win, top, visible, sp.list_w, sp.list_w -| 2);
+                    const detail_win = win.child(.{ .x_off = @intCast(sp.detail_x), .y_off = top, .width = sp.detail_w, .height = visible });
+                    detail.drawHistoryPreview(self, vx, writer, detail_win, sp.detail_w, visible, w, rec);
+                } else {
+                    history.draw(self, &self.scratch, win, top, visible, w, body_w);
+                }
+            },
 
             .browse => {
                 const pane_h: u16 = visible;
@@ -1480,20 +1514,19 @@ pub const App = struct {
                     return;
                 }
 
-                const list_w: u16 = @max(30, (w * 38) / 100);
-                const detail_x: u16 = 2 + list_w + 2;
-                const detail_w: u16 = if (w > detail_x + 1) w - detail_x - 1 else 0;
+                const sp = paneSplit(w);
+                const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = sp.list_w, .height = pane_h });
+                const detail_win = win.child(.{ .x_off = @intCast(sp.detail_x), .y_off = top, .width = sp.detail_w, .height = pane_h });
 
-                const list_win = win.child(.{ .x_off = 2, .y_off = top, .width = list_w, .height = pane_h });
-                const detail_win = win.child(.{ .x_off = @intCast(detail_x), .y_off = top, .width = detail_w, .height = pane_h });
-
-                browse.drawBrowseList(self, &self.scratch, list_win, pane_h, list_w);
-                detail.drawDetailPane(self, vx, writer, detail_win, detail_w, pane_h, w);
+                browse.drawBrowseList(self, &self.scratch, list_win, pane_h, sp.list_w);
+                detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, pane_h, w, false);
             },
 
             .detail => {
                 const detail_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = visible });
-                detail.drawDetailPane(self, vx, writer, detail_win, body_w, visible, w);
+                // Two-column only for History-opened detail (ROD-113 scope); the
+                // Browse-opened detail view keeps the single stack.
+                detail.drawDetailPane(self, vx, writer, detail_win, body_w, visible, w, self.detail_origin == .history);
             },
 
             .settings => settings.drawSettings(self, win, top, visible, w),

@@ -203,6 +203,35 @@ Column widths flex with terminal resize. The cover art cell block is fixed at
 `14 × 20`. Below 80 cols, cover art is hidden and the detail column uses full width
 for metadata. Below 60 cols, collapse to single-column list only.
 
+The split formula is implemented as `App.paneSplit(w)` (app.zig), a shared helper
+that returns `{ list_w, detail_x, detail_w }`. It is used by both Browse and by the
+wide-History path (ROD-113) so the geometry is identical across both surfaces.
+
+```
+list_w  = max(30, w * 38 / 100)
+detail_x = 2 + list_w + 2          // 2-cell left margin + list + 2-cell gap
+detail_w = w − detail_x − 1
+```
+
+Sample widths:
+
+| Terminal width | list_w | detail_w |
+|---|---|---|
+| 100 cols | 38 | ≈57 |
+| 120 cols | 45 | ≈70 |
+| 160 cols | 60 | ≈95 |
+
+**Named threshold constants (as-built):**
+
+| Constant | File | Value | Meaning |
+|---|---|---|---|
+| `App.history_split_min` | `app.zig` | `100` | History list grows a preview panel at or above this width. |
+| `detail_two_col_min` | `view/detail.zig` | `100` | History-opened detail pane switches to two columns at or above this width. |
+
+Both thresholds are `100` — they align with the ≥100-col cover-art tier and ensure
+the right column is wide enough for synopsis wrap and a usable episode grid.
+Single-breakpoint design means 120/160/etc. need no special-casing.
+
 ### 3.3 Cover Art Block
 
 The cover art occupies a fixed region at the top of the detail column, left-aligned
@@ -684,6 +713,108 @@ Notes:
   de-emphasis.
 - The resume indicator `[▸12]` in the row header is the episode the user will resume
   from: `state.now` + bold.
+
+### 5.4a History — Wide Terminal (≥100 cols)
+
+At `terminal_width ≥ 100`, the History list gains a Browse-style right-side preview
+panel for the focused entry. Empty, loading, and error states do not split — they
+keep the full-width single column.
+
+**History list + preview — 120 cols.** List: 45 cols. Preview: ≈70 cols.
+
+```
+                                                                                         [context: top bar, full width]
+  ZIGOKU  ░  Watchlist                                                          ·        [h1+bold fg] [d] [f] right: [f]·
+                                                                                         [spacer row]
+  ▸ watching (4)                            [   COVER ART IMAGE               ]         [fg+bold header; preview: 20×7 cells]
+  ─────────────────────────────────────     [   or "no art yet" in d+italic   ]         [border.hair rule, list pane only]
+    ▸ Frieren: Beyond Journey's End   ◐     [                                  ]         [focused row: bg.surface, f+bold title]
+      [████████◐░░░░░░░]  6 / 28 eps        Frieren: Beyond Journey's End               [f+bold title in preview]
+                                             放映中                                      [h chip; omitted if null]
+    ▸ Vinland Saga S2                  ○    [--/100]                                     [d score placeholder]
+      [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────           [border.hair]
+                                             放映中   冬 2024                             [h chip, f chip; omitted if null]
+    ◐ Blue Period                      ◐     An elf mage who once defeated the            [m synopsis, word-wrapped to preview_w]
+      [██████◐░░░░░░░░░]  5 / 12 eps         Demon King now wanders the
+  ─────────────────────────────────────     continent without purpose, until
+                                             she meets a young girl…
+  ▸ completed (12)
+  ─────────────────────────────────────
+    ● Fullmetal Alchemist: Brotherhood
+      [████████████████]  64 / 64 eps
+
+  ▌  jk move · enter open · F1 browse · F3 settings · q quit
+```
+
+Notes:
+- The preview panel shares the same `paneSplit(w)` geometry as Browse (§3.2).
+  At 120 cols: list_w=45, preview_x=49, preview_w≈70.
+- The focused entry drives the preview. When focus changes, the preview updates
+  immediately — same rendering cycle, no separate fetch.
+- The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
+  when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
+  takes the full list_w and the badge is omitted.
+- Preview content (top to bottom): cover art → title (bold) → score `[NN/100]` →
+  hairline → status line → synopsis (word-wrapped). No episode grid in the preview.
+- Status line shows the airing status chip when the source provided one; otherwise
+  the watchlist `list_status` label (always present). The two are mutually exclusive.
+- Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
+  `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
+  in [m]+italic when synopsis is null; status/season chips omitted when null.
+- Empty / loading / error states (no focused record) fall back to the full-width
+  §5.4 single-column layout. The split only engages when a record is focused.
+
+---
+
+**History-opened detail pane — two columns (≥100 cols).**
+
+When the user opens an entry from History (`Enter` on a focused row), the detail
+pane renders in two columns at `detail_pane_width ≥ detail_two_col_min` (100).
+This split applies only when `detail_origin == .history`. Browse-opened detail
+remains single-column regardless of terminal width.
+
+The detail pane receives the full body width (`terminal_width − 2`), so the split
+is wider than the preview case:
+
+```
+left_w  = max(20, pane_w * 38 / 100)
+right_x = left_w + 2
+right_w = remainder
+```
+
+Sample widths (pane ≈ terminal − 2):
+
+| Terminal width | left_w | right_w |
+|---|---|---|
+| 120 cols | ≈44 | ≈72 |
+| 160 cols | ≈60 | ≈96 |
+
+**120-col terminal — History-opened detail.**
+
+```
+  ZIGOKU  ░  Watchlist                                                          ·
+
+  [   COVER ART IMAGE   ]   An elf mage who once defeated the Demon King now     [left col: cover → title → score → hairline → meta]
+  [   20 × 7 cells      ]   wanders the continent without purpose, until she     [right col: synopsis word-wrapped to right_w]
+  [                     ]   meets a young girl named Fern…                       [m synopsis]
+                                                                                  [blank row]
+  Frieren: Beyond Journey's End                                                   [fg+bold title]
+   放映中  冬 2024                                                                [chips; omitted if null]
+  [--/100]                   [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10]           [right col: episode grid]
+  ────────────────────────   [11][12][13][14][15][16][17][18][19][20]             [cols = right_w / 5]
+   28 eps                    [21][22][23][24][25][26][27][28]
+
+  ▌  hjkl scroll · h back · enter play · q back
+```
+
+Notes:
+- Left column (top to bottom): cover art → title → score → hairline → episode count.
+- Right column (top to bottom): synopsis (word-wrapped to `right_w`) → blank row →
+  episode grid (`cols = right_w / 5`).
+- Cover art uses the existing ≥100-col breakpoint (`cover_w=20`). It fits in the
+  left column at all wide widths — no new breakpoint introduced.
+- Below 100 cols and for all Browse-opened detail, the existing single-column
+  vertical stack (§5.3) is unchanged.
 
 ### 5.5 Settings
 
@@ -1286,6 +1417,7 @@ unreachable rendering.
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
+| History wide-terminal threshold is 100 cols (`history_split_min`, `detail_two_col_min`) (ROD-113) | 100 is the §3.2 cover-art tier boundary — the point at which the layout already has enough room for a 20-col cover block. Using the same number as the cover-art breakpoint means the split engages exactly when the panes can carry the visual weight. At 100 cols the preview column is ≈57 chars wide and the detail right column is ≈72 chars wide — both are wide enough for synopsis word-wrap to feel intentional and for the episode grid to tile without crowding (`cols = right_w / 5` gives ≥14 columns at 100 cols). A single breakpoint avoids discontinuous layout transitions: widths between 100 and 160 scale smoothly through `paneSplit(w)` with no special-casing. The alternative (a 120-col or 140-col threshold) would leave the common 120×40 terminal in the wide path with a slightly narrower right column — no meaningful gain, more breakpoint surface to maintain. | If common terminal widths (e.g. narrower than expected) make the preview feel cramped at 100 cols, raise the threshold to 110 or 120 and update both constants together. |
 
 ---
 
