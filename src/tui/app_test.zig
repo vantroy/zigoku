@@ -640,6 +640,7 @@ test "history detail episodes_done seeds cursor from progress" {
     try testing.expectEqual(@as(usize, 4), app.episode_cursor);
 
     app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
 }
 
 test "history detail resume overrides next-episode cursor" {
@@ -674,6 +675,7 @@ test "history detail resume overrides next-episode cursor" {
     try testing.expectEqual(@as(usize, 2), app.episode_cursor);
 
     app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
 }
 
 test "history detail completed show defaults cursor to episode one" {
@@ -700,6 +702,7 @@ test "history detail completed show defaults cursor to episode one" {
     try testing.expectEqual(@as(usize, 0), app.episode_cursor);
 
     app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
 }
 
 test "h / l in settings view are no-ops (single pane)" {
@@ -987,6 +990,90 @@ test "episodes_done populates episode_results" {
     try testing.expectEqual(@as(usize, 2), app.episode_results.?.len);
 
     app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
+}
+
+test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history; // cursor 0 → Frieren, source_id "a"
+
+    const cached = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    });
+    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+        .episodes = cached,
+        .expires_at = std.math.maxInt(i64),
+    });
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+
+    // Synchronous hit: detail opens, episodes present, no spinner, no fetch thread.
+    try testing.expectEqual(.detail, app.active_view);
+    try testing.expect(!app.episode_loading);
+    try testing.expect(app.episode_thread == null);
+    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
+    try testing.expectEqualStrings("2", app.episode_results.?[1].raw);
+
+    app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
+}
+
+test "episode cache: a fetch populates the LRU for next time (ROD-130)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.detail_for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episode_loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 2);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    const for_id = try std.testing.allocator.dupe(u8, "a");
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+
+    const entry = app.episode_lru.get("allanime\x00a\x00sub") orelse return error.TestExpectationFailed;
+    try testing.expectEqual(@as(usize, 2), entry.episodes.len);
+    try testing.expectEqualStrings("1", entry.episodes[0].raw);
+
+    app.freeEpisodeResults();
+    app.episode_lru.deinit(app.gpa);
+}
+
+test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+
+    // expires_at in the past → must be ignored, forcing the (empty) dummy fetch.
+    const stale = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    });
+    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+        .episodes = stale,
+        .expires_at = 0,
+    });
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+
+    // Stale entry ignored → the async fetch path was taken (loading set, no
+    // synchronous results). Had it been served, loading would be false and
+    // episode_results would hold the 3 cached entries. (testTick drains the
+    // worker's episodes_done without re-applying it, so loading stays set.)
+    try testing.expect(app.episode_loading);
+    try testing.expect(app.episode_results == null);
+
+    app.freeEpisodeResults(); // frees detail_for_id set on the miss path
+    app.episode_lru.deinit(app.gpa);
 }
 
 test "episodes_done stale result is discarded" {

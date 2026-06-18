@@ -32,6 +32,49 @@ pub const DecodedCoverCache = lru_mod.LruCache([]const u8, cover_mod.Pixels, 5, 
 pub const max_cover_raw_cache_bytes = 32 * 1024 * 1024;
 pub const max_cover_decoded_cache_bytes = 48 * 1024 * 1024;
 
+/// One slot of the episode hot-cache: a canonical GPA-owned episode list plus
+/// the Unix-seconds expiry mirroring the DB episode_cache TTL, so the in-memory
+/// mirror never serves data the DB itself would refuse as stale (ROD-130).
+pub const EpisodeLruEntry = struct {
+    episodes: []domain.EpisodeNumber,
+    expires_at: i64,
+};
+const EpisodeListOps = struct {
+    pub fn freeValue(alloc: Allocator, value: EpisodeLruEntry) void {
+        for (value.episodes) |ep| alloc.free(ep.raw);
+        alloc.free(value.episodes);
+    }
+    pub fn valueBytes(value: EpisodeLruEntry) usize {
+        return value.episodes.len * @sizeOf(domain.EpisodeNumber);
+    }
+};
+pub const episode_lru_cap = 8;
+/// Hot in-memory mirror of the DB episode cache (ROD-130), keyed by
+/// "source\x00source_id\x00translation". A synchronous hit bypasses the async
+/// fetch so the detail pane opens instantly on repeat visits. Entries hold
+/// canonical episode copies (each .raw individually owned); a hit dups into the
+/// view, so LRU eviction can never invalidate displayed memory.
+pub const EpisodeLruCache = lru_mod.LruCache([]const u8, EpisodeLruEntry, episode_lru_cap, EpisodeListOps);
+
+/// Duplicate an episode list into a fresh canonical GPA allocation: a new outer
+/// slice plus an individually-owned copy of every `.raw`. Mirrors the exact
+/// ownership shape `episodesTask` produces, so the result is freeable by
+/// `freeEpisodeResults` / `EpisodeListOps`. On OOM the partial allocation is
+/// unwound and the error propagates (callers fall back to a network fetch).
+pub fn dupEpisodesOwned(alloc: Allocator, eps: []const domain.EpisodeNumber) ![]domain.EpisodeNumber {
+    const out = try alloc.alloc(domain.EpisodeNumber, eps.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |ep| alloc.free(ep.raw);
+        alloc.free(out);
+    }
+    for (eps, 0..) |ep, i| {
+        out[i] = .{ .raw = try alloc.dupe(u8, ep.raw) };
+        filled = i + 1;
+    }
+    return out;
+}
+
 pub fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
     return if (s) |x| try alloc.dupe(u8, x) else null;
 }
