@@ -397,11 +397,11 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 }
 
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
-    if (self.episode_loading) {
+    if (self.episodes.loading) {
         centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
         return;
     }
-    const eps = self.episode_results orelse {
+    const eps = self.episodes.results orelse {
         // No fetch fired yet (detail pane opened but no item selected).
         return;
     };
@@ -414,8 +414,8 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
     const cell_w: u16 = 5;
     const cols: u16 = @max(1, w / cell_w);
 
-    // Scroll so that episode_cursor is in view.
-    const cursor_row: usize = self.episode_cursor / cols;
+    // Scroll so that the episode cursor is in view.
+    const cursor_row: usize = self.episodes.cursor / cols;
     const viewport_rows: usize = h;
     const view_top: usize = if (cursor_row >= viewport_rows)
         cursor_row + 1 - viewport_rows
@@ -423,14 +423,14 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         0;
 
     // §4.6 launching cell: the episode currently resolving/playing renders a
-    // spinner in its grid slot. It tracks the SESSION, not episode_cursor — the
-    // grid stays navigable during play (you can browse while mpv loads), so the
-    // spinner stays pinned to the played episode, and only on the show actually
-    // on screen (same_show, mirroring finishPlayback's guard).
+    // spinner in its grid slot. It tracks the SESSION, not the episode cursor —
+    // the grid stays navigable during play (you can browse while mpv loads), so
+    // the spinner stays pinned to the played episode, and only on the show
+    // actually on screen (same_show, mirroring finishPlayback's guard).
     const launching_idx: usize = blk: {
         const here = self.playing and self.session.episode_index > 0 and
-            self.detail_for_id != null and self.session.anime_id.len > 0 and
-            std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
+            self.episodes.for_id != null and self.session.anime_id.len > 0 and
+            std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?);
         // sentinel: no real episode index can reach maxInt(usize), so no cell matches.
         break :blk if (here) self.session.episode_index - 1 else std.math.maxInt(usize);
     };
@@ -442,7 +442,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         var c: u16 = 0;
         while (c < cols and ep_idx < eps.len) : (c += 1) {
             const ep = eps[ep_idx];
-            const focused = ep_idx == self.episode_cursor and self.active_pane == .detail;
+            const focused = ep_idx == self.episodes.cursor and self.active_pane == .detail;
             const launching = ep_idx == launching_idx;
 
             // Use ep_scratch to avoid dangling stack buffers. Index relative
@@ -463,7 +463,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // paused semantic (§2.4), so it is deliberately not used here. A
             // launching cell escalates focus→hot past isSlowPath (§4.8), same as
             // every other slow-path spinner; it outranks focus/watched.
-            const watched = ep_idx < @as(usize, self.detail_progress);
+            const watched = ep_idx < @as(usize, self.episodes.progress);
             const cell_style = if (launching)
                 self.s(if (self.isSlowPath()) self.palette.hot else self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
             else if (focused)

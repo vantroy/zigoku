@@ -61,7 +61,7 @@ pub const EpisodeLruCache = lru_mod.LruCache([]const u8, EpisodeLruEntry, episod
 /// Duplicate an episode list into a fresh canonical GPA allocation: a new outer
 /// slice plus an individually-owned copy of every `.raw`. Mirrors the exact
 /// ownership shape `episodesTask` produces, so the result is freeable by
-/// `freeEpisodeResults` / `EpisodeListOps`. On OOM the partial allocation is
+/// `EpisodeState.freeResults` / `EpisodeListOps`. On OOM the partial allocation is
 /// unwound and the error propagates (callers fall back to a network fetch).
 pub fn dupEpisodesOwned(alloc: Allocator, eps: []const domain.EpisodeNumber) ![]domain.EpisodeNumber {
     const out = try alloc.alloc(domain.EpisodeNumber, eps.len);
