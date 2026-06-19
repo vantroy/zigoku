@@ -1491,6 +1491,10 @@ pub const App = struct {
             } else if (key.matches('g', .{})) {
                 self.episodes.cursor = 0;
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+                // libvaxis delivers shift+g inconsistently across terminals: some
+                // report the 'G' codepoint with .shift set, others report bare 'G'
+                // (already-uppercased) with no modifier. Match both so G lands
+                // regardless of terminal.
                 self.episodes.cursor = ep_len - 1;
             }
             return;
@@ -1512,6 +1516,8 @@ pub const App = struct {
         } else if (key.matches('g', .{})) {
             self.list_cursor = 0;
         } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            // Match both shift+'G' and bare uppercase 'G' (see episode-grid nav
+            // above): terminals disagree on whether shift is reported separately.
             self.list_cursor = nav_len - 1;
         }
         // The cursor moved in split browse: (re)arm the detail prefetch debounce.
