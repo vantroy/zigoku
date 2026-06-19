@@ -558,7 +558,7 @@ pub const App = struct {
     /// When a preview/detail pane is on-screen alongside the list, this is the
     /// list cursor, so the cover tracks the cursor like the cheap synchronous
     /// fields already do via renderedDetailAnime:
-    ///   - split browse (cols >= 60, list pane focused): the results cursor;
+    ///   - split browse (cols >= 60, list pane active): the results cursor;
     ///   - wide history (cols >= 100, ROD-113 preview engaged): the focused record.
     /// Everywhere else it defers to currentDetailAnime's "actively-focused show"
     /// contract, which is load-bearing for play/cache/stale-check paths and must
@@ -936,6 +936,11 @@ pub const App = struct {
             .episodes_error => {
                 self.episode_loading = false;
                 self.async_start_ms = 0;
+                // Uphold the "a task error clears pending deadlines" invariant that
+                // task_error holds for the search debounce. Harmless today (the
+                // detail_for_id guard already suppresses a re-fire), but leaving it
+                // armed is a trap for any future change to detail_for_id's lifecycle.
+                self.detail_sync_deadline_ms = 0;
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
                 // failure so the blank pane isn't a silent dead end.
@@ -1547,6 +1552,8 @@ pub const App = struct {
                     }
                 },
                 .history => {
+                    // right is a no-op in single-pane history; only enter opens
+                    // the detail view (there's no list→detail pane to step into).
                     if (key.matches(vaxis.Key.enter, .{})) self.openHistoryDetail(loop, io, provider);
                 },
                 .detail => {
