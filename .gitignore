@@ -6,5 +6,7 @@ zig-pkg/
 /main
 
 # ad-hoc scratch binaries from `zig run`/build-exe at the repo root (review agents
-# leave these behind; keep them out of `git add -A`)
+# leave these behind; keep them out of `git add -A`). Both name orders, since an
+# agent compiled `nyra_test` (suffix) past the `test_*` (prefix) rule once.
 /test_*
+/*_test
