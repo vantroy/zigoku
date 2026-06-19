@@ -860,7 +860,16 @@ test "Resume.startSecondsRewound rewinds for context, saturating at the top (ROD
     const early: Resume = .{ .position_secs = 3, .duration_secs = 1400, .fully_watched = false };
     try testing.expectEqual(@as(u64, 0), early.startSecondsRewound(5));
 
-    // A position with no resume point stays 0 — nothing to rewind into.
+    // Rewind exactly equal to position — the boundary, begins from top not underflow.
+    const exact: Resume = .{ .position_secs = 5, .duration_secs = 1400, .fully_watched = false };
+    try testing.expectEqual(@as(u64, 0), exact.startSecondsRewound(5));
+
+    // Natural-end passthrough: startSeconds() suppresses to 0, so the rewind early-
+    // outs and never resurrects a start inside the window the guard skips.
+    const near_end: Resume = .{ .position_secs = 1200, .duration_secs = 1400, .fully_watched = false }; // ~86%
+    try testing.expectEqual(@as(u64, 0), near_end.startSecondsRewound(5));
+
+    // Fully-watched stays 0 — nothing to rewind into.
     const done: Resume = .{ .position_secs = 500, .duration_secs = 1400, .fully_watched = true };
     try testing.expectEqual(@as(u64, 0), done.startSecondsRewound(5));
 }
