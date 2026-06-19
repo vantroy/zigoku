@@ -624,14 +624,18 @@ pub const AllAnime = struct {
         return pick;
     }
 
-    /// True if candidate `a` beats incumbent `b` for `quality`. A null resolution
-    /// counts as 0 — it can only come from a BANDWIDTH-only STREAM-INF, and
-    /// sorting it to the bottom is the safe, predictable call. This is a total
-    /// order over resolution, so folding it across the candidates yields the
-    /// cap-policy winner regardless of arrival order.
+    /// True if candidate `a` beats incumbent `b` for `quality`. A *known*
+    /// resolution always beats an unknown one (null), and two unknowns tie — we
+    /// never pick a stream on a resolution we can't see over one we can. This
+    /// matters most under a rung cap: an unknown stream (a BANDWIDTH-only
+    /// STREAM-INF) could be any bitrate, so treating it as "0p, safely in budget"
+    /// would hand a capped user the exact firehose the cap exists to prevent.
+    /// Unknowns are thus a last resort, chosen only when *every* candidate is
+    /// unknown. Over known resolutions this is a strict weak order, so the fold
+    /// yields the cap-policy winner regardless of arrival order.
     fn preferred(a: domain.StreamLink, b: domain.StreamLink, quality: domain.Quality) bool {
-        const ra = a.resolution orelse 0;
-        const rb = b.resolution orelse 0;
+        const ra = a.resolution orelse return false; // unknown `a` never beats `b`
+        const rb = b.resolution orelse return true; // known `a` beats unknown `b`
         return switch (quality) {
             .best => ra > rb,
             .worst => ra < rb,
@@ -670,10 +674,11 @@ pub const AllAnime = struct {
     }
 
     /// Validate a candidate variant into a `StreamLink`, or null if it's unsafe
-    /// for mpv's argv: the URL must be a clean `http(s)` — no control chars, no
-    /// leading `--` that mpv would read as an option. Referer is pre-sanitized by
-    /// safeReferer. The quality pick is deferred to `selectVariant`; this only
-    /// guards what's allowed to *become* a candidate.
+    /// for mpv's argv: the URL must start with `http(s)://` (which also rejects a
+    /// leading `--` mpv would read as an option) and carry only clean argv bytes
+    /// (no control chars). Referer is pre-sanitized by safeReferer. The quality
+    /// pick is deferred to `selectVariant`; this only guards what's allowed to
+    /// *become* a candidate.
     fn consider(url: []const u8, res: ?u32, referer: []const u8) ?domain.StreamLink {
         if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return null;
         if (!cleanArg(url)) return null;
@@ -1029,6 +1034,7 @@ test "selectVariant: cap policy picks the right rung (ROD-152)" {
     try std.testing.expectEqual(@as(?u32, 1080), AllAnime.selectVariant(&full, .best).?.resolution);
     try std.testing.expectEqual(@as(?u32, 480), AllAnime.selectVariant(&full, .worst).?.resolution);
     // Exact rung present → take it.
+    try std.testing.expectEqual(@as(?u32, 480), AllAnime.selectVariant(&full, .p480).?.resolution);
     try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&full, .p720).?.resolution);
     try std.testing.expectEqual(@as(?u32, 1080), AllAnime.selectVariant(&full, .p1080).?.resolution);
 
@@ -1040,11 +1046,19 @@ test "selectVariant: cap policy picks the right rung (ROD-152)" {
     var over = [_]domain.StreamLink{ mk(720), mk(1080) };
     try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&over, .p480).?.resolution);
 
-    // A null-resolution variant sorts to the bottom: it's the worst, and never
-    // beats a real rung for `best` or an in-budget pick.
+    // A known resolution always beats an unknown (null) one, in *every* mode —
+    // we never act on a resolution we can't see. For a rung cap this is the H1
+    // fix: an unknown could be any bitrate, so it must not masquerade as a safe
+    // in-budget pick and beat a real (if over-budget) 720p.
     var withnull = [_]domain.StreamLink{ mk(null), mk(720) };
     try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .best).?.resolution);
-    try std.testing.expectEqual(@as(?u32, null), AllAnime.selectVariant(&withnull, .worst).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .worst).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .p480).?.resolution);
+
+    // …but when *every* candidate is unknown, we still return one — never error
+    // out when a stream actually exists.
+    var allnull = [_]domain.StreamLink{ mk(null), mk(null) };
+    try std.testing.expect(AllAnime.selectVariant(&allnull, .p720) != null);
 }
 
 test "isPrivateV4: private/loopback/link-local ranges blocked, public allowed" {
