@@ -530,6 +530,87 @@ test "l in browse detail pane is a no-op (already rightmost)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+test "left/right arrows mirror h/l for browse pane switching (ROD-156 #1)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+    });
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+        app.freeEpisodeResults();
+    }
+
+    // right enters the detail pane (mirrors l).
+    try testTick(&app, keyEv(vaxis.Key.right, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+
+    // right in the detail pane is a no-op — and crucially does NOT play (play is
+    // enter-gated; right must not be a hidden play trigger).
+    try testTick(&app, keyEv(vaxis.Key.right, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+    try testing.expect(!app.playing);
+
+    // left steps back to the list (mirrors h).
+    try testTick(&app, keyEv(vaxis.Key.left, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+
+    // left in the list pane is a no-op (already leftmost).
+    try testTick(&app, keyEv(vaxis.Key.left, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+}
+
+test "left/right arrows are no-ops in single-pane history (ROD-156 #1)" {
+    var app: App = .{};
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .list;
+    try testTick(&app, keyEv(vaxis.Key.right, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testTick(&app, keyEv(vaxis.Key.left, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+}
+
+test "entering the detail pane disarms the prefetch race — a fired deadline can't double-spawn (ROD-156)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 80;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 2);
+    inline for (.{ "a", "b" }) |id| {
+        app.results.appendAssumeCapacity(.{
+            .id = try std.testing.allocator.dupe(u8, id),
+            .name = try std.testing.allocator.dupe(u8, id),
+        });
+    }
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+        app.freeEpisodeResults();
+    }
+
+    // Scroll: arms the episode prefetch debounce for the hovered show.
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expect(app.detail_sync_deadline_ms > 0);
+    try testing.expect(app.detailSyncActive());
+
+    // Enter the detail pane before the deadline fires. The .tick fire guard is
+    // detailSyncActive(), which requires the list pane — so once we're in the
+    // detail pane the armed deadline can never spawn a second episode fetch.
+    // (fireEpisodesForId also joins any in-flight thread before spawning, so one
+    // episode thread is the hard ceiling — refutes the dual-thread hypothesis.)
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+    try testing.expect(!app.detailSyncActive());
+}
+
 test "browse list pane detail render info uses selected anime" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
@@ -551,6 +632,107 @@ test "browse list pane detail render info uses selected anime" {
 
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
+}
+
+test "detailSyncTarget tracks the list cursor in split browse, defers elsewhere (ROD-156)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 2);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+    });
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "y"),
+        .name = try std.testing.allocator.dupe(u8, "Y"),
+    });
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+    }
+
+    // Narrow terminal: no split pane, so the prefetch path is inert and the
+    // target defers to currentDetailAnime (null while focused on the list).
+    app.term_cols = 40;
+    try testing.expect(!app.detailSyncActive());
+    try testing.expect(app.detailSyncTarget() == null);
+    try testing.expect(std.meta.eql(app.detailSyncTarget(), app.currentDetailAnime()));
+
+    // Wide terminal, list pane: the detail pane is on-screen, so the target is
+    // the list cursor even though currentDetailAnime still returns null.
+    app.term_cols = 80;
+    try testing.expect(app.detailSyncActive());
+    try testing.expect(app.currentDetailAnime() == null);
+    try testing.expectEqualStrings("X", app.detailSyncTarget().?.name);
+    app.list_cursor = 1;
+    try testing.expectEqualStrings("Y", app.detailSyncTarget().?.name);
+
+    // Focusing the detail pane hands the target back to currentDetailAnime —
+    // the prefetch path is no longer the one driving it.
+    app.active_pane = .detail;
+    try testing.expect(!app.detailSyncActive());
+    try testing.expect(std.meta.eql(app.detailSyncTarget(), app.currentDetailAnime()));
+}
+
+test "detailSyncTarget tracks the history cursor in wide preview mode, no episode prefetch (ROD-156)" {
+    var app: App = .{};
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+
+    // Narrow: no ROD-113 preview pane, so the cover path is inert and the target
+    // defers to currentDetailAnime (null in the history view).
+    app.term_cols = 80;
+    try testing.expect(app.detailSyncTarget() == null);
+
+    // Wide (>= history_split_min): the preview is on-screen, so the cover tracks
+    // the focused record as the cursor moves.
+    app.term_cols = 120;
+    try testing.expectEqualStrings("Frieren", app.detailSyncTarget().?.name);
+    app.list_cursor = 1;
+    try testing.expectEqualStrings("K-On!", app.detailSyncTarget().?.name);
+
+    // History shows a cover but no episode grid, so it must never arm the
+    // episode prefetch debounce.
+    try testing.expect(!app.detailSyncActive());
+}
+
+test "cursor move arms the detail prefetch debounce only in split browse (ROD-156)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    inline for (.{ "a", "b", "c" }) |id| {
+        app.results.appendAssumeCapacity(.{
+            .id = try std.testing.allocator.dupe(u8, id),
+            .name = try std.testing.allocator.dupe(u8, id),
+        });
+    }
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+    }
+
+    // Narrow: a cursor move must NOT arm the debounce.
+    app.term_cols = 40;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    try testing.expectEqual(@as(i64, 0), app.detail_sync_deadline_ms);
+
+    // Wide: a real cursor move arms it.
+    app.term_cols = 80;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testing.expect(app.detail_sync_deadline_ms > 0);
+
+    // A no-op move (j at the bottom) doesn't re-arm — disarm and confirm.
+    app.detail_sync_deadline_ms = 0;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testing.expectEqual(@as(i64, 0), app.detail_sync_deadline_ms);
 }
 
 test "h / l in history view are no-ops (single pane)" {
