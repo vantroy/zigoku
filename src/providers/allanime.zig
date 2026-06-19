@@ -183,9 +183,13 @@ pub const AllAnime = struct {
     // path and the long-tail `--<hex>` providers, exactly as the oracle does.
     const ALLOWED_SOURCES = [_][]const u8{ "Yt-mp4", "S-Mp4", "Uv-mp4", "Ak", "Default" };
 
+    // Match case-insensitively (ROD-178): the oracle's casing doesn't track
+    // AllAnime's live responses — the API sends `S-mp4` (lowercase m) where the
+    // list carries `S-Mp4`, and an exact match silently dropped that provider,
+    // costing long-tail coverage on shows where it was the only viable source.
     fn sourceAllowed(name: ?[]const u8) bool {
         const n = name orelse return false;
-        for (ALLOWED_SOURCES) |a| if (std.mem.eql(u8, n, a)) return true;
+        for (ALLOWED_SOURCES) |a| if (std.ascii.eqlIgnoreCase(n, a)) return true;
         return false;
     }
 
@@ -1011,6 +1015,13 @@ test "sourceAllowed: only anipy's trusted provider names pass" {
     try std.testing.expect(AllAnime.sourceAllowed("Yt-mp4"));
     try std.testing.expect(!AllAnime.sourceAllowed("Sak")); // not in list
     try std.testing.expect(!AllAnime.sourceAllowed(null));
+    // ROD-178: the match is case-insensitive. AllAnime sends `S-mp4` (lowercase
+    // m) where our list carries `S-Mp4`; an exact match dropped it. Mixed casing
+    // on any entry must still pass.
+    try std.testing.expect(AllAnime.sourceAllowed("S-mp4")); // the real-world casing
+    try std.testing.expect(AllAnime.sourceAllowed("default"));
+    try std.testing.expect(AllAnime.sourceAllowed("UV-MP4"));
+    try std.testing.expect(!AllAnime.sourceAllowed("S-mp5")); // still not a real fuzzy match
 }
 
 test "consider/safeReferer: reject mpv-argv injection (C1)" {
