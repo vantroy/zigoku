@@ -4,3 +4,7 @@ zig-pkg/
 
 # compiled binary (zig build-exe emits ./main)
 /main
+
+# ad-hoc scratch binaries from `zig run`/build-exe at the repo root (review agents
+# leave these behind; keep them out of `git add -A`)
+/test_*

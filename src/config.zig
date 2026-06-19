@@ -29,7 +29,7 @@ pub const Config = struct {
     // survives non-/usr/bin installs (brew, nix, /usr/local). Users can pin an
     // absolute path here. (Ticket suggested "/usr/bin/mpv"; PATH is safer.)
     mpv_path: []const u8 = "mpv",
-    default_quality: []const u8 = "1080",
+    default_quality: []const u8 = "best", // "best" | "1080" | "720" | "480" | "worst" — see domain.Quality (ROD-152)
     translation: []const u8 = "sub", // "sub" | "dub"
     resume_offset_sec: u32 = 5,
     skip_mode: []const u8 = "both", // "none" | "intro" | "outro" | "both"

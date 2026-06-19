@@ -35,8 +35,10 @@ pub const SourceProvider = struct {
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
         /// List a show's episode numbers in the given track, numerically sorted.
         episodes: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber,
-        /// Resolve a playable stream for one episode.
-        resolve: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation) anyerror!domain.StreamLink,
+        /// Resolve a playable stream for one episode at the requested quality.
+        /// `quality` is the user's preference (ROD-152); a source with no variants
+        /// is free to ignore it.
+        resolve: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink,
     };
 
     pub fn name(self: SourceProvider) []const u8 {
@@ -48,7 +50,7 @@ pub const SourceProvider = struct {
     pub fn episodes(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
         return self.vtable.episodes(self.ptr, arena, io, show_id, tt);
     }
-    pub fn resolve(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation) anyerror!domain.StreamLink {
-        return self.vtable.resolve(self.ptr, arena, io, show_id, episode, tt);
+    pub fn resolve(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
+        return self.vtable.resolve(self.ptr, arena, io, show_id, episode, tt, quality);
     }
 };

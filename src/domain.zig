@@ -22,6 +22,42 @@ pub const Translation = enum {
     }
 };
 
+/// The user's stream-quality preference (ROD-152). `best`/`worst` are the
+/// open-ended sentinels; the rungs name a vertical-pixel ceiling. The provider
+/// applies a *cap* policy against whatever variants a source actually exposes —
+/// see `allanime.selectVariant`. Sources with no variants (the fast4speed direct
+/// URL) ignore this entirely; it's a no-op there, not a dead toggle.
+pub const Quality = enum {
+    best,
+    p1080,
+    p720,
+    p480,
+    worst,
+
+    /// Parse a config string into a preference, degrading anything unrecognized
+    /// to `.best` — the safe default, and the same "degrade at the call site"
+    /// contract `Config.translationEnum` keeps. The settings cycle stores bare
+    /// strings ("1080", "best"…), so this is the one place they become typed.
+    pub fn fromString(s: []const u8) Quality {
+        if (std.mem.eql(u8, s, "worst")) return .worst;
+        if (std.mem.eql(u8, s, "480")) return .p480;
+        if (std.mem.eql(u8, s, "720")) return .p720;
+        if (std.mem.eql(u8, s, "1080")) return .p1080;
+        return .best;
+    }
+
+    /// The vertical-pixel ceiling for a rung, or null for the `best`/`worst`
+    /// sentinels (which select by extremum, not by cap).
+    pub fn cap(self: Quality) ?u32 {
+        return switch (self) {
+            .p1080 => 1080,
+            .p720 => 720,
+            .p480 => 480,
+            .best, .worst => null,
+        };
+    }
+};
+
 /// One show in the catalog.
 ///
 /// Only `id` and `name` are guaranteed. `id` is the *provider's* opaque show
