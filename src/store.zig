@@ -211,7 +211,18 @@ pub const Store = struct {
 
     /// Open (creating if needed) the DB at `path`, set WAL + foreign keys, and
     /// migrate to the current schema. `path` must be null-terminated.
+    ///
+    /// Threading: this single connection handle is shared across threads — the
+    /// main loop (getAnime/upsertAnime/episode-cache) and the history worker can
+    /// touch it concurrently during startup, and interrupt() is called on it from
+    /// the main thread at quit. That sharing is only safe under SQLite's serialized
+    /// threading mode. We rely on it by NOT passing SQLITE_OPEN_NOMUTEX (which would
+    /// downgrade to multi-thread mode, where one connection is not safe across
+    /// threads). Do not add NOMUTEX/FULLMUTEX here without auditing every
+    /// cross-thread call site. The assert below trips loud if a build links a
+    /// non-serialized SQLite.
     pub fn open(path: [:0]const u8) Error!Store {
+        std.debug.assert(c.sqlite3_threadsafe() == 1); // 1 = serialized (see Threading note)
         var db: SqliteDb = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
         if (c.sqlite3_open_v2(path.ptr, &db, flags, null) != c.SQLITE_OK) {
@@ -230,6 +241,16 @@ pub const Store = struct {
     /// A private in-memory DB — for tests. Each call is an isolated, blank store.
     pub fn openMemory() Error!Store {
         return open(":memory:");
+    }
+
+    /// Abort any statement currently running on this connection. `sqlite3_interrupt`
+    /// is documented thread-safe regardless of threading mode, and a no-op when no
+    /// statement is running. Used on quit to abandon an in-flight loadHistory so
+    /// teardown doesn't block on the query (ROD-179). (The broader cross-thread
+    /// sharing of this handle — see open() — relies on serialized mode, not this
+    /// call specifically.)
+    pub fn interrupt(self: *Store) void {
+        _ = c.sqlite3_interrupt(self.db);
     }
 
     pub fn close(self: *Store) void {

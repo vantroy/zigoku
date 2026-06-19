@@ -146,10 +146,21 @@ pub fn run(
     // result into the same queue the tty reader feeds; tick() drains it. The
     // thread is short-lived and joined before teardown.
     var hist_thread: ?std.Thread = null;
-    // TODO(ROD-75): no cancellation — quitting while loadHistory is mid-query
-    // blocks here until it returns. Fine for local SQLite; revisit if a real
-    // async fetch lands behind this seam.
-    defer if (hist_thread) |t| t.join();
+    // On quit, abandon an in-flight history query before joining so teardown
+    // never blocks on the SELECT: sqlite3_interrupt makes the worker's
+    // sqlite3_step bail, the join returns at once, and the discarded result is
+    // never read. The remaining cancellation gap — the scroll-fired episode
+    // prefetch joins synchronously on the main loop — is tracked in ROD-179.
+    //
+    // Declared before the search/enrich/episode-thread joins below, so by LIFO
+    // it runs *after* them: every other worker is already joined when interrupt
+    // fires, so the interrupt can only hit loadHistory's statement — never a
+    // statement another worker started (interrupt also affects statements that
+    // begin before it returns).
+    defer if (hist_thread) |t| {
+        if (store) |st| st.interrupt();
+        t.join();
+    };
     if (store) |st| {
         hist_thread = std.Thread.spawn(.{}, loadHistoryTask, .{ &loop, hist_arena.allocator(), st }) catch blk: {
             // Couldn't spawn — fall back to a synchronous load so the user still
