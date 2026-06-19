@@ -128,6 +128,14 @@ pub const AllAnime = struct {
     /// Returns null for non-AniList thumbnails (~13% are MyAnimeList CDN urls,
     /// whose path is an image id, not a usable anime id) and any unrecognised
     /// shape — the caller then falls back to title matching.
+    ///
+    /// TRUST: this assumes AllAnime's thumbnail honestly names the show it
+    /// describes. A compromised provider (or a TLS MITM) could embed a wrong-but-
+    /// valid id and mis-enrich one row's cover/synopsis. That is the same trust we
+    /// already place in AllAnime — it picks the title we'd otherwise match on and
+    /// serves the very streams we play — so this widens no boundary; `anilist_id`
+    /// is a nullable enrichment column, not a key (store.zig), so there is no
+    /// collision/persistence beyond a single row, overwritten on the next enrich.
     fn anilistIdFromThumb(url_opt: ?[]const u8) ?u64 {
         const url = url_opt orelse return null;
         if (std.mem.indexOf(u8, url, "anilistcdn/media/anime/cover/") == null) return null;
@@ -151,9 +159,11 @@ pub const AllAnime = struct {
         // scale downstream (`averageScore`) — is 0–100. Rescale so a search-seeded
         // score and an enrichment score read on the same axis. Clamp defensively.
         const score: ?u32 = if (e.score) |s| blk: {
-            if (s <= 0) break :blk null;
-            const scaled = @round(s * 10.0);
-            break :blk @intFromFloat(@min(scaled, 100.0));
+            // NaN fails every comparison, so `s <= 0` alone won't reject it, and
+            // @intFromFloat is UB on NaN/Inf/out-of-range — guard finiteness first.
+            // (0/unrated → null; the @min caps a corrupt over-range score at 100.)
+            if (!std.math.isFinite(s) or s <= 0) break :blk null;
+            break :blk @intFromFloat(@min(@round(s * 10.0), 100.0));
         } else null;
         return .{
             .id = e._id,
@@ -194,8 +204,9 @@ pub const AllAnime = struct {
         }
 
         // Rank best-match-first. AllAnime returns rough relevance order; we
-        // sharpen it with an explicit title-match score (ROD-60). No `score`
-        // field comes back from AllAnime, so episode count is the only tie-break.
+        // sharpen it with an explicit title-match score (ROD-60), tie-broken on
+        // episode count. (AllAnime's own `score` is now parsed for metadata but
+        // intentionally not part of the ranking — relevance, not popularity.)
         std.mem.sort(domain.Anime, list.items, RankCtx{ .query = query, .tt = opts.translation }, rankGreater);
 
         if (list.items.len > opts.limit) list.shrinkRetainingCapacity(opts.limit);
@@ -1010,6 +1021,23 @@ test "edgeToAnime: maps the widened search edge (ROD-181)" {
     try std.testing.expectEqualStrings("(untitled)", f2.name);
     try std.testing.expectEqual(@as(?u32, null), f2.year);
     try std.testing.expectEqual(@as(?u64, null), f2.anilist_id);
+}
+
+test "edgeToAnime: score rescale clamps over-range and rejects non-finite (ROD-181)" {
+    const mk = struct {
+        fn score(v: ?f64) ?u32 {
+            return AllAnime.edgeToAnime(.{ ._id = "x", .score = v }).score;
+        }
+    }.score;
+    try std.testing.expectEqual(@as(?u32, 89), mk(8.88)); // round(88.8)
+    try std.testing.expectEqual(@as(?u32, 100), mk(9.999)); // round(99.99) → 100
+    try std.testing.expectEqual(@as(?u32, 100), mk(11.5)); // over-range → clamp
+    try std.testing.expectEqual(@as(?u32, 100), mk(999.0)); // absurd → clamp
+    try std.testing.expectEqual(@as(?u32, null), mk(0)); // unrated
+    try std.testing.expectEqual(@as(?u32, null), mk(-3.0)); // negative
+    try std.testing.expectEqual(@as(?u32, null), mk(null)); // absent
+    try std.testing.expectEqual(@as(?u32, null), mk(std.math.nan(f64))); // NaN guard
+    try std.testing.expectEqual(@as(?u32, null), mk(std.math.inf(f64))); // Inf guard
 }
 
 test "jsonEscape: control characters are \\u-escaped (RFC 8259)" {
