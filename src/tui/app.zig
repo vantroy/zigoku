@@ -1445,8 +1445,9 @@ pub const App = struct {
             return;
         }
 
-        // h / l pane switching (Browse only) (§10.3c).
-        if (self.input_mode == .normal and key.matches('h', .{})) {
+        // h / l pane switching (Browse only) (§10.3c). Left/right arrows mirror
+        // h/l for parity with the j/k ↔ up/down list-nav block (ROD-156 #1).
+        if (self.input_mode == .normal and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) {
             if (self.active_view == .browse and self.active_pane == .detail) {
                 self.active_pane = .list;
             } else if (self.active_view == .detail) {
@@ -1460,7 +1461,7 @@ pub const App = struct {
         }
         // Enter is only handled here in normal mode. In search mode it must fall
         // through to the search mode check below so onSearchKey can lock the results.
-        if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.enter, .{}))) {
+        if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}))) {
             switch (self.active_view) {
                 .browse => {
                     if (self.active_pane == .list and self.results.items.len > 0) {
