@@ -19,6 +19,18 @@ const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){
 // cover url, ROD-181) we look the media up directly — no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
 
+// Both queries are interpolated raw into a JSON body with `{s}`, so they must
+// contain nothing that needs JSON-string escaping. Enforce at comptime rather
+// than reaching for std.json.stringify on a constant — if someone adds a quote
+// or control char to the selection set, this fails the build, not a 400 at runtime.
+comptime {
+    for (GQL_SEARCH ++ GQL_BY_ID) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) {
+            @compileError("GraphQL query contains a character that needs JSON escaping; build the request body with std.json instead of {s} interpolation");
+        }
+    }
+}
+
 pub const Metadata = struct {
     anilist_id: ?u64 = null,
     mal_id: ?u64 = null,
