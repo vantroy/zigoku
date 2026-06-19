@@ -252,14 +252,62 @@ fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
 
     var buf_a: [256]u8 = undefined;
     var buf_b: [256]u8 = undefined;
-    const na = normalizeTitle(&buf_a, a);
-    const nb = normalizeTitle(&buf_b, b);
+    var sbuf_a: [256]u8 = undefined;
+    var sbuf_b: [256]u8 = undefined;
+    const na = canonSeason(&sbuf_a, normalizeTitle(&buf_a, a));
+    const nb = canonSeason(&sbuf_b, normalizeTitle(&buf_b, b));
     if (na.len == 0 or nb.len == 0) return -5000;
 
     if (std.mem.eql(u8, na, nb)) return 1600;
     if (std.mem.startsWith(u8, nb, na) or std.mem.startsWith(u8, na, nb)) return 1250;
     if (std.mem.indexOf(u8, nb, na) != null or std.mem.indexOf(u8, na, nb) != null) return 900;
     return -5000;
+}
+
+/// Canonicalize an explicit "Season N" / "Nth Season" marker in an
+/// already-normalized title to a single `s<N>` token, so AllAnime's `…season2`
+/// reconciles with AniList's `…2ndseason` form (ROD-181, the fuzzy fallback for
+/// the ~13% of shows with no mineable AniList id). Only the explicit `season`
+/// keyword is coerced — a bare trailing number ("title 2") is left alone, as it
+/// is too ambiguous to fold safely (cf. "86", "Ranma 1/2"). Returns `s` verbatim
+/// when there is no season marker or on any buffer overflow.
+fn canonSeason(out: []u8, s: []const u8) []const u8 {
+    const kw = "season";
+    const idx = std.mem.indexOf(u8, s, kw) orelse return s;
+    const before = s[0..idx];
+    const after = s[idx + kw.len ..];
+
+    // Form A: digits directly after the keyword ("season2").
+    var dlen: usize = 0;
+    while (dlen < after.len and std.ascii.isDigit(after[dlen])) dlen += 1;
+    var num: []const u8 = after[0..dlen];
+    var base_pre: []const u8 = before;
+    var tail: []const u8 = after[dlen..];
+
+    if (dlen == 0) {
+        // Form B: digits (+ ordinal) directly before the keyword ("2ndseason").
+        var b = before;
+        inline for (.{ "st", "nd", "rd", "th" }) |ord| {
+            if (std.mem.endsWith(u8, b, ord)) {
+                b = b[0 .. b.len - ord.len];
+                break;
+            }
+        }
+        var dstart = b.len;
+        while (dstart > 0 and std.ascii.isDigit(b[dstart - 1])) dstart -= 1;
+        if (dstart == b.len) return s; // "season" with no adjacent number — leave it
+        num = b[dstart..];
+        base_pre = b[0..dstart];
+        tail = after;
+    }
+
+    var n: usize = 0;
+    inline for (.{ base_pre, "s", num, tail }) |part| {
+        if (n + part.len > out.len) return s; // overflow → bail to original
+        @memcpy(out[n .. n + part.len], part);
+        n += part.len;
+    }
+    return out[0..n];
 }
 
 fn normalizeTitle(buf: []u8, s: []const u8) []const u8 {
@@ -372,6 +420,28 @@ test "normalizeTitle folds ASCII punctuation and whitespace" {
 test "titleScore prefers exact over prefix over substring" {
     try std.testing.expect(titleScore("Frieren", "Frieren") > titleScore("Frieren", "Frieren Season 2"));
     try std.testing.expect(titleScore("Frieren", "Frieren Season 2") > titleScore("Frieren", "The World of Frieren"));
+}
+
+test "canonSeason: reconciles Season N and Nth Season, leaves the rest (ROD-181)" {
+    var buf: [256]u8 = undefined;
+    // Form A ("season<n>") and Form B ("<n>ordinal season") collapse identically.
+    try std.testing.expectEqualStrings("frierens2", canonSeason(&buf, "frierenseason2"));
+    try std.testing.expectEqualStrings("frierens2", canonSeason(&buf, "frieren2ndseason"));
+    try std.testing.expectEqualStrings("ks3", canonSeason(&buf, "k3rdseason"));
+    // Form B without an ordinal: a bare digit directly before the keyword.
+    try std.testing.expectEqualStrings("titles2", canonSeason(&buf, "title2season"));
+    // No keyword → verbatim. Bare trailing number → intentionally NOT coerced.
+    try std.testing.expectEqualStrings("frieren", canonSeason(&buf, "frieren"));
+    try std.testing.expectEqualStrings("loghorizon2", canonSeason(&buf, "loghorizon2"));
+    // "season" with no adjacent number is left alone (e.g. a literal word).
+    try std.testing.expectEqualStrings("seasonsoflife", canonSeason(&buf, "seasonsoflife"));
+}
+
+test "titleScore reconciles 'Season N' vs 'Nth Season' (ROD-181)" {
+    // The exact failing pair: AllAnime '… Season 2' vs AniList '… 2nd Season'.
+    try std.testing.expectEqual(@as(i32, 1600), titleScore("Sousou no Frieren Season 2", "Sousou no Frieren 2nd Season"));
+    // A base title must still not score as an exact match for its sequel.
+    try std.testing.expect(titleScore("Frieren Season 2", "Frieren") < 1600);
 }
 
 test "bestMatch rejects ambiguous close titles" {
