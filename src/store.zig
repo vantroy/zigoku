@@ -232,6 +232,14 @@ pub const Store = struct {
         return open(":memory:");
     }
 
+    /// Abort any statement currently running on this connection. Safe to call
+    /// from another thread (SQLite is built serialized here — open() sets no
+    /// NOMUTEX flag). Used on quit to abandon an in-flight loadHistory so
+    /// teardown doesn't block on the query (ROD-179).
+    pub fn interrupt(self: *Store) void {
+        _ = c.sqlite3_interrupt(self.db);
+    }
+
     pub fn close(self: *Store) void {
         _ = c.sqlite3_close(self.db);
         self.db = null;
