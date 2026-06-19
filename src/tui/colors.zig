@@ -21,7 +21,7 @@ pub const Palette = struct {
     bg_surface: Color,
     bg_elevated: Color,
     chrome: Color, // border.hair
-    // Semantic aliases — canonical mapping lives in DESIGN.md §3 (color.* table).
+    // Semantic aliases — canonical mapping lives in DESIGN.md §1.2 (color.* table).
     // Keep code that references these annotated with the token (the established
     // convention, e.g. chrome.zig `fg2 // text.muted`) so the alias and the
     // spec never drift apart.
