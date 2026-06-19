@@ -216,6 +216,10 @@ pub const AllAnime = struct {
             if (!sourceAllowed(s.sourceName)) continue;
             const url = s.sourceUrl orelse continue;
             if (std.mem.indexOf(u8, url, "tools.fast4speed.rsvp") != null) {
+                // The direct path is single-variant 1080p; the quality preference
+                // has nothing to pick from here. Log it so a `--debug` session
+                // explains why `worst`/`480` look inert on a popular show.
+                log.debug("allanime resolve: fast4speed direct 1080p, quality={s} not applicable", .{@tagName(quality)});
                 return .{ .url = url, .resolution = 1080, .referer = STREAM_REFERER };
             }
         }
@@ -235,7 +239,12 @@ pub const AllAnime = struct {
                 log.debug("allanime provider {s}: {s}", .{ url, @errorName(e) });
             };
         }
-        return selectVariant(variants.items, quality) orelse error.NoDirectStream;
+        const pick = selectVariant(variants.items, quality) orelse return error.NoDirectStream;
+        // Make the selector observable: how many rungs we had, and which one the
+        // preference landed on. This is the receipt that the cap policy actually
+        // fired (and the difference between best/worst is real on this source).
+        log.debug("allanime resolve: quality={s} picked {?d}p from {d} variant(s)", .{ @tagName(quality), pick.resolution, variants.items.len });
+        return pick;
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
