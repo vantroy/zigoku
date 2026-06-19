@@ -17,7 +17,10 @@ pub const Event = union(enum) {
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
-    /// History finished loading (owned, gpa-allocated — App takes ownership).
+    /// History finished loading. The slice is arena-backed (run() owns the
+    /// history arena and frees it at teardown); App only *borrows* it via
+    /// setHistory — never free this with the gpa. On a quit-time interrupt the
+    /// worker may post a partial slice that the exiting loop never drains.
     history_loaded: []AnimeRecord,
     /// A background task failed; payload is a human-readable reason.
     task_error: []const u8,
