@@ -151,6 +151,12 @@ pub fn run(
     // sqlite3_step bail, the join returns at once, and the discarded result is
     // never read. The remaining cancellation gap — the scroll-fired episode
     // prefetch joins synchronously on the main loop — is tracked in ROD-179.
+    //
+    // Declared before the search/enrich/episode-thread joins below, so by LIFO
+    // it runs *after* them: every other worker is already joined when interrupt
+    // fires, so the interrupt can only hit loadHistory's statement — never a
+    // statement another worker started (interrupt also affects statements that
+    // begin before it returns).
     defer if (hist_thread) |t| {
         if (store) |st| st.interrupt();
         t.join();
