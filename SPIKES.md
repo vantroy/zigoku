@@ -216,6 +216,22 @@ channel.
   use-after-free once that worker's arena deinits. (Do this in a scratch copy;
   it's instructive precisely because it's wrong.)
 
+**Addendum (ROD-153) — the *other* half of 0.16 concurrency:** the worker model
+above is raw `std.Thread` + channel because it's *fire-and-forget* — spawn, post
+a result back through the event loop, exit; nothing is awaited in-scope. The
+`std.Io` concurrency API (the "futures that can be aborted" the lock notes above
+hint at) shines for the opposite shape: a short-lived, **structured, awaited-
+right-here** race. See `withDeadline` in `src/providers/allanime.zig` — it bounds
+a long-tail GET in wall-clock time by spawning the fetch with `io.concurrent`,
+racing it against a timer task through an `Io.Select`, and `cancel`-ing the
+loser. The payoff is real: on the Threaded backend a `cancel` interrupts the
+fetch's blocked `recv` with `SIG.IO`, so a stalled CDN genuinely unwinds instead
+of hanging. std's stream reader has *no* per-read deadline, so this race is the
+only way to put a clock on it. Two concurrency models now coexist on purpose —
+threads+channel for background jobs, Io-concurrency for in-scope races — and the
+rule of thumb is exactly that: **do you await it here, or does it report back
+later?**
+
 ---
 
 ## 4. `allanime_stream.zig` — protocol + crypto, the reverse-engineering one
