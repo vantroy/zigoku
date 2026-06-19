@@ -20,13 +20,17 @@ pub const Palette = struct {
     bg_base: Color,
     bg_surface: Color,
     bg_elevated: Color,
-    chrome: Color,
-    fg: Color,
-    fg2: Color,
-    fg3: Color,
-    focus: Color,
-    hot: Color,
-    warn: Color,
+    chrome: Color, // border.hair
+    // Semantic aliases — canonical mapping lives in DESIGN.md §3 (color.* table).
+    // Keep code that references these annotated with the token (the established
+    // convention, e.g. chrome.zig `fg2 // text.muted`) so the alias and the
+    // spec never drift apart.
+    fg: Color, //   text.primary
+    fg2: Color, //  text.muted
+    fg3: Color, //  text.dim
+    focus: Color, // state.focus
+    hot: Color, //  state.now
+    warn: Color, // state.warn
 };
 
 /// Current default: Terminal Ghost (unchanged hex values).
