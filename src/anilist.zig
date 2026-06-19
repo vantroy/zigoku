@@ -12,7 +12,24 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const ENDPOINT = "https://graphql.anilist.co";
-const GQL = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){id idMal title{romaji english native} episodes averageScore status seasonYear description(asHtml:false) coverImage{large}}}}";
+// Shared selection set so the search and by-id queries can never drift apart.
+const GQL_FIELDS = "id idMal title{romaji english native} episodes averageScore status seasonYear description(asHtml:false) coverImage{large}";
+const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
+// Deterministic join: when AllAnime handed us an AniList id (mined from the
+// cover url, ROD-181) we look the media up directly — no title matching.
+const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
+
+// Both queries are interpolated raw into a JSON body with `{s}`, so they must
+// contain nothing that needs JSON-string escaping. Enforce at comptime rather
+// than reaching for std.json.stringify on a constant — if someone adds a quote
+// or control char to the selection set, this fails the build, not a 400 at runtime.
+comptime {
+    for (GQL_SEARCH ++ GQL_BY_ID) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) {
+            @compileError("GraphQL query contains a character that needs JSON escaping; build the request body with std.json instead of {s} interpolation");
+        }
+    }
+}
 
 pub const Metadata = struct {
     anilist_id: ?u64 = null,
@@ -60,6 +77,15 @@ const Resp = struct {
     data: ?Data = null,
 };
 
+// by-id response shape: a single `Media` rather than a `Page` of them.
+const MediaData = struct {
+    Media: ?Media = null,
+};
+
+const MediaResp = struct {
+    data: ?MediaData = null,
+};
+
 pub fn apply(show: domain.Anime, meta: Metadata) domain.Anime {
     var out = show;
     if (out.english_name == null) out.english_name = meta.title_english;
@@ -75,15 +101,49 @@ pub fn apply(show: domain.Anime, meta: Metadata) domain.Anime {
 }
 
 pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
+    // Deterministic path: AllAnime gave us the AniList id (mined from the cover
+    // url, ROD-181). Look the media up by id — exact, no title matching, so the
+    // "Nth Season" mismatch and sequel-ambiguity failures simply don't apply.
+    if (show.anilist_id) |id| return enrichById(arena, io, id);
+    return enrichBySearch(arena, io, show);
+}
+
+fn enrichById(arena: Allocator, io: Io, id: u64) !?Metadata {
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"query\":\"{s}\",\"variables\":{{\"id\":{d}}}}}",
+        .{ GQL_BY_ID, id },
+    );
+    const raw = postGql(arena, io, body) orelse return null;
+    const parsed = std.json.parseFromSlice(MediaResp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    const data = parsed.value.data orelse return null;
+    const media = data.Media orelse return null;
+    return try mediaToMeta(arena, media);
+}
+
+fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
     const search = show.english_name orelse show.name;
     if (search.len == 0) return null;
 
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":8}}}}",
-        .{ GQL, try jsonEscape(arena, search) },
+        .{ GQL_SEARCH, try jsonEscape(arena, search) },
     );
+    const raw = postGql(arena, io, body) orelse return null;
+    const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    const data = parsed.value.data orelse return null;
+    const best = bestMatch(show, data.Page.media) orelse return null;
+    return try mediaToMeta(arena, best);
+}
 
+/// POST a GraphQL body to AniList; returns the response bytes (arena-owned) or
+/// null on transport/HTTP failure. Caller parses the shape it expects.
+fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
@@ -99,23 +159,20 @@ pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
         },
     }) catch return null;
     if (res.status != .ok) return null;
+    return resp_aw.writer.buffered();
+}
 
-    const parsed = std.json.parseFromSlice(Resp, arena, resp_aw.writer.buffered(), .{
-        .ignore_unknown_fields = true,
-    }) catch return null;
-    const data = parsed.value.data orelse return null;
-    const best = bestMatch(show, data.Page.media) orelse return null;
-
+fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
     return .{
-        .anilist_id = best.id,
-        .mal_id = best.idMal,
-        .title_english = best.title.english,
-        .thumb = best.coverImage.large,
-        .total_episodes = best.episodes,
-        .year = best.seasonYear,
-        .status = best.status,
-        .description = if (best.description) |d| try sanitizeDescription(arena, d) else null,
-        .score = best.averageScore,
+        .anilist_id = m.id,
+        .mal_id = m.idMal,
+        .title_english = m.title.english,
+        .thumb = m.coverImage.large,
+        .total_episodes = m.episodes,
+        .year = m.seasonYear,
+        .status = m.status,
+        .description = if (m.description) |d| try sanitizeDescription(arena, d) else null,
+        .score = m.averageScore,
     };
 }
 
@@ -195,14 +252,62 @@ fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
 
     var buf_a: [256]u8 = undefined;
     var buf_b: [256]u8 = undefined;
-    const na = normalizeTitle(&buf_a, a);
-    const nb = normalizeTitle(&buf_b, b);
+    var sbuf_a: [256]u8 = undefined;
+    var sbuf_b: [256]u8 = undefined;
+    const na = canonSeason(&sbuf_a, normalizeTitle(&buf_a, a));
+    const nb = canonSeason(&sbuf_b, normalizeTitle(&buf_b, b));
     if (na.len == 0 or nb.len == 0) return -5000;
 
     if (std.mem.eql(u8, na, nb)) return 1600;
     if (std.mem.startsWith(u8, nb, na) or std.mem.startsWith(u8, na, nb)) return 1250;
     if (std.mem.indexOf(u8, nb, na) != null or std.mem.indexOf(u8, na, nb) != null) return 900;
     return -5000;
+}
+
+/// Canonicalize an explicit "Season N" / "Nth Season" marker in an
+/// already-normalized title to a single `s<N>` token, so AllAnime's `…season2`
+/// reconciles with AniList's `…2ndseason` form (ROD-181, the fuzzy fallback for
+/// the ~13% of shows with no mineable AniList id). Only the explicit `season`
+/// keyword is coerced — a bare trailing number ("title 2") is left alone, as it
+/// is too ambiguous to fold safely (cf. "86", "Ranma 1/2"). Returns `s` verbatim
+/// when there is no season marker or on any buffer overflow.
+fn canonSeason(out: []u8, s: []const u8) []const u8 {
+    const kw = "season";
+    const idx = std.mem.indexOf(u8, s, kw) orelse return s;
+    const before = s[0..idx];
+    const after = s[idx + kw.len ..];
+
+    // Form A: digits directly after the keyword ("season2").
+    var dlen: usize = 0;
+    while (dlen < after.len and std.ascii.isDigit(after[dlen])) dlen += 1;
+    var num: []const u8 = after[0..dlen];
+    var base_pre: []const u8 = before;
+    var tail: []const u8 = after[dlen..];
+
+    if (dlen == 0) {
+        // Form B: digits (+ ordinal) directly before the keyword ("2ndseason").
+        var b = before;
+        inline for (.{ "st", "nd", "rd", "th" }) |ord| {
+            if (std.mem.endsWith(u8, b, ord)) {
+                b = b[0 .. b.len - ord.len];
+                break;
+            }
+        }
+        var dstart = b.len;
+        while (dstart > 0 and std.ascii.isDigit(b[dstart - 1])) dstart -= 1;
+        if (dstart == b.len) return s; // "season" with no adjacent number — leave it
+        num = b[dstart..];
+        base_pre = b[0..dstart];
+        tail = after;
+    }
+
+    var n: usize = 0;
+    inline for (.{ base_pre, "s", num, tail }) |part| {
+        if (n + part.len > out.len) return s; // overflow → bail to original
+        @memcpy(out[n .. n + part.len], part);
+        n += part.len;
+    }
+    return out[0..n];
 }
 
 fn normalizeTitle(buf: []u8, s: []const u8) []const u8 {
@@ -315,6 +420,28 @@ test "normalizeTitle folds ASCII punctuation and whitespace" {
 test "titleScore prefers exact over prefix over substring" {
     try std.testing.expect(titleScore("Frieren", "Frieren") > titleScore("Frieren", "Frieren Season 2"));
     try std.testing.expect(titleScore("Frieren", "Frieren Season 2") > titleScore("Frieren", "The World of Frieren"));
+}
+
+test "canonSeason: reconciles Season N and Nth Season, leaves the rest (ROD-181)" {
+    var buf: [256]u8 = undefined;
+    // Form A ("season<n>") and Form B ("<n>ordinal season") collapse identically.
+    try std.testing.expectEqualStrings("frierens2", canonSeason(&buf, "frierenseason2"));
+    try std.testing.expectEqualStrings("frierens2", canonSeason(&buf, "frieren2ndseason"));
+    try std.testing.expectEqualStrings("ks3", canonSeason(&buf, "k3rdseason"));
+    // Form B without an ordinal: a bare digit directly before the keyword.
+    try std.testing.expectEqualStrings("titles2", canonSeason(&buf, "title2season"));
+    // No keyword → verbatim. Bare trailing number → intentionally NOT coerced.
+    try std.testing.expectEqualStrings("frieren", canonSeason(&buf, "frieren"));
+    try std.testing.expectEqualStrings("loghorizon2", canonSeason(&buf, "loghorizon2"));
+    // "season" with no adjacent number is left alone (e.g. a literal word).
+    try std.testing.expectEqualStrings("seasonsoflife", canonSeason(&buf, "seasonsoflife"));
+}
+
+test "titleScore reconciles 'Season N' vs 'Nth Season' (ROD-181)" {
+    // The exact failing pair: AllAnime '… Season 2' vs AniList '… 2nd Season'.
+    try std.testing.expectEqual(@as(i32, 1600), titleScore("Sousou no Frieren Season 2", "Sousou no Frieren 2nd Season"));
+    // A base title must still not score as an exact match for its sequel.
+    try std.testing.expect(titleScore("Frieren Season 2", "Frieren") < 1600);
 }
 
 test "bestMatch rejects ambiguous close titles" {
