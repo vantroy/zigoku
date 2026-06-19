@@ -92,8 +92,13 @@ pub const fg2 = Color{ .rgb = .{ 0x2a, 0x60, 0x40 } };
 pub const fg3 = Color{ .rgb = .{ 0x16, 0x35, 0x25 } };
 
 // ── Accents ─────────────────────────────────────────────────────────────────
-/// Cyan. Focus — the pane/element the keyboard is driving.
-pub const focus = Color{ .rgb = .{ 0x00, 0xe5, 0xcc } };
+/// Cyan. Focus — the pane/element the keyboard is driving. Overdriven (was
+/// 0x00,0xe5,0xcc) so the focused row clears fg-green's luminance instead of
+/// reading dimmer than its neighbours — the same fix phosphor's focus already
+/// has. 0x00ffee read too hot on a real terminal; this warmer teal (luminance
+/// 0.770) still beats fg-green (0.734). Stays cyan-hued to keep the "cyan ghost"
+/// identity (§1.1) (ROD-156 #4).
+pub const focus = Color{ .rgb = .{ 0x20, 0xff, 0xdd } };
 /// Spectral Magenta. The signature. The one thing happening now (cursor, the
 /// live action). Used sparingly — two magentas dilute the pointer semantic.
 pub const hot = Color{ .rgb = .{ 0xff, 0x2d, 0x78 } };
