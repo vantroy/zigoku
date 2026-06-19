@@ -342,7 +342,14 @@ pub const AllAnime = struct {
         var buf: [2]Outcome = undefined;
         var sel: Io.Select(Outcome) = .init(io, &buf);
         sel.concurrent(.done, func, args) catch return @call(.auto, func, args);
-        sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {};
+        sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
+            // Timer didn't arm (OOM — the fetch arm already proved concurrency is
+            // available). Awaiting the lone fetch here would reintroduce the very
+            // unbounded hang this race exists to kill, so cancel it and fall back
+            // to the inline, unbounded run instead — same contract as the .done arm.
+            while (sel.cancel()) |_| {}
+            return @call(.auto, func, args);
+        };
         const first = sel.await() catch {
             while (sel.cancel()) |_| {}
             return error.Timeout;
@@ -1053,6 +1060,24 @@ test "withDeadline: returns a fast operation's result untouched (ROD-153)" {
     }.run;
     const out = try AllAnime.withDeadline(io, Io.Duration.fromSeconds(30), quick, .{});
     try std.testing.expectEqualStrings("ok", out);
+}
+
+test "withDeadline: propagates a winning operation's error untouched (ROD-153)" {
+    // The op losing-or-winning the race must pass its own error through, not have
+    // it masked by the deadline machinery — `fetchBody` leans on this to surface
+    // HttpNotOk. Here the op finishes (with an error) well inside the deadline.
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const failing = struct {
+        fn run() ![]const u8 {
+            return error.Boom;
+        }
+    }.run;
+    try std.testing.expectError(
+        error.Boom,
+        AllAnime.withDeadline(io, Io.Duration.fromSeconds(30), failing, .{}),
+    );
 }
 
 test "isPrivateV4: multicast and broadcast blocked (Elara M1)" {
