@@ -399,6 +399,15 @@ pub const App = struct {
     async_start_ms: i64 = 0,
     /// Deadline for search debounce (ms). 0 = no pending debounce.
     debounce_deadline_ms: i64 = 0,
+    /// Deadline for the split-browse detail prefetch debounce (ms). Armed when
+    /// the list cursor moves while the detail pane is on-screen; fired in .tick
+    /// to prefetch the hovered show's episodes. Separate from the search debounce
+    /// so the two never stomp each other (ROD-156 #2,#3).
+    detail_sync_deadline_ms: i64 = 0,
+    /// Last-seen terminal width (columns). Seeded in layout() every frame from
+    /// real geometry so onKey/tick can gate split-browse and wide-history
+    /// behaviour without being passed the winsize event.
+    term_cols: u16 = 0,
     /// Last tick timestamp (ms). Updated on every .tick event; used by draw functions.
     now_ms: i64 = 0,
     /// Toast queue (oldest first). null = empty slot.
@@ -543,6 +552,37 @@ pub const App = struct {
             },
             .history, .settings => null,
         };
+    }
+
+    /// The show whose cover should be synced from the current navigation state.
+    /// When a preview/detail pane is on-screen alongside the list, this is the
+    /// list cursor, so the cover tracks the cursor like the cheap synchronous
+    /// fields already do via renderedDetailAnime:
+    ///   - split browse (cols >= 60, list pane focused): the results cursor;
+    ///   - wide history (cols >= 100, ROD-113 preview engaged): the focused record.
+    /// Everywhere else it defers to currentDetailAnime's "actively-focused show"
+    /// contract, which is load-bearing for play/cache/stale-check paths and must
+    /// not shift (ROD-156).
+    pub fn detailSyncTarget(self: *const App) ?Anime {
+        if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
+            return self.selectedAnime();
+        }
+        if (self.active_view == .history and self.term_cols >= history_split_min) {
+            return if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null;
+        }
+        return self.currentDetailAnime();
+    }
+
+    /// Whether split browse is on-screen with the list pane focused — the
+    /// condition under which the *episode* prefetch debounce should arm/fire.
+    /// Browse-only: the wide-history preview (ROD-113) shows a cover but no
+    /// episode grid, so history needs cover sync (via detailSyncTarget) but no
+    /// episode prefetch (ROD-156).
+    pub fn detailSyncActive(self: *const App) bool {
+        return self.active_view == .browse and
+            self.active_pane == .list and
+            self.term_cols >= 60 and
+            self.results.items.len > 0;
     }
 
     pub const DetailRenderInfo = struct {
@@ -769,6 +809,8 @@ pub const App = struct {
             .winsize => |ws| {
                 // Screen resize is handled in run()'s loop (it owns vx), but the
                 // app still normalizes browse layout state here so draw remains pure.
+                // term_cols is seeded in layout(), which run() calls right after
+                // this every frame, so it stays correct without a write here.
                 if (ws.cols < 60 and self.active_view == .browse) self.active_pane = .list;
             },
             .focus_in, .focus_out => {},
@@ -778,6 +820,7 @@ pub const App = struct {
                 self.history_loading = false;
                 self.search_loading = false;
                 self.debounce_deadline_ms = 0;
+                self.detail_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
             },
@@ -910,7 +953,10 @@ pub const App = struct {
 
                 // The result is stale if the selection moved off this id while
                 // the fetch was in flight; the controller owns that nav check.
-                const target_id = if (self.currentDetailAnime()) |a| a.id else null;
+                // Must use the same resolver cover.sync started from — in split
+                // browse that's the list cursor, else the keep-check would reject
+                // every cover the list-pane prefetch just fetched (ROD-156 #2).
+                const target_id = if (self.detailSyncTarget()) |a| a.id else null;
                 const keep = target_id != null and std.mem.eql(u8, target_id.?, ev.for_id);
                 if (!keep) {
                     self.cover.clear(self.gpa);
@@ -960,6 +1006,20 @@ pub const App = struct {
                     self.clearResults();
                     self.fireSearch(loop, io, provider, 1);
                 }
+                // Split-browse detail prefetch: the cursor settled, so fetch the
+                // hovered show's episodes. Fired after search so a same-tick search
+                // that cleared results suppresses this via detailSyncActive (ROD-156
+                // #3). The detail_for_id guard skips a show already loaded/in-flight.
+                if (self.detail_sync_deadline_ms > 0 and now >= self.detail_sync_deadline_ms) {
+                    self.detail_sync_deadline_ms = 0;
+                    if (self.detailSyncActive()) {
+                        if (self.selectedAnime()) |target| {
+                            const already = self.detail_for_id != null and
+                                std.mem.eql(u8, self.detail_for_id.?, target.id);
+                            if (!already) self.fireEpisodesForId(loop, io, provider, target.id);
+                        }
+                    }
+                }
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |*t| {
                         if (!t.persistent) {
@@ -974,8 +1034,11 @@ pub const App = struct {
         if (event != .tick) {
             // Resolve the cover target from navigation state here (the controller's
             // job) and hand the primitives to the subsystem — CoverState never
-            // reaches into selection state itself (ROD-160).
-            const anime = self.currentDetailAnime();
+            // reaches into selection state itself (ROD-160). detailSyncTarget lets
+            // the cover track the list cursor in split browse; CoverState's own
+            // up_to_date short-circuit is the debounce, so no deadline needed here
+            // (ROD-156 #2).
+            const anime = self.detailSyncTarget();
             const started = self.cover.sync(
                 self.gpa,
                 loop,
@@ -1465,8 +1528,16 @@ pub const App = struct {
             switch (self.active_view) {
                 .browse => {
                     if (self.active_pane == .list and self.results.items.len > 0) {
+                        // If the split-browse prefetch is already in flight for the
+                        // hovered show, don't fireEpisodes again — that would join
+                        // and respawn the same fetch. Just reveal the pane; the
+                        // in-flight result lands through its own event (ROD-156 #3).
+                        const sel = self.selectedAnime();
+                        const prefetching = self.episode_loading and sel != null and
+                            self.detail_for_id != null and
+                            std.mem.eql(u8, self.detail_for_id.?, sel.?.id);
                         self.active_pane = .detail;
-                        self.fireEpisodes(loop, io, provider);
+                        if (!prefetching) self.fireEpisodes(loop, io, provider);
                     } else if (self.active_pane == .detail) {
                         // Enter on episode in detail pane: play
                         if (key.matches(vaxis.Key.enter, .{})) {
@@ -1544,6 +1615,7 @@ pub const App = struct {
         };
         if (nav_len == 0) return;
 
+        const prev_cursor = self.list_cursor;
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
             if (self.list_cursor + 1 < nav_len) self.list_cursor += 1;
         } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
@@ -1552,6 +1624,12 @@ pub const App = struct {
             self.list_cursor = 0;
         } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
             self.list_cursor = nav_len - 1;
+        }
+        // The cursor moved in split browse: (re)arm the detail prefetch debounce.
+        // Re-arming on each move means only the settled show fetches after a fast
+        // j/k scroll; a no-op move (j at the bottom) doesn't re-arm (ROD-156 #2,#3).
+        if (self.list_cursor != prev_cursor and self.detailSyncActive()) {
+            self.detail_sync_deadline_ms = nowMs(io) + 300;
         }
         // Load-more: at last result + j, trigger page+1 if possible.
         if (key.matches('j', .{}) and
@@ -1673,6 +1751,11 @@ pub const App = struct {
     /// `list_top`. `h`/`w` are the full terminal size; the per-view budget math
     /// mirrors drawContent's (content rows = h-3; History packs 2 rows/entry).
     pub fn layout(self: *App, h: u16, w: u16) void {
+        // Seed the split-browse/-history width gate from real geometry every
+        // frame. run() drains the initial .winsize before tick() sees it, so the
+        // .winsize handler alone would leave term_cols at 0 until the first manual
+        // resize — and the prefetch would stay inert until then (ROD-156).
+        self.term_cols = w;
         // Match draw()'s too-small guard: below this there's no viewport to settle.
         if (h < 4 or w < 16) return;
         const visible: u16 = h - 3;
