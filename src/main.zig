@@ -224,7 +224,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     var start_seconds: u64 = 0;
     if (store) |st| {
         if (st.getResume(SOURCE, show.id, cli.translation, episode.raw) catch null) |r| {
-            start_seconds = r.startSeconds();
+            start_seconds = r.startSecondsRewound(cfg.resume_offset_sec);
             if (start_seconds > 0) try out.print("  ↺ resuming at {d}s\n", .{start_seconds});
         }
     }

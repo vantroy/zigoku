@@ -191,6 +191,17 @@ pub const Resume = struct {
         if (!std.math.isFinite(self.position_secs) or self.position_secs >= u64_max_f) return 0;
         return @intFromFloat(self.position_secs);
     }
+
+    /// `startSeconds`, rewound by `rewind_sec` so the viewer drops back into
+    /// context instead of mid-action (ROD-84, `Config.resume_offset_sec`). Only
+    /// the value handed to mpv's `--start` should use this; `startSeconds` stays
+    /// the raw "is there a resume point" truth for UI cursor seeding. A rewind
+    /// past the start just begins from the top (saturating).
+    pub fn startSecondsRewound(self: Resume, rewind_sec: u32) u64 {
+        const raw = self.startSeconds();
+        if (raw == 0) return 0; // top-of-episode / natural-end / watched — nothing to rewind
+        return raw -| rewind_sec;
+    }
 };
 
 // ── Store ───────────────────────────────────────────────────────────────────
@@ -837,6 +848,30 @@ test "Resume.startSeconds respects natural-end + watched" {
 
     const done: Resume = .{ .position_secs = 500, .duration_secs = 1400, .fully_watched = true };
     try testing.expectEqual(@as(u64, 0), done.startSeconds());
+}
+
+test "Resume.startSecondsRewound rewinds for context, saturating at the top (ROD-84)" {
+    const mid: Resume = .{ .position_secs = 300, .duration_secs = 1400, .fully_watched = false };
+    try testing.expectEqual(@as(u64, 295), mid.startSecondsRewound(5)); // 300 - 5
+    try testing.expectEqual(@as(u64, 270), mid.startSecondsRewound(30));
+    try testing.expectEqual(@as(u64, 300), mid.startSecondsRewound(0)); // offset off → raw
+
+    // Rewind past the start clamps to 0 (begin from the top), never underflows.
+    const early: Resume = .{ .position_secs = 3, .duration_secs = 1400, .fully_watched = false };
+    try testing.expectEqual(@as(u64, 0), early.startSecondsRewound(5));
+
+    // Rewind exactly equal to position — the boundary, begins from top not underflow.
+    const exact: Resume = .{ .position_secs = 5, .duration_secs = 1400, .fully_watched = false };
+    try testing.expectEqual(@as(u64, 0), exact.startSecondsRewound(5));
+
+    // Natural-end passthrough: startSeconds() suppresses to 0, so the rewind early-
+    // outs and never resurrects a start inside the window the guard skips.
+    const near_end: Resume = .{ .position_secs = 1200, .duration_secs = 1400, .fully_watched = false }; // ~86%
+    try testing.expectEqual(@as(u64, 0), near_end.startSecondsRewound(5));
+
+    // Fully-watched stays 0 — nothing to rewind into.
+    const done: Resume = .{ .position_secs = 500, .duration_secs = 1400, .fully_watched = true };
+    try testing.expectEqual(@as(u64, 0), done.startSecondsRewound(5));
 }
 
 test "recordPlay bumps count, progress, last_watched and reorders history" {
