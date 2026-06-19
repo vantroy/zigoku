@@ -94,10 +94,81 @@ pub const AllAnime = struct {
     // ── search ─────────────────────────────────────────────────────────────────
 
     const AvailEps = struct { sub: u32 = 0, dub: u32 = 0 };
-    const SEdge = struct { _id: []const u8, name: ?[]const u8 = null, availableEpisodes: AvailEps = .{} };
+    // The persisted search op returns far more than the id/name/episodes we
+    // historically parsed. We pull every field with a `domain.Anime` home in one
+    // pass (ROD-181) so the parser never has to grow again. Two of these directly
+    // fix AniList matching — `englishName` (matches AniList's `english` even when
+    // its `romaji` uses an unreconcilable "Nth Season" form) and the year (revives
+    // the year-weighted scoring branch + sequel tie-break) — and the rest seed the
+    // AllAnime-first metadata so the detail pane is populated even when enrichment
+    // never lands. `airedStart`/`season` are optional objects; `score` is a 0–10
+    // float we rescale to AniList's 0–100 in `edgeToAnime`.
+    const YearObj = struct { year: ?u32 = null };
+    const SEdge = struct {
+        _id: []const u8,
+        name: ?[]const u8 = null,
+        englishName: ?[]const u8 = null,
+        nativeName: ?[]const u8 = null,
+        thumbnail: ?[]const u8 = null,
+        type: ?[]const u8 = null,
+        score: ?f64 = null,
+        availableEpisodes: AvailEps = .{},
+        airedStart: ?YearObj = null,
+        season: ?YearObj = null,
+    };
     const SShows = struct { edges: []SEdge };
     const SData = struct { shows: SShows };
     const SResp = struct { data: ?SData = null };
+
+    /// AllAnime serves most covers straight from AniList's CDN, and the filename
+    /// embeds the AniList media id: `…/cover/large/bx182255-hash.jpg` → 182255.
+    /// That id is a *deterministic* enrichment join key — strictly better than
+    /// fuzzy title matching — so we mine it here (ROD-181). The leading letters
+    /// are a size/kind bucket (`b`, `bx`, `n`, `nx`…); the digits are the id.
+    /// Returns null for non-AniList thumbnails (~13% are MyAnimeList CDN urls,
+    /// whose path is an image id, not a usable anime id) and any unrecognised
+    /// shape — the caller then falls back to title matching.
+    fn anilistIdFromThumb(url_opt: ?[]const u8) ?u64 {
+        const url = url_opt orelse return null;
+        if (std.mem.indexOf(u8, url, "anilistcdn/media/anime/cover/") == null) return null;
+        const slash = std.mem.lastIndexOfScalar(u8, url, '/') orelse return null;
+        var i = slash + 1;
+        while (i < url.len and std.ascii.isAlphabetic(url[i])) i += 1; // size-bucket prefix
+        const start = i;
+        while (i < url.len and std.ascii.isDigit(url[i])) i += 1;
+        if (i == start) return null;
+        return std.fmt.parseInt(u64, url[start..i], 10) catch null;
+    }
+
+    /// Map one raw search edge to a `domain.Anime`. String fields borrow the
+    /// parsed-JSON slices (caller owns the lifetime); year prefers the actual
+    /// debut (`airedStart`) and falls back to the broadcast season's year —
+    /// either may be absent (ROD-181).
+    fn edgeToAnime(e: SEdge) domain.Anime {
+        const aired_year: ?u32 = if (e.airedStart) |a| a.year else null;
+        const season_year: ?u32 = if (e.season) |s| s.year else null;
+        // AllAnime scores 0–10 (one or two decimals); AniList — the canonical
+        // scale downstream (`averageScore`) — is 0–100. Rescale so a search-seeded
+        // score and an enrichment score read on the same axis. Clamp defensively.
+        const score: ?u32 = if (e.score) |s| blk: {
+            if (s <= 0) break :blk null;
+            const scaled = @round(s * 10.0);
+            break :blk @intFromFloat(@min(scaled, 100.0));
+        } else null;
+        return .{
+            .id = e._id,
+            .name = e.name orelse "(untitled)",
+            .english_name = e.englishName,
+            .native_name = e.nativeName,
+            .thumb = e.thumbnail,
+            .anilist_id = anilistIdFromThumb(e.thumbnail),
+            .kind = e.type,
+            .score = score,
+            .eps_sub = e.availableEpisodes.sub,
+            .eps_dub = e.availableEpisodes.dub,
+            .year = aired_year orelse season_year,
+        };
+    }
 
     pub fn search(self: *AllAnime, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) ![]domain.Anime {
         _ = self;
@@ -119,12 +190,7 @@ pub const AllAnime = struct {
 
         var list: std.ArrayList(domain.Anime) = .empty;
         for (data.shows.edges) |e| {
-            try list.append(arena, .{
-                .id = e._id,
-                .name = e.name orelse "(untitled)",
-                .eps_sub = e.availableEpisodes.sub,
-                .eps_dub = e.availableEpisodes.dub,
-            });
+            try list.append(arena, edgeToAnime(e));
         }
 
         // Rank best-match-first. AllAnime returns rough relevance order; we
@@ -888,6 +954,62 @@ test "rankGreater: orders anime by descending relevance" {
     // rankGreater returns true when a should sort before b.
     try std.testing.expect(AllAnime.rankGreater(ctx, exact, unrelated));
     try std.testing.expect(!AllAnime.rankGreater(ctx, unrelated, exact));
+}
+
+test "anilistIdFromThumb: mines the AniList media id from cover urls" {
+    const f = AllAnime.anilistIdFromThumb;
+    // The three live prefix shapes (size/kind buckets) all yield the digits.
+    try std.testing.expectEqual(@as(?u64, 182255), f("https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182255-butzrqd4I0aC.jpg"));
+    try std.testing.expectEqual(@as(?u64, 9203), f("https://s4.anilist.co/file/anilistcdn/media/anime/cover/medium/b9203-Dvr3qxjibGHK.png"));
+    try std.testing.expectEqual(@as(?u64, 437), f("https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/nx437-w44gw3LYmLba.jpg"));
+    // MyAnimeList CDN (~13% of edges): path is an image id, not a usable anime id.
+    try std.testing.expectEqual(@as(?u64, null), f("https://cdn.myanimelist.net/images/anime/10/11244.jpg"));
+    // Defensive: null url, and an anilist-shaped path with no digits.
+    try std.testing.expectEqual(@as(?u64, null), f(null));
+    try std.testing.expectEqual(@as(?u64, null), f("https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx-nope.jpg"));
+}
+
+test "edgeToAnime: maps the widened search edge (ROD-181)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Edge 0: full payload incl. anilist-CDN thumb + airedStart year + score.
+    // Edge 1: airedStart absent → season.year fallback; MAL thumb → no id.
+    // Edge 2: only the required _id (everything else defaulted/absent).
+    // Extra unknown fields (episodeDuration, characterCount) must be ignored.
+    const json =
+        \\{"data":{"shows":{"edges":[
+        \\{"_id":"A","name":"Sousou no Frieren Season 2","englishName":"Frieren: Beyond Journey's End Season 2","nativeName":"葬送のフリーレン 第2期","thumbnail":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182255-h.jpg","type":"TV","score":8.88,"availableEpisodes":{"sub":10,"dub":10,"raw":0},"airedStart":{"year":2026,"month":1},"season":{"quarter":"Winter","year":2026},"episodeDuration":"60000","characterCount":"9"},
+        \\{"_id":"B","name":"Old Show","thumbnail":"https://cdn.myanimelist.net/images/anime/10/11244.jpg","score":0,"availableEpisodes":{"sub":12,"dub":0},"season":{"quarter":"Fall","year":1998}},
+        \\{"_id":"C","availableEpisodes":{"sub":1,"dub":0}}
+        \\]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(AllAnime.SResp, a, json, .{ .ignore_unknown_fields = true });
+    const edges = parsed.value.data.?.shows.edges;
+    try std.testing.expectEqual(@as(usize, 3), edges.len);
+
+    const f0 = AllAnime.edgeToAnime(edges[0]);
+    try std.testing.expectEqualStrings("Sousou no Frieren Season 2", f0.name);
+    try std.testing.expectEqualStrings("Frieren: Beyond Journey's End Season 2", f0.english_name.?);
+    try std.testing.expectEqualStrings("葬送のフリーレン 第2期", f0.native_name.?);
+    try std.testing.expectEqual(@as(?u64, 182255), f0.anilist_id);
+    try std.testing.expectEqualStrings("TV", f0.kind.?);
+    try std.testing.expectEqual(@as(?u32, 89), f0.score); // 8.88 → round(88.8) → 89
+    try std.testing.expectEqual(@as(u32, 10), f0.eps_sub);
+    try std.testing.expectEqual(@as(?u32, 2026), f0.year); // airedStart wins
+
+    const f1 = AllAnime.edgeToAnime(edges[1]);
+    try std.testing.expectEqual(@as(?u64, null), f1.anilist_id); // MAL thumb
+    try std.testing.expectEqual(@as(?u32, 1998), f1.year); // season.year fallback
+    try std.testing.expectEqual(@as(?u32, null), f1.score); // score 0 → null
+    try std.testing.expectEqual(@as(?[]const u8, null), f1.english_name);
+
+    const f2 = AllAnime.edgeToAnime(edges[2]);
+    try std.testing.expectEqualStrings("C", f2.id);
+    try std.testing.expectEqualStrings("(untitled)", f2.name);
+    try std.testing.expectEqual(@as(?u32, null), f2.year);
+    try std.testing.expectEqual(@as(?u64, null), f2.anilist_id);
 }
 
 test "jsonEscape: control characters are \\u-escaped (RFC 8259)" {

@@ -97,6 +97,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
 
     out.name = try alloc.dupe(u8, a.name);
     out.english_name = try dupeOptText(alloc, a.english_name);
+    out.native_name = try dupeOptText(alloc, a.native_name);
     out.thumb = try dupeOptText(alloc, a.thumb);
     out.banner = try dupeOptText(alloc, a.banner);
     out.status = try dupeOptText(alloc, a.status);
@@ -109,6 +110,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     alloc.free(a.id);
     if (a.name.len > 0) alloc.free(a.name);
     if (a.english_name) |x| alloc.free(x);
+    if (a.native_name) |x| alloc.free(x);
     if (a.thumb) |x| alloc.free(x);
     if (a.banner) |x| alloc.free(x);
     if (a.status) |x| alloc.free(x);
