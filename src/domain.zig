@@ -72,6 +72,9 @@ pub const Anime = struct {
     id: []const u8,
     name: []const u8,
     english_name: ?[]const u8 = null,
+    /// Native (usually Japanese) title. Populated from the provider search where
+    /// available; render-side use lands with the kanji chips (ROD-141).
+    native_name: ?[]const u8 = null,
     /// MyAnimeList id — AniSkip needs it (M5). Filled by AniList enrichment.
     mal_id: ?u64 = null,
     /// AniList id — the future ID-join key into the metadata layer. Enrichment.
