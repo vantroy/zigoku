@@ -83,6 +83,12 @@ pub const settings_row_count = settings_state.settings_row_count;
 /// existing `app_mod.PlaybackSession` references keep resolving.
 pub const PlaybackSession = @import("playback_session.zig").PlaybackSession;
 
+/// Episode cache + detail-grid subsystem (ROD-180). Owns the detail pane's
+/// episode list/cursor/watched-mark + the two-tier episode cache in its own
+/// module; re-exported here so existing `app_mod.EpisodeState` references keep
+/// resolving.
+pub const EpisodeState = @import("episode_state.zig").EpisodeState;
+
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -328,28 +334,16 @@ pub const App = struct {
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
 
-    /// Handle for the most recent episode-fetch thread. Joined in fireEpisodes before a new spawn.
+    /// Handle for the most recent episode-fetch thread. Joined in fireEpisodes
+    /// before a new spawn. Transport stays on App (the shell joins it on
+    /// teardown); the episode record/cache lives in `episodes` (ROD-180).
     episode_thread: ?std.Thread = null,
-    /// Current episode list for the detail pane. GPA-owned (each .raw owned); null until fetched.
-    /// Use freeEpisodeResults() to release.
-    episode_results: ?[]domain.EpisodeNumber = null,
-    /// GPA-duped id of the show whose episodes are in episode_results (or in-flight).
-    /// null = nothing requested yet.
-    detail_for_id: ?[]const u8 = null,
-    /// Whether an episode fetch is in flight.
-    episode_loading: bool = false,
-    /// Cursor position within the episode grid (0-based index into episode_results).
-    episode_cursor: usize = 0,
-    /// Hot in-memory LRU mirror of the DB episode cache (ROD-130): a synchronous
-    /// hit here (or in the DB) opens the detail pane instantly on a repeat visit,
-    /// bypassing the async fetch. Owns canonical episode copies; the view dups on
-    /// hit, so eviction never touches displayed memory.
-    episode_lru: workers.EpisodeLruCache = .{},
-    /// Watched high-water mark (1-based) for the detail show: episodes with a
-    /// 0-based index < this render dimmed as "done" (ROD-131). Seeded from the
-    /// store's `progress` on a history-origin load and bumped by `finishPlayback`
-    /// after a counted watch. 0 = nothing watched / unknown.
-    detail_progress: u32 = 0,
+    /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
+    /// the show it belongs to, the grid cursor + watched high-water mark, and the
+    /// two-tier episode cache. Transport (episode_thread/async_start_ms) stays on
+    /// App; the subsystem owns only the record + cache. Embedded by value so
+    /// `App{}` stays trivially constructible. See `EpisodeState`.
+    episodes: EpisodeState = .{},
     /// Cover/image subsystem — fetch policy, decoded-pixel + Kitty-image state,
     /// and the cover worker-thread lifecycle. See `CoverState` (ROD-160).
     cover: CoverState = .{},
@@ -504,8 +498,8 @@ pub const App = struct {
         self.clearResults();
         self.results.deinit(self.gpa);
         self.results = .empty;
-        self.freeEpisodeResults();
-        self.episode_lru.deinit(self.gpa);
+        self.episodes.freeResults(self.gpa);
+        self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
         self.cover.deinitCaches(self.gpa);
@@ -626,29 +620,15 @@ pub const App = struct {
         return provider.name();
     }
 
-    fn seedHistoryEpisodeCursor(self: *App, rec: AnimeRecord, episodes: []domain.EpisodeNumber) void {
-        const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
-        // Dim already-watched cells on open, consistent with the post-playback
-        // treatment (ROD-131). Browse-origin detail does not seed progress today
-        // — same scope line as the resume-cursor seed below.
-        self.detail_progress = std.math.cast(u32, progress) orelse 0;
-        if (progress == 0) return;
-
-        const current_idx = progress - 1;
-        if (current_idx < episodes.len) {
-            if (self.store) |st| {
-                if (st.getResume(rec.source, rec.source_id, self.translation, episodes[current_idx].raw) catch null) |saved_resume| {
-                    if (saved_resume.startSeconds() > 0) {
-                        self.episode_cursor = current_idx;
-                        return;
-                    }
-                }
-            }
+    /// Resolve the history record whose cursor should seed the episode grid, or
+    /// null when the current nav state isn't history-origin detail. The episode
+    /// subsystem never reads nav state (ROD-180); the controller hands it the
+    /// record (or null) for both the cache-hit and fresh-fetch seed paths.
+    fn historyDetailRecord(self: *App) ?AnimeRecord {
+        if (self.active_view == .detail and self.detail_origin == .history) {
+            return self.selectedHistoryRecord();
         }
-
-        if (progress < episodes.len) {
-            self.episode_cursor = progress;
-        }
+        return null;
     }
 
     /// Controller glue for the playback-event handlers (ROD-162): hand the final
@@ -670,8 +650,8 @@ pub const App = struct {
         // the played episode (1-based) and whether the detail pane still shows
         // that show. `session.finish` calls `clear`, which zeroes both.
         const played_index = self.session.episode_index;
-        const same_show = self.detail_for_id != null and self.session.anime_id.len > 0 and
-            std.mem.eql(u8, self.session.anime_id, self.detail_for_id.?);
+        const same_show = self.episodes.for_id != null and self.session.anime_id.len > 0 and
+            std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?);
 
         self.session.finish(self.gpa, self.store, final_update, completed);
         self.playing = false;
@@ -693,14 +673,14 @@ pub const App = struct {
     fn advanceAfterWatch(self: *App, played_index: u32) void {
         // Bail before touching anything if the grid isn't loaded (a contrived
         // navigate-away-and-back-mid-play case): `episodes_done` re-seeds
-        // `detail_progress` from the store, so a bump here would be dropped.
-        const eps = self.episode_results orelse return;
-        self.detail_progress = @max(self.detail_progress, played_index);
+        // `episodes.progress` from the store, so a bump here would be dropped.
+        const eps = self.episodes.results orelse return;
+        self.episodes.progress = @max(self.episodes.progress, played_index);
         // played_index is 1-based, so the next episode is at 0-based index
         // played_index. When that is past the end, N was the finale.
         const next: usize = played_index;
         if (next < eps.len) {
-            self.episode_cursor = next;
+            self.episodes.cursor = next;
             var buf: [32]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "episode {d} done", .{played_index}) catch "episode done";
             self.pushToast(.success, msg, false);
@@ -753,18 +733,6 @@ pub const App = struct {
             self.gpa.free(q_copy);
             return;
         };
-    }
-
-    pub fn freeEpisodeResults(self: *App) void {
-        if (self.episode_results) |eps| {
-            for (eps) |ep| self.gpa.free(ep.raw);
-            self.gpa.free(eps);
-            self.episode_results = null;
-        }
-        if (self.detail_for_id) |id| {
-            self.gpa.free(id);
-            self.detail_for_id = null;
-        }
     }
 
     pub fn setHistory(self: *App, recs: []AnimeRecord) void {
@@ -920,37 +888,46 @@ pub const App = struct {
             .episodes_done => |ev| {
                 defer self.gpa.free(ev.for_id);
                 // Stale: discard if not for the current detail show.
-                if (self.detail_for_id == null or !std.mem.eql(u8, ev.for_id, self.detail_for_id.?)) {
+                if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) {
                     for (ev.episodes) |ep| self.gpa.free(ep.raw);
                     self.gpa.free(ev.episodes);
                     return;
                 }
-                self.episode_loading = false;
+                self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // Free any old results (fireEpisodes clears them, but be defensive).
-                if (self.episode_results) |old| {
+                if (self.episodes.results) |old| {
                     for (old) |ep| self.gpa.free(ep.raw);
                     self.gpa.free(old);
                 }
-                self.episode_results = ev.episodes;
-                self.episode_cursor = 0;
-                self.detail_progress = 0;
-                if (self.active_view == .detail and self.detail_origin == .history) {
-                    if (self.selectedHistoryRecord()) |rec| {
-                        self.seedHistoryEpisodeCursor(rec, ev.episodes);
-                    }
+                self.episodes.results = ev.episodes;
+                self.episodes.cursor = 0;
+                self.episodes.progress = 0;
+                if (self.historyDetailRecord()) |rec| {
+                    self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
                 }
                 // ROD-130: mirror the fresh fetch into the DB + hot LRU so the
-                // next visit to this show is a synchronous cache hit.
-                self.cacheEpisodes(provider, ev.for_id, ev.episodes);
+                // next visit to this show is a synchronous cache hit. Source/status
+                // are resolved from nav state here and handed to the subsystem
+                // (ROD-180).
+                //
+                // NOTE (Elara H2): currentDetailSourceName reads live UI state. If
+                // the user returned to the History list before this async result
+                // arrived, it falls back to provider.name(), which can mis-key a
+                // non-default-source history show. Harmless today (a mis-keyed entry
+                // is simply never served and ages out), to be fixed by ROD-170,
+                // which captures the fetch's source at fire time.
+                const source = self.currentDetailSourceName(provider);
+                const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
+                self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
             },
             .episodes_error => {
-                self.episode_loading = false;
+                self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // Uphold the "a task error clears pending deadlines" invariant that
                 // task_error holds for the search debounce. Harmless today (the
-                // detail_for_id guard already suppresses a re-fire), but leaving it
-                // armed is a trap for any future change to detail_for_id's lifecycle.
+                // episodes.for_id guard already suppresses a re-fire), but leaving
+                // it armed is a trap for any future change to for_id's lifecycle.
                 self.detail_sync_deadline_ms = 0;
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
@@ -965,7 +942,7 @@ pub const App = struct {
                 }
                 self.cover.loading = false;
                 self.cover.joinThread();
-                if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
+                if (!self.search_loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
 
                 // The result is stale if the selection moved off this id while
                 // the fetch was in flight; the controller owns that nav check.
@@ -987,7 +964,7 @@ pub const App = struct {
                 if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return;
                 self.cover.loading = false;
                 self.cover.joinThread();
-                if (!self.search_loading and !self.episode_loading and !self.playing) self.async_start_ms = 0;
+                if (!self.search_loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
                 // Record the failed url *before* clear() frees it.
                 self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
                 self.cover.clear(self.gpa);
@@ -1025,13 +1002,13 @@ pub const App = struct {
                 // Split-browse detail prefetch: the cursor settled, so fetch the
                 // hovered show's episodes. Fired after search so a same-tick search
                 // that cleared results suppresses this via detailSyncActive (ROD-156
-                // #3). The detail_for_id guard skips a show already loaded/in-flight.
+                // #3). The episodes.for_id guard skips a show already loaded/in-flight.
                 if (self.detail_sync_deadline_ms > 0 and now >= self.detail_sync_deadline_ms) {
                     self.detail_sync_deadline_ms = 0;
                     if (self.detailSyncActive()) {
                         if (self.selectedAnime()) |target| {
-                            const already = self.detail_for_id != null and
-                                std.mem.eql(u8, self.detail_for_id.?, target.id);
+                            const already = self.episodes.for_id != null and
+                                std.mem.eql(u8, self.episodes.for_id.?, target.id);
                             if (!already) self.fireEpisodesForId(loop, io, provider, target.id);
                         }
                     }
@@ -1090,149 +1067,43 @@ pub const App = struct {
         };
     }
 
-    /// Build the "source\x00source_id\x00translation" episode cache key into
-    /// `buf`. Null bytes never appear in any component, so the separator is
-    /// collision-safe. Returns null if it doesn't fit (caller skips the cache).
-    fn episodeCacheKey(buf: []u8, source: []const u8, source_id: []const u8, tt: domain.Translation) ?[]const u8 {
-        return std.fmt.bufPrint(buf, "{s}\x00{s}\x00{s}", .{ source, source_id, tt.str() }) catch null;
-    }
-
-    /// Install a cache-sourced episode list as the live detail state (ROD-130):
-    /// no thread, no loading spinner. `view` is canonical GPA-owned; ownership
-    /// transfers to `episode_results`. Mirrors the state the `episodes_done`
-    /// handler leaves behind so the two write sites stay consistent.
-    /// `id` and `view` are both GPA-owned; ownership transfers to
-    /// `detail_for_id` / `episode_results`. Infallible by contract — the caller
-    /// pre-allocates both, so a hit can never leave `episode_results` set with a
-    /// null `detail_for_id` (which would silently block playback — Elara C1).
-    fn applyCachedEpisodes(self: *App, id: []const u8, view: []domain.EpisodeNumber) void {
-        self.episode_results = view;
-        self.detail_for_id = id;
-        self.episode_cursor = 0;
-        self.detail_progress = 0;
-        self.episode_loading = false;
-        self.async_start_ms = 0;
-        if (self.active_view == .detail and self.detail_origin == .history) {
-            if (self.selectedHistoryRecord()) |rec| self.seedHistoryEpisodeCursor(rec, view);
-        }
-    }
-
-    /// Synchronous episode cache fast-path (ROD-130): on an LRU hit (fresh) or a
-    /// fresh DB hit, populate `episode_results` directly and return true; the
-    /// caller then skips the async fetch. A miss returns false. Reads stay on the
-    /// main thread (no sqlite-from-worker concern). Caller must have already
-    /// cleared prior `episode_results` via `freeEpisodeResults`.
-    fn tryEpisodeCacheHit(self: *App, provider: SourceProvider, source_id: []const u8) bool {
-        const source = self.currentDetailSourceName(provider);
-        var key_buf: [256]u8 = undefined;
-        const key = episodeCacheKey(&key_buf, source, source_id, self.translation) orelse return false;
-        const now = Store.nowSecs();
-
-        // 1) Hot LRU mirror.
-        if (self.episode_lru.get(key)) |entry| {
-            if (now < entry.expires_at) {
-                // detail_for_id first (small): on OOM bail before touching
-                // episode_results, so a hit never half-installs (Elara C1).
-                const id = self.gpa.dupe(u8, source_id) catch return false;
-                const view = workers.dupEpisodesOwned(self.gpa, entry.episodes) catch {
-                    self.gpa.free(id);
-                    return false;
-                };
-                self.applyCachedEpisodes(id, view);
-                return true;
-            }
-            // Stale: drop it so a repeatedly-visited stale entry can't squat in
-            // the MRU slot (get() just promoted it) and evict fresher entries
-            // during the refetch window (Elara H1). The refetch re-populates it.
-            self.episode_lru.remove(self.gpa, key);
-        }
-
-        // 2) DB cache — getCachedEpisodes returns null for stale/missing rows. An
-        // empty list is never stored (cacheEpisodes guards eps.len==0), so a
-        // zero-length result here is treated as a miss (Elara M2).
-        const st = self.store orelse return false;
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
-        const cached = (st.getCachedEpisodes(arena.allocator(), source, source_id, self.translation, now) catch null) orelse return false;
-        if (cached.len == 0) return false;
-
-        const id = self.gpa.dupe(u8, source_id) catch return false;
-        const view = workers.dupEpisodesOwned(self.gpa, cached) catch {
-            self.gpa.free(id);
-            return false;
-        };
-        // Promote into the hot LRU (best-effort; on failure the next visit just
-        // re-reads the DB). The status drives a fresh TTL, matching putCachedEpisodes.
-        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-        if (workers.dupEpisodesOwned(self.gpa, cached)) |lru_copy| {
-            self.episode_lru.putOwned(self.gpa, key, .{ .episodes = lru_copy, .expires_at = now + Store.cacheTtl(status) }) catch {
-                for (lru_copy) |ep| self.gpa.free(ep.raw);
-                self.gpa.free(lru_copy);
-            };
-        } else |_| {}
-
-        self.applyCachedEpisodes(id, view);
-        return true;
-    }
-
-    /// Mirror a freshly-fetched episode list into the DB + hot LRU (ROD-130).
-    /// Best-effort: a cache write failure never disrupts navigation/playback.
-    fn cacheEpisodes(self: *App, provider: SourceProvider, source_id: []const u8, eps: []const domain.EpisodeNumber) void {
-        if (eps.len == 0) return;
-        // NOTE (Elara H2): currentDetailSourceName reads live UI state. If the
-        // user returned to the History list before this async result arrived, it
-        // falls back to provider.name(), which can mis-key a non-default-source
-        // history show. Harmless today (a mis-keyed entry is simply never served
-        // and ages out), to be fixed by ROD-170, which captures the fetch's
-        // source at fire time rather than re-deriving it here.
-        const source = self.currentDetailSourceName(provider);
-        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-        const now = Store.nowSecs();
-
-        if (self.store) |st| {
-            var arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena.deinit();
-            st.putCachedEpisodes(source, source_id, self.translation, eps, status, now, arena.allocator()) catch |e|
-                log.debug("putCachedEpisodes failed: {s}", .{@errorName(e)});
-        }
-
-        var key_buf: [256]u8 = undefined;
-        const key = episodeCacheKey(&key_buf, source, source_id, self.translation) orelse return;
-        const lru_copy = workers.dupEpisodesOwned(self.gpa, eps) catch return;
-        self.episode_lru.putOwned(self.gpa, key, .{ .episodes = lru_copy, .expires_at = now + Store.cacheTtl(status) }) catch {
-            for (lru_copy) |ep| self.gpa.free(ep.raw);
-            self.gpa.free(lru_copy);
-        };
-    }
-
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
         if (self.episode_thread) |t| {
             t.join();
             self.episode_thread = null;
         }
 
-        self.freeEpisodeResults();
-        self.episode_cursor = 0;
+        self.episodes.freeResults(self.gpa);
+        self.episodes.cursor = 0;
 
         // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
-        if (self.tryEpisodeCacheHit(provider, source_id)) return;
+        // Resolve the source/status/history-record from nav state here and hand
+        // them to the subsystem, which never reads App (ROD-180). On a hit the
+        // subsystem installs the results; clear the shared slow-path timer since
+        // no async op is now running.
+        const source = self.currentDetailSourceName(provider);
+        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
+        if (self.episodes.tryCacheHit(self.gpa, self.store, source, source_id, self.translation, status, self.historyDetailRecord())) {
+            self.async_start_ms = 0;
+            return;
+        }
 
-        self.episode_loading = true;
+        self.episodes.loading = true;
         self.async_start_ms = self.now_ms;
 
-        // Two GPA-duped copies: one for App.detail_for_id, one for the task (→ event).
+        // Two GPA-duped copies: one for episodes.for_id, one for the task (→ event).
         const id_for_app = self.gpa.dupe(u8, source_id) catch return;
         const id_for_task = self.gpa.dupe(u8, source_id) catch {
             self.gpa.free(id_for_app);
             return;
         };
-        self.detail_for_id = id_for_app;
+        self.episodes.for_id = id_for_app;
 
         self.episode_thread = std.Thread.spawn(.{}, episodesTask, .{
             loop, self.gpa, io, provider, id_for_task, self.translation,
         }) catch {
             self.gpa.free(id_for_task);
-            self.episode_loading = false;
+            self.episodes.loading = false;
             return;
         };
     }
@@ -1251,8 +1122,8 @@ pub const App = struct {
     }
 
     fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        const eps = self.episode_results orelse return;
-        if (eps.len == 0 or self.episode_cursor >= eps.len) return;
+        const eps = self.episodes.results orelse return;
+        if (eps.len == 0 or self.episodes.cursor >= eps.len) return;
         if (self.playing) return;
 
         if (self.play_thread) |t| {
@@ -1260,10 +1131,10 @@ pub const App = struct {
             self.play_thread = null;
         }
 
-        const selected_id = self.detail_for_id orelse return;
-        const ep = eps[self.episode_cursor];
+        const selected_id = self.episodes.for_id orelse return;
+        const ep = eps[self.episodes.cursor];
         const source_name = self.currentDetailSourceName(provider);
-        const episode_index: u32 = @intCast(self.episode_cursor + 1);
+        const episode_index: u32 = @intCast(self.episodes.cursor + 1);
 
         var start_seconds: u64 = 0;
         if (self.store) |st| {
@@ -1549,9 +1420,9 @@ pub const App = struct {
                         // and respawn the same fetch. Just reveal the pane; the
                         // in-flight result lands through its own event (ROD-156 #3).
                         const sel = self.selectedAnime();
-                        const prefetching = self.episode_loading and sel != null and
-                            self.detail_for_id != null and
-                            std.mem.eql(u8, self.detail_for_id.?, sel.?.id);
+                        const prefetching = self.episodes.loading and sel != null and
+                            self.episodes.for_id != null and
+                            std.mem.eql(u8, self.episodes.for_id.?, sel.?.id);
                         self.active_pane = .detail;
                         if (!prefetching) self.fireEpisodes(loop, io, provider);
                     } else if (self.active_pane == .detail) {
@@ -1611,16 +1482,16 @@ pub const App = struct {
 
         // In detail pane: j/k/g/G navigate the episode grid.
         if ((self.active_view == .browse and self.active_pane == .detail) or self.active_view == .detail) {
-            const ep_len: usize = if (self.episode_results) |eps| eps.len else 0;
+            const ep_len: usize = if (self.episodes.results) |eps| eps.len else 0;
             if (ep_len == 0) return;
             if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                if (self.episode_cursor + 1 < ep_len) self.episode_cursor += 1;
+                if (self.episodes.cursor + 1 < ep_len) self.episodes.cursor += 1;
             } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                if (self.episode_cursor > 0) self.episode_cursor -= 1;
+                if (self.episodes.cursor > 0) self.episodes.cursor -= 1;
             } else if (key.matches('g', .{})) {
-                self.episode_cursor = 0;
+                self.episodes.cursor = 0;
             } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-                self.episode_cursor = ep_len - 1;
+                self.episodes.cursor = ep_len - 1;
             }
             return;
         }

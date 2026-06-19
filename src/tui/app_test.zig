@@ -511,7 +511,7 @@ test "l in browse list pane switches to detail pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
     for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.results.deinit(std.testing.allocator);
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "h in browse detail pane switches to list pane" {
@@ -543,7 +543,7 @@ test "left/right arrows mirror h/l for browse pane switching (ROD-156 #1)" {
     defer {
         for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
         app.results.deinit(std.testing.allocator);
-        app.freeEpisodeResults();
+        app.episodes.freeResults(app.gpa);
     }
 
     // right enters the detail pane (mirrors l).
@@ -593,7 +593,7 @@ test "entering the detail pane disarms the prefetch race — a fired deadline ca
     defer {
         for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
         app.results.deinit(std.testing.allocator);
-        app.freeEpisodeResults();
+        app.episodes.freeResults(app.gpa);
     }
 
     // Scroll: arms the episode prefetch debounce for the hovered show.
@@ -757,9 +757,9 @@ test "Enter in history opens standalone detail view" {
     try testing.expectEqual(.detail, app.active_view);
     try testing.expectEqual(.history, app.detail_origin);
     try testing.expectEqual(.detail, app.active_pane);
-    try testing.expectEqualStrings("a", app.detail_for_id orelse return error.TestExpectationFailed);
+    try testing.expectEqualStrings("a", app.episodes.for_id orelse return error.TestExpectationFailed);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "q from history-opened detail returns to history" {
@@ -806,8 +806,8 @@ test "history detail episodes_done seeds cursor from progress" {
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "a");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episodes.loading = true;
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 6);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
@@ -819,10 +819,10 @@ test "history detail episodes_done seeds cursor from progress" {
     const for_id = try std.testing.allocator.dupe(u8, "a");
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
-    try testing.expectEqual(@as(usize, 4), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 4), app.episodes.cursor);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "history detail resume overrides next-episode cursor" {
@@ -841,8 +841,8 @@ test "history detail resume overrides next-episode cursor" {
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "resume-show");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "resume-show");
+    app.episodes.loading = true;
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 6);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
@@ -854,10 +854,10 @@ test "history detail resume overrides next-episode cursor" {
     const for_id = try std.testing.allocator.dupe(u8, "resume-show");
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "history detail completed show defaults cursor to episode one" {
@@ -870,8 +870,8 @@ test "history detail completed show defaults cursor to episode one" {
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "done");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "done");
+    app.episodes.loading = true;
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 4);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
@@ -881,10 +881,10 @@ test "history detail completed show defaults cursor to episode one" {
     const for_id = try std.testing.allocator.dupe(u8, "done");
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
-    try testing.expectEqual(@as(usize, 0), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 0), app.episodes.cursor);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "h / l in settings view are no-ops (single pane)" {
@@ -1137,42 +1137,42 @@ test "episode_cursor j/k navigation in detail pane" {
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
     eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
     eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
-    app.episode_results = eps;
-    app.episode_cursor = 0;
+    app.episodes.results = eps;
+    app.episodes.cursor = 0;
 
     try testTick(&app, keyEv('j', .{}));
-    try testing.expectEqual(@as(usize, 1), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 1), app.episodes.cursor);
     try testTick(&app, keyEv('j', .{}));
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
     try testTick(&app, keyEv('j', .{})); // pinned at last
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
     try testTick(&app, keyEv('k', .{}));
-    try testing.expectEqual(@as(usize, 1), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 1), app.episodes.cursor);
     try testTick(&app, keyEv('g', .{}));
-    try testing.expectEqual(@as(usize, 0), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 0), app.episodes.cursor);
     try testTick(&app, keyEv('G', .{}));
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor);
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "episodes_done populates episode_results" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     const for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.episodes.loading = true;
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 2);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
     eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
-    try testing.expect(!app.episode_loading);
-    try testing.expectEqual(@as(usize, 2), app.episode_results.?.len);
+    try testing.expect(!app.episodes.loading);
+    try testing.expectEqual(@as(usize, 2), app.episodes.results.?.len);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)" {
@@ -1185,7 +1185,7 @@ test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)
     const cached = try workers.dupEpisodesOwned(app.gpa, &.{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
     });
-    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+    try app.episodes.lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
         .episodes = cached,
         .expires_at = std.math.maxInt(i64),
     });
@@ -1194,13 +1194,13 @@ test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)
 
     // Synchronous hit: detail opens, episodes present, no spinner, no fetch thread.
     try testing.expectEqual(.detail, app.active_view);
-    try testing.expect(!app.episode_loading);
+    try testing.expect(!app.episodes.loading);
     try testing.expect(app.episode_thread == null);
-    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
-    try testing.expectEqualStrings("2", app.episode_results.?[1].raw);
+    try testing.expectEqual(@as(usize, 3), app.episodes.results.?.len);
+    try testing.expectEqualStrings("2", app.episodes.results.?[1].raw);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "episode cache: a fetch populates the LRU for next time (ROD-130)" {
@@ -1211,8 +1211,8 @@ test "episode cache: a fetch populates the LRU for next time (ROD-130)" {
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "a");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episodes.loading = true;
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 2);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
@@ -1221,12 +1221,12 @@ test "episode cache: a fetch populates the LRU for next time (ROD-130)" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
 
-    const entry = app.episode_lru.get("allanime\x00a\x00sub") orelse return error.TestExpectationFailed;
+    const entry = app.episodes.lru.get("allanime\x00a\x00sub") orelse return error.TestExpectationFailed;
     try testing.expectEqual(@as(usize, 2), entry.episodes.len);
     try testing.expectEqualStrings("1", entry.episodes[0].raw);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
@@ -1240,7 +1240,7 @@ test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
     const stale = try workers.dupEpisodesOwned(app.gpa, &.{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
     });
-    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+    try app.episodes.lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
         .episodes = stale,
         .expires_at = 0,
     });
@@ -1251,11 +1251,11 @@ test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
     // synchronous results). Had it been served, loading would be false and
     // episode_results would hold the 3 cached entries. (testTick drains the
     // worker's episodes_done without re-applying it, so loading stays set.)
-    try testing.expect(app.episode_loading);
-    try testing.expect(app.episode_results == null);
+    try testing.expect(app.episodes.loading);
+    try testing.expect(app.episodes.results == null);
 
-    app.freeEpisodeResults(); // frees detail_for_id set on the miss path
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa); // frees detail_for_id set on the miss path
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "episode cache: evicting displayed show A keeps episode_results valid (ROD-130)" {
@@ -1268,14 +1268,14 @@ test "episode cache: evicting displayed show A keeps episode_results valid (ROD-
     const cached = try workers.dupEpisodesOwned(app.gpa, &.{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
     });
-    try app.episode_lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
+    try app.episodes.lru.putOwned(app.gpa, "allanime\x00a\x00sub", .{
         .episodes = cached,
         .expires_at = std.math.maxInt(i64),
     });
 
     // Sync hit → episode_results is an INDEPENDENT dup of show A's episodes.
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
-    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
+    try testing.expectEqual(@as(usize, 3), app.episodes.results.?.len);
 
     // Flood the cache past capacity so A's LRU entry is evicted + freed.
     var i: usize = 0;
@@ -1283,24 +1283,24 @@ test "episode cache: evicting displayed show A keeps episode_results valid (ROD-
         var kb: [32]u8 = undefined;
         const k = try std.fmt.bufPrint(&kb, "filler\x00{d}\x00sub", .{i});
         const fill = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "x" }});
-        try app.episode_lru.putOwned(app.gpa, k, .{ .episodes = fill, .expires_at = std.math.maxInt(i64) });
+        try app.episodes.lru.putOwned(app.gpa, k, .{ .episodes = fill, .expires_at = std.math.maxInt(i64) });
     }
-    try testing.expect(app.episode_lru.get("allanime\x00a\x00sub") == null); // A evicted
+    try testing.expect(app.episodes.lru.get("allanime\x00a\x00sub") == null); // A evicted
 
     // The view copy survives eviction intact (Option-B invariant).
-    try testing.expectEqual(@as(usize, 3), app.episode_results.?.len);
-    try testing.expectEqualStrings("2", app.episode_results.?[1].raw);
+    try testing.expectEqual(@as(usize, 3), app.episodes.results.?.len);
+    try testing.expectEqualStrings("2", app.episodes.results.?[1].raw);
 
-    app.freeEpisodeResults();
-    app.episode_lru.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
 }
 
 test "episodes_done stale result is discarded" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     // Current show: "anime2"; incoming event is for "anime1" — stale.
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime2");
-    app.episode_loading = true;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "anime2");
+    app.episodes.loading = true;
 
     const stale_id = try std.testing.allocator.dupe(u8, "anime1");
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
@@ -1308,13 +1308,13 @@ test "episodes_done stale result is discarded" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = stale_id } });
     // Still loading (wasn't cleared by stale event), episode_results still null.
-    try testing.expect(app.episode_loading);
-    try testing.expect(app.episode_results == null);
+    try testing.expect(app.episodes.loading);
+    try testing.expect(app.episodes.results == null);
 
     // Cleanup detail_for_id manually.
-    if (app.detail_for_id) |id| {
+    if (app.episodes.for_id) |id| {
         std.testing.allocator.free(id);
-        app.detail_for_id = null;
+        app.episodes.for_id = null;
     }
 }
 
@@ -1505,8 +1505,8 @@ test "deinitOwnedState releases app-owned runtime resources" {
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
-    app.episode_results = eps;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.episodes.results = eps;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "anime1");
 
     app.cover.pixels = .{ .rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0xaa, 0xbb, 0xcc, 0xff }), .w = 1, .h = 1 };
     app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
@@ -1519,8 +1519,8 @@ test "deinitOwnedState releases app-owned runtime resources" {
 
     try testing.expectEqual(@as(usize, 0), app.results.items.len);
     try testing.expectEqual(@as(u32, 0), app.search_page);
-    try testing.expect(app.episode_results == null);
-    try testing.expect(app.detail_for_id == null);
+    try testing.expect(app.episodes.results == null);
+    try testing.expect(app.episodes.for_id == null);
     try testing.expect(app.cover.pixels == null);
     try testing.expect(app.cover.for_id == null);
     try testing.expect(app.cover.failed_for_id == null);
@@ -1772,9 +1772,9 @@ test "play_error mid-episode is a real play but not watched, and surfaces failur
     var app: App = .{};
     app.gpa = testing.allocator;
     app.store = &store;
-    app.episode_results = try allocEpisodes(10);
-    app.episode_cursor = 7; // on episode 8
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(10);
+    app.episodes.cursor = 7; // on episode 8
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.source = "allanime";
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
@@ -1796,13 +1796,13 @@ test "play_error mid-episode is a real play but not watched, and surfaces failur
     try testing.expectEqual(@as(i64, 1), rec.play_count); // counted as a play
     try testing.expectEqual(@as(i64, 0), rec.progress); // but NOT watched-through
 
-    try testing.expectEqual(@as(usize, 7), app.episode_cursor); // unmoved
-    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    try testing.expectEqual(@as(usize, 7), app.episodes.cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_error with no observed position skips recordPlay and preserves checkpoint" {
@@ -1839,7 +1839,7 @@ test "play_error with no observed position skips recordPlay and preserves checkp
 // --- ROD-131: detail cursor + watched-state reaction after playback ---
 
 /// Allocate `n` 1-based episode cells ("1".."n") for the detail grid. Caller
-/// owns them via `app.freeEpisodeResults()`.
+/// owns them via `app.episodes.freeResults(app.gpa)`.
 fn allocEpisodes(n: usize) ![]domain.EpisodeNumber {
     const eps = try testing.allocator.alloc(domain.EpisodeNumber, n);
     errdefer testing.allocator.free(eps);
@@ -1856,9 +1856,9 @@ fn allocEpisodes(n: usize) ![]domain.EpisodeNumber {
 test "play_done advances detail cursor to next episode and dims watched" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2; // on episode 3
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2; // on episode 3
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -1866,21 +1866,21 @@ test "play_done advances detail cursor to next episode and dims watched" {
 
     try testTick(&app, .{ .play_done = .{ .time_pos = 1400, .duration = 1440 } });
 
-    try testing.expectEqual(@as(usize, 3), app.episode_cursor); // advanced to episode 4
-    try testing.expectEqual(@as(u32, 3), app.detail_progress); // 1..3 now dim
+    try testing.expectEqual(@as(usize, 3), app.episodes.cursor); // advanced to episode 4
+    try testing.expectEqual(@as(u32, 3), app.episodes.progress); // 1..3 now dim
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_error with a completed position still advances the detail cursor" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2; // on episode 3
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2; // on episode 3
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -1890,22 +1890,22 @@ test "play_error with a completed position still advances the detail cursor" {
     // and the detail pane reacts just like a clean completed exit.
     try testTick(&app, .{ .play_error = .{ .time_pos = 1300, .duration = 1440 } });
 
-    try testing.expectEqual(@as(usize, 3), app.episode_cursor); // advanced to episode 4
-    try testing.expectEqual(@as(u32, 3), app.detail_progress);
+    try testing.expectEqual(@as(usize, 3), app.episodes.cursor); // advanced to episode 4
+    try testing.expectEqual(@as(u32, 3), app.episodes.progress);
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
     try testing.expect(app.toast_queue[1] == null); // success only, no false failure toast
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_done with a partial watch does not advance or dim (ROD-168)" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2; // on episode 3
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2; // on episode 3
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -1915,19 +1915,19 @@ test "play_done with a partial watch does not advance or dim (ROD-168)" {
     // so the cursor holds, nothing dims, and no success toast fires.
     try testTick(&app, .{ .play_done = .{ .time_pos = 300, .duration = 1440 } });
 
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
-    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     try testing.expect(app.toast_queue[0] == null); // clean partial quit is silent
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_done on the final episode stays put and toasts all caught up" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 5; // on the last episode
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 5; // on the last episode
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "6");
@@ -1935,21 +1935,21 @@ test "play_done on the final episode stays put and toasts all caught up" {
 
     try testTick(&app, .{ .play_done = .{ .time_pos = 1400, .duration = 1440 } });
 
-    try testing.expectEqual(@as(usize, 5), app.episode_cursor); // no N+1 to move to
-    try testing.expectEqual(@as(u32, 6), app.detail_progress); // whole grid dim
+    try testing.expectEqual(@as(usize, 5), app.episodes.cursor); // no N+1 to move to
+    try testing.expectEqual(@as(u32, 6), app.episodes.progress); // whole grid dim
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("all caught up", t.text[0..t.text_len]);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_error with no observed position does not advance the cursor" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2;
-    app.detail_for_id = try testing.allocator.dupe(u8, "show1");
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2;
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -1958,25 +1958,25 @@ test "play_error with no observed position does not advance the cursor" {
     // mpv died at position 0: record_play is derived false — nothing counted.
     try testTick(&app, .{ .play_error = .{ .time_pos = 0, .duration = 1440 } });
 
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
-    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     // §4.10: a failed play no longer advances/dims, but is no longer silent —
     // it surfaces an error toast so the dead playback isn't a mystery.
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "episodes_error surfaces an error toast" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_loading = true;
+    app.episodes.loading = true;
 
     try testTick(&app, .episodes_error);
 
-    try testing.expect(!app.episode_loading);
+    try testing.expect(!app.episodes.loading);
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expectEqualStrings("couldn't load episodes", t.text[0..t.text_len]);
@@ -1985,10 +1985,10 @@ test "episodes_error surfaces an error toast" {
 test "playback for a different show than the detail pane does not advance it" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2;
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2;
     // The detail pane moved to a different show while mpv was backgrounded.
-    app.detail_for_id = try testing.allocator.dupe(u8, "other-show");
+    app.episodes.for_id = try testing.allocator.dupe(u8, "other-show");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -1996,20 +1996,20 @@ test "playback for a different show than the detail pane does not advance it" {
 
     try testTick(&app, .{ .play_done = null });
 
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // detail pane untouched
-    try testing.expectEqual(@as(u32, 0), app.detail_progress);
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // detail pane untouched
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress);
     try testing.expect(app.toast_queue[0] == null);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "play_error on a different show still surfaces the failure toast" {
     var app: App = .{};
     app.gpa = testing.allocator;
-    app.episode_results = try allocEpisodes(6);
-    app.episode_cursor = 2;
+    app.episodes.results = try allocEpisodes(6);
+    app.episodes.cursor = 2;
     // The detail pane moved to a different show before mpv failed.
-    app.detail_for_id = try testing.allocator.dupe(u8, "other-show");
+    app.episodes.for_id = try testing.allocator.dupe(u8, "other-show");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
     app.session.episode_raw = try testing.allocator.dupe(u8, "3");
@@ -2020,13 +2020,13 @@ test "play_error on a different show still surfaces the failure toast" {
     // the pane is on — the user deserves to know mpv died.
     try testTick(&app, .{ .play_error = null });
 
-    try testing.expectEqual(@as(usize, 2), app.episode_cursor); // unmoved
-    try testing.expectEqual(@as(u32, 0), app.detail_progress); // nothing dimmed
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
 
-    app.freeEpisodeResults();
+    app.episodes.freeResults(app.gpa);
 }
 
 test "firePlay: double-play guard is a no-op when playing is true" {
@@ -2038,8 +2038,8 @@ test "firePlay: double-play guard is a no-op when playing is true" {
 
     const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
     eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
-    app.episode_results = eps;
-    app.detail_for_id = try std.testing.allocator.dupe(u8, "anime1");
+    app.episodes.results = eps;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "anime1");
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
 
@@ -2047,7 +2047,7 @@ test "firePlay: double-play guard is a no-op when playing is true" {
     try testing.expect(app.play_thread == null);
     try testing.expect(app.playing);
 
-    std.testing.allocator.free(app.detail_for_id.?);
+    std.testing.allocator.free(app.episodes.for_id.?);
     std.testing.allocator.free(eps[0].raw);
     std.testing.allocator.free(eps);
 }
