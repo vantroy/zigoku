@@ -858,8 +858,9 @@ Notes:
   resolution extremum; a rung picks the highest variant *at or below* it, falling
   back to the lowest available when every variant overshoots — so a capped user is
   never bumped over their ceiling, but always gets a playable stream. The fast4speed
-  direct path has no variants, so the setting is a silent no-op there (not a dead
-  toggle) — the picker only bites on m3u8/wixmp long-tail sources.
+  direct path has no variants — it always returns its single 1080p URL regardless
+  of the setting, so the preference is a silent no-op there (not a dead toggle). The
+  picker only bites on m3u8/wixmp long-tail sources.
 
 ### 5.6 Loading / Now Resolving
 
