@@ -826,7 +826,7 @@ Live-editable. Full width. No cover art.
   Player
   ─────────────────────────────────────────────────────────────────────────────────
   ▸ mpv path                    /usr/bin/mpv                   enter to edit
-    default quality             1080p                          hjkl to cycle
+    default quality             best                           hjkl to cycle
     subtitle language           English                        hjkl to cycle
     audio language              Japanese                       hjkl to cycle
 
@@ -852,6 +852,15 @@ Notes:
   off, the whole toggle is `text.dim`.
 - Section headers: `text.primary` + bold.
 - Hint column (right): `text.dim`.
+- **Default quality (ROD-152)** cycles `worst · 480 · 720 · 1080 · best`, default
+  `best`. It is honoured at stream-resolution time via a *cap* policy over the
+  variants a source exposes (`allanime.selectVariant`): `best`/`worst` pick the
+  resolution extremum; a rung picks the highest variant *at or below* it, falling
+  back to the lowest available when every variant overshoots — so a capped user is
+  never bumped over their ceiling, but always gets a playable stream. The fast4speed
+  direct path has no variants — it always returns its single 1080p URL regardless
+  of the setting, so the preference is a silent no-op there (not a dead toggle). The
+  picker only bites on m3u8/wixmp long-tail sources.
 
 ### 5.6 Loading / Now Resolving
 

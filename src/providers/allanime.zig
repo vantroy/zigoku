@@ -86,9 +86,9 @@ pub const AllAnime = struct {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
         return self.episodes(arena, io, show_id, tt);
     }
-    fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation) anyerror!domain.StreamLink {
+    fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
-        return self.resolve(arena, io, show_id, ep, tt);
+        return self.resolve(arena, io, show_id, ep, tt, quality);
     }
 
     // ── search ─────────────────────────────────────────────────────────────────
@@ -189,7 +189,7 @@ pub const AllAnime = struct {
         return false;
     }
 
-    pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation) !domain.StreamLink {
+    pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
         // Same two-level escaping as episodes(): `videoInner` escapes show_id and
         // the episode label at the inner JSON level, then jsonEscape wraps the
@@ -221,19 +221,21 @@ pub const AllAnime = struct {
         }
 
         // Long-tail (ROD-92): less-popular shows only expose `--<hex>` providers.
-        // Decipher each, follow it, and keep the best variant across all of them.
-        // One bad provider doesn't sink the rest — followProvider skips on error.
-        var best: ?domain.StreamLink = null;
+        // Decipher each, follow it, and gather every safe variant it exposes. One
+        // bad provider doesn't sink the rest — followProvider appends what it has
+        // and we log the error. The quality pick (ROD-152) happens once, at the
+        // end, over the full candidate set — so the cap policy sees every rung
+        // across every provider, not a per-provider local best.
+        var variants: std.ArrayList(domain.StreamLink) = .empty;
         for (sources) |s| {
             if (!sourceAllowed(s.sourceName)) continue;
             const url = s.sourceUrl orelse continue;
             if (!std.mem.startsWith(u8, url, "--")) continue;
-            best = followProvider(arena, io, url[2..], best) catch |e| blk: {
+            followProvider(arena, io, url[2..], &variants) catch |e| {
                 log.debug("allanime provider {s}: {s}", .{ url, @errorName(e) });
-                break :blk best;
             };
         }
-        return best orelse error.NoDirectStream;
+        return selectVariant(variants.items, quality) orelse error.NoDirectStream;
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
@@ -605,11 +607,52 @@ pub const AllAnime = struct {
         return std.mem.concat(arena, u8, &.{ base[0..dir_end], ref });
     }
 
-    /// Keep whichever stream has the higher resolution (null counts as 0). This
-    /// is the "default to best" policy — ROD-152's selector layers on top later.
-    fn better(cur: ?domain.StreamLink, cand: domain.StreamLink) domain.StreamLink {
-        const c = cur orelse return cand;
-        return if ((cand.resolution orelse 0) > (c.resolution orelse 0)) cand else c;
+    /// Pick the variant matching the user's quality preference from the gathered
+    /// candidates, or null when there are none (ROD-152). Cap policy:
+    ///   `best`  → highest resolution
+    ///   `worst` → lowest resolution
+    ///   a rung  → the highest variant *at or below* the rung; if every variant
+    ///             exceeds it, the lowest available — we never bump a capped user
+    ///             over their ceiling when we can avoid it, but always return
+    ///             *something* the source actually offers (nearest-available).
+    fn selectVariant(variants: []const domain.StreamLink, quality: domain.Quality) ?domain.StreamLink {
+        if (variants.len == 0) return null;
+        var pick = variants[0];
+        for (variants[1..]) |v| {
+            if (preferred(v, pick, quality)) pick = v;
+        }
+        return pick;
+    }
+
+    /// True if candidate `a` beats incumbent `b` for `quality`. A *known*
+    /// resolution always beats an unknown one (null), and two unknowns tie — we
+    /// never pick a stream on a resolution we can't see over one we can. This
+    /// matters most under a rung cap: an unknown stream (a BANDWIDTH-only
+    /// STREAM-INF) could be any bitrate, so treating it as "0p, safely in budget"
+    /// would hand a capped user the exact firehose the cap exists to prevent.
+    /// Unknowns are thus a last resort, chosen only when *every* candidate is
+    /// unknown. Over known resolutions this is a strict weak order, so the fold
+    /// yields the cap-policy winner regardless of arrival order.
+    fn preferred(a: domain.StreamLink, b: domain.StreamLink, quality: domain.Quality) bool {
+        const ra = a.resolution orelse return false; // unknown `a` never beats `b`
+        const rb = b.resolution orelse return true; // known `a` beats unknown `b`
+        return switch (quality) {
+            .best => ra > rb,
+            .worst => ra < rb,
+            // A rung: compare by cap-rank so a single `>` implements the policy.
+            else => qualityRank(ra, quality.cap().?) > qualityRank(rb, quality.cap().?),
+        };
+    }
+
+    /// Rank a resolution against a cap so one `>` comparison is the whole cap
+    /// policy. In-budget variants (≤ cap) score non-negative and rise with
+    /// resolution → the highest-≤-cap wins. Over-budget variants score negative
+    /// and rise toward zero as resolution shrinks → the smallest over-budget wins,
+    /// and any in-budget variant always outranks any over-budget one. i64 so the
+    /// negated u32 can't overflow.
+    fn qualityRank(res: u32, cap_px: u32) i64 {
+        if (res <= cap_px) return @as(i64, res);
+        return -@as(i64, res);
     }
 
     /// True if `s` is safe to place in mpv's argv. Allowlist, not denylist: only
@@ -630,21 +673,25 @@ pub const AllAnime = struct {
         return if (cleanArg(v)) v else SITE;
     }
 
-    /// Fold a candidate variant into `best`, dropping anything unsafe for mpv's
-    /// argv: the URL must be a clean `http(s)` — no control chars, no leading `--`
-    /// that mpv would read as an option. Referer is pre-sanitized by safeReferer.
-    fn consider(best: ?domain.StreamLink, url: []const u8, res: ?u32, referer: []const u8) ?domain.StreamLink {
-        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return best;
-        if (!cleanArg(url)) return best;
-        return better(best, .{ .url = url, .resolution = res, .referer = referer });
+    /// Validate a candidate variant into a `StreamLink`, or null if it's unsafe
+    /// for mpv's argv: the URL must start with `http(s)://` (which also rejects a
+    /// leading `--` mpv would read as an option) and carry only clean argv bytes
+    /// (no control chars). Referer is pre-sanitized by safeReferer. The quality
+    /// pick is deferred to `selectVariant`; this only guards what's allowed to
+    /// *become* a candidate.
+    fn consider(url: []const u8, res: ?u32, referer: []const u8) ?domain.StreamLink {
+        if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return null;
+        if (!cleanArg(url)) return null;
+        return .{ .url = url, .resolution = res, .referer = referer };
     }
 
-    /// Follow one deciphered `--<hex>` provider to its best stream variant,
-    /// folding into `best_in`. Network-bound; the parsers it calls are the tested
-    /// part. A failed link is logged and skipped, not fatal — another provider or
-    /// link may still yield a stream.
-    fn followProvider(arena: Allocator, io: Io, hex_path: []const u8, best_in: ?domain.StreamLink) !?domain.StreamLink {
-        var best = best_in;
+    /// Follow one deciphered `--<hex>` provider, appending every safe stream
+    /// variant it exposes to `out`. Network-bound; the parsers it calls are the
+    /// tested part. A failed *link* is logged and skipped, not fatal — another
+    /// link may still yield a stream; a failed *provider* (decipher/path/parse)
+    /// errors out, but the variants already appended survive (the caller keeps
+    /// the partial set). The quality pick happens later in `selectVariant`.
+    fn followProvider(arena: Allocator, io: Io, hex_path: []const u8, out: *std.ArrayList(domain.StreamLink)) !void {
         const deciphered = try decipherProviderPath(arena, hex_path);
         const path = try clockJson(arena, deciphered);
         // Defense-in-depth for the userinfo SSRF: a path not starting with `/`
@@ -659,7 +706,9 @@ pub const AllAnime = struct {
 
             // Shape 1: wixmp repackager — synthetic per-quality URLs, no manifest.
             if (try wixmpVariants(arena, link)) |vs| {
-                for (vs) |v| best = consider(best, v.url, v.resolution, STREAM_REFERER);
+                for (vs) |v| {
+                    if (consider(v.url, v.resolution, STREAM_REFERER)) |sl| try out.append(arena, sl);
+                }
                 continue;
             }
 
@@ -672,12 +721,13 @@ pub const AllAnime = struct {
             const vs = try parseMasterPlaylist(arena, body);
             if (vs.len == 0) {
                 // No variants → it's already a media playlist; play it directly.
-                best = consider(best, link, 1080, referer);
+                if (consider(link, 1080, referer)) |sl| try out.append(arena, sl);
             } else {
-                for (vs) |v| best = consider(best, try joinUrl(arena, link, v.url), v.resolution, referer);
+                for (vs) |v| {
+                    if (consider(try joinUrl(arena, link, v.url), v.resolution, referer)) |sl| try out.append(arena, sl);
+                }
             }
         }
-        return best;
     }
 
     // ── ranking ──────────────────────────────────────────────────────────────────
@@ -960,13 +1010,55 @@ test "consider/safeReferer: reject mpv-argv injection (C1)" {
     try std.testing.expectEqualStrings("https://ok.test/", AllAnime.safeReferer("https://ok.test/"));
     try std.testing.expectEqualStrings("https://allanime.day", AllAnime.safeReferer(null));
     // A URL with control chars, or one that mpv would read as an option, is dropped.
-    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "https://x/a\nb", 1080, "r"));
-    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "--script=evil.lua", 720, "r"));
-    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider(null, "ftp://x/v.ts", 720, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider("https://x/a\nb", 1080, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider("--script=evil.lua", 720, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider("ftp://x/v.ts", 720, "r"));
     // A clean http(s) URL is accepted.
-    const ok = AllAnime.consider(null, "https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
+    const ok = AllAnime.consider("https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
     try std.testing.expectEqualStrings("https://cdn.test/v.m3u8", ok.url);
     try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
+}
+
+test "selectVariant: cap policy picks the right rung (ROD-152)" {
+    const mk = struct {
+        fn v(res: ?u32) domain.StreamLink {
+            return .{ .url = "https://cdn.test/v.m3u8", .resolution = res };
+        }
+    }.v;
+
+    // Empty candidate set → nothing to play.
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.selectVariant(&.{}, .best));
+
+    var full = [_]domain.StreamLink{ mk(480), mk(1080), mk(720) };
+    // best/worst select by extremum, order-independent.
+    try std.testing.expectEqual(@as(?u32, 1080), AllAnime.selectVariant(&full, .best).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 480), AllAnime.selectVariant(&full, .worst).?.resolution);
+    // Exact rung present → take it.
+    try std.testing.expectEqual(@as(?u32, 480), AllAnime.selectVariant(&full, .p480).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&full, .p720).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 1080), AllAnime.selectVariant(&full, .p1080).?.resolution);
+
+    // Requested rung absent → highest variant at or below it.
+    var gap = [_]domain.StreamLink{ mk(480), mk(1080) };
+    try std.testing.expectEqual(@as(?u32, 480), AllAnime.selectVariant(&gap, .p720).?.resolution);
+
+    // Every variant exceeds the cap → the smallest available (nearest-available).
+    var over = [_]domain.StreamLink{ mk(720), mk(1080) };
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&over, .p480).?.resolution);
+
+    // A known resolution always beats an unknown (null) one, in *every* mode —
+    // we never act on a resolution we can't see. For a rung cap this is the H1
+    // fix: an unknown could be any bitrate, so it must not masquerade as a safe
+    // in-budget pick and beat a real (if over-budget) 720p.
+    var withnull = [_]domain.StreamLink{ mk(null), mk(720) };
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .best).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .worst).?.resolution);
+    try std.testing.expectEqual(@as(?u32, 720), AllAnime.selectVariant(&withnull, .p480).?.resolution);
+
+    // …but when *every* candidate is unknown, we still return one — never error
+    // out when a stream actually exists.
+    var allnull = [_]domain.StreamLink{ mk(null), mk(null) };
+    try std.testing.expect(AllAnime.selectVariant(&allnull, .p720) != null);
 }
 
 test "isPrivateV4: private/loopback/link-local ranges blocked, public allowed" {

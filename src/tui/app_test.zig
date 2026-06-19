@@ -49,7 +49,7 @@ fn dummySearchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: sourc
 fn dummyEpisodesFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
     return &.{};
 }
-fn dummyResolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation) anyerror!domain.StreamLink {
+fn dummyResolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
     return .{ .url = "" };
 }
 
@@ -1949,14 +1949,16 @@ test "settings: l/h cycle a preset field and wrap around" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = 1; // default_quality, defaults to "1080"
+    app.settings.cursor = 1; // default_quality, defaults to "best"
 
     try testTick(&app, keyEv('l', .{}));
-    try testing.expectEqualStrings("best", app.config.default_quality); // 1080 -> best
+    try testing.expectEqualStrings("worst", app.config.default_quality); // best (last) wraps forward to worst (first)
     try testTick(&app, keyEv('l', .{}));
-    try testing.expectEqualStrings("480", app.config.default_quality); // wrap best -> 480
+    try testing.expectEqualStrings("480", app.config.default_quality); // worst -> 480
     try testTick(&app, keyEv('h', .{}));
-    try testing.expectEqualStrings("best", app.config.default_quality); // wrap back 480 -> best
+    try testing.expectEqualStrings("worst", app.config.default_quality); // back 480 -> worst
+    try testTick(&app, keyEv('h', .{}));
+    try testing.expectEqualStrings("best", app.config.default_quality); // wrap back worst -> best
 }
 
 test "settings: subtitle-language cycle keeps live translation in sync" {
