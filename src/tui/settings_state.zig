@@ -80,7 +80,7 @@ comptime {
     std.debug.assert(settings_rows[5].id == .cover_art);
 }
 
-const quality_presets = [_][]const u8{ "480", "720", "1080", "best" };
+const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
 const language_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };

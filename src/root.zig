@@ -45,6 +45,7 @@ pub const Anime = domain.Anime;
 pub const EpisodeNumber = domain.EpisodeNumber;
 pub const StreamLink = domain.StreamLink;
 pub const Translation = domain.Translation;
+pub const Quality = domain.Quality;
 
 /// Zigoku version. Keep in sync with `build.zig.zon`.
 pub const version = "0.1.0";

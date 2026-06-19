@@ -233,7 +233,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     try out.print("\n→ resolving ep {s} ({s})…\n", .{ episode.raw, cli.translation.str() });
     try out.flush();
 
-    const link = try provider.resolve(arena, io, show.id, episode, cli.translation);
+    const link = try provider.resolve(arena, io, show.id, episode, cli.translation, zigoku.Quality.fromString(cfg.default_quality));
     const res_str = if (link.resolution) |r| r else 0;
     try out.print("  ✓ stream resolved ({d}p)\n", .{res_str});
 
