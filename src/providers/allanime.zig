@@ -1010,7 +1010,7 @@ test "wixmpVariants: returns null for non-wixmp links" {
     try std.testing.expectEqual(@as(?[]AllAnime.Variant, null), try AllAnime.wixmpVariants(a, "https://example.com/x.m3u8"));
 }
 
-test "sourceAllowed: only anipy's trusted provider names pass" {
+test "sourceAllowed: case-insensitive match against anipy's trusted names" {
     try std.testing.expect(AllAnime.sourceAllowed("Default"));
     try std.testing.expect(AllAnime.sourceAllowed("Yt-mp4"));
     try std.testing.expect(!AllAnime.sourceAllowed("Sak")); // not in list
@@ -1021,7 +1021,7 @@ test "sourceAllowed: only anipy's trusted provider names pass" {
     try std.testing.expect(AllAnime.sourceAllowed("S-mp4")); // the real-world casing
     try std.testing.expect(AllAnime.sourceAllowed("default"));
     try std.testing.expect(AllAnime.sourceAllowed("UV-MP4"));
-    try std.testing.expect(!AllAnime.sourceAllowed("S-mp5")); // still not a real fuzzy match
+    try std.testing.expect(!AllAnime.sourceAllowed("S-mp5")); // near-miss: one char off, not a list entry
 }
 
 test "consider/safeReferer: reject mpv-argv injection (C1)" {
