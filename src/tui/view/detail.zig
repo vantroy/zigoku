@@ -398,7 +398,7 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
     if (self.episodes.loading) {
-        centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
+        if (h > 0) centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
         return;
     }
     const eps = self.episodes.results orelse {
@@ -406,7 +406,11 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         return;
     };
     if (eps.len == 0) {
-        putClipped(win, 0, 0, w, "no episodes", self.s(self.palette.fg3, .{ .italic = true }));
+        // §4.6 absent state: a show the source returned with genuinely zero
+        // episodes. Centered + text.dim italic to match the cover/feed/history
+        // empties ("no art yet", "no feed yet", "nothing here yet") so it reads
+        // as a deliberate "nothing here", not a pane that left-aligned a row.
+        if (h > 1) centerText(win, h / 2, w, "no episodes", self.s(self.palette.fg3, .{ .italic = true }));
         return;
     }
 

@@ -443,6 +443,21 @@ focus and watched states. On a completed watch it resolves directly to watched
 (no intermediate frame) as the cursor advances; on a partial or failed play it
 returns to focus and the cursor holds (§4.10).
 
+**Grid region states (no cells to draw).** Before any cell renders, the grid
+region resolves one of three non-cell states, which must read as distinct:
+
+| State | Render | Voice |
+|---|---|---|
+| Fetching | `⠋ loading episodes…` in `state.focus`, top of region | active, spinner |
+| Genuinely zero episodes (`episodes_done`, empty array) | `no episodes` in `text.dim` + italic, **centered** | deliberate absent state |
+| No fetch fired (no item selected) | nothing | blank by design |
+
+The zero-episode case is a real source result, *not* a failure — a fetch error
+toasts instead (`episodes_error`, §4.10) and never reaches the grid. It is
+centered + muted to match the cover/feed/history absent states (`no art yet`,
+`no feed yet`, `nothing here yet`, §9.5) so it reads as "nothing here," not as a
+half-drawn loading row pinned to the top-left.
+
 ### 4.7 Toast Notifications
 
 Toasts float above the bottom bar, right-aligned, temporary (2.5s auto-dismiss).
