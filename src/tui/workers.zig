@@ -332,7 +332,7 @@ fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
 /// All string params are GPA-owned by this task and freed before return.
 /// `mpv_path` and `skip_mode` are borrowed from `App.config` (ROD-85), which
 /// outlives this thread — they must not be freed here.
-pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64, mal_id: ?u32, episode_ordinal: u32, mpv_path: []const u8, skip_mode: []const u8) void {
+pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64, mal_id: ?u32, episode_ordinal: u32, mpv_path: []const u8, skip_mode: []const u8, quality: domain.Quality) void {
     defer gpa.free(id);
     defer gpa.free(ep_raw);
     defer gpa.free(title);
@@ -341,7 +341,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     defer arena.deinit();
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
-    const link = provider.resolve(arena.allocator(), io, id, ep, translation) catch |e| {
+    const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
         log.debug("resolve failed: {s}", .{@errorName(e)});
         loop.postEvent(.{ .play_error = null }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;

@@ -1239,6 +1239,7 @@ pub const App = struct {
             episode_index,
             self.config.mpv_path,
             self.config.skip_mode,
+            domain.Quality.fromString(self.config.default_quality),
         }) catch {
             self.session.clear(self.gpa);
             self.gpa.free(id_copy);
