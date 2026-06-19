@@ -1189,7 +1189,7 @@ pub const App = struct {
         var start_seconds: u64 = 0;
         if (self.store) |st| {
             if (st.getResume(source_name, selected_id, self.translation, ep.raw) catch null) |saved_resume| {
-                start_seconds = saved_resume.startSeconds();
+                start_seconds = saved_resume.startSecondsRewound(self.config.resume_offset_sec);
             }
         }
 
