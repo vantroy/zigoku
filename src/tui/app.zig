@@ -392,6 +392,10 @@ pub const App = struct {
     detail_score_buf: [32]u8 = undefined,
     /// Stable storage for the "N eps" metadata line in drawDetailPane.
     detail_meta_buf: [32]u8 = undefined,
+    /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
+    /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack
+    /// local would dangle by `render()` and emit garbage.
+    detail_season_buf: [16]u8 = undefined,
     /// Stable storage for the "[N]" result count in drawBottomBar search mode.
     cnt_scratch: [16]u8 = undefined,
     /// Scratch for the animated browse chip text ("⠋ search") in drawTopBar.

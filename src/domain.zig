@@ -78,6 +78,17 @@ pub const Season = enum {
         if (std.ascii.eqlIgnoreCase(s, "fall") or std.ascii.eqlIgnoreCase(s, "autumn")) return .fall;
         return null;
     }
+
+    /// DESIGN.md §2.3: kanji label for the season chip.
+    /// 春 spring / 夏 summer / 秋 autumn / 冬 winter (ROD-141).
+    pub fn kanji(self: Season) []const u8 {
+        return switch (self) {
+            .winter => "冬",
+            .spring => "春",
+            .summer => "夏",
+            .fall   => "秋",
+        };
+    }
 };
 
 /// A calendar date at whatever precision the source offered. `year` is always
@@ -260,4 +271,12 @@ test "Season.fromString folds AniList and AllAnime spellings" {
 test "Translation.str returns correct tag name" {
     try std.testing.expectEqualStrings("sub", Translation.sub.str());
     try std.testing.expectEqualStrings("dub", Translation.dub.str());
+}
+
+test "Season.kanji returns correct glyphs" {
+    // DESIGN.md §2.3: 春 spring / 夏 summer / 秋 autumn / 冬 winter (ROD-141).
+    try std.testing.expectEqualStrings("冬", Season.winter.kanji());
+    try std.testing.expectEqualStrings("春", Season.spring.kanji());
+    try std.testing.expectEqualStrings("夏", Season.summer.kanji());
+    try std.testing.expectEqualStrings("秋", Season.fall.kanji());
 }
