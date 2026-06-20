@@ -116,31 +116,11 @@ const MediaResp = struct {
     data: ?MediaData = null,
 };
 
-/// Overlay enrichment onto a show, filling only the fields the provider left
-/// blank (AllAnime is the source of truth; AniList backfills). String/slice
-/// fields adopt `meta`'s lifetime — callers that outlive the parse arena must
-/// copy first (see `workers.enrichTask`, which owns the live path). Currently
-/// unused — kept as the single documented mapping; the worker inlines the same
-/// fill-if-null logic so it can deep-copy each field as it goes.
-pub fn apply(show: domain.Anime, meta: Metadata) domain.Anime {
-    var out = show;
-    if (out.english_name == null) out.english_name = meta.title_english;
-    if (out.native_name == null) out.native_name = meta.title_native;
-    if (out.thumb == null) out.thumb = meta.thumb;
-    if (out.status == null) out.status = meta.status;
-    if (out.kind == null) out.kind = meta.kind;
-    if (out.description == null) out.description = meta.description;
-    if (out.anilist_id == null) out.anilist_id = meta.anilist_id;
-    if (out.mal_id == null) out.mal_id = meta.mal_id;
-    if (out.total_episodes == null) out.total_episodes = meta.total_episodes;
-    if (out.year == null) out.year = meta.year;
-    if (out.season == null) out.season = meta.season;
-    if (out.start_date == null) out.start_date = meta.start_date;
-    if (out.genres.len == 0) out.genres = meta.genres;
-    if (out.studios.len == 0) out.studios = meta.studios;
-    if (out.score == null) out.score = meta.score;
-    return out;
-}
+// NOTE: the show ← Metadata fill-if-null mapping lives in `workers.enrichTask`,
+// not here. It has to: each filled field is deep-copied into GPA as it goes, so
+// nothing aliases the parse arena that `Metadata`'s slices borrow from. A
+// standalone `apply(show, meta)` helper would hand back a struct pointing into
+// that soon-dead arena — a UAF trap — so there deliberately isn't one.
 
 pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
     // Deterministic path: AllAnime gave us the AniList id (mined from the cover
