@@ -164,12 +164,13 @@ Scores are integer 0–100 from AniList. Display format: `[NN/100]` or `[NNN/100
 
 ### 2.3 Kanji Status Chips
 
-> **Status: Planned (ROD-141).** This chip system is the target spec — the render
-> path currently emits English labels (e.g. the top bar renders `Watchlist` /
-> `⠋ search`, see §10.7), and `domain.zig` carries the airing-status data awaiting
-> the chip render land. Treat the kanji table below — and the kanji in every ASCII
-> mock in this doc — as the intended end state authored against Terminal Ghost, not
-> current behaviour.
+> **Status: Implemented in the detail panel (ROD-141).** The status + season/year
+> chips render in the detail header per §4.4 (kanji table below). Two surfaces are
+> still pending: the **top bar** renders the view label (`Watchlist` / `⠋ search`,
+> §10.7) rather than the season/year chip specced in §10.3b — that chip is ROD-186;
+> and chips only appear where the row was enriched **live** — History-sourced rows
+> lack the persisted columns (ROD-185), so they fall back to no chip. Treat the
+> kanji table and ASCII mocks as the authored end state.
 
 These are inline text spans, not box-drawn — the bare kanji glyph(s), no brackets,
 with surrounding spaces for visual separation (color alone distinguishes a chip).
