@@ -580,7 +580,7 @@ test "observedPlaybackWasMeaningful requires positive observed position" {
 test "persistFinalProgress writes the latest observed position" {
     var store = try Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     persistFinalProgress(&store, "allanime", "show1", "7", .sub, .{
         .time_pos = 91.5,
@@ -595,7 +595,7 @@ test "persistFinalProgress writes the latest observed position" {
 test "persistFinalProgress is a no-op without an observed update" {
     var store = try Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     persistFinalProgress(&store, "allanime", "show1", "7", .sub, null);
     try std.testing.expect((try store.getResume("allanime", "show1", .sub, "7")) == null);

@@ -828,7 +828,7 @@ test "history detail episodes_done seeds cursor from progress" {
 test "history detail resume overrides next-episode cursor" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "resume-show", .title = "Resume Show", .progress = 3 }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "resume-show", .title = "Resume Show", .progress = 3 }, 1000, std.testing.allocator);
     try store.saveProgress("allanime", "resume-show", .sub, "3", 91.5, 1440, 1001);
 
     var app: App = .{};
@@ -1600,7 +1600,7 @@ test "position_update refreshes live playback fields" {
 test "position_update checkpoints playback progress every 30 seconds" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1635,7 +1635,7 @@ test "position_update checkpoints playback progress every 30 seconds" {
 test "play_done persists final observed position after checkpoints" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1658,7 +1658,7 @@ test "play_done persists final observed position after checkpoints" {
 test "play_done ignores non-meaningful final position and preserves checkpoint" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1702,7 +1702,7 @@ test "play_done clears live playback fields" {
 test "play_error with a completed position persists final and records the play" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1737,7 +1737,7 @@ test "play_error with a completed position persists final and records the play" 
 test "play_done with a partial watch records the play but not the progress (ROD-168)" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1767,7 +1767,7 @@ test "play_done with a partial watch records the play but not the progress (ROD-
 test "play_error mid-episode is a real play but not watched, and surfaces failure (ROD-168)" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
 
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1808,7 +1808,7 @@ test "play_error mid-episode is a real play but not watched, and surfaces failur
 test "play_error with no observed position skips recordPlay and preserves checkpoint" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
-    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000);
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show" }, 1000, std.testing.allocator);
     try store.saveProgress("allanime", "show1", .sub, "3", 90, 1440, 1001);
 
     var app: App = .{};
