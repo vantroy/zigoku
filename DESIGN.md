@@ -171,8 +171,8 @@ Scores are integer 0–100 from AniList. Display format: `[NN/100]` or `[NNN/100
 > mock in this doc — as the intended end state authored against Terminal Ghost, not
 > current behaviour.
 
-These are inline text spans, not box-drawn. Rendered as: `[KANJI]` with surrounding
-spaces for visual separation.
+These are inline text spans, not box-drawn — the bare kanji glyph(s), no brackets,
+with surrounding spaces for visual separation (color alone distinguishes a chip).
 
 | Chip | Kanji | English fallback | Color |
 |---|---|---|---|
@@ -411,13 +411,25 @@ Detail pane score line format:
 
 ### 4.4 Status Chip (Kanji)
 
-Inline span. No border. Mandatory 1-cell leading space, 1-cell trailing space.
-Color per Section 2.3. Rendered immediately after the title in the detail header
-section.
+Inline spans, no border; color carries the meaning (Section 2.3). The detail
+header stacks romaji title → english → native (italic) → **chips row** → score+
+genres, so the chips render on their own row beneath the alt-title lines rather
+than trailing the title inline (the alt-titles claim the title's row). On that
+dedicated row the chips sit **flush at column 0**, aligned with the title stack —
+no leading indent. The status chip comes first, then the season+year chip
+(Section 2.3), separated by two spaces (ROD-141).
 
 ```
-  Frieren: Beyond Journey's End   放映中   冬 2024
+Sousou no Frieren
+Frieren: Beyond Journey's End
+葬送のフリーレン
+完結  秋 2023
+✦ [93/100] · Adventure · Drama · Fantasy
 ```
+
+When a title carries no alt-title lines, the chips still take their own row for a
+consistent header rhythm. Each chip is omitted entirely when its field is absent
+(no empty span); a row with neither status nor season is skipped.
 
 ### 4.5 Progress Bar
 
