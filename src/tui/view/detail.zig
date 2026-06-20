@@ -331,8 +331,8 @@ fn drawAltTitles(self: *App, win: vaxis.Window, w: u16, h: u16, anime: Anime, st
 }
 
 /// Kanji chips row (ROD-141, DESIGN.md §2.3 / §4.4): status chip followed by
-/// season+year chip on a single line, each separated by two spaces. Chips are
-/// plain text spans (no box), with mandatory 1-cell leading space per §4.4.
+/// season+year chip on a single line, two spaces between them. Chips are plain
+/// text spans (no box), flush at column 0 to align with the title stack (§4.4).
 /// Emits nothing when both are absent. Returns the next free row.
 fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16) u16 {
     if (start_row >= h) return start_row;
@@ -380,7 +380,9 @@ fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16
         segs[n] = .{ .text = season_text, .style = self.s(self.palette.focus, .{}) };
         n += 1;
     }
-    _ = win.print(segs[0..n], .{ .row_offset = start_row, .col_offset = 0 });
+    // wrap: .none — these prints target the multi-row pane window, so without it
+    // a chip straddling the pane edge would fold onto the next row (the hairline).
+    _ = win.print(segs[0..n], .{ .row_offset = start_row, .col_offset = 0, .wrap = .none });
 
     return start_row + 1;
 }
@@ -412,9 +414,12 @@ fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u1
     // the "✦" star (3 bytes, 1 col) and the " · " separator's "·" (2 bytes, 1 col)
     // each overcount, opening phantom gaps before the genres (ROD-141 / Mira
     // review). Letting vaxis report the real display column closes them.
+    // wrap: .none on every print — these target the multi-row pane window, so a
+    // segment reaching the pane edge must stop, not fold onto the next row (which
+    // would overwrite the hairline with genre text at narrow widths).
     var col = win.print(
         &.{.{ .text = score_text, .style = score_style }},
-        .{ .row_offset = start_row, .col_offset = 0 },
+        .{ .row_offset = start_row, .col_offset = 0, .wrap = .none },
     ).col;
 
     // ROD-141 genres: " · Genre1 · Genre2…" appended to the score line.
@@ -425,7 +430,7 @@ fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u1
             col = win.print(&.{
                 .{ .text = " · ", .style = self.s(self.palette.fg3, .{}) },
                 .{ .text = genre, .style = self.s(self.palette.fg2, .{}) },
-            }, .{ .row_offset = start_row, .col_offset = col }).col;
+            }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none }).col;
         }
     }
 
