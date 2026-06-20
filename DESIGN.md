@@ -45,7 +45,7 @@ Rules:
 | `text.primary` | `#39ff6a` | All primary readable text. Titles, labels, interactive list items. Phosphor green. |
 | `text.muted` | `#2a6040` | Secondary metadata: episode counts, year, genre list, synopsis body. Dim phosphor. |
 | `text.dim` | `#163525` | De-emphasized rows: watched items, dropped entries, disabled states. |
-| `state.focus` | `#00e5cc` | Focused / selected element. The cursor row in a list. Active pane indicator. Cyan ghost. |
+| `state.focus` | `#20ffdd` | Focused / selected element. The cursor row in a list. Active pane indicator. Cyan ghost. Overdriven from the original `#00e5cc` (ROD-156 #4) so the focused row clears `text.primary`'s luminance instead of reading dimmer than its neighbours — luminance 0.770 vs fg-green's 0.734. Stays cyan-hued to keep the ghost identity. |
 | `state.now` | `#ff2d78` | The one thing that matters right now. Airing status chip. Score highlight when >90. The `▌` cursor. Spectral Magenta. |
 | `state.success` | `#39ff6a` | Same hex as `text.primary` — success toasts use bold primary green to signal "done." |
 | `state.error` | `#ff2d78` | Error toasts. Same as `state.now` — magenta also means alarm. Context distinguishes them. |
@@ -98,6 +98,32 @@ kanji chips, synopsis ellipsis marker, loading animation frames.
 
 **Blink is used exactly once** — the `▌` status cursor. Nowhere else.
 
+### 1.4 Palette Selection (themes)
+
+The §1.1 hex table is **Terminal Ghost**, the default and reference theme — every
+mock, state, and decision in this doc is authored against it. But the tokens are not
+hardcoded into render code. `src/tui/colors.zig` defines a `Palette` struct (one field
+per §1.2 semantic alias) and ships three concrete instances:
+
+| Theme | Identifier | Character |
+|---|---|---|
+| Terminal Ghost | `terminal_ghost` | Default. The §1.1 palette verbatim. Green-on-void phosphor with cyan focus + magenta signature. |
+| Phosphor | `phosphor` | Pure monochrome phosphor — `focus` and `fg` share the green hue, so bold (not color) carries focus distinction; `hot` is a complementary orange-red. |
+| Nord | `nord` | Nord polar-night + snow-storm + aurora mapping. `hot` uses aurora orange (nord12) rather than nord15 purple for more urgency. **Focus distinction is hue-based, not luminance-based:** `focus` (nord8 frost) reads *dimmer* than `fg` (nord4 snow), so the focused row leans on hue shift + bold rather than out-glowing its neighbours — a deliberate trade to stay faithful to Nord's own palette relationships, not the §1.1 luminance-lift rule. |
+
+The active palette is chosen by the `palette` config key (`config.zig`, default
+`"terminal_ghost"`). `App` holds a `*const Palette`; render functions reference its
+fields instead of the module-level constants, so a theme switch takes effect without
+touching component code.
+
+**Dark-only still holds.** All three themes are dark. "No light theme, ever" (§0) is a
+constraint on every palette, not just the default — a theme is a re-hue of the same
+dark system, never a light/dark toggle. **Theme-invariant rules:** one-magenta-pointer
+and bold-is-promotion (§1.3) hold across every palette. The focus-clears-`fg`-luminance
+rule (§1.1) is *not* universal — Terminal Ghost and Phosphor honour it, Nord trades it
+for a hue-shift focus per the note above. A new theme must keep the two invariants;
+how it makes `focus` legible against `fg` (luminance lift or hue shift) is its own call.
+
 ---
 
 ## 2. Glyph / Iconography Set
@@ -112,8 +138,8 @@ against common terminal setups.
 |---|---|---|---|
 | `▌` | CURSOR | Persistent status cursor, blinks ~1hz | `state.now` |
 | `▸` | PLAY | Playable / resume point | `state.focus` |
-| `▹` | PLAY_QUEUED | In queue, not started | `text.muted` |
-| `◉` | DOT_ACTIVE | Currently airing, episode just dropped | `state.now` |
+| `▹` | PLAY_QUEUED | In queue, not started · **Planned, not yet rendered (ROD-141)** | `text.muted` |
+| `◉` | DOT_ACTIVE | Currently airing, episode just dropped · **Planned, not yet rendered (ROD-141)** | `state.now` |
 | `●` | DOT_FILLED | Watched episode | `text.dim` |
 | `○` | DOT_EMPTY | Unwatched episode | `text.muted` |
 | `◐` | DOT_PARTIAL | Resume point (partially watched) | `state.focus` |
@@ -137,6 +163,13 @@ Scores are integer 0–100 from AniList. Display format: `[NN/100]` or `[NNN/100
 - Score 0–50 or unscored: `text.dim` → `[--/100]`
 
 ### 2.3 Kanji Status Chips
+
+> **Status: Planned (ROD-141).** This chip system is the target spec — the render
+> path currently emits English labels (e.g. the top bar renders `Watchlist` /
+> `⠋ search`, see §10.7), and `domain.zig` carries the airing-status data awaiting
+> the chip render land. Treat the kanji table below — and the kanji in every ASCII
+> mock in this doc — as the intended end state authored against Terminal Ghost, not
+> current behaviour.
 
 These are inline text spans, not box-drawn. Rendered as: `[KANJI]` with surrounding
 spaces for visual separation.
@@ -342,7 +375,7 @@ overflow into the score field. Score field is 10 chars wide, right-reserved.
 | Selected (entered detail) | `bg.base` | `state.focus` | per score rules | `▸` in `state.focus` dim |
 | Watched / completed | `bg.base` | `text.dim` | `text.dim` | `●` in `text.dim` |
 | Currently watching | `bg.base` | `text.primary` | per score rules | `◐` in `state.focus` |
-| Airing (live) | `bg.base` | `text.primary` | per score rules | `◉` in `state.now` |
+| Airing (live) _(Planned, ROD-141 — §2.1; glyph suppressed in M3, §9.1)_ | `bg.base` | `text.primary` | per score rules | `◉` in `state.now` |
 | Search non-match (filtered out) | not rendered | — | — | — |
 
 The focus indicator is the row's background shift + bold title + `▸`. There is no
@@ -1073,8 +1106,10 @@ Cache the decoded pixel buffer — do not re-fetch from network on resize.
 
 ```
 AppState {
-    mode:          enum { browse, history, settings, detail }
-    input_mode:    enum { normal, search, command }
+    active_view:   enum { browse, history, detail, settings }  // which view (§10.1)
+    active_pane:   enum { list, detail }                       // pane focus within a view (§10.3)
+    detail_origin: enum { browse, history }                    // where .detail was entered from, for the Esc chain (§10.4)
+    input_mode:    enum { normal, search }                     // command-line (`:`) input is future M4+ (§3.5)
     list_cursor:   usize
     detail_scroll: usize
     episode_cursor: ?usize
@@ -1091,13 +1126,21 @@ AppState {
 This maps directly to the component state specs in Section 4. Each render pass reads
 from this state and writes cells — no retained rendering state.
 
+> **As-built note (ROD-72 → ROD-180).** An earlier draft modelled view + detail-open
+> state as a single `mode` enum. That was never built — the two-field
+> `active_view` + `active_pane` model was kept and `.detail` was promoted to a
+> standalone view (see §10.1, §10.7). `input_mode` has no `command` member yet; the
+> `:` command line is deferred (§4.2).
+
 ### 7.7 Color Token Constants File
 
-Create `src/tui/colors.zig` with all tokens as constants. Every cell styling call
-references these — never inline hex in component code.
+`src/tui/colors.zig` holds every token. Every cell styling call references these —
+never inline hex in component code. The module-level constants below are the
+**Terminal Ghost** source values; the file also wraps them (plus the `phosphor` and
+`nord` themes) in a `Palette` struct selected at runtime — see §1.4.
 
 ```zig
-// src/tui/colors.zig
+// src/tui/colors.zig — Terminal Ghost source values
 pub const bg_base    = vaxis.Color{ .rgb = .{ 0x02, 0x0d, 0x06 } };
 pub const bg_surface = vaxis.Color{ .rgb = .{ 0x06, 0x14, 0x10 } };
 pub const bg_elevated= vaxis.Color{ .rgb = .{ 0x0b, 0x1f, 0x18 } };
@@ -1105,13 +1148,13 @@ pub const chrome     = vaxis.Color{ .rgb = .{ 0x1a, 0x40, 0x30 } };
 pub const fg         = vaxis.Color{ .rgb = .{ 0x39, 0xff, 0x6a } };
 pub const fg2        = vaxis.Color{ .rgb = .{ 0x2a, 0x60, 0x40 } };
 pub const fg3        = vaxis.Color{ .rgb = .{ 0x16, 0x35, 0x25 } };
-pub const focus      = vaxis.Color{ .rgb = .{ 0x00, 0xe5, 0xcc } };
+pub const focus      = vaxis.Color{ .rgb = .{ 0x20, 0xff, 0xdd } }; // overdriven, §1.1 / ROD-156 #4
 pub const hot        = vaxis.Color{ .rgb = .{ 0xff, 0x2d, 0x78 } };
 pub const warn       = vaxis.Color{ .rgb = .{ 0xe5, 0xb8, 0x00 } };
 ```
 
-This file is the single source of truth. If Rod wants to tweak a color, there is one
-place to change it.
+This file is the single source of truth. Render code reads the active `Palette`'s
+fields (§1.4), so tweaking a color — or switching themes — happens in exactly one place.
 
 ---
 
@@ -1457,15 +1500,25 @@ table below.
 
 ### 10.1 Views
 
-Zigoku has three views. They share the same top-bar / bottom-bar chrome and the
+Zigoku has four views. They share the same top-bar / bottom-bar chrome and the
 same `bg.base` void background. They differ in content layout and available
 keybinds.
 
 | View | Identifier | Default | Layout |
 |---|---|---|---|
 | Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2) |
-| History | `active_view = .history` | Yes (M3 landing, §9.2) | Single-pane: full-width watchlist (§5.4) |
+| History | `active_view = .history` | Yes (M3 landing, §9.2) | Single-pane watchlist; splits to preview + detail at ≥100 cols (§5.4a) |
+| Detail | `active_view = .detail` | No | Full-screen detail + episode grid (§5.3), opened with `Enter` from Browse or History |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
+
+**`.detail` is both an `active_pane` value within Browse and a standalone `active_view`.**
+Browse's right-hand detail *pane* (§10.3, reached with `l`/`Enter`) is unchanged. The
+standalone Detail view is the full-screen detail + episode grid (§5.3), opened with
+`Enter` from **History**. It records its entry point in `detail_origin` so the Esc/`q`
+chain (§10.4) returns there. `detail_origin` also carries a `.browse` arm — wired and
+handled, but reserved for a future full-detail entry from Browse; in the current build
+Browse uses only its in-view pane, so the standalone view is History-entered only. See
+the §10.7 decision log for how this superseded the original single-`mode` model.
 
 Browse is not available as a landing view in M3 — there is no feed to populate it.
 It becomes live when the user presses `F1` or `H` from History (which triggers a
@@ -1488,6 +1541,11 @@ Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
 
 `S` from Settings is a no-op. There is no "toggle Settings" semantic — `q` or
 `Esc` exits Settings.
+
+**Entering the standalone Detail view** is not a view-switch keybind — it is a
+drill-in: `Enter` on a row in **History** opens `active_view = .detail` (§10.1).
+`Esc`/`q` returns to `detail_origin` (§10.4). Browse does not drill into the
+standalone view; its `Enter`/`l` step into the in-view detail *pane* (§10.3c).
 
 #### F-key aliases (discoverable navigation)
 
@@ -1543,6 +1601,7 @@ The `·` dot rendered right-aligned in the top bar marks pane-level focus.
 |---|---|---|
 | Browse | `.list` | `color.fg3` (dim — list is the default, no emphasis needed) |
 | Browse | `.detail` | `color.focus` (cyan — detail pane is explicitly selected) |
+| Detail (standalone) | `.list` | `color.focus` (the full-screen view is focused) |
 | History | `.list` (only value) | `color.focus` (the screen is focused, render at full focus weight) |
 | Settings | `.list` (only value) | `color.focus` |
 
@@ -1560,12 +1619,15 @@ Top bar rendering by view — the chip after `░` changes with `active_view`:
 
 | `active_view` | Top bar chip | Color |
 |---|---|---|
-| `.browse` | Season/year kanji (e.g. `冬 2026`) | `color.focus` |
+| `.browse` | `⠋ search` spinner — **stub**; target state is season/year kanji (e.g. `冬 2026`), see §10.7 | `color.focus` |
 | `.history` | `Watchlist` | `color.focus` |
+| `.detail` | Inherits `detail_origin`'s chip (`Watchlist` from History; the Browse-origin path mirrors `.browse`) | `color.focus` |
 | `.settings` | `Settings` | `color.focus` |
 
 This is already implied by §5.4 and §5.5 mocks. Stated here explicitly so Haru
-does not have to infer it from two different sections.
+does not have to infer it from two different sections. The `.browse` kanji chip is
+deferred until Browse has a live feed (§10.7) — today it renders the search-stub
+spinner, matching the empty Browse content area.
 
 #### 10.3c `h` / `l` behavior by view
 
@@ -1591,9 +1653,10 @@ Esc action is listed. Everything not listed is a no-op.
 | View | `input_mode` | `active_pane` | `Esc` action |
 |---|---|---|---|
 | Any | `search` | any | Close search prompt. Restore full list. Set `input_mode = .normal`. Stay in current view. |
-| Any | `command` | any | Close command prompt. Set `input_mode = .normal`. Stay in current view. |
+| Any | `command` | any | _Future (M4+):_ close command prompt, set `input_mode = .normal`. `input_mode` has no `.command` member yet (§7.6), so this row is inert in the current build. |
 | Browse | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
 | Browse | `normal` | `.list` | No-op. `q` handles quit from Browse. Esc does not quit. |
+| Detail (standalone) | `normal` | any | Return to `detail_origin` — `active_view = detail_origin` (`.history` today → History; `.browse` arm reserved, §10.1), `active_pane = .list`. Same as `q` from Detail. |
 | History | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to `H`. |
 | Settings | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to pressing `q` from Settings. |
 | Settings | `edit` (field under edit) | `.list` | Cancel field edit. Return to Settings normal. `input_mode` stays `.normal`; the edit buffer is discarded. |
@@ -1821,5 +1884,5 @@ if (key.matches('q', .{})) {
 | `·` stays lit at `color.focus` in single-pane views | Dimming or hiding the `·` in History/Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
 | `·` is dim for Browse list, lit for Browse detail | The detail pane is the "deeper" selection — the user has moved into a secondary surface. Lighting the `·` on detail-entry is a confirmation that the focus moved. Keeping it dim on list avoids the indicator fighting with the active row highlight for attention. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
 | Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
-| `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | Collapse into `mode` when ROD-74 lands and detail navigation is implemented. |
+| `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | **Resolved (ROD-74 / ROD-180):** detail navigation landed and the two-field model was *kept*, not collapsed into `mode`. `.detail` was promoted to a standalone `active_view` (see §10.1) while remaining an `active_pane` value in Browse; `mode` was never introduced. The two fields proved the right shape. |
 | Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | Switch to season/year kanji in `color.focus` when Browse has a real feed to populate (ROD-73 search landing or later). |
