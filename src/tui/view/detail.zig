@@ -221,6 +221,79 @@ fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Wi
     return cover_h + 1;
 }
 
+// ── ROD-141: kanji status chip mapping ───────────────────────────────────────
+
+/// The result of a status→chip lookup: kanji text and which palette field
+/// carries its color. Using a field accessor avoids capturing a Palette
+/// pointer inside a comptime value; the caller resolves the color at render.
+const StatusChip = struct {
+    kanji: []const u8,
+    /// One of: .hot (state.now), .fg2 (text.muted), .focus (state.focus),
+    ///         .fg3 (text.dim), .warn (state.warn).
+    color_field: enum { hot, fg2, focus, fg3, warn },
+};
+
+/// DESIGN.md §2.3: map an AniList or AllAnime raw status string to the chip
+/// definition. Case-insensitive; both vocabularies accepted. Returns null for
+/// unknown / empty strings — callers must omit the chip, never render empty.
+///
+/// AniList vocab: FINISHED / RELEASING / NOT_YET_RELEASED / CANCELLED
+/// AllAnime vocab: RELEASING / ongoing (case-insensitive).
+pub fn statusChipFor(status: []const u8) ?StatusChip {
+    if (std.ascii.eqlIgnoreCase(status, "RELEASING") or
+        std.ascii.eqlIgnoreCase(status, "ongoing"))
+        return .{ .kanji = "放映中", .color_field = .hot };
+
+    if (std.ascii.eqlIgnoreCase(status, "FINISHED"))
+        return .{ .kanji = "完結", .color_field = .fg2 };
+
+    if (std.ascii.eqlIgnoreCase(status, "NOT_YET_RELEASED"))
+        return .{ .kanji = "放映前", .color_field = .focus };
+
+    if (std.ascii.eqlIgnoreCase(status, "CANCELLED"))
+        return .{ .kanji = "中止", .color_field = .fg3 };
+
+    // Hiatus is not a standard AniList/AllAnime value but is listed in §2.3 for
+    // completeness. Map it too in case a future source uses it.
+    if (std.ascii.eqlIgnoreCase(status, "HIATUS"))
+        return .{ .kanji = "休止中", .color_field = .warn };
+
+    return null;
+}
+
+/// Resolve a StatusChip's color from the active palette.
+fn chipColor(self: *const App, chip: StatusChip) vaxis.Color {
+    return switch (chip.color_field) {
+        .hot   => self.palette.hot,
+        .fg2   => self.palette.fg2,
+        .focus => self.palette.focus,
+        .fg3   => self.palette.fg3,
+        .warn  => self.palette.warn,
+    };
+}
+
+// ── ROD-141 minimum synopsis cap (ROD-137 grid constraint) ───────────────────
+
+/// Minimum guaranteed grid rows at the worst supported geometry (35-row terminal).
+/// Used by synopsisCap to reserve enough rows for a usable episode grid.
+const min_grid_rows: u16 = 2;
+
+/// How many synopsis rows to allow in the single-column layout, given the
+/// remaining height after all header rows have been placed and the grid's
+/// minimum reservation is subtracted.
+///
+/// ROD-137/ROD-141 constraint: at 35-row terminal, the episode grid must have
+/// ≥2 visible rows for a ≥28-episode show. The cap is:
+///     max(1, remaining_h - (1 spacer + min_grid_rows))
+/// where `remaining_h = h - header_rows_so_far`.
+fn synopsisCap(remaining_h: u16) u16 {
+    const reserved: u16 = 1 + min_grid_rows; // 1 spacer + 2 grid rows
+    if (remaining_h <= reserved) return 1;
+    return remaining_h - reserved;
+}
+
+// ── draw helpers ─────────────────────────────────────────────────────────────
+
 /// Title (bold name or "—" placeholder). Returns the next free row.
 fn drawTitle(self: *App, win: vaxis.Window, w: u16, info: DetailRenderInfo, start_row: u16) u16 {
     if (info.anime != null and !std.mem.eql(u8, info.title, "—")) {
@@ -231,8 +304,90 @@ fn drawTitle(self: *App, win: vaxis.Window, w: u16, info: DetailRenderInfo, star
     return start_row + 1;
 }
 
+/// Alternate title rows (ROD-141): english_name if it differs from the romaji
+/// name already on the title line; native_name in italic (foreign-language rule
+/// DESIGN.md §1.3). Both are nullable — emit only present, non-empty values.
+/// Returns the next free row.
+fn drawAltTitles(self: *App, win: vaxis.Window, w: u16, h: u16, anime: Anime, start_row: u16) u16 {
+    var row = start_row;
+
+    // English name — only if it meaningfully differs from the displayed title.
+    if (anime.english_name) |eng| {
+        if (eng.len > 0 and !std.mem.eql(u8, eng, anime.name) and row < h) {
+            putClipped(win, row, 0, w, eng, self.s(self.palette.fg2, .{}));
+            row += 1;
+        }
+    }
+
+    // Native name — italic per the foreign-language rule (§1.3).
+    if (anime.native_name) |nat| {
+        if (nat.len > 0 and row < h) {
+            putClipped(win, row, 0, w, nat, self.s(self.palette.fg2, .{ .italic = true }));
+            row += 1;
+        }
+    }
+
+    return row;
+}
+
+/// Kanji chips row (ROD-141, DESIGN.md §2.3 / §4.4): status chip followed by
+/// season+year chip on a single line, each separated by two spaces. Chips are
+/// plain text spans (no box), with mandatory 1-cell leading space per §4.4.
+/// Emits nothing when both are absent. Returns the next free row.
+fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16) u16 {
+    if (start_row >= h) return start_row;
+
+    const status_chip: ?StatusChip = if (anime.status) |st|
+        (if (st.len > 0) statusChipFor(st) else null)
+    else
+        null;
+
+    // Season chip: "冬 2026" etc. Only when both season and year are present.
+    const has_season = anime.season != null and anime.year != null;
+
+    if (status_chip == null and !has_season) return start_row; // nothing to emit
+
+    // Render the whole row as one `win.print` of styled segments so vaxis
+    // advances wide-glyph (kanji) cell widths in a single consistent pass while
+    // each span keeps its own color (§2.3). Two spaces separate the two chips.
+    // Chips sit flush at col 0, aligning with the title/alt-title stack above —
+    // §4.4's "leading space" is for the chip rendered *inline after the title*;
+    // here it lives on its own row, so a leading indent would only misalign it
+    // (Mira review).
+    //
+    // CRITICAL: the season text must live in App-owned storage, not a stack
+    // local. vaxis cells hold a *slice* into the segment text (not a copy), and
+    // the frame isn't emitted until `render()` — well after this function
+    // returns. A stack buffer would dangle and render as garbage (ROD-141).
+    const fg3 = self.s(self.palette.fg3, .{});
+    const season_text: []const u8 = if (has_season)
+        std.fmt.bufPrint(&self.detail_season_buf, "{s} {d}", .{ anime.season.?.kanji(), anime.year.? }) catch ""
+    else
+        "";
+
+    var segs: [3]vaxis.Segment = undefined;
+    var n: usize = 0;
+    if (status_chip) |chip| {
+        segs[n] = .{ .text = chip.kanji, .style = self.s(chipColor(self, chip), .{}) };
+        n += 1;
+    }
+    if (season_text.len > 0) {
+        // Two-space gap before the season chip when a status chip precedes it.
+        if (status_chip != null) {
+            segs[n] = .{ .text = "  ", .style = fg3 };
+            n += 1;
+        }
+        segs[n] = .{ .text = season_text, .style = self.s(self.palette.focus, .{}) };
+        n += 1;
+    }
+    _ = win.print(segs[0..n], .{ .row_offset = start_row, .col_offset = 0 });
+
+    return start_row + 1;
+}
+
 /// Score line — "[--/100]" until AniList enrichment fills `a.score`, then tiered
-/// rendering. Returns the next free row.
+/// rendering per §2.2. Genres (if any) follow on the same line separated by
+/// ` · ` (§4.3 mock format). Returns the next free row.
 fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u16) u16 {
     const score_text: []const u8 = if (anime) |a| blk: {
         if (a.score) |score| {
@@ -251,7 +406,29 @@ fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u1
         }
         break :blk self.s(self.palette.fg3, .{});
     } else self.s(self.palette.fg3, .{});
-    putClipped(win, start_row, 0, w, score_text, score_style);
+
+    // Render the score, then genres, as chained `win.print`s, advancing by the
+    // print's *returned* cursor column. Tracking columns by slice length drifts:
+    // the "✦" star (3 bytes, 1 col) and the " · " separator's "·" (2 bytes, 1 col)
+    // each overcount, opening phantom gaps before the genres (ROD-141 / Mira
+    // review). Letting vaxis report the real display column closes them.
+    var col = win.print(
+        &.{.{ .text = score_text, .style = score_style }},
+        .{ .row_offset = start_row, .col_offset = 0 },
+    ).col;
+
+    // ROD-141 genres: " · Genre1 · Genre2…" appended to the score line.
+    // Only emitted when genres is non-empty (§9.1: omit entirely when null/empty).
+    if (anime) |a| {
+        for (a.genres) |genre| {
+            if (col >= w) break;
+            col = win.print(&.{
+                .{ .text = " · ", .style = self.s(self.palette.fg3, .{}) },
+                .{ .text = genre, .style = self.s(self.palette.fg2, .{}) },
+            }, .{ .row_offset = start_row, .col_offset = col }).col;
+        }
+    }
+
     return start_row + 1;
 }
 
@@ -262,10 +439,22 @@ fn drawHairline(self: *App, win: vaxis.Window, w: u16, row: u16) void {
     put(win, row, 0, ("─" ** 160)[0 .. @as(usize, cols) * 3], self.s(self.palette.chrome, .{}));
 }
 
-/// Title + score + hairline + episode-count metadata stack. Returns the next
-/// free row. `h` bounds each step so a short pane never overdraws.
+/// Title + chips + score/genres + hairline + episode-count metadata stack
+/// (ROD-141). Returns the next free row. `h` bounds each step so a short pane
+/// never overdraws.
 fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderInfo, start_row: u16) u16 {
     var row = drawTitle(self, win, w, info, start_row);
+
+    // Alternate titles (english + native) — only present when the Anime has them.
+    if (info.anime) |a| {
+        if (row < h) row = drawAltTitles(self, win, w, h, a, row);
+    }
+
+    // Kanji chips: status + season/year. Omitted entirely when both are absent.
+    if (info.anime) |a| {
+        if (row < h) row = drawChips(self, win, h, a, row);
+    }
+
     row = drawScore(self, win, w, info.anime, row);
 
     // Hairline. The row advance sits inside the height guard (the original inline
@@ -287,7 +476,40 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
 }
 
 /// Synopsis — the real description when present, otherwise the null-degrade
-/// stub. Word-wraps within `w`. Returns the next free row.
+/// stub. Word-wraps within `w`, capped at `max_lines` rows.
+/// Returns the next free row.
+fn drawSynopsisLimited(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, start_row: u16, max_lines: u16) u16 {
+    var row = start_row;
+    if (row >= h) return row;
+    const cap = @min(max_lines, h - row);
+    if (anime) |a| {
+        if (a.description) |desc| {
+            const lines_written = drawWrappedText(win, row, 0, w, cap, desc, self.s(self.palette.fg2, .{}));
+            // If we hit the cap (description likely continues), place a "…" ellipsis
+            // marker at the trailing edge of the last rendered line (DESIGN.md §1.3
+            // / line ~95: "synopsis ellipsis marker"). The marker is italic text.dim.
+            // Truncation is inferred when lines_written >= cap — an exact cap-fill
+            // from a perfectly-fitting description is a false positive, but the visual
+            // cost is a dim "…" at the end of an already-complete line: acceptable.
+            if (lines_written >= cap and cap > 0 and w > 0) {
+                // "…" is 3 UTF-8 bytes but 1 display column. Place at the last col.
+                const ellipsis_col: u16 = w - 1;
+                put(win, row + cap - 1, ellipsis_col, "…", self.s(self.palette.fg3, .{ .italic = true }));
+            }
+            row += lines_written;
+        } else {
+            putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
+            row += 1;
+        }
+    } else {
+        putClipped(win, row, 0, w, "no synopsis yet", self.s(self.palette.fg2, .{ .italic = true }));
+        row += 1;
+    }
+    return row;
+}
+
+/// Synopsis — uncapped variant used in the two-column layout where the right
+/// column is dedicated to synopsis + grid (no header rows competing for height).
 fn drawSynopsis(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, start_row: u16) u16 {
     var row = start_row;
     if (row >= h) return row;
@@ -342,14 +564,22 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         const lrow = drawCover(self, vx, writer, left_win, info.anime, term_w);
         _ = drawHeader(self, left_win, left_w, h, info, lrow);
 
+        // Two-column: synopsis gets the full right column height minus the grid
+        // reservation — no synopsis cap needed here, the column is dedicated.
         const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
         drawGrid(self, right_win, right_w, h, rrow);
         return;
     }
 
+    // Single-column layout: cap synopsis to leave ≥2 grid rows (ROD-137).
+    // Row budget math (worst case, 35-row terminal, cover ~7 rows + 1 spacer):
+    //   cover=8, title=1, [alt_titles≤2], chips≤1, score=1, hl=1, meta=1, hl=1
+    //   → header uses ≤16 rows, leaving ≥16 for synopsis+grid at h=32.
+    //   synopsisCap reserves 1 spacer + 2 grid rows = 3, so max synopsis = h - header - 3.
     var row: u16 = drawCover(self, vx, writer, win, info.anime, term_w);
     row = drawHeader(self, win, w, h, info, row);
-    row = drawSynopsis(self, win, w, h, info.anime, row);
+    const cap = synopsisCap(if (h > row) h - row else 0);
+    row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
     drawGrid(self, win, w, h, row);
 }
 
@@ -380,17 +610,20 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
         row += 1;
     }
 
-    // Status — the airing status when the source gave one, else the watchlist
-    // status (which always has a value; defaults to "planning"). The history
-    // row itself already shows progress + list_status, so airing status is the
-    // complementary fact worth surfacing here.
+    // Kanji chips (ROD-141): status chip then season/year chip. The history
+    // row itself shows progress + list_status, so the airing-status kanji is
+    // the complementary fact here (matches §5.4a preview mock).
+    // Fallback: if no chip resolves (status null/unknown), show list_status in
+    // text.muted as a last resort so the pane is never entirely silent.
     if (row < h) {
-        const status_text: []const u8 = if (anime.status) |st|
-            (if (st.len > 0) st else rec.list_status)
-        else
-            rec.list_status;
-        putClipped(win, row, 0, w, status_text, self.s(self.palette.fg2, .{}));
-        row += 1;
+        const chips_row = row;
+        row = drawChips(self, win, h, anime, row);
+        if (row == chips_row) {
+            // No chip was emitted (status absent/unknown) — fall back to the
+            // watchlist status label so the preview isn't silent about state.
+            putClipped(win, chips_row, 0, w, rec.list_status, self.s(self.palette.fg2, .{}));
+            row = chips_row + 1;
+        }
     }
 
     _ = drawSynopsis(self, win, w, h, anime, row);
@@ -494,4 +727,74 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             ep_idx += 1;
         }
     }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+test "statusChipFor: AniList vocab" {
+    const t = std.testing;
+
+    // Airing → 放映中, state.now
+    const airing = statusChipFor("RELEASING").?;
+    try t.expectEqualStrings("放映中", airing.kanji);
+    try t.expectEqual(.hot, airing.color_field);
+
+    // Completed → 完結, text.muted
+    const done = statusChipFor("FINISHED").?;
+    try t.expectEqualStrings("完結", done.kanji);
+    try t.expectEqual(.fg2, done.color_field);
+
+    // Not yet aired → 放映前, state.focus
+    const soon = statusChipFor("NOT_YET_RELEASED").?;
+    try t.expectEqualStrings("放映前", soon.kanji);
+    try t.expectEqual(.focus, soon.color_field);
+
+    // Cancelled → 中止, text.dim
+    const cancelled = statusChipFor("CANCELLED").?;
+    try t.expectEqualStrings("中止", cancelled.kanji);
+    try t.expectEqual(.fg3, cancelled.color_field);
+}
+
+test "statusChipFor: AllAnime vocab" {
+    const t = std.testing;
+
+    // AllAnime sends "RELEASING" (same) and "ongoing" (lowercase alias).
+    const rel = statusChipFor("RELEASING").?;
+    try t.expectEqualStrings("放映中", rel.kanji);
+
+    const ongoing = statusChipFor("ongoing").?;
+    try t.expectEqualStrings("放映中", ongoing.kanji);
+}
+
+test "statusChipFor: case-insensitivity" {
+    const t = std.testing;
+
+    try t.expect(statusChipFor("releasing") != null);
+    try t.expect(statusChipFor("Finished") != null);
+    try t.expect(statusChipFor("not_yet_released") != null);
+    try t.expect(statusChipFor("ONGOING") != null);
+}
+
+test "statusChipFor: null on unknown/empty" {
+    const t = std.testing;
+
+    try t.expect(statusChipFor("") == null);
+    try t.expect(statusChipFor("unknown") == null);
+    try t.expect(statusChipFor("AIRING") == null); // not a valid vocab word
+}
+
+test "synopsisCap: reserves spacer + min grid rows" {
+    const t = std.testing;
+
+    // When remaining_h is exactly the reservation, cap floors to 1.
+    try t.expectEqual(@as(u16, 1), synopsisCap(3)); // 3 == 1 spacer + 2 grid rows
+
+    // Normal case: cap = remaining - reservation.
+    try t.expectEqual(@as(u16, 5), synopsisCap(8));  // 8 - 3 = 5
+    try t.expectEqual(@as(u16, 12), synopsisCap(15)); // 15 - 3 = 12
+
+    // Edge: remaining less than reservation → floor to 1.
+    try t.expectEqual(@as(u16, 1), synopsisCap(0));
+    try t.expectEqual(@as(u16, 1), synopsisCap(1));
+    try t.expectEqual(@as(u16, 1), synopsisCap(2));
 }
