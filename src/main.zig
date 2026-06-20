@@ -199,7 +199,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
 
     // ROD-66/97: remember this show. Refreshes source metadata, preserves any
     // existing history (play_count/progress/status).
-    if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs()) catch |e|
+    if (store) |st| st.upsertAnime(zigoku.AnimeRecord.fromDomain(SOURCE, show, cli.translation), zigoku.Store.nowSecs(), arena) catch |e|
         std.log.debug("upsertAnime failed: {s}", .{@errorName(e)});
 
     // 2. Episodes — ROD-68: serve from cache when warm, else fetch + cache.
