@@ -81,6 +81,25 @@ pub fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
     return if (s) |x| try alloc.dupe(u8, x) else null;
 }
 
+/// Deep-copy a slice of strings (genres, studios) into a fresh owned slice plus
+/// an individually-owned copy of every element — the shape `freeOwnedAnime`
+/// frees. On OOM the partial allocation is unwound and the error propagates.
+/// Returns `&.{}` for an empty input (no allocation, nothing to free).
+pub fn dupeOwnedStrList(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
+    if (items.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |s| alloc.free(s);
+        alloc.free(out);
+    }
+    for (items, 0..) |s, i| {
+        out[i] = try alloc.dupe(u8, s);
+        filled = i + 1;
+    }
+    return out;
+}
+
 pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
     var out: Anime = .{
         .id = try alloc.dupe(u8, a.id),
@@ -91,6 +110,8 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .eps_dub = a.eps_dub,
         .total_episodes = a.total_episodes,
         .year = a.year,
+        .season = a.season,
+        .start_date = a.start_date,
         .score = a.score,
     };
     errdefer freeOwnedAnime(alloc, out);
@@ -103,6 +124,8 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
     out.status = try dupeOptText(alloc, a.status);
     out.description = try dupeOptText(alloc, a.description);
     out.kind = try dupeOptText(alloc, a.kind);
+    out.genres = try dupeOwnedStrList(alloc, a.genres);
+    out.studios = try dupeOwnedStrList(alloc, a.studios);
     return out;
 }
 
@@ -209,14 +232,29 @@ pub fn enrichTask(
 
     for (results) |*a| {
         const meta = anilist.enrich(arena.allocator(), io, a.*) catch null orelse continue;
+        // Fill only what AllAnime left blank (it's the source of truth); deep-copy
+        // each string/slice into GPA before the arena `meta` came from is torn down.
+        // A failed copy leaves the prior (blank) value rather than a dangling one.
         if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
+        if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
         if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
         if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
+        if (a.kind == null) a.kind = dupeOptText(gpa, meta.kind) catch a.kind;
         if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
+        // Optional-on-OOM (matches the dupeOptText fields): a failed copy yields
+        // null and we keep the prior slice, never aliasing the soon-dead arena.
+        if (a.genres.len == 0) {
+            if (dupeOwnedStrList(gpa, meta.genres) catch null) |g| a.genres = g;
+        }
+        if (a.studios.len == 0) {
+            if (dupeOwnedStrList(gpa, meta.studios) catch null) |s| a.studios = s;
+        }
         if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
         if (a.mal_id == null) a.mal_id = meta.mal_id;
         if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
         if (a.year == null) a.year = meta.year;
+        if (a.season == null) a.season = meta.season;
+        if (a.start_date == null) a.start_date = meta.start_date;
         if (a.score == null) a.score = meta.score;
     }
 
@@ -497,6 +535,39 @@ pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+test "dupeOwnedAnime round-trips the widened metadata fields leak-clean (ROD-140)" {
+    const alloc = std.testing.allocator; // fails the test on any leak or double-free
+    const src: Anime = .{
+        .id = "show1",
+        .name = "Sousou no Frieren",
+        .english_name = "Frieren",
+        .native_name = "葬送のフリーレン",
+        .kind = "TV",
+        .season = .fall,
+        .start_date = .{ .year = 2023, .month = 9, .day = 29 },
+        .genres = &.{ "Adventure", "Drama", "Fantasy" },
+        .studios = &.{"Madhouse"},
+    };
+
+    const owned = try dupeOwnedAnime(alloc, src);
+    defer freeOwnedAnime(alloc, owned);
+
+    // Value types copy through; slices are deep, independent copies.
+    try std.testing.expectEqual(domain.Season.fall, owned.season.?);
+    try std.testing.expectEqual(@as(?u32, 29), owned.start_date.?.day);
+    try std.testing.expectEqual(@as(usize, 3), owned.genres.len);
+    try std.testing.expectEqualStrings("Fantasy", owned.genres[2]);
+    try std.testing.expect(owned.genres.ptr != src.genres.ptr); // not aliasing the source
+    try std.testing.expectEqual(@as(usize, 1), owned.studios.len);
+    try std.testing.expectEqualStrings("Madhouse", owned.studios[0]);
+}
+
+test "dupeOwnedStrList returns the empty sentinel without allocating" {
+    // &.{} in → &.{} out, freeable as a no-op (len 0). No allocator touch.
+    const out = try dupeOwnedStrList(std.testing.allocator, &.{});
+    try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
 test "observedPlaybackWasMeaningful requires positive observed position" {
