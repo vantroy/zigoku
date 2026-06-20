@@ -13,7 +13,7 @@ const Io = std.Io;
 
 const ENDPOINT = "https://graphql.anilist.co";
 // Shared selection set so the search and by-id queries can never drift apart.
-const GQL_FIELDS = "id idMal title{romaji english native} episodes averageScore status seasonYear description(asHtml:false) coverImage{large}";
+const GQL_FIELDS = "id idMal title{romaji english native} episodes averageScore status season seasonYear startDate{year month day} format genres studios{nodes{name}} description(asHtml:false) coverImage{large}";
 const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
@@ -35,10 +35,19 @@ pub const Metadata = struct {
     anilist_id: ?u64 = null,
     mal_id: ?u64 = null,
     title_english: ?[]const u8 = null,
+    title_native: ?[]const u8 = null,
     thumb: ?[]const u8 = null,
     total_episodes: ?u32 = null,
     year: ?u32 = null,
+    season: ?domain.Season = null,
+    start_date: ?domain.Date = null,
     status: ?[]const u8 = null,
+    /// AniList `format` (TV/MOVIE/OVA…) — populates `domain.Anime.kind`.
+    kind: ?[]const u8 = null,
+    /// Arena-owned at the call site (borrowed from the parsed JSON); the worker
+    /// deep-copies into GPA before arena teardown. Empty slice = none provided.
+    genres: []const []const u8 = &.{},
+    studios: []const []const u8 = &.{},
     description: ?[]const u8 = null,
     score: ?u32 = null,
 };
@@ -53,6 +62,22 @@ const Cover = struct {
     large: ?[]const u8 = null,
 };
 
+const StartDate = struct {
+    year: ?u32 = null,
+    month: ?u32 = null,
+    day: ?u32 = null,
+};
+
+const Studio = struct {
+    name: ?[]const u8 = null,
+};
+
+// AniList nests studios as `studios{nodes{name}}`; default to an empty node list
+// so a media entry that omits the field parses without error.
+const Studios = struct {
+    nodes: []const Studio = &.{},
+};
+
 const Media = struct {
     id: u64,
     idMal: ?u64 = null,
@@ -60,7 +85,12 @@ const Media = struct {
     episodes: ?u32 = null,
     averageScore: ?u32 = null,
     status: ?[]const u8 = null,
+    season: ?[]const u8 = null,
     seasonYear: ?u32 = null,
+    startDate: StartDate = .{},
+    format: ?[]const u8 = null,
+    genres: []const []const u8 = &.{},
+    studios: Studios = .{},
     description: ?[]const u8 = null,
     coverImage: Cover = .{},
 };
@@ -86,16 +116,28 @@ const MediaResp = struct {
     data: ?MediaData = null,
 };
 
+/// Overlay enrichment onto a show, filling only the fields the provider left
+/// blank (AllAnime is the source of truth; AniList backfills). String/slice
+/// fields adopt `meta`'s lifetime — callers that outlive the parse arena must
+/// copy first (see `workers.enrichTask`, which owns the live path). Currently
+/// unused — kept as the single documented mapping; the worker inlines the same
+/// fill-if-null logic so it can deep-copy each field as it goes.
 pub fn apply(show: domain.Anime, meta: Metadata) domain.Anime {
     var out = show;
     if (out.english_name == null) out.english_name = meta.title_english;
+    if (out.native_name == null) out.native_name = meta.title_native;
     if (out.thumb == null) out.thumb = meta.thumb;
     if (out.status == null) out.status = meta.status;
+    if (out.kind == null) out.kind = meta.kind;
     if (out.description == null) out.description = meta.description;
     if (out.anilist_id == null) out.anilist_id = meta.anilist_id;
     if (out.mal_id == null) out.mal_id = meta.mal_id;
     if (out.total_episodes == null) out.total_episodes = meta.total_episodes;
     if (out.year == null) out.year = meta.year;
+    if (out.season == null) out.season = meta.season;
+    if (out.start_date == null) out.start_date = meta.start_date;
+    if (out.genres.len == 0) out.genres = meta.genres;
+    if (out.studios.len == 0) out.studios = meta.studios;
     if (out.score == null) out.score = meta.score;
     return out;
 }
@@ -167,13 +209,47 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
         .anilist_id = m.id,
         .mal_id = m.idMal,
         .title_english = m.title.english,
+        .title_native = m.title.native,
         .thumb = m.coverImage.large,
         .total_episodes = m.episodes,
         .year = m.seasonYear,
+        .season = if (m.season) |s| domain.Season.fromString(s) else null,
+        .start_date = startDate(m.startDate),
         .status = m.status,
+        .kind = m.format,
+        .genres = m.genres, // arena-borrowed; the worker deep-copies into GPA
+        .studios = try studioNames(arena, m.studios),
         .description = if (m.description) |d| try sanitizeDescription(arena, d) else null,
         .score = m.averageScore,
     };
+}
+
+/// Lift AniList's `startDate` into a `domain.Date`. The year anchors the date —
+/// without it AniList sends `{year:null,month:null,day:null}`, which is "no date"
+/// (e.g. an unannounced show), not a partial one.
+fn startDate(sd: StartDate) ?domain.Date {
+    const y = sd.year orelse return null;
+    return .{ .year = y, .month = sd.month, .day = sd.day };
+}
+
+/// Flatten `studios{nodes{name}}` into a flat name slice, dropping any node that
+/// somehow lacks a name. Arena-owned (slice + borrowed name bytes); the worker
+/// deep-copies into GPA. Returns `&.{}` when there are no studios.
+fn studioNames(arena: Allocator, s: Studios) ![]const []const u8 {
+    var count: usize = 0;
+    for (s.nodes) |node| {
+        if (node.name != null) count += 1;
+    }
+    if (count == 0) return &.{};
+    const out = try arena.alloc([]const u8, count); // exact fit, no slack slots
+    var i: usize = 0;
+    for (s.nodes) |node| {
+        if (node.name) |name| {
+            out[i] = name;
+            i += 1;
+        }
+    }
+    return out;
 }
 
 fn bestMatch(show: domain.Anime, media: []const Media) ?Media {
@@ -461,6 +537,32 @@ test "bestMatch accepts unique exact title with episode sanity" {
     };
     const best = bestMatch(show, &candidates) orelse return error.TestExpectationFailed;
     try std.testing.expectEqual(@as(u64, 1), best.id);
+}
+
+test "mediaToMeta maps the widened by-id response shape (ROD-140)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The exact by-id response shape, with every widened field populated and an
+    // unknown field (siteUrl) that ignore_unknown_fields must skip.
+    const json =
+        \\{"data":{"Media":{"id":182255,"idMal":52991,"title":{"romaji":"Sousou no Frieren","english":"Frieren: Beyond Journey's End","native":"葬送のフリーレン"},"episodes":28,"averageScore":89,"status":"FINISHED","season":"FALL","seasonYear":2023,"startDate":{"year":2023,"month":9,"day":29},"format":"TV","genres":["Adventure","Drama","Fantasy"],"studios":{"nodes":[{"name":"Madhouse"}]},"description":"<i>An elf</i> &amp; her party.","coverImage":{"large":"https://img/large.jpg"},"siteUrl":"https://anilist.co/anime/182255"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(MediaResp, a, json, .{ .ignore_unknown_fields = true });
+    const meta = try mediaToMeta(a, parsed.value.data.?.Media.?);
+
+    try std.testing.expectEqual(@as(?u64, 182255), meta.anilist_id);
+    try std.testing.expectEqualStrings("葬送のフリーレン", meta.title_native.?);
+    try std.testing.expectEqual(domain.Season.fall, meta.season.?);
+    try std.testing.expectEqual(@as(u32, 2023), meta.start_date.?.year);
+    try std.testing.expectEqual(@as(?u32, 9), meta.start_date.?.month);
+    try std.testing.expectEqual(@as(?u32, 29), meta.start_date.?.day);
+    try std.testing.expectEqualStrings("TV", meta.kind.?);
+    try std.testing.expectEqual(@as(usize, 3), meta.genres.len);
+    try std.testing.expectEqualStrings("Fantasy", meta.genres[2]);
+    try std.testing.expectEqual(@as(usize, 1), meta.studios.len);
+    try std.testing.expectEqualStrings("Madhouse", meta.studios[0]);
+    try std.testing.expectEqualStrings("An elf & her party.", meta.description.?);
 }
 
 test "sanitizeDescription strips tags and decodes common entities" {
