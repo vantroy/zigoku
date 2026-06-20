@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, SchemaTooNew };
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 4;
+const SCHEMA_VERSION: c_int = 5;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -121,6 +121,22 @@ const MIGRATION_V4 =
     \\END;
 ;
 
+// ROD-185: persist the ROD-140 enrichment widening so History (which reads only
+// the store via animeFromHistoryRecord) shows the season chip / native title /
+// genres, not just the V2 subset. `season` stores the canonical lowercase tag
+// (@tagName, round-trips through domain.Season.fromString). `genres` is a
+// '\n'-joined blob — display-only, never queried by genre, so it mirrors
+// episode_cache.episodes_blob rather than earning a normalized side table.
+const MIGRATION_V5 =
+    \\ALTER TABLE anime ADD COLUMN season       TEXT;
+    \\ALTER TABLE anime ADD COLUMN native_name  TEXT;
+    \\ALTER TABLE anime ADD COLUMN kind         TEXT;
+    \\ALTER TABLE anime ADD COLUMN start_year   INTEGER;
+    \\ALTER TABLE anime ADD COLUMN start_month  INTEGER;
+    \\ALTER TABLE anime ADD COLUMN start_day    INTEGER;
+    \\ALTER TABLE anime ADD COLUMN genres       TEXT;    -- '\n'-joined; see note above
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -138,6 +154,16 @@ pub const AnimeRecord = struct {
     description: ?[]const u8 = null,
     score: ?i64 = null,
     total_episodes: ?i64 = null,
+    // ROD-185 enrichment. `season` is the canonical lowercase tag; `genres` is
+    // the split list (arena-owned on read, borrowed from domain on construct) —
+    // the '\n' blob lives only in the column, joined at upsert / split at load.
+    season: ?[]const u8 = null,
+    native_name: ?[]const u8 = null,
+    kind: ?[]const u8 = null,
+    start_year: ?i64 = null,
+    start_month: ?i64 = null,
+    start_day: ?i64 = null,
+    genres: []const []const u8 = &.{},
     list_status: []const u8 = "planning",
     user_rating: ?f64 = null,
     notes: ?[]const u8 = null,
@@ -169,6 +195,15 @@ pub const AnimeRecord = struct {
             .description = a.description,
             .score = if (a.score) |s| std.math.cast(i64, s) else null,
             .total_episodes = if (a.total_episodes) |n| @intCast(n) else if (eps > 0) @intCast(eps) else null,
+            // Store the canonical tag ("winter"…) so it round-trips through
+            // domain.Season.fromString on the way back out.
+            .season = if (a.season) |s| @tagName(s) else null,
+            .native_name = a.native_name,
+            .kind = a.kind,
+            .start_year = if (a.start_date) |d| @intCast(d.year) else null,
+            .start_month = if (a.start_date) |d| if (d.month) |m| @intCast(m) else null else null,
+            .start_day = if (a.start_date) |d| if (d.day) |dd| @intCast(dd) else null else null,
+            .genres = a.genres,
         };
     }
 };
@@ -270,12 +305,18 @@ pub const Store = struct {
     /// Deliberately does NOT touch user state on conflict (play_count, progress,
     /// list_status, user_rating, notes, added_at, last_watched_at) — re-running a
     /// search must never wipe the viewer's history.
-    pub fn upsertAnime(self: *Store, a: AnimeRecord, now: i64) Error!void {
+    /// `scratch` joins the genres list into a '\n' blob for binding (only touched
+    /// when `a.genres` is non-empty); pass an arena — like `putCachedEpisodes`,
+    /// the join isn't freed here, it rides the caller's arena to teardown. It is
+    /// safe to pass a non-arena (e.g. `testing.allocator`) ONLY when `a.genres` is
+    /// empty — then nothing is allocated and the lifetime contract is moot.
+    pub fn upsertAnime(self: *Store, a: AnimeRecord, now: i64, scratch: Allocator) Error!void {
         const sql =
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
             \\    cover_url, year, status, description, score, total_episodes,
-            \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible,
+            \\    season, native_name, kind, start_year, start_month, start_day, genres)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -287,6 +328,13 @@ pub const Store = struct {
             \\    description    = COALESCE(excluded.description, anime.description),
             \\    score          = COALESCE(excluded.score, anime.score),
             \\    total_episodes = COALESCE(excluded.total_episodes, anime.total_episodes),
+            \\    season         = COALESCE(excluded.season, anime.season),
+            \\    native_name    = COALESCE(excluded.native_name, anime.native_name),
+            \\    kind           = COALESCE(excluded.kind, anime.kind),
+            \\    start_year     = COALESCE(excluded.start_year, anime.start_year),
+            \\    start_month    = COALESCE(excluded.start_month, anime.start_month),
+            \\    start_day      = COALESCE(excluded.start_day, anime.start_day),
+            \\    genres         = COALESCE(excluded.genres, anime.genres),
             \\    history_visible = MAX(excluded.history_visible, anime.history_visible)
         ;
         const stmt = try self.prepare(sql);
@@ -312,6 +360,20 @@ pub const Store = struct {
         _ = c.sqlite3_bind_int64(stmt, 18, if (a.added_at != 0) a.added_at else now);
         bindOptI64(stmt, 19, a.last_watched_at);
         _ = c.sqlite3_bind_int64(stmt, 20, if (a.history_visible) 1 else 0);
+        bindOptText(stmt, 21, a.season);
+        bindOptText(stmt, 22, a.native_name);
+        bindOptText(stmt, 23, a.kind);
+        bindOptI64(stmt, 24, a.start_year);
+        bindOptI64(stmt, 25, a.start_month);
+        bindOptI64(stmt, 26, a.start_day);
+        // Empty list → bind NULL so the COALESCE preserves any genres already
+        // persisted by an earlier enrichment (same "re-search never wipes" rule
+        // the scalar fields lean on).
+        if (a.genres.len == 0) {
+            _ = c.sqlite3_bind_null(stmt, 27);
+        } else {
+            bindText(stmt, 27, try joinGenres(scratch, a.genres));
+        }
 
         try self.stepDone(stmt);
     }
@@ -322,7 +384,8 @@ pub const Store = struct {
         const sql =
             \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
             \\    year, status, description, score, total_episodes, list_status,
-            \\    user_rating, notes, play_count, progress, added_at, last_watched_at
+            \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
+            \\    season, native_name, kind, start_year, start_month, start_day, genres
             \\FROM anime
             \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
@@ -352,6 +415,13 @@ pub const Store = struct {
                 .progress = c.sqlite3_column_int64(stmt, 16),
                 .added_at = c.sqlite3_column_int64(stmt, 17),
                 .last_watched_at = colOptI64(stmt, 18),
+                .season = try dupeText(arena, stmt, 19),
+                .native_name = try dupeText(arena, stmt, 20),
+                .kind = try dupeText(arena, stmt, 21),
+                .start_year = colOptI64(stmt, 22),
+                .start_month = colOptI64(stmt, 23),
+                .start_day = colOptI64(stmt, 24),
+                .genres = try dupeGenres(arena, stmt, 25),
                 .history_visible = true,
             });
         }
@@ -363,7 +433,8 @@ pub const Store = struct {
         const sql =
             \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
             \\    year, status, description, score, total_episodes, list_status,
-            \\    user_rating, notes, play_count, progress, added_at, last_watched_at
+            \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
+            \\    season, native_name, kind, start_year, start_month, start_day, genres
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -392,6 +463,13 @@ pub const Store = struct {
             .progress = c.sqlite3_column_int64(stmt, 16),
             .added_at = c.sqlite3_column_int64(stmt, 17),
             .last_watched_at = colOptI64(stmt, 18),
+            .season = try dupeText(arena, stmt, 19),
+            .native_name = try dupeText(arena, stmt, 20),
+            .kind = try dupeText(arena, stmt, 21),
+            .start_year = colOptI64(stmt, 22),
+            .start_month = colOptI64(stmt, 23),
+            .start_day = colOptI64(stmt, 24),
+            .genres = try dupeGenres(arena, stmt, 25),
         };
     }
 
@@ -598,6 +676,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 4;");
             v = 4;
         }
+        if (v < 5) {
+            try self.exec(MIGRATION_V5);
+            try self.exec("PRAGMA user_version = 5;");
+            v = 5;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -689,6 +772,29 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+// Genres persist as a single '\n'-joined blob (display-only — never queried by
+// genre, so a column beats a side table). Genre names never contain newlines,
+// the same guarantee episode labels lean on in episode_cache.
+fn joinGenres(scratch: Allocator, genres: []const []const u8) Error![]const u8 {
+    var blob: std.ArrayList(u8) = .empty;
+    for (genres, 0..) |g, i| {
+        if (i != 0) try blob.append(scratch, '\n');
+        try blob.appendSlice(scratch, g);
+    }
+    return blob.items;
+}
+
+/// Split the stored genres blob back into an arena-owned list. A NULL/empty
+/// column is an empty list, never a one-element list of "".
+fn dupeGenres(arena: Allocator, stmt: Stmt, idx: c_int) Error![]const []const u8 {
+    const blob = (try dupeText(arena, stmt, idx)) orelse return &.{};
+    if (blob.len == 0) return &.{};
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, blob, '\n');
+    while (it.next()) |g| try list.append(arena, g);
+    return list.toOwnedSlice(arena);
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -709,7 +815,7 @@ test "upsertAnime + loadHistory round-trips" {
     defer s.close();
 
     const a = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "abc", .name = "Frieren", .eps_sub = 28 }, .sub);
-    try s.upsertAnime(a, 1000);
+    try s.upsertAnime(a, 1000, arena);
 
     const rows = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -729,8 +835,8 @@ test "loadHistory excludes hidden metadata-cache rows" {
     var s = try Store.openMemory();
     defer s.close();
 
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "Hidden", .history_visible = false }, 1000);
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "Shown", .history_visible = true }, 1001);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "Hidden", .history_visible = false }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "Shown", .history_visible = true }, 1001, arena);
 
     const rows = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -745,9 +851,9 @@ test "migration v4 hides polluted search-cache rows while preserving real histor
     var s = try Store.openMemory();
     defer s.close();
 
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "search-only", .title = "Search Only", .history_visible = true }, 1000);
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "played", .title = "Played", .history_visible = true, .play_count = 1, .progress = 3, .last_watched_at = 2000 }, 1001);
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "rated", .title = "Rated", .history_visible = true, .user_rating = 8.5 }, 1002);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "search-only", .title = "Search Only", .history_visible = true }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "played", .title = "Played", .history_visible = true, .play_count = 1, .progress = 3, .last_watched_at = 2000 }, 1001, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "rated", .title = "Rated", .history_visible = true, .user_rating = 8.5 }, 1002, arena);
 
     try s.exec(MIGRATION_V4);
 
@@ -765,7 +871,7 @@ test "recordPlay promotes hidden row into history" {
     var s = try Store.openMemory();
     defer s.close();
 
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .history_visible = false }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .history_visible = false }, 1000, arena);
     try s.recordPlay(T_SOURCE, "x", 2, 2000, true);
 
     const rows = try s.loadHistory(arena);
@@ -795,7 +901,7 @@ test "getAnime returns persisted enrichment" {
         .description = "Elf mage grief hour",
         .score = 91,
         .total_episodes = 28,
-    }, 1000);
+    }, 1000, arena);
 
     const rec = (try s.getAnime(arena, T_SOURCE, "frieren")) orelse return error.TestExpectationFailed;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
@@ -806,6 +912,80 @@ test "getAnime returns persisted enrichment" {
     try testing.expectEqualStrings("Elf mage grief hour", rec.description orelse "");
 }
 
+test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Persist via the real domain→record path so the @tagName / Date / genres
+    // mapping in fromDomain is exercised, not hand-rolled record literals.
+    const genres = [_][]const u8{ "Action", "Adventure", "Fantasy" };
+    const rec = AnimeRecord.fromDomain(T_SOURCE, .{
+        .id = "frieren",
+        .name = "Sousou no Frieren",
+        .native_name = "葬送のフリーレン",
+        .season = .fall,
+        .start_date = .{ .year = 2023, .month = 9, .day = 29 },
+        .kind = "TV",
+        .genres = &genres,
+    }, .sub);
+    try s.upsertAnime(rec, 1000, arena);
+
+    // getAnime path
+    const got = (try s.getAnime(arena, T_SOURCE, "frieren")) orelse return error.TestExpectationFailed;
+    try testing.expectEqualStrings("fall", got.season orelse "");
+    try testing.expectEqualStrings("葬送のフリーレン", got.native_name orelse "");
+    try testing.expectEqualStrings("TV", got.kind orelse "");
+    try testing.expectEqual(@as(?i64, 2023), got.start_year);
+    try testing.expectEqual(@as(?i64, 9), got.start_month);
+    try testing.expectEqual(@as(?i64, 29), got.start_day);
+    try testing.expectEqual(@as(usize, 3), got.genres.len);
+    try testing.expectEqualStrings("Action", got.genres[0]);
+    try testing.expectEqualStrings("Fantasy", got.genres[2]);
+
+    // loadHistory path sees the same blob split back into a list.
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("fall", rows[0].season orelse "");
+    try testing.expectEqual(@as(usize, 3), rows[0].genres.len);
+    try testing.expectEqualStrings("Adventure", rows[0].genres[1]);
+}
+
+test "a later search without genres preserves the persisted genres list" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const genres = [_][]const u8{ "Action", "Fantasy" };
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .genres = &genres }, 1000, arena);
+    // A plain re-search carries no genres (empty list → NULL bind → COALESCE keeps
+    // the stored blob, same rule the scalar enrichment fields lean on).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 2000, arena);
+
+    const got = (try s.getAnime(arena, T_SOURCE, "x")) orelse return error.TestExpectationFailed;
+    try testing.expectEqual(@as(usize, 2), got.genres.len);
+    try testing.expectEqualStrings("Action", got.genres[0]);
+}
+
+test "empty genres reads back as an empty list, never [\"\"]" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, arena);
+    const got = (try s.getAnime(arena, T_SOURCE, "x")) orelse return error.TestExpectationFailed;
+    try testing.expectEqual(@as(usize, 0), got.genres.len);
+}
+
 test "upsertAnime preserves user state on re-search" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -814,11 +994,11 @@ test "upsertAnime preserves user state on re-search" {
     var s = try Store.openMemory();
     defer s.close();
 
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Old Title" }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Old Title" }, 1000, arena);
     try s.recordPlay(T_SOURCE, "x", 3, 2000, true); // play_count=1, progress=3
 
     // A later search refreshes the title but must NOT reset play_count/progress.
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "New Title", .total_episodes = 12 }, 3000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "New Title", .total_episodes = 12 }, 3000, arena);
 
     const rows = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), rows.len);
@@ -831,7 +1011,7 @@ test "upsertAnime preserves user state on re-search" {
 test "saveProgress + getResume; watched threshold" {
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, testing.allocator);
 
     // 94% → not watched.
     try s.saveProgress(T_SOURCE, "x", .sub, "1", 940, 1000, 1001);
@@ -851,7 +1031,7 @@ test "saveProgress + getResume; watched threshold" {
 test "sub and dub resume independently" {
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, testing.allocator);
 
     try s.saveProgress(T_SOURCE, "x", .sub, "1", 100, 1400, 1001);
     try s.saveProgress(T_SOURCE, "x", .dub, "1", 700, 1400, 1002);
@@ -902,8 +1082,8 @@ test "recordPlay bumps count, progress, last_watched and reorders history" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A" }, 1000);
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A" }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001, arena);
 
     // Play B → it should jump to the top of history.
     try s.recordPlay(T_SOURCE, "b", 5, 2000, true);
@@ -923,7 +1103,7 @@ test "recordPlay with completed=false records the play but not the progress" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, arena);
 
     // A short watch of episode 4: it's a real play (count/last_watched/visible)
     // but must NOT bump the progress high-water mark (ROD-168).
@@ -949,7 +1129,7 @@ test "episode cache: hit, expiry, sub/dub separation" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000); // FK parent
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, arena); // FK parent
 
     const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "1.5" }, .{ .raw = "2" } };
     // FINISHED → 7d TTL.
@@ -982,7 +1162,7 @@ test "foreign key cascade deletes progress and cache with its anime" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 1000, arena);
     try s.saveProgress(T_SOURCE, "x", .sub, "1", 100, 1400, 1001);
     const eps = [_]domain.EpisodeNumber{.{ .raw = "1" }};
     try s.putCachedEpisodes(T_SOURCE, "x", .sub, &eps, "FINISHED", 1000, arena);

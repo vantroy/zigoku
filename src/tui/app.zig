@@ -47,6 +47,7 @@ const Loop = event_mod.Loop;
 // the rest of the render helpers now live with the per-view passes (ROD-144).
 const put = render.put;
 const dupeOptText = workers.dupeOptText;
+const dupeOwnedStrList = workers.dupeOwnedStrList;
 const dupeOwnedAnime = workers.dupeOwnedAnime;
 const freeOwnedAnime = workers.freeOwnedAnime;
 const searchTask = workers.searchTask;
@@ -525,19 +526,42 @@ pub const App = struct {
         return null;
     }
 
+    /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
+    /// missing or out-of-range year collapses the whole date to null (a date with
+    /// no year isn't a date); month/day independently degrade to "not provided".
+    fn dateFromRecord(rec: AnimeRecord) ?domain.Date {
+        const y = rec.start_year orelse return null;
+        const year = std.math.cast(u32, y) orelse return null;
+        return .{
+            .year = year,
+            .month = if (rec.start_month) |m| std.math.cast(u32, m) else null,
+            .day = if (rec.start_day) |d| std.math.cast(u32, d) else null,
+        };
+    }
+
+    /// A borrowed view: the returned `Anime`'s slice fields (name, genres,
+    /// status, …) alias `rec`'s arena memory — this is NOT an ownership transfer.
+    /// Used transiently on the stack within render/nav; never store it past the
+    /// record's arena and never hand it to `freeOwnedAnime` (that frees gpa-owned
+    /// shapes; use `hydrateAnimeFromRecord` when you need a gpa-owned copy).
     pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
         return .{
             .id = rec.source_id,
             .name = rec.title,
             .english_name = rec.title_english,
+            .native_name = rec.native_name,
             .mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null,
             .anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null,
             .thumb = rec.cover_url,
             .total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null,
             .year = if (rec.year) |x| std.math.cast(u32, x) else null,
+            .season = if (rec.season) |tag| domain.Season.fromString(tag) else null,
+            .start_date = dateFromRecord(rec),
             .status = rec.status,
             .description = rec.description,
+            .genres = rec.genres,
             .score = if (rec.score) |x| std.math.cast(u32, x) else null,
+            .kind = rec.kind,
         };
     }
 
@@ -750,14 +774,21 @@ pub const App = struct {
 
     fn hydrateAnimeFromRecord(self: *App, a: *Anime, rec: AnimeRecord) void {
         if (a.english_name == null) a.english_name = dupeOptText(self.gpa, rec.title_english) catch a.english_name;
+        if (a.native_name == null) a.native_name = dupeOptText(self.gpa, rec.native_name) catch a.native_name;
         if (a.thumb == null) a.thumb = dupeOptText(self.gpa, rec.cover_url) catch a.thumb;
         if (a.status == null) a.status = dupeOptText(self.gpa, rec.status) catch a.status;
         if (a.description == null) a.description = dupeOptText(self.gpa, rec.description) catch a.description;
+        if (a.kind == null) a.kind = dupeOptText(self.gpa, rec.kind) catch a.kind;
         if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
         if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
         if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
         if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
         if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
+        // Season/start_date are pure values (no heap); genres is deep-copied into
+        // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
+        if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
+        if (a.start_date == null) a.start_date = dateFromRecord(rec);
+        if (a.genres.len == 0) a.genres = dupeOwnedStrList(self.gpa, rec.genres) catch a.genres;
     }
 
     fn hydrateResultsFromStore(self: *App, source_name: []const u8, offset: usize, count: usize) void {
@@ -776,12 +807,18 @@ pub const App = struct {
 
     fn persistResults(self: *App, source_name: []const u8, offset: usize, count: usize, visible: bool) void {
         const st = self.store orelse return;
+        // Scratch arena for the per-row genres-blob join (reset each iteration so
+        // it can't grow across a whole search page). Reset-retaining keeps the
+        // backing capacity, so it's one alloc amortized over the page.
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
             var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation);
             rec.history_visible = visible;
-            st.upsertAnime(rec, Store.nowSecs()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
+            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
+            _ = arena.reset(.retain_capacity);
         }
     }
 
