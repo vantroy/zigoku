@@ -58,6 +58,38 @@ pub const Quality = enum {
     }
 };
 
+/// Broadcast season (the cours a show debuts in). AniList serves these
+/// uppercase (`WINTER`…), AllAnime capitalized (`Winter`…); both fold to one
+/// canonical value here so the render layer maps a single set to kanji 春/夏/秋/冬
+/// (ROD-141) instead of re-parsing two source spellings.
+pub const Season = enum {
+    winter,
+    spring,
+    summer,
+    fall,
+
+    /// Parse AniList's `season` or AllAnime's `season.quarter`, case-insensitive;
+    /// `autumn` aliases `fall`. Unknown/empty → null (an absent season, never a
+    /// wrong one).
+    pub fn fromString(s: []const u8) ?Season {
+        if (std.ascii.eqlIgnoreCase(s, "winter")) return .winter;
+        if (std.ascii.eqlIgnoreCase(s, "spring")) return .spring;
+        if (std.ascii.eqlIgnoreCase(s, "summer")) return .summer;
+        if (std.ascii.eqlIgnoreCase(s, "fall") or std.ascii.eqlIgnoreCase(s, "autumn")) return .fall;
+        return null;
+    }
+};
+
+/// A calendar date at whatever precision the source offered. `year` is always
+/// present when the date exists; `month`/`day` fill in when known (AllAnime
+/// gives year+month from `airedStart`, AniList year+month+day from `startDate`).
+/// A pure value type — no heap, so it copies and frees for free.
+pub const Date = struct {
+    year: u32,
+    month: ?u32 = null,
+    day: ?u32 = null,
+};
+
 /// One show in the catalog.
 ///
 /// Only `id` and `name` are guaranteed. `id` is the *provider's* opaque show
@@ -87,6 +119,13 @@ pub const Anime = struct {
     /// is missing or partial.
     total_episodes: ?u32 = null,
     year: ?u32 = null,
+    /// Broadcast season (the cours of `year`). Sourced AllAnime-first from
+    /// `season.quarter`, backfilled by AniList enrichment. Pairs with `year` for
+    /// the season+year detail chip (ROD-141).
+    season: ?Season = null,
+    /// Full debut date when a source offers more than the year. AllAnime's
+    /// `airedStart` gives year+month; AniList's `startDate` adds the day.
+    start_date: ?Date = null,
     status: ?[]const u8 = null,
     description: ?[]const u8 = null,
     genres: []const []const u8 = &.{},
@@ -204,6 +243,18 @@ test "EpisodeNumber.lessThan: specials after numbered run" {
     // Two specials are not less-than each other (neither < the other, both +inf).
     try std.testing.expect(!EpisodeNumber.lessThan({}, sp, ova));
     try std.testing.expect(!EpisodeNumber.lessThan({}, ova, sp));
+}
+
+test "Season.fromString folds AniList and AllAnime spellings" {
+    // AniList uppercase, AllAnime capitalized — both fold to one value.
+    try std.testing.expectEqual(Season.winter, Season.fromString("WINTER").?);
+    try std.testing.expectEqual(Season.fall, Season.fromString("Fall").?);
+    // `autumn` aliases `fall`; case is irrelevant.
+    try std.testing.expectEqual(Season.fall, Season.fromString("autumn").?);
+    try std.testing.expectEqual(Season.summer, Season.fromString("sUmMeR").?);
+    // Unknown/empty → null, never a wrong guess.
+    try std.testing.expect(Season.fromString("") == null);
+    try std.testing.expect(Season.fromString("rainy") == null);
 }
 
 test "Translation.str returns correct tag name" {

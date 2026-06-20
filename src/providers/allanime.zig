@@ -103,7 +103,12 @@ pub const AllAnime = struct {
     // AllAnime-first metadata so the detail pane is populated even when enrichment
     // never lands. `airedStart`/`season` are optional objects; `score` is a 0–10
     // float we rescale to AniList's 0–100 in `edgeToAnime`.
-    const YearObj = struct { year: ?u32 = null };
+    // `airedStart` carries the real debut date (year+month, sometimes day);
+    // `season` carries the broadcast cours (quarter + year). We keep every field
+    // the payload sends rather than the bare year — the quarter feeds the season
+    // chip and the month feeds the start-date detail row (ROD-140).
+    const AiredStart = struct { year: ?u32 = null, month: ?u32 = null, day: ?u32 = null };
+    const SeasonObj = struct { quarter: ?[]const u8 = null, year: ?u32 = null };
     const SEdge = struct {
         _id: []const u8,
         name: ?[]const u8 = null,
@@ -113,8 +118,8 @@ pub const AllAnime = struct {
         type: ?[]const u8 = null,
         score: ?f64 = null,
         availableEpisodes: AvailEps = .{},
-        airedStart: ?YearObj = null,
-        season: ?YearObj = null,
+        airedStart: ?AiredStart = null,
+        season: ?SeasonObj = null,
     };
     const SShows = struct { edges: []SEdge };
     const SData = struct { shows: SShows };
@@ -155,6 +160,17 @@ pub const AllAnime = struct {
     fn edgeToAnime(e: SEdge) domain.Anime {
         const aired_year: ?u32 = if (e.airedStart) |a| a.year else null;
         const season_year: ?u32 = if (e.season) |s| s.year else null;
+        // Primary-source metadata: fold the quarter to our canonical Season, and
+        // keep `airedStart`'s precision as a full debut date (year is required
+        // for the date to exist; month/day ride along when present).
+        const season: ?domain.Season = if (e.season) |s|
+            (if (s.quarter) |q| domain.Season.fromString(q) else null)
+        else
+            null;
+        const start_date: ?domain.Date = if (e.airedStart) |sd|
+            (if (sd.year) |y| domain.Date{ .year = y, .month = sd.month, .day = sd.day } else null)
+        else
+            null;
         // AllAnime scores 0–10 (one or two decimals); AniList — the canonical
         // scale downstream (`averageScore`) — is 0–100. Rescale so a search-seeded
         // score and an enrichment score read on the same axis. Clamp defensively.
@@ -177,6 +193,8 @@ pub const AllAnime = struct {
             .eps_sub = e.availableEpisodes.sub,
             .eps_dub = e.availableEpisodes.dub,
             .year = aired_year orelse season_year,
+            .season = season,
+            .start_date = start_date,
         };
     }
 
@@ -1009,18 +1027,25 @@ test "edgeToAnime: maps the widened search edge (ROD-181)" {
     try std.testing.expectEqual(@as(?u32, 89), f0.score); // 8.88 → round(88.8) → 89
     try std.testing.expectEqual(@as(u32, 10), f0.eps_sub);
     try std.testing.expectEqual(@as(?u32, 2026), f0.year); // airedStart wins
+    try std.testing.expectEqual(domain.Season.winter, f0.season.?); // season.quarter
+    try std.testing.expectEqual(@as(?u32, 2026), f0.start_date.?.year); // airedStart precision
+    try std.testing.expectEqual(@as(?u32, 1), f0.start_date.?.month);
+    try std.testing.expectEqual(@as(?u32, null), f0.start_date.?.day); // not in payload
 
     const f1 = AllAnime.edgeToAnime(edges[1]);
     try std.testing.expectEqual(@as(?u64, null), f1.anilist_id); // MAL thumb
     try std.testing.expectEqual(@as(?u32, 1998), f1.year); // season.year fallback
     try std.testing.expectEqual(@as(?u32, null), f1.score); // score 0 → null
     try std.testing.expectEqual(@as(?[]const u8, null), f1.english_name);
+    try std.testing.expectEqual(domain.Season.fall, f1.season.?); // quarter without airedStart
+    try std.testing.expectEqual(@as(?domain.Date, null), f1.start_date); // no airedStart → no date
 
     const f2 = AllAnime.edgeToAnime(edges[2]);
     try std.testing.expectEqualStrings("C", f2.id);
     try std.testing.expectEqualStrings("(untitled)", f2.name);
     try std.testing.expectEqual(@as(?u32, null), f2.year);
     try std.testing.expectEqual(@as(?u64, null), f2.anilist_id);
+    try std.testing.expectEqual(@as(?domain.Season, null), f2.season); // bare _id → no season
 }
 
 test "edgeToAnime: score rescale clamps over-range and rejects non-finite (ROD-181)" {
