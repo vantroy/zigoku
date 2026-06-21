@@ -232,27 +232,35 @@ const DrawCtx = struct {
         const is_watching = rec.list_status == .watching;
         const is_paused = rec.list_status == .paused;
 
-        // §4.1 focus affordance: the focused row gets a full-width bg.surface band,
-        // the ▸ play glyph in focus cyan, and a cyan+bold title.
-        const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
-        if (selected) {
+        // §4.1 + ROD-194: the focus affordance (bg.surface band + cyan ▸ + cyan-bold
+        // title) is earned ONLY when this is the selected row AND the list pane holds
+        // focus. When the detail pane has focus the selected row steps down — the band
+        // drops, the ▸ dims, the title loses bold — so pane focus is unmistakable.
+        const list_focused = self.active_pane == .list;
+        const sel_focused = selected and list_focused;
+        const row_bg = if (sel_focused) self.palette.bg_surface else self.palette.bg_base;
+        if (sel_focused) {
             fillRow(c.win, row, c.w, self.palette.bg_surface);
             fillRow(c.win, row + 1, c.w, self.palette.bg_surface);
         }
 
-        // §2.4 watchlist status glyphs. Focus ▸ overrides when selected. Colors:
-        // watching/paused=focus(+dim for paused), dropped=fg3, completed=●, else ○.
+        // §2.4 watchlist status glyphs. Selected ▸ overrides; watching also uses ▸.
+        // Colors (ROD-194): selected → focus cyan (dim when list unfocused). Status
+        // glyphs step OFF focus — watching/paused/completed/planning → fg2, dropped →
+        // fg3 — so an unselected watching row can't impersonate the cursor.
         const marker: []const u8 =
             if (selected or is_watching) "▸ " else if (is_completed) "● " else if (is_paused) "◐ " else if (is_dropped) "· " else "○ ";
         const marker_color =
-            if (selected or is_watching or is_paused) self.palette.focus else if (is_dropped) self.palette.fg3 else self.palette.fg2;
-        const marker_dim = is_paused and !selected;
+            if (selected) self.palette.focus else if (is_dropped) self.palette.fg3 else self.palette.fg2;
+        // Dim the ▸ when the selected row is unfocused, or for an unselected paused row.
+        const marker_dim = (selected and !list_focused) or (is_paused and !selected);
         put(c.win, row, 2, marker, self.s(marker_color, .{ .bg = row_bg, .dim = marker_dim }));
 
         // §4.1: completed/dropped rows use text.dim for title; watching/planning fg.
+        // Selected title keeps focus cyan but drops bold when the list is unfocused.
         const de_emphasized = is_completed or is_dropped;
         const title_style = if (selected)
-            self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
+            self.s(self.palette.focus, .{ .bg = row_bg, .bold = list_focused })
         else if (de_emphasized)
             self.s(self.palette.fg3, .{ .bg = row_bg })
         else
@@ -265,7 +273,7 @@ const DrawCtx = struct {
         }
 
         // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
-        drawProgressBar(c.win, row + 1, title_col, c.bar_w, c.bar_avail, rec, row_bg, &c.scratch.bar[c.slot], self.palette);
+        drawProgressBar(c.win, row + 1, title_col, c.bar_w, c.bar_avail, rec, row_bg, &c.scratch.bar[c.slot], self.palette, selected, list_focused);
         c.slot += 1;
     }
 };

@@ -199,6 +199,12 @@ distinguishes it. The leading/trailing space is mandatory padding.
 | Paused | `◐ paused` | `state.focus` + dim |
 | Dropped | `· dropped` | `text.dim` |
 
+This is the canonical status-label spec (group headers keep these colors). In a **list
+row**, the watching/paused glyph color is overridden by the §4.1 selection rule
+(ROD-194): the status glyph reads `text.muted` when unselected and only becomes
+`state.focus` when the row is selected **and** the list pane has focus — `state.focus` is
+the cursor's color, not a status color.
+
 ---
 
 ## 3. Layout Grammar
@@ -388,16 +394,28 @@ overflow into the score field. Score field is 10 chars wide, right-reserved.
 | State | Background | Title color | Score color | Left glyph |
 |---|---|---|---|---|
 | Default | `bg.base` | `text.primary` | per score rules | none / `·` dim |
-| Focused | `bg.surface` | `state.focus` + bold | per score rules (focus overrides nothing) | `▸` in `state.focus` |
-| Selected (entered detail) | `bg.base` | `state.focus` | per score rules | `▸` in `state.focus` dim |
+| Selected, list focused | `bg.surface` | `state.focus` + bold | per score rules (focus overrides nothing) | `▸` in `state.focus` |
+| Selected, list **unfocused** (detail pane active) | `bg.base` | `state.focus` (no bold) | per score rules | `▸` in `state.focus` dim |
 | Watched / completed | `bg.base` | `text.dim` | `text.dim` | `●` in `text.dim` |
-| Currently watching | `bg.base` | `text.primary` | per score rules | `◐` in `state.focus` |
+| Currently watching (unselected) | `bg.base` | `text.primary` | per score rules | `▸` in `text.muted` |
+| Paused (unselected) | `bg.base` | `text.primary` | per score rules | `◐` in `text.muted` + dim |
 | Airing (live) _(Planned, ROD-141 — §2.1; glyph suppressed in M3, §9.1)_ | `bg.base` | `text.primary` | per score rules | `◉` in `state.now` |
 | Search non-match (filtered out) | not rendered | — | — | — |
 
-The focus indicator is the row's background shift + bold title + `▸`. There is no
+The selection indicator is the row's background shift + bold title + `▸`. There is no
 full-row color highlight. The background shift (`bg.base` → `bg.surface`) is subtle
 but consistent.
+
+**ROD-194 — selection is focus-aware.** `state.focus` (cyan) is reserved for the
+selection affordance, and the affordance is earned only when the row is selected **and
+its list pane holds keyboard focus**. When the detail pane takes focus the selected row
+steps down — the `bg.surface` band drops back to `bg.base`, the `▸` dims, and the title
+loses its bold — so the active pane is unmistakable (the symmetric step-up is the
+detail/grid lighting). This is why a non-selection status color (the `◐` watching glyph)
+must NOT borrow `state.focus`: an unselected `watching` row in cyan would impersonate the
+cursor. Watching/paused/completed/planning glyphs use `text.muted`; `dropped` uses
+`text.dim`; only the selected, list-focused row gets `state.focus`. Applies identically
+to Browse and History (the two-pane list grammar, §10.3).
 
 ### 4.2 Bottom Command Line (all three states)
 
@@ -454,21 +472,33 @@ Used in History/Watchlist view only. Represents episode progress.
 
 Format: `[████████░░░░░░░░]  8 / 28 eps`
 
-- Filled cells: `state.focus` (watching) or `text.dim` (completed/dropped).
+- Filled cells: **selection-aware** (see below) — `state.focus` only on the cursor bar,
+  otherwise the per-status color.
 - Empty cells: `border.hair`.
 - `█` for filled, `░` for empty.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
-- Episode fraction text: `text.muted`.
+- Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `▸` in `state.now` color injected at the resume position within
   the bar. e.g. `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28.
 
-| State | Bar fill color | Fraction color |
-|---|---|---|
-| Watching | `state.focus` | `text.muted` |
-| Completed | `text.dim` | `text.dim` |
-| Paused | `state.focus` dim | `text.muted` |
-| Dropped | `text.dim` | `text.dim` |
-| Planning | `border.hair` (empty bar) | `text.dim` |
+The fill color is **selection-aware** (ROD-194): `state.focus` means "the focused cursor
+row" (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is
+`selected and list_focused` — and there it OVERRIDES the per-status color, so the cursor
+always owns the single brightest bar (this is the §4.1 repro fix: a selected completed
+row must out-rank an unselected watching one). Off that row the bar drops to the status
+color, and an unselected watching bar can never impersonate the cursor. The two cursor
+rows below override ALL statuses; the canonical rules are `render.barFillColor` /
+`render.barFracColor` (both unit-tested).
+
+| State | Condition | Bar fill color | Fraction color |
+|---|---|---|---|
+| **Cursor — list focused** (any status) | `selected and list_focused` | `state.focus` (`dim` if paused) | `text.muted` for watching/paused, else `text.dim` |
+| **Cursor — detail focused** (any status) | `selected and !list_focused` | `text.muted` (`dim` if paused) | `text.dim` |
+| Watching — unselected | `!selected` | `text.muted` | `text.dim` |
+| Paused — unselected | `!selected` | `text.muted` dim | `text.dim` |
+| Completed — unselected | `!selected` | `text.dim` | `text.dim` |
+| Dropped — unselected | `!selected` | `text.dim` | `text.dim` |
+| Planning — unselected | `!selected` | `border.hair` (empty bar) | `text.dim` |
 
 ### 4.6 Episode Grid Cell
 
@@ -1244,6 +1274,7 @@ revisited without archaeology.
 | Help line updates contextually per view | The bottom bar doubles as a contextual hint line. Fewer permanent labels means less to ignore. | If users report confusion about available keys, add a `?` keybind that shows a full key reference in `bg.elevated` overlay. |
 | Score ≥ 91 earns `state.now` | The 91 threshold maps to AniList's "Favorites" tier. Below 91, scores are metadata. Above, they are a claim. | Adjust threshold if the distribution feels wrong in practice. |
 | List column 38% / detail 62% at default width | Tested against 120-col and 160-col terminals. 38% gives ~45 chars for the list — enough for most anime titles without truncation. Detail gets the rest. | Adjust if common terminal widths expose truncation problems. |
+| `state.focus` (cyan) gated to the selected, list-focused row; status colors step off it (ROD-194) | One token can't mean both "the cursor" and "this show is airing/watching" — a fully-filled watching bar in `state.focus` was out-shouting the selected row, and pane focus was invisible because the selection looked identical focused or not. Reserving cyan for `selected and list_focused` fixes both: unselected watching/paused step down to `text.muted` (the `▸`/`◐` glyph still carries the status), and losing list focus visibly recedes the selected row (band drops, `▸` dims, title un-bolds). The `·` dot stays as low-weight orientation; the list itself now carries the focus signal. Magenta remains reserved for the §8 status-bar cursor. | If watchlist scanning suffers because watching rows no longer read as a cyan "heat signature" at a glance, trial `state.focus` dim (not full) for unselected watching, or widen the `text.muted`↔`text.dim` gap so watching vs completed bars stay distinct. |
 
 ---
 

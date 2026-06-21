@@ -52,14 +52,20 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const a = self.results.items[i];
         const selected = i == self.list_cursor;
 
-        const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
-        if (selected) fillRow(win, row, w, self.palette.bg_surface);
+        // ROD-194: the selection affordance (band + cyan-bold ▸/title) is earned only
+        // when the list pane holds focus. With the detail pane focused the selected row
+        // steps down — band drops, ▸ dims, title loses bold — mirroring History so the
+        // active pane is unmistakable.
+        const list_focused = self.active_pane == .list;
+        const sel_focused = selected and list_focused;
+        const row_bg = if (sel_focused) self.palette.bg_surface else self.palette.bg_base;
+        if (sel_focused) fillRow(win, row, w, self.palette.bg_surface);
 
         const marker = if (selected) "▸ " else "  ";
-        put(win, row, 0, marker, self.s(self.palette.focus, .{ .bg = row_bg }));
+        put(win, row, 0, marker, self.s(self.palette.focus, .{ .bg = row_bg, .dim = selected and !list_focused }));
 
         const title_style = if (selected)
-            self.s(self.palette.focus, .{ .bg = row_bg, .bold = true })
+            self.s(self.palette.focus, .{ .bg = row_bg, .bold = list_focused })
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
         // Meta (eps) if pane is wide enough — rarely true in split view.

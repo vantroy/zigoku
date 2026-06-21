@@ -613,6 +613,7 @@ test "l in browse list pane switches to detail pane" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
+    app.term_cols = 80; // two-pane width: l focuses the detail pane (ROD-194)
     // l requires a selected result.
     try app.results.ensureTotalCapacity(std.testing.allocator, 1);
     app.results.appendAssumeCapacity(.{
@@ -642,11 +643,69 @@ test "l in browse detail pane is a no-op (already rightmost)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+// ROD-194: below pane_split_min Browse has no detail pane to focus into, so
+// Enter/Space must open the full-screen zoom (mirroring single-column History).
+// The regression: l/Enter flipped active_pane to .detail (lighting the · chip)
+// while the content stayed on the list, and Space did nothing.
+fn singleColumnBrowse(app: *App) !void {
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 50; // < pane_split_min: single column, no pane
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+    });
+}
+
+fn teardownBrowse(app: *App) void {
+    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.results.deinit(std.testing.allocator);
+    app.episodes.freeResults(app.gpa);
+}
+
+test "Enter in single-column browse (<60) opens the zoom + fires episodes (ROD-194)" {
+    var app: App = .{};
+    try singleColumnBrowse(&app);
+    defer teardownBrowse(&app);
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(.detail, app.active_view);
+    try testing.expectEqual(.browse, app.detail_origin);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("x", app.episodes.for_id orelse return error.TestExpectationFailed);
+}
+
+test "Space in single-column browse (<60) opens the zoom (ROD-194)" {
+    var app: App = .{};
+    try singleColumnBrowse(&app);
+    defer teardownBrowse(&app);
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view);
+    try testing.expectEqual(.browse, app.detail_origin);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("x", app.episodes.for_id orelse return error.TestExpectationFailed);
+}
+
+test "l in single-column browse (<60) is a no-op — no pane to focus, chip stays dim (ROD-194)" {
+    var app: App = .{};
+    try singleColumnBrowse(&app);
+    defer teardownBrowse(&app);
+
+    try testTick(&app, keyEv('l', .{}));
+    // The regression was l flipping active_pane to .detail with nothing drawn.
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.list, app.active_pane);
+}
+
 test "left/right arrows mirror h/l for browse pane switching (ROD-156 #1)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
+    app.term_cols = 80; // two-pane width: right/l focus the detail pane (ROD-194)
     try app.results.ensureTotalCapacity(std.testing.allocator, 1);
     app.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
