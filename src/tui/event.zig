@@ -22,6 +22,14 @@ pub const Event = union(enum) {
     /// setHistory — never free this with the gpa. On a quit-time interrupt the
     /// worker may post a partial slice that the exiting loop never drains.
     history_loaded: []AnimeRecord,
+    /// History finished RELOADING after playback (ROD-191). Same arena-borrow
+    /// contract as history_loaded; posted only by reloadHistoryTask so run()'s
+    /// double-buffer reaper can tell a reload's outcome from the initial load.
+    history_reloaded: []AnimeRecord,
+    /// A post-playback history reload failed; the current slice is kept. Distinct
+    /// from task_error so a transient reload failure neither wipes the watchlist nor
+    /// raises the persistent load_error banner — it just clears the reload latch.
+    history_reload_failed,
     /// A background task failed; payload is a human-readable reason.
     task_error: []const u8,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
