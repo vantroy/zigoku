@@ -300,9 +300,11 @@ pub const App = struct {
     detail_origin: enum { browse, history } = .browse,
 
     /// Which pane has keyboard focus within the current view.
-    /// Only meaningful in Browse (two panes). History and Settings are single-pane
-    /// and treat this field as always .list — it still exists so the top-bar `·`
-    /// rendering function can read it without a view branch.
+    /// Meaningful in both Browse and History (two-pane at `w >= pane_split_min`,
+    /// ROD-170): it drives the `h`/`l` pane toggle, the top-bar `·`, and the
+    /// focus-aware selection step-down (ROD-194 — the list selection recedes when
+    /// the detail pane has focus). Settings is single-pane and pins it to .list;
+    /// History below pane_split_min is clamped to .list (single column).
     active_pane: enum { list, detail } = .list,
 
     /// Current input mode. `.search` = typing a query; `.normal` = list navigation.
