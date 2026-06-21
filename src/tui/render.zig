@@ -21,7 +21,10 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
 /// (bg.surface for the focused entry, bg.base otherwise). `frac_buf` must be
-/// App-owned — vaxis holds a reference until the next render call.
+/// App-owned — vaxis holds a reference until the next render call. `avail` is the
+/// total columns available for the whole "[bar]  N / M eps" element starting at
+/// `col` (caller-computed against the list's right edge, accounting for the
+/// left margin) — the frac is clipped to it so it can't bleed into a neighbour.
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
     const is_watching = rec.list_status == .watching;
     const is_paused = rec.list_status == .paused;
