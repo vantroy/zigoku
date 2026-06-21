@@ -266,6 +266,10 @@ pub const RenderScratch = struct {
     /// Detail-pane cover spinner glyph. Separate from `msg` so the split-pane
     /// frame (Browse list + detail) never aliases one buffer (ROD-155 review).
     detail_msg: [32]u8 = undefined,
+    /// Per-group "(N)" count strings for the History group headers (ROD-139). One
+    /// slot per status group; same outlive-vx.render() contract as `meta`. 8 slots:
+    /// 5 statuses today, 3 spare. Headers past the 8th silently drop their count.
+    hist_header: [8][24]u8 = undefined,
 };
 
 pub const App = struct {
@@ -515,15 +519,39 @@ pub const App = struct {
         return self.results.items[self.list_cursor];
     }
 
+    /// The focused record, in the History view's §5.4 grouped order. Delegates to
+    /// the renderer's walk so the highlighted row and the focused record share one
+    /// ordering definition (ROD-139).
     pub fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
-        if (self.history.len == 0) return null;
-        var visible_i: usize = 0;
-        for (self.history) |rec| {
-            if (!self.historyEntryVisible(rec.title)) continue;
-            if (visible_i == self.list_cursor) return rec;
-            visible_i += 1;
+        return history.recordAtCursor(self);
+    }
+
+    /// Apply a manual watch-state transition to the focused History entry
+    /// (ROD-139 §1 — the p/x/c/w keybinds). Persists through the store, then
+    /// mutates the in-memory record so the grouped view regroups it on the next
+    /// draw — no full reload. On a store error the in-memory state is left
+    /// untouched so the two never diverge. No-op if nothing is focused.
+    fn setSelectedHistoryStatus(self: *App, status: domain.ListStatus) void {
+        const st = self.store orelse return;
+        const idx = history.indexAtCursor(self) orelse return;
+        const rec = &self.history[idx];
+        st.setListStatus(rec.source, rec.source_id, status) catch |e| {
+            log.debug("setListStatus failed: {s}", .{@errorName(e)});
+            return;
+        };
+        rec.list_status = status;
+        // Mirror the store's force-complete progress snap: a real total fills the
+        // bar; unknown/0 leaves progress as-is (same guard as Store.setListStatus).
+        // We deliberately do NOT mirror history_visible=1 that the store sets — every
+        // record in self.history is already visible (loadHistory filters on it), so
+        // there's nothing to flip. And w/x/p (incl. `w` on a completed show) leave
+        // progress untouched by design: re-watching keeps the full bar until a play
+        // moves the high-water — matching Store.setListStatus exactly.
+        if (status == .completed) {
+            if (rec.total_episodes) |t| {
+                if (t > 0) rec.progress = t;
+            }
         }
-        return null;
     }
 
     /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
@@ -1372,6 +1400,12 @@ pub const App = struct {
                 .history => {
                     self.active_view = .browse;
                     self.active_pane = .list;
+                    // Reset the viewport on the way out: list_top is a physical-row
+                    // offset in History but an entry index in Browse — carrying a
+                    // stale value across the semantic split is a latent trap. Match
+                    // the F1/F2 view-switch arms (cursor + top both to the top).
+                    self.list_cursor = 0;
+                    self.list_top = 0;
                 },
                 .settings => unreachable,
                 .detail => {
@@ -1507,6 +1541,10 @@ pub const App = struct {
             } else if (self.active_view == .history or self.active_view == .settings) {
                 self.active_view = .browse;
                 self.active_pane = .list;
+                // See the q-from-History arm: clear the viewport so a History
+                // physical-row list_top never leaks into Browse's entry-index space.
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
             // Browse + list + normal: no-op. q handles quit.
             return;
@@ -1539,6 +1577,25 @@ pub const App = struct {
                 self.episodes.cursor = ep_len - 1;
             }
             return;
+        }
+
+        // History: manual watch-state transitions (ROD-139 §1). Act on the focused
+        // entry; the grouped view regroups it on the next draw. `c` is the bare
+        // codepoint — Ctrl-C (quit) is matched and returned earlier, so no clash.
+        if (self.active_view == .history) {
+            if (key.matches('p', .{})) {
+                self.setSelectedHistoryStatus(.paused);
+                return;
+            } else if (key.matches('x', .{})) {
+                self.setSelectedHistoryStatus(.dropped);
+                return;
+            } else if (key.matches('c', .{})) {
+                self.setSelectedHistoryStatus(.completed);
+                return;
+            } else if (key.matches('w', .{})) {
+                self.setSelectedHistoryStatus(.watching);
+                return;
+            }
         }
 
         // List navigation (history + browse list pane).
@@ -1696,9 +1753,26 @@ pub const App = struct {
         if (h < 4 or w < 16) return;
         const visible: u16 = h - 3;
         switch (self.active_view) {
-            // @max(1, …) guards visible=1 producing a zero slot count, which
-            // would corrupt list_top via scrollIntoView's arithmetic.
-            .history => self.scrollIntoView(@max(1, visible / 2)),
+            // History: list_top is a physical-row offset (chrome-aware), so scroll
+            // works in physical rows via the renderer's geometry — not the entry
+            // units browse uses (ROD-139). Keep the cursor's whole 2-row entry in
+            // view, then clamp the tail so we never scroll past the last row.
+            .history => {
+                const g = history.geometry(self);
+                const v: usize = visible;
+                if (v == 0) {
+                    self.list_top = 0;
+                } else {
+                    const cur: usize = g.cursor_row;
+                    if (cur < self.list_top) {
+                        self.list_top = cur;
+                    } else if (cur + 2 > self.list_top + v) {
+                        self.list_top = (cur + 2) -| v;
+                    }
+                    const max_top: usize = if (g.total > v) g.total - v else 0;
+                    if (self.list_top > max_top) self.list_top = max_top;
+                }
+            },
             .browse => self.scrollIntoView(visible),
             .detail, .settings => {},
         }
