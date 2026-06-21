@@ -33,10 +33,12 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     };
     put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
 
-    // Render the · indicator right-aligned (§10.3b).
+    // Render the · indicator right-aligned (§10.3b). ROD-170: History is now a
+    // two-pane view, so it dims on list focus / lights on detail focus exactly
+    // like Browse. The zoom (.detail) and single-pane Settings stay lit.
     const dot_color = switch (self.active_view) {
-        .browse => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
-        .history, .detail, .settings => self.palette.focus,
+        .browse, .history => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
+        .detail, .settings => self.palette.focus,
     };
     if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
 }
@@ -119,16 +121,26 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
             .list => "hjkl · / search · F1/F2/F3 views · q quit",
-            .detail => "hjkl scroll · h back · enter play · q back",
+            // ROD-170: detail pane can promote to the full-screen zoom with Space.
+            .detail => "hjkl scroll · h back · enter play · space zoom · q back",
         },
+        // ROD-170: History is a two-pane like Browse. List focus keeps the
+        // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
+        // Browse detail line, adding the Space zoom only where the grid lives
+        // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
         .history => if (self.history.len == 0)
             "/ search · F1 browse · q quit"
-        else
-            // p/x/c/w surface the ROD-139 watch-state transitions per §3.5's
-            // contextual help line. F-keys bundled (matches the browse line) to
-            // keep settings discoverable without overflowing the row.
-            "jk move · enter open · p/x/c/w status · F1/F2/F3 views · q quit",
-        .detail => "hjkl scroll · h back · enter play · q back",
+        else switch (self.active_pane) {
+            .list => "jk move · l/enter detail · p/x/c/w status · F1/F2/F3 · q quit",
+            // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
+            // preview band there is no grid, so enter/space drill into the zoom.
+            .detail => if (w >= App.zoom_min)
+                "hjkl scroll · h back · enter play · space zoom · q back"
+            else
+                "enter/space zoom · h back · q back",
+        },
+        // The full-screen zoom: Space or Esc demote back to the pane; q backs out.
+        .detail => "hjkl scroll · enter play · space/esc back · q back",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
