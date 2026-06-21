@@ -52,6 +52,13 @@ pub const EpisodeState = struct {
     /// store's `progress` on a history-origin load and bumped by `finishPlayback`
     /// after a counted watch. 0 = nothing watched / unknown.
     progress: u32 = 0,
+    /// 0-based index of the resume cell (ROD-192): the episode the user will
+    /// continue from — the mid-episode checkpoint if one exists, else the next
+    /// unwatched. `null` when nothing is in progress (unstarted, or caught up).
+    /// Decoupled from `cursor` (which the user moves freely): the grid paints the
+    /// `▸` resume glyph here regardless of where the cursor sits. Seeded alongside
+    /// `cursor` in `seedHistoryCursor` and advanced by `advanceAfterWatch`.
+    resume_idx: ?usize = null,
 
     /// Free the GPA-owned episode list and the show id, resetting both to null.
     /// Idempotent.
@@ -97,6 +104,7 @@ pub const EpisodeState = struct {
         // treatment (ROD-131). Browse-origin detail does not seed progress today
         // — same scope line as the resume-cursor seed below.
         self.progress = std.math.cast(u32, progress) orelse 0;
+        self.resume_idx = null;
         if (progress == 0) return;
 
         const current_idx = progress - 1;
@@ -105,6 +113,7 @@ pub const EpisodeState = struct {
                 if (st.getResume(rec.source, rec.source_id, translation, episodes[current_idx].raw) catch null) |saved_resume| {
                     if (saved_resume.startSeconds() > 0) {
                         self.cursor = current_idx;
+                        self.resume_idx = current_idx;
                         return;
                     }
                 }
@@ -113,6 +122,7 @@ pub const EpisodeState = struct {
 
         if (progress < episodes.len) {
             self.cursor = progress;
+            self.resume_idx = progress;
         }
     }
 
@@ -136,6 +146,7 @@ pub const EpisodeState = struct {
         self.for_id = id;
         self.cursor = 0;
         self.progress = 0;
+        self.resume_idx = null;
         self.loading = false;
         if (history_rec) |rec| self.seedHistoryCursor(store, translation, rec, view);
     }
