@@ -542,6 +542,11 @@ pub const App = struct {
         rec.list_status = status;
         // Mirror the store's force-complete progress snap: a real total fills the
         // bar; unknown/0 leaves progress as-is (same guard as Store.setListStatus).
+        // We deliberately do NOT mirror history_visible=1 that the store sets — every
+        // record in self.history is already visible (loadHistory filters on it), so
+        // there's nothing to flip. And w/x/p (incl. `w` on a completed show) leave
+        // progress untouched by design: re-watching keeps the full bar until a play
+        // moves the high-water — matching Store.setListStatus exactly.
         if (status == .completed) {
             if (rec.total_episodes) |t| {
                 if (t > 0) rec.progress = t;
