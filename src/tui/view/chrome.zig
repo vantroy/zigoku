@@ -124,7 +124,10 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .history => if (self.history.len == 0)
             "/ search · F1 browse · q quit"
         else
-            "jk move · enter open · F1 browse · F3 settings · q quit",
+            // p/x/c/w surface the ROD-139 watch-state transitions per §3.5's
+            // contextual help line. F-keys bundled (matches the browse line) to
+            // keep settings discoverable without overflowing the row.
+            "jk move · enter open · p/x/c/w status · F1/F2/F3 views · q quit",
         .detail => "hjkl scroll · h back · enter play · q back",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
