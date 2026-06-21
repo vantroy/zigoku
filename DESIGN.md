@@ -164,13 +164,15 @@ Scores are integer 0–100 from AniList. Display format: `[NN/100]` or `[NNN/100
 
 ### 2.3 Kanji Status Chips
 
-> **Status: Implemented in the detail panel (ROD-141).** The status + season/year
-> chips render in the detail header per §4.4 (kanji table below). Two surfaces are
-> still pending: the **top bar** renders the view label (`Watchlist` / `⠋ search`,
-> §10.7) rather than the season/year chip specced in §10.3b — that chip is ROD-186;
-> and chips only appear where the row was enriched **live** — History-sourced rows
-> lack the persisted columns (ROD-185), so they fall back to no chip. Treat the
-> kanji table and ASCII mocks as the authored end state.
+> **Status: Implemented in the detail panel (ROD-141) and the top bar (ROD-186).**
+> The status + season/year chips render in the detail header per §4.4 (kanji table
+> below). The **top bar** now also carries a season/year chip as an *add-on beside*
+> the view-label chip (not a replacement): the view label stays `state.focus`, the
+> season chip sits two spaces after it in `text.muted` so the two read as distinct
+> registers (§3.4, §10.3b). Caveat unchanged: chips only carry data where the row
+> was enriched — pre-ROD-185 History rows lack the persisted columns and fall back
+> to the current cour (top bar) or no chip (detail). Treat the kanji table and
+> ASCII mocks as the authored end state.
 
 These are inline text spans, not box-drawn — the bare kanji glyph(s), no brackets,
 with surrounding spaces for visual separation (color alone distinguishes a chip).
@@ -310,13 +312,24 @@ width unchanged to `drawCover` is incorrect in the persistent pane context.
 Single row. Full terminal width. Content:
 
 ```
-  ZIGOKU  ░  冬 2026
+  ZIGOKU  ░  Browse  冬 2026
 ```
 
 - App name: `text.primary` + bold. Always visible, never interactive.
 - `░` separator: `border.hair`.
-- Season/year kanji chip: `state.focus`. Updates to reflect the currently browsed
-  season context. On app load, shows current season from system date.
+- View-label chip: `state.focus`. Names the surface — `Browse` / `Watchlist` /
+  `Settings` (the detail zoom inherits its origin's label). This is the navigation
+  identity chip.
+- Season/year kanji chip (ROD-186): an add-on two spaces after the view label, in
+  `text.muted` so it reads as metadata distinct from the cyan identity chip beside
+  it (and never competes with the cyan `·` at the right edge). Content: the
+  currently selected show's season+year when a row is selected and both are known;
+  otherwise the current real-world cour from the system clock (AniList's season
+  boundaries — 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov — with December rolled
+  into next year's Winter, so it agrees with the show chips). The detail zoom is the
+  exception: committed to one show, it shows only that show's season with no cour
+  fallback. Settings shows no season chip (no show context). Drops first on narrow
+  widths (below ~36 cols), the view label and `·` survive.
 - Right-aligned: active pane indicator (a `·` in `state.focus` color to mark which
   pane has keyboard focus — list or detail).
 
@@ -687,7 +700,7 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  冬 2026                                                              ·      [h1+bold fg] [d] [f] right: [f]·
+  ZIGOKU  ░  Browse  冬 2026                                                      ·      [h1+bold fg] [d] [f] right: [f]·
                                                                                          [spacer row]
   ▸ Frieren: Beyond Journey's End        ✦ [96/100]  [   COVER ART IMAGE         ]     [focused row: bg.surface, f+bold title, h score+bold, 20×28 cells]
   · Fullmetal Alchemist: Brotherhood       [97/100]  [   kitty graphics          ]     [default row: fg title, h score]
@@ -714,7 +727,7 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
 The user pressed `/`. The bottom bar becomes the search prompt. The list filters live.
 
 ```
-  ZIGOKU  ░  冬 2026                                                              ·
+  ZIGOKU  ░  Browse  冬 2026                                                      ·
 
   ▸ Frieren: Beyond Journey's End        ✦ [96/100]  [   COVER ART IMAGE         ]
   · Fullmetal Alchemist: Brotherhood       [97/100]  [                           ]     [results filtered to query]
@@ -750,7 +763,7 @@ the canvas is all detail. `Esc` demotes back to the two-pane view with `active_p
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  冬 2026                                                              ·      [h1+bold fg] [d] [f] right: [f]·
+  ZIGOKU  ░  Browse  冬 2026                                                      ·      [h1+bold fg] [d] [f] right: [f]·
                                                                                          [spacer row]
   [   COVER ART IMAGE   ]   Frieren: Beyond Journey's End                               [left col: cover block; right col: title fg+bold]
   [   20 × 7 cells      ]    放映中  冬 2024                                            [h chip, f chip]
@@ -797,7 +810,7 @@ wide two-pane layout (§5.4a).
 **Narrow / empty — single column (w < 60, or no records):**
 
 ```
-  ZIGOKU  ░  Watchlist                                                            ·
+  ZIGOKU  ░  Watchlist  冬 2024                                                   ·
 
   ▸ watching (4)
   ─────────────────────────────────────────────────────────────────────────────────
@@ -866,7 +879,7 @@ record is focused.
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  Watchlist                                                          ·        [h1+bold fg] [d] [f] right: [f]· dim (list focused)]
+  ZIGOKU  ░  Watchlist  冬 2024                                                 ·        [h1+bold fg] [d] [f] right: [f]· dim (list focused)]
                                                                                          [spacer row]
   ▸ watching (4)                            [   COVER ART IMAGE               ]         [fg+bold header; detail pane: 20-col cover (detail_w≈70≥40)]
   ─────────────────────────────────────     [   or "no art yet" in d+italic   ]         [border.hair rule, list pane only]
@@ -893,7 +906,7 @@ record is focused.
 **History two-pane, detail pane focused — 120 cols.** Same geometry; `·` lights cyan.
 
 ```
-  ZIGOKU  ░  Watchlist                                                              ·    [· is f (cyan) — detail pane active]
+  ZIGOKU  ░  Watchlist  冬 2024                                                     ·    [· is f (cyan) — detail pane active]
 
   ▸ watching (4)                            [   COVER ART IMAGE               ]
   ─────────────────────────────────────     [                                  ]
@@ -943,7 +956,7 @@ focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
 `cols ≈ 96 / 5 ≈ 19` grid columns.
 
 ```
-  ZIGOKU  ░  Watchlist                                                                                            ·
+  ZIGOKU  ░  Watchlist  冬 2024                                                                                   ·
 
   [   COVER ART   ]   Frieren: Beyond Journey's End
   [   20 × 7 cells]    放映中  冬 2024
@@ -1016,7 +1029,7 @@ Notes:
 Full-screen loading state shown on app startup and during heavy AniList sync.
 
 ```
-  ZIGOKU  ░  冬 2026                                                              ·
+  ZIGOKU  ░  Browse  冬 2026                                                      ·
 
 
 
@@ -1346,7 +1359,8 @@ exist, the user lands in History first. Browse is reached by keybind `H` from
 History.
 
 **Normal state (DB has rows).** Reuse the §5.4 layout verbatim. The top bar
-reads `ZIGOKU  ░  Watchlist` — same as §5.4. The `·` pane focus dot is in [f].
+reads `ZIGOKU  ░  Watchlist  冬 2024` — same as §5.4 (the season chip mirrors the
+focused row, or the current cour when it has no season). The `·` pane focus dot is in [f].
 Section 9.1's degrade rules apply to any null enrichment fields in each row
 (season chips and score badges are omitted; progress bars degrade gracefully when
 `total_episodes` is null).
@@ -1356,7 +1370,7 @@ who has never played anything — the History view cannot show a list. This stat
 not covered by §5.
 
 ```
-  ZIGOKU  ░  Watchlist                                                            ·
+  ZIGOKU  ░  Watchlist  冬 2024                                                   ·
 
                                                                                      [spacer rows]
 
@@ -1441,7 +1455,7 @@ The startup loading state (§9.4 below) fails. The loading copy updates to refle
 the failure:
 
 ```
-  ZIGOKU  ░  Watchlist                                                            ·
+  ZIGOKU  ░  Watchlist  冬 2024                                                   ·
 
 
 
@@ -1516,7 +1530,7 @@ In M3, startup does two things: opens the local SQLite DB and loads history. It
 does not contact AniList. The corrected copy:
 
 ```
-  ZIGOKU  ░  Watchlist                                                            ·
+  ZIGOKU  ░  Watchlist  冬 2024                                                   ·
 
 
 
@@ -1724,19 +1738,23 @@ The `·` is always rendered. It does not disappear in single-pane views. Its
 persistent presence at a fixed right-aligned position is the anchor that makes
 the top bar feel stable across view transitions.
 
-Top bar rendering by view — the chip after `░` changes with `active_view`:
+Top bar rendering by view — a view-label chip after `░`, plus a season/year add-on
+chip after that (ROD-186). The two are differentiated by color, no separator glyph:
 
-| `active_view` | Top bar chip | Color |
+| `active_view` | View-label chip (`color.focus`) | Season chip (`color.fg2` / text.muted) |
 |---|---|---|
-| `.browse` | `⠋ search` spinner — **stub**; target state is season/year kanji (e.g. `冬 2026`), see §10.7 | `color.focus` |
-| `.history` | `Watchlist` | `color.focus` |
-| `.detail` | Inherits `detail_origin`'s chip (`Watchlist` from History; the Browse-origin path mirrors `.browse`) | `color.focus` |
-| `.settings` | `Settings` | `color.focus` |
+| `.browse` | `Browse` | selected show's season+year, else current cour |
+| `.history` | `Watchlist` | selected show's season+year, else current cour |
+| `.detail` | inherits `detail_origin` (`Browse`\|`Watchlist`) | focused show's season+year only — **no** cour fallback |
+| `.settings` | `Settings` | — (none) |
 
-This is already implied by §5.4 and §5.5 mocks. Stated here explicitly so Haru
-does not have to infer it from two different sections. The `.browse` kanji chip is
-deferred until Browse has a live feed (§10.7) — today it renders the search-stub
-spinner, matching the empty Browse content area.
+The season chip sits two spaces after the view label and drops first under width
+pressure (below ~36 cols); the view label and the `·` always survive. ROD-186
+retired the old `.browse` `⠋ search` spinner stub — Browse is a live feed now, and
+search status lives in the bottom bar (`/query_` + `[N results]`), so the top bar
+no longer doubles as a search indicator. The two-cyan problem (view label and
+season chip were both specced `color.focus`) is resolved by demoting the season
+chip to `text.muted`, matching how season/year reads in History rows (§5.4).
 
 #### 10.3c `h` / `l` behavior by view
 
@@ -2068,7 +2086,8 @@ if (key.matches('q', .{})) {
 | `·` is dim for Browse/History list, lit for Browse/History detail (ROD-170) | History is now a two-pane view. The `·` follows the same Browse logic: dim on list (default, no secondary selection), lit cyan on detail (user has gone deeper). The prior History rule ("always lit — single-pane") is retired. Color is always cyan; magenta is reserved for the §8 status-bar cursor. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
 | Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
 | `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | **Resolved (ROD-74 / ROD-180):** detail navigation landed and the two-field model was *kept*, not collapsed into `mode`. `.detail` was promoted to a standalone `active_view` (see §10.1) while remaining an `active_pane` value in Browse; `mode` was never introduced. The two fields proved the right shape. |
-| Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | Switch to season/year kanji in `color.focus` when Browse has a real feed to populate (ROD-73 search landing or later). |
+| Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | **Resolved (ROD-186):** Browse now has a live feed, so the spinner stub retired. Rather than *replace* the chip slot, the season/year chip was added *beside* the view label as an add-on (Rod's call — "huge amount of space there"), forcing a differentiation decision (next row). |
+| **ROD-186: season chip is an add-on in `text.muted`, not a replacement in `color.focus`** | The original §3.4/§10.3b spec gave the season chip `color.focus` as the *only* chip. The coexistence decision (keep the view label, add the season chip) put two chips side by side — both specced cyan, which would blur into one blob (§2.3: chips are distinguished by color alone, no boxes). Demoting the season chip to `text.muted` (fg2) makes them distinct with zero extra glyphs, matches how season/year already reads in History rows (§5.4), and leaves `color.focus` to mean one thing on the left (view identity) while the cyan `·` owns the right edge. Content rule (Rod): selected show's season+year, falling back to the current cour from the system clock — except the detail zoom, which is committed to one show and shows only its season (no fallback). Rejected: a `░`/`·` separator between the two cyan chips (adds chrome, §0). | If user testing shows the muted season chip is missed, brighten it one step (text.muted → text.primary) before reaching for `color.focus`. |
 | **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, right pane updates on cursor move) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
 | **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
 | **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. `q` provides the full back-out (zoom → list) for users who want to get all the way out. (Exception: at `w < 60` there is no pane to land on, so Esc/`Space`/`h` demote to the single-column list.) | No revisit expected. |
