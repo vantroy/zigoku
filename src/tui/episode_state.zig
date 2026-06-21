@@ -12,7 +12,7 @@
 //! *record + cache*, not the *transport*. `episode_thread` (the handle run()
 //! joins on teardown) and `async_start_ms` (the shared slow-path timer, not
 //! episode-scoped) stay on App. The controller (`tick`'s episode-event handlers +
-//! `fireEpisodes`/`openHistoryDetail`) resolves the source name, status, and any
+//! `fireEpisodes`/`fireEpisodesForId`) resolves the source name, status, and any
 //! history record from navigation state and passes those primitives in here; it
 //! owns the thread spawn and the async-timer reset itself. Embed by value
 //! (`episodes: EpisodeState = .{}`); no back-reference, no `@fieldParentPtr`.
