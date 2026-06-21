@@ -215,7 +215,7 @@ Panes are separated by:
 No outer border. No pane-chrome box-drawing. The app fills the terminal window edge
 to edge with `bg.base`, and content floats within it.
 
-### 3.2 Column Structure — Browse / Detail (default layout)
+### 3.2 Column Structure — Browse / History / Detail (shared layout)
 
 ```
 ┌────────────────── TERMINAL WIDTH ──────────────────┐
@@ -232,14 +232,22 @@ to edge with `bg.base`, and content floats within it.
 └─────────────────────────────────────────────────────┘
 ```
 
-Column widths flex with terminal resize. The cover art cell block is fixed at
-`20 cols × 28 rows` when terminal width ≥ 100. At 80–99 cols, it shrinks to
-`14 × 20`. Below 80 cols, cover art is hidden and the detail column uses full width
-for metadata. Below 60 cols, collapse to single-column list only.
+Column widths flex with terminal resize. This two-pane geometry is shared by both
+Browse and History (ROD-170). Cover art sizing in the detail pane is governed by
+the **effective column width** (`detail_w`), not terminal width, so it scales
+correctly in both the persistent pane and the full-screen zoom:
+
+| `detail_w` (effective col width) | Cover size |
+|---|---|
+| ≥ 40 cols | `20 cols × 7 rows` (max; §3.3 hard cap) |
+| 25–39 cols | `14 cols × 5 rows` |
+| < 25 cols | hidden |
+
+Below 60 cols terminal width, collapse to single-column list only (no detail pane).
 
 The split formula is implemented as `App.paneSplit(w)` (app.zig), a shared helper
-that returns `{ list_w, detail_x, detail_w }`. It is used by both Browse and by the
-wide-History path (ROD-113) so the geometry is identical across both surfaces.
+that returns `{ list_w, detail_x, detail_w }`. Used identically by Browse and
+History so the geometry is identical across both surfaces.
 
 ```
 list_w  = max(30, w * 38 / 100)
@@ -249,22 +257,24 @@ detail_w = w − detail_x − 1
 
 Sample widths:
 
-| Terminal width | list_w | detail_w |
-|---|---|---|
-| 100 cols | 38 | ≈57 |
-| 120 cols | 45 | ≈70 |
-| 160 cols | 60 | ≈95 |
+| Terminal width | list_w | detail_w | cover tier |
+|---|---|---|---|
+| 80 cols | 30 | ≈45 | 20-col cover (detail_w ≥ 40) |
+| 100 cols | 38 | ≈57 | 20-col cover |
+| 120 cols | 45 | ≈70 | 20-col cover |
+| 160 cols | 60 | ≈95 | 20-col cover |
 
-**Named threshold constants (as-built):**
+**Named threshold constants (as-built / ROD-170):**
 
 | Constant | File | Value | Meaning |
 |---|---|---|---|
-| `App.history_split_min` | `app.zig` | `100` | History list grows a preview panel at or above this width. |
-| `detail_two_col_min` | `view/detail.zig` | `100` | History-opened detail pane switches to two columns at or above this width. |
+| `App.pane_split_min` | `app.zig` | `60` | Both Browse and History split to two panes at or above this width. Below this, single-column list only. |
+| `App.zoom_min` | `app.zig` | `100` | At or above this width the interactive episode grid renders **in-pane** (and `Enter` plays from it; `Space` promotes to the zoom). Below it the in-pane grid is suppressed — the grid is reached via the full-screen zoom, which `Enter`/`Space` open at any width. |
+| `detail_two_col_min` | `view/detail.zig` | `100` | Full-screen zoom switches to two internal columns at or above this width (§5.4a). Sized for the full canvas, not the ~58% pane. |
 
-Both thresholds are `100` — they align with the ≥100-col cover-art tier and ensure
-the right column is wide enough for synopsis wrap and a usable episode grid.
-Single-breakpoint design means 120/160/etc. need no special-casing.
+The `zoom_min = 100` threshold aligns with the §5.3 episode grid — grid columns
+`≈ detail_w / 5` give ≈ 8 usable columns at 100 cols, adequate for the 12–26 ep
+majority. The zoom earns its keep for long-runners at 160+ cols (≈ 14 columns, §5.4a).
 
 ### 3.3 Cover Art Block
 
@@ -282,6 +292,12 @@ to 256-color). This is not great, but it preserves the visual weight of the cove
 
 **Loading state:** render the cover block with `bg.surface` fill and a centered
 loading spinner (see Section 5 — Loading).
+
+**Cover sizing rule.** Select the cover tier from the **effective column width**
+(`detail_w` for the persistent pane; full canvas width minus margins for the
+full-screen zoom — §5.4a), not terminal width. Hard cap: `cover_w` never exceeds
+20 cols (§0: "ghostly, not gaudy"). The tiers from §3.2 apply. Passing terminal
+width unchanged to `drawCover` is incorrect in the persistent pane context.
 
 ### 3.4 Top Bar
 
@@ -693,49 +709,62 @@ Notes:
 - The `_` character after `fr` is the text cursor: `state.focus`.
 - Result count is right-aligned in `text.muted`.
 
-### 5.3 Detail + Episode Grid
+### 5.3 Detail Zoom — Full-Screen
 
-User pressed `Enter` on a result. The detail pane expands to show the full episode
-grid. The list column narrows to 32 cols to give the episode grid room. (Or: the
-list is hidden entirely at narrow widths — implementor's call; see Section 3.2.)
+The user pressed `Space` from a focused detail pane (`active_pane = .detail`,
+`w ≥ 100`). `active_view` becomes `.detail` (full-screen zoom). The list is gone;
+the canvas is all detail. `Esc` demotes back to the two-pane view with `active_pane
+= .detail`. This surface is reached identically from Browse and History.
+
+120-col terminal — zoom entered from Browse or History:
 
 ```
-  ZIGOKU  ░  冬 2026                                                              ·
+                                                                                         [context: top bar, full width]
+  ZIGOKU  ░  冬 2026                                                              ·      [h1+bold fg] [d] [f] right: [f]·
+                                                                                         [spacer row]
+  [   COVER ART IMAGE   ]   Frieren: Beyond Journey's End                               [left col: cover block; right col: title fg+bold]
+  [   20 × 7 cells      ]    放映中  冬 2024                                            [h chip, f chip]
+  [                     ]   ✦ [96/100] · Fantasy · Adventure · Drama                   [h+bold score, d·, m genres]
+                            ─────────────────────────────────────────────────────       [border.hair]
+                             28 eps · TV · 23 min · Madhouse                            [m metadata]
+                            ─────────────────────────────────────────────────────       [border.hair]
+                             An elf mage who once defeated the Demon King now            [m synopsis, word-wrapped]
+                             wanders the continent without purpose, until she
+                             meets a young girl named Fern…
+                            ─────────────────────────────────────────────────────
+                             Episodes
+                            [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12]          [h▸ resume, d● watched, m unwatched]
+                            [13][14][15][16][17][18][19][20][21][22][23][24]
+                            [25][26][27][28]
 
-  ▸ Frieren: Beyond Journey's…            [   COVER ART IMAGE                    ]
-  · FMA: Brotherhood                      [   20 × 28 cells                      ]
-  ◉ Vinland Saga                          [                                       ]
-  ● Mob Psycho 100                        [                                       ]
-  · Steins;Gate                           [                                       ]
-  · Attack on Titan                       Frieren: Beyond Journey's End
-  · NGE                                    放映中  冬 2024
-  · Made in Abyss                         ✦ [96/100] · Fantasy · Adventure · Drama
-                                          ─────────────────────────────────────────
-                                           28 eps · TV · 23 min · Madhouse
-                                          ─────────────────────────────────────────
-                                           An elf mage who once defeated the Demon
-                                           King now wanders the continent seeking
-                                           meaning, accompanied by new companions…
-                                          ─────────────────────────────────────────
-                                           Episodes
-                                          [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10]  [h▸ resume, d● watched, m unwatched]
-                                          [11][12][13][14][15][16][17][18][19][20]
-                                          [21][22][23][24][25][26][27][28]
-
-  ▌  hjkl · / search · g/G top/bottom · enter play · q back                           [h▌, d help, m+underline keys]
+  ▌  hjkl scroll · enter play · space/esc back                                          [h▌, d help, m+underline keys]
 ```
 
 Notes:
-- `[▸1]` is the resume cell: `state.now` + bold. The user left off here.
+- Full canvas width. The list is gone — this is the zoom surface.
+- `active_view = .detail`. `detail_origin` records the origin (`.browse` or
+  `.history`). `Esc` or `Space` demotes back to the two-pane, `active_pane = .detail`.
+  `q` returns to `detail_origin` view, `active_pane = .list`.
+- `[▸1]` is the resume cell: `state.now` + bold.
 - `[●2]` through `[●6]` are watched: `text.dim`.
 - `[ 7]` onward are unwatched: `text.muted`.
-- The help line at the bottom updates contextually — when in the detail pane with
-  a focused episode, it shows `enter play` instead of the browse hint.
+- Cover art uses the full left column width for the tier calculation (§3.3). At
+  120 cols, `left_w ≈ 44` → 20-col cover applies.
+- `Space` is a zoom toggle: it promotes from detail pane and demotes from zoom.
+  `Esc` also demotes (and is the "canonical back" key throughout the app).
+  Both are shown in the help line as `space/esc back`.
+- The two-column internal split (cover left / content right) uses the same
+  `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
+  density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
 
-### 5.4 History / Watchlist
+### 5.4 History / Watchlist — Narrow (w < 60) or No Records
 
-Dedicated view, reached with a keybind (e.g. `H` from Browse, or a future tab/pane
-system). Full-width list. No cover art column at this view — list owns the width.
+Below 60 cols, or when no records exist (§9.2 empty state), History renders as a
+single-column full-width list. No detail pane. The mock below also doubles as the
+canonical list-side content reference — the same rows appear in the left pane of the
+wide two-pane layout (§5.4a).
+
+**Narrow / empty — single column (w < 60, or no records):**
 
 ```
   ZIGOKU  ░  Watchlist                                                            ·
@@ -762,7 +791,7 @@ system). Full-width list. No cover art column at this view — list owns the wid
       [████████████████]  24 / 24 eps  · completed 2023-11-02
                                                                                      [d bar, d meta]
 
-  ▌  hjkl · H browse · / search · enter open · q quit
+  ▌  jk move · l/enter detail · F1 browse · F3 settings · q quit
 ```
 
 Notes:
@@ -774,108 +803,137 @@ Notes:
   de-emphasis.
 - The resume indicator `[▸12]` in the row header is the episode the user will resume
   from: `state.now` + bold.
+- `l` or `Enter` from list focus moves to the detail pane (same grammar as Browse).
+  At `w < 60` single-column, `l` is a no-op (no pane to move to), but `Enter`
+  (or `Space`) opens the full-screen zoom — the only detail surface at this width.
 
-### 5.4a History — Wide Terminal (≥100 cols)
+### 5.4a History — Two-Pane (ROD-170)
 
-At `terminal_width ≥ 100`, the History list gains a Browse-style right-side preview
-panel for the focused entry. Empty, loading, and error states do not split — they
-keep the full-width single column.
+History now uses the same two-pane grammar as Browse. The section title remains
+5.4a for continuity; the ROD-113 preview model it previously described is superseded.
 
-**History list + preview — 120 cols.** List: 45 cols. Preview: ≈70 cols.
+**Width tiers:**
+
+The grid lives in **one of two places**: the in-pane view (`w ≥ 100`) or the
+full-screen zoom (any width). `Enter`/`Space` "drill toward the grid":
+
+| `w` | Layout |
+|---|---|
+| `w < 60` | Single-column list (§5.4). Clamp `active_pane = .list`. No pane to focus, so `Enter`/`Space` open the **zoom** directly (the only detail surface here). |
+| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + chips + score + synopsis). No *in-pane* grid. Pane toggle `h`/`l` works; `Enter`/`Space` from the focused pane promote to the **zoom** to reach the grid. |
+| `w ≥ 100` | Two panes. Detail = full `drawDetailPane` with the interactive grid in-pane. `Enter` plays the focused episode; `Space` promotes to the zoom. |
+
+Episodes fetch on focus at any two-pane width (`w ≥ 60`), so the zoom always has
+its grid ready; below 60 the fetch fires when `Enter`/`Space` open the zoom.
+
+Empty / loading / error states (no focused record) fall back to the §5.4
+single-column layout — no half-empty split. The split only engages when a
+record is focused.
+
+---
+
+**History two-pane, list focused — 120 cols.** List: 45 cols. Detail: ≈70 cols.
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  Watchlist                                                          ·        [h1+bold fg] [d] [f] right: [f]·
+  ZIGOKU  ░  Watchlist                                                          ·        [h1+bold fg] [d] [f] right: [f]· dim (list focused)]
                                                                                          [spacer row]
-  ▸ watching (4)                            [   COVER ART IMAGE               ]         [fg+bold header; preview: 20×7 cells]
+  ▸ watching (4)                            [   COVER ART IMAGE               ]         [fg+bold header; detail pane: 20-col cover (detail_w≈70≥40)]
   ─────────────────────────────────────     [   or "no art yet" in d+italic   ]         [border.hair rule, list pane only]
-    ▸ Frieren: Beyond Journey's End   ◐     [                                  ]         [focused row: bg.surface, f+bold title]
-      [████████◐░░░░░░░]  6 / 28 eps        Frieren: Beyond Journey's End               [f+bold title in preview]
-                                             放映中                                      [h chip; omitted if null]
-    ▸ Vinland Saga S2                  ○    [--/100]                                     [d score placeholder]
+    ▸ Frieren: Beyond Journey's End         [                                  ]         [focused row: bg.surface, f+bold title]
+      [████████◐░░░░░░░]  6 / 28 eps        Frieren: Beyond Journey's End               [f+bold title in detail pane]
+                                             放映中  冬 2024                             [h chip, f chip; omitted if null]
+    ◐ Vinland Saga S2                       [--/100]                                     [d score placeholder]
       [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────           [border.hair]
-                                             放映中   冬 2024                             [h chip, f chip; omitted if null]
-    ◐ Blue Period                      ◐     An elf mage who once defeated the            [m synopsis, word-wrapped to preview_w]
-      [██████◐░░░░░░░░░]  5 / 12 eps         Demon King now wanders the
-  ─────────────────────────────────────     continent without purpose, until
-                                             she meets a young girl…
-  ▸ completed (12)
+                                             28 eps · TV · 24 min                        [m metadata]
+    ○ Blue Period                           ─────────────────────────────────           [border.hair]
+      [██████◐░░░░░░░░░]  5 / 12 eps         An elf mage who once defeated the           [m synopsis, word-wrapped to detail_w]
+  ─────────────────────────────────────     Demon King now wanders the
+                                             continent without purpose, until
+  ▸ completed (12)                           she meets a young girl…
   ─────────────────────────────────────
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  jk move · enter open · F1 browse · F3 settings · q quit
+  ▌  hjkl · l/enter detail · F1 browse · F3 settings · q quit                          [list focused; help matches Browse §10.5]
 ```
-
-Notes:
-- The preview panel shares the same `paneSplit(w)` geometry as Browse (§3.2).
-  At 120 cols: list_w=45, preview_x=49, preview_w≈70.
-- The focused entry drives the preview. When focus changes, the preview updates
-  immediately — same rendering cycle, no separate fetch.
-- The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
-  when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
-  takes the full list_w and the badge is omitted.
-- Preview content (top to bottom): cover art → title (bold) → score `[NN/100]` →
-  hairline → status line → synopsis (word-wrapped). No episode grid in the preview.
-- Status line shows the airing status chip when the source provided one; otherwise
-  the watchlist `list_status` label (always present). The two are mutually exclusive.
-- Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
-  `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
-  in [m]+italic when synopsis is null; status/season chips omitted when null.
-- Empty / loading / error states (no focused record) fall back to the full-width
-  §5.4 single-column layout. The split only engages when a record is focused.
 
 ---
 
-**History-opened detail pane — two columns (≥100 cols).**
-
-When the user opens an entry from History (`Enter` on a focused row), the detail
-pane renders in two columns at `detail_pane_width ≥ detail_two_col_min` (100).
-This split applies only when `detail_origin == .history`. Browse-opened detail
-remains single-column regardless of terminal width.
-
-The detail pane receives the full body width (`terminal_width − 2`), so the split
-is wider than the preview case:
+**History two-pane, detail pane focused — 120 cols.** Same geometry; `·` lights cyan.
 
 ```
-left_w  = max(20, pane_w * 38 / 100)
-right_x = left_w + 2
-right_w = remainder
-```
+  ZIGOKU  ░  Watchlist                                                              ·    [· is f (cyan) — detail pane active]
 
-Sample widths (pane ≈ terminal − 2):
+  ▸ watching (4)                            [   COVER ART IMAGE               ]
+  ─────────────────────────────────────     [                                  ]
+    ▸ Frieren: Beyond Journey's End         [                                  ]         [selected row: bg.base, f title, ▸ dim]
+      [████████◐░░░░░░░]  6 / 28 eps        Frieren: Beyond Journey's End
+                                             放映中  冬 2024
+    ◐ Vinland Saga S2                       [--/100]
+      [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────
+                                             28 eps · TV · 24 min
+    ○ Blue Period                           ─────────────────────────────────
+      [██████◐░░░░░░░░░]  5 / 12 eps        [▸1][●2][●3][●4][●5][●6][ 7][ 8]           [interactive grid; h▸ resume, d● watched, m unwatched]
+  ─────────────────────────────────────     [ 9][10][11][12][13][14][15][16]
+                                            [17][18][19][20][21][22][23][24]
+  ▸ completed (12)                          [25][26][27][28]
+  ─────────────────────────────────────
+    ● Fullmetal Alchemist: Brotherhood
+      [████████████████]  64 / 64 eps
 
-| Terminal width | left_w | right_w |
-|---|---|---|
-| 120 cols | ≈44 | ≈72 |
-| 160 cols | ≈60 | ≈96 |
-
-**120-col terminal — History-opened detail.**
-
-```
-  ZIGOKU  ░  Watchlist                                                          ·
-
-  [   COVER ART IMAGE   ]   An elf mage who once defeated the Demon King now     [left col: cover → title → score → hairline → meta]
-  [   20 × 7 cells      ]   wanders the continent without purpose, until she     [right col: synopsis word-wrapped to right_w]
-  [                     ]   meets a young girl named Fern…                       [m synopsis]
-                                                                                  [blank row]
-  Frieren: Beyond Journey's End                                                   [fg+bold title]
-   放映中  冬 2024                                                                [chips; omitted if null]
-  [--/100]                   [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10]           [right col: episode grid]
-  ────────────────────────   [11][12][13][14][15][16][17][18][19][20]             [cols = right_w / 5]
-   28 eps                    [21][22][23][24][25][26][27][28]
-
-  ▌  hjkl scroll · h back · enter play · q back
+  ▌  hjkl scroll · h back · enter play · space zoom · q back                           [detail pane focused; space promotes to zoom §5.3]
 ```
 
 Notes:
-- Left column (top to bottom): cover art → title → score → hairline → episode count.
-- Right column (top to bottom): synopsis (word-wrapped to `right_w`) → blank row →
-  episode grid (`cols = right_w / 5`).
-- Cover art uses the existing ≥100-col breakpoint (`cover_w=20`). It fits in the
-  left column at all wide widths — no new breakpoint introduced.
-- Below 100 cols and for all Browse-opened detail, the existing single-column
-  vertical stack (§5.3) is unchanged.
+- The detail pane uses `paneSplit(w)` geometry (§3.2). At 120 cols: list_w=45,
+  detail_w≈70. Cover tier from `detail_w`: ≥40 → 20-col cover.
+- The focused entry drives the detail pane. Focus change = immediate update.
+- No *in-pane* grid at `60 ≤ w < 100`. The in-pane grid appears only when
+  `w ≥ 100` and `active_pane = .detail`; below that the grid is reached via the
+  zoom (`Enter`/`Space` from the focused preview pane).
+- `Space` (any two-pane width) and, at `60 ≤ w < 100`, `Enter` from detail-pane
+  focus promote to the full-screen zoom (`active_view = .detail`, §5.3). At
+  `w ≥ 100` `Enter` plays instead (the grid is in-pane). `Esc`/`Space` demote
+  back to the two-pane (`active_pane = .detail`) when there's room, else to the
+  list (`w < 60`); `q` is the full back-out to the list.
+- The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
+  when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
+  takes full `list_w` and the badge is omitted.
+- Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
+  `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
+  in [m]+italic when synopsis is null; chips omitted when null.
+
+---
+
+**Full-screen zoom from History — 160-col terminal (§5.3 geometry).**
+
+At `w ≥ 160`, `detail_w ≈ 95` in the two-pane. After `Space` from detail pane
+focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
+`cols ≈ 96 / 5 ≈ 19` grid columns.
+
+```
+  ZIGOKU  ░  Watchlist                                                                                            ·
+
+  [   COVER ART   ]   Frieren: Beyond Journey's End
+  [   20 × 7 cells]    放映中  冬 2024
+  [               ]   ✦ [96/100] · Fantasy · Adventure · Drama
+                      ────────────────────────────────────────────────────────────────────────────────────
+                       28 eps · TV · 23 min · Madhouse
+                      ────────────────────────────────────────────────────────────────────────────────────
+                       An elf mage who once defeated the Demon King now wanders the continent…
+                      ────────────────────────────────────────────────────────────────────────────────────
+                       Episodes
+                      [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12][13][14][15][16][17][18][19]
+                      [20][21][22][23][24][25][26][27][28]
+
+  ▌  hjkl scroll · enter play · space/esc back
+```
+
+The two-column internal split (`left_w / right_w`) uses `detail_two_col_min = 100`
+(full canvas width — not the ~58% pane). At 160-col, right_w ≈ 96 gives 19 grid
+columns. At 120-col zoom, right_w ≈ 72 gives 14 columns. This is where the zoom
+earns its keep over the pane's ≈8 columns at 120 cols.
 
 ### 5.5 Settings
 
@@ -1497,7 +1555,7 @@ unreachable rendering.
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
-| History wide-terminal threshold is 100 cols (`history_split_min`, `detail_two_col_min`) (ROD-113) | 100 is the §3.2 cover-art tier boundary — the point at which the layout already has enough room for a 20-col cover block. Using the same number as the cover-art breakpoint means the split engages exactly when the panes can carry the visual weight. At 100 cols the preview column is ≈57 chars wide and the detail right column is ≈72 chars wide — both are wide enough for synopsis word-wrap to feel intentional and for the episode grid to tile without crowding (`cols = right_w / 5` gives ≥14 columns at 100 cols). A single breakpoint avoids discontinuous layout transitions: widths between 100 and 160 scale smoothly through `paneSplit(w)` with no special-casing. The alternative (a 120-col or 140-col threshold) would leave the common 120×40 terminal in the wide path with a slightly narrower right column — no meaningful gain, more breakpoint surface to maintain. | If common terminal widths (e.g. narrower than expected) make the preview feel cramped at 100 cols, raise the threshold to 110 or 120 and update both constants together. |
+| Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. `detail_two_col_min = 100` remains for the full-screen zoom's internal two-column split (full canvas, not the ~58% pane). | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
 
 ---
 
@@ -1519,23 +1577,22 @@ keybinds.
 
 | View | Identifier | Default | Layout |
 |---|---|---|---|
-| Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2) |
-| History | `active_view = .history` | Yes (M3 landing, §9.2) | Single-pane watchlist; splits to preview + detail at ≥100 cols (§5.4a) |
-| Detail | `active_view = .detail` | No | Full-screen detail + episode grid (§5.3), opened with `Enter` from Browse or History |
+| Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
+| History | `active_view = .history` | Yes (M3 landing, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
+| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
-**`.detail` is both an `active_pane` value within Browse and a standalone `active_view`.**
-Browse's right-hand detail *pane* (§10.3, reached with `l`/`Enter`) is unchanged. The
-standalone Detail view is the full-screen detail + episode grid (§5.3), opened with
-`Enter` from **History**. It records its entry point in `detail_origin` so the Esc/`q`
-chain (§10.4) returns there. `detail_origin` also carries a `.browse` arm — wired and
-handled, but reserved for a future full-detail entry from Browse; in the current build
-Browse uses only its in-view pane, so the standalone view is History-entered only. See
-the §10.7 decision log for how this superseded the original single-`mode` model.
+**`.detail` is both an `active_pane` value within Browse/History and a standalone `active_view` (the zoom).**
+Browse's and History's right-hand detail *pane* (§10.3, reached with `l`/`Enter`) is the
+default "triage scrub" surface. The standalone Detail view is the full-screen zoom (§5.3),
+reached with `Space` from a focused detail pane in **either** Browse or History when `w ≥ 100`.
+`detail_origin` records the entry point (`.browse` or `.history`); both arms are now live.
+`Esc` from zoom demotes back to the two-pane with `active_pane = .detail`. `q` from zoom
+returns to `detail_origin` view with `active_pane = .list`. See §10.4 for the full Esc chain,
+and §10.7 for the decision log.
 
 Browse is not available as a landing view in M3 — there is no feed to populate it.
-It becomes live when the user presses `F1` or `H` from History (which triggers a
-search prompt, since Browse idle needs a query). This is unchanged from §9.2.
+It becomes live when the user presses `F1` or `H` from History. This is unchanged from §9.2.
 
 ---
 
@@ -1555,10 +1612,16 @@ Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
 `S` from Settings is a no-op. There is no "toggle Settings" semantic — `q` or
 `Esc` exits Settings.
 
-**Entering the standalone Detail view** is not a view-switch keybind — it is a
-drill-in: `Enter` on a row in **History** opens `active_view = .detail` (§10.1).
-`Esc`/`q` returns to `detail_origin` (§10.4). Browse does not drill into the
-standalone view; its `Enter`/`l` step into the in-view detail *pane* (§10.3c).
+**Entering the standalone Detail zoom** is not a view-switch keybind — it is a
+promote. `Space` from `active_pane = .detail` opens `active_view = .detail` at any
+two-pane width in **either Browse or History**; at `60 ≤ w < 100` `Enter` from the
+focused pane promotes too (no in-pane grid to play), and at `w < 60` `Enter`/`Space`
+from the History list open the zoom directly (no pane to focus). At `w ≥ 100`
+`Enter` from the detail pane plays instead — the grid is in-pane. `Esc`/`Space`
+demote back to the two-pane (`active_pane = .detail`) when there's room, else to
+the list; `q` is the full back-out to `detail_origin` with `active_pane = .list`
+(§10.4). `Enter`/`l` from the list step into the in-view detail *pane* first
+(§10.3c) whenever there is one (`w ≥ 60`).
 
 #### F-key aliases (discoverable navigation)
 
@@ -1600,11 +1663,12 @@ Focus is which pane currently receives keyboard input. It has two dimensions:
 2. **Pane-level focus** — within a multi-pane view, which pane is active.
    Controlled by `h` and `l`.
 
-In single-pane views (History, Settings), pane-level focus is always `.list`
-and does not change. There is no second pane to move to.
+In Settings (single-pane), pane-level focus is always `.list` and does not change.
+There is no second pane to move to.
 
-In Browse, pane-level focus switches between `.list` (left) and `.detail`
-(right) via `h` / `l`.
+In Browse and History (`w ≥ 60`), pane-level focus switches between `.list` (left)
+and `.detail` (right) via `h` / `l`. In History at `w < 60`, `active_pane` is
+clamped to `.list` — only one column is rendered.
 
 #### 10.3b The `·` indicator (§3.4)
 
@@ -1614,15 +1678,16 @@ The `·` dot rendered right-aligned in the top bar marks pane-level focus.
 |---|---|---|
 | Browse | `.list` | `color.fg3` (dim — list is the default, no emphasis needed) |
 | Browse | `.detail` | `color.focus` (cyan — detail pane is explicitly selected) |
-| Detail (standalone) | `.list` | `color.focus` (the full-screen view is focused) |
-| History | `.list` (only value) | `color.focus` (the screen is focused, render at full focus weight) |
+| History | `.list` | `color.fg3` (dim — symmetric with Browse list; History is now a two-pane view) |
+| History | `.detail` | `color.focus` (cyan — detail pane is explicitly selected, same as Browse) |
+| Detail (zoom, `active_view = .detail`) | — | `color.focus` (the full-screen zoom is focused) |
 | Settings | `.list` (only value) | `color.focus` |
 
-**Rationale for Browse list dim:** when the detail pane is not open, the `·`
-being dim signals "browse mode, no secondary selection." When focus moves to
-detail, it lights to cyan — the user has gone "deeper" and the indicator tracks
-that. This maps to the §8 decision "single magenta cursor, not per-pane focus
-indicators" — the `·` uses cyan only, never magenta.
+**Rationale for Browse/History list dim (now symmetric):** History adopts the same
+two-pane grammar as Browse (ROD-170). The `·` follows the same logic: dim on list
+(default, no secondary selection), lit cyan on detail (user has gone deeper). The
+prior History rule ("always lit because single-pane") is superseded — History is no
+longer single-pane. The `·` uses cyan only, never magenta (§8 decision).
 
 The `·` is always rendered. It does not disappear in single-pane views. Its
 persistent presence at a fixed right-aligned position is the anchor that makes
@@ -1644,16 +1709,18 @@ spinner, matching the empty Browse content area.
 
 #### 10.3c `h` / `l` behavior by view
 
-| View | `h` | `l` |
-|---|---|---|
-| Browse, `active_pane = .list` | no-op (already leftmost) | set `active_pane = .detail` |
-| Browse, `active_pane = .detail` | set `active_pane = .list` | no-op (already rightmost) |
-| History | no-op | no-op |
-| Settings | no-op | no-op |
+| View | `active_pane` | `h` | `l` |
+|---|---|---|---|
+| Browse | `.list` | no-op (already leftmost) | set `active_pane = .detail` |
+| Browse | `.detail` | set `active_pane = .list` | no-op (already rightmost) |
+| History (`w ≥ 60`) | `.list` | no-op (already leftmost) | set `active_pane = .detail` |
+| History (`w ≥ 60`) | `.detail` | set `active_pane = .list` | no-op (already rightmost) |
+| History (`w < 60`) | `.list` (clamped) | no-op | no-op |
+| Settings | `.list` (only) | no-op | no-op |
 
-In single-pane views, `h` and `l` are silently consumed — they do not trigger
-an error toast or any visual feedback. The `j`/`k` navigation still works
-normally in all views.
+History now has identical `h`/`l` pane-toggle behavior to Browse when `w ≥ 60`.
+At `w < 60`, History collapses to single-column and `h`/`l` are silently consumed.
+`j`/`k` navigate the focused pane's content in all views.
 
 ---
 
@@ -1669,20 +1736,27 @@ Esc action is listed. Everything not listed is a no-op.
 | Any | `command` | any | _Future (M4+):_ close command prompt, set `input_mode = .normal`. `input_mode` has no `.command` member yet (§7.6), so this row is inert in the current build. |
 | Browse | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
 | Browse | `normal` | `.list` | No-op. `q` handles quit from Browse. Esc does not quit. |
-| Detail (standalone) | `normal` | any | Return to `detail_origin` — `active_view = detail_origin` (`.history` today → History; `.browse` arm reserved, §10.1), `active_pane = .list`. Same as `q` from Detail. |
+| Detail (zoom) | `normal` | — | **Demote:** `active_view = detail_origin`; `active_pane = .detail` when there's room for the pane (`w ≥ 60`), else `.list` (the zoom was opened from a single-column list at `w < 60`). `Space` and `h` have the same effect (zoom toggle / back). |
+| History (`w ≥ 60`) | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
 | History | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to `H`. |
 | Settings | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to pressing `q` from Settings. |
 | Settings | `edit` (field under edit) | `.list` | Cancel field edit. Return to Settings normal. `input_mode` stays `.normal`; the edit buffer is discarded. |
 
-**Why Esc does not quit from Browse normal:** `q` is the quit key throughout
-(§6.1). Esc-to-quit is a common beginner assumption but it conflicts with the
-vim idiom of Esc-as-return. Keeping Esc as "go back one level" and `q` as "quit
-or back" is consistent and does not surprise vim users.
+**`q` from zoom vs Esc from zoom:** Esc demotes to two-pane with `active_pane = .detail`
+— the user stays in context with the title. `q` returns to `detail_origin` view
+with `active_pane = .list` — a full back-out. Both work; Esc is "less far back."
 
-**Why Esc from History goes to Browse (not quit):** History is not the root
-application level — it is a view. There is no concept of "quit the History
-view" meaning "quit the app." Esc navigates backward in the view hierarchy
-(History → Browse), and `q` from Browse prompts quit.
+**Why Esc does not quit from Browse normal:** `q` is the quit key throughout
+(§6.1). Esc-as-return is the vim idiom. In Browse list normal with no modal open,
+there is no level back — Esc is a no-op rather than a quit trigger.
+
+**Why Esc from History (.list) goes to Browse:** History is a view, not the root.
+Esc navigates backward (History → Browse); `q` from Browse prompts quit.
+
+**Why zoom Esc lands on `.detail`, not `.list`:** the user arrived at zoom via
+the detail pane. Esc undoes one step. Skipping back to list would be jarring —
+especially on a long-runner the user was navigating. The exception is `w < 60`,
+where there is no pane to land on, so Esc returns to the single-column list.
 
 ---
 
@@ -1710,25 +1784,63 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `F1`, `F2`, `F3`, `q`.
 #### Browse — normal, detail pane focused
 
 ```
-  ▌  hjkl scroll · h back · enter play · q back
+  ▌  hjkl scroll · h back · enter play · space zoom · q back
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
-Note: this is the §5.3 detail-pane context. `q` means "return to list" here, not
-"quit app" — consistent with §6.1's `q` = "quit current view (back one level)."
+Note: `q` returns to list, not quit. Browse uses this string at all two-pane
+widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. At
+`60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the prefetched
+episode and `Space` promotes to the full-screen zoom. At 80 cols the string fits
+within the ~74-char budget:
+`hjkl scroll · h back · enter play · space zoom · q back` = 52 chars + `▌ ` = 54.
 
-#### History — normal
+#### History — normal, list pane focused
 
 ```
-  ▌  jk move · enter open · F1 browse · F3 settings · q quit
+  ▌  hjkl · l/enter detail · F1 browse · F3 settings · q quit
 ```
 
-Underlined: `j`, `k`, `enter`, `F1`, `F3`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `l`, `enter`, `F1`, `F3`, `q`.
 
-Note: `F2` is not shown (the user is already in History). Show only the other
-two view destinations. `H` is not shown because the help line targets newcomers;
-vim users who want `H` already know it.
+Note: `F2` is not shown (the user is already in History). `H` is not shown
+(help line targets newcomers). `l/enter` is shown explicitly — History now
+uses the same pane grammar as Browse, and `l` may not be obvious in a watchlist
+context without a hint.
+
+#### History — normal, detail pane focused (w ≥ 100)
+
+```
+  ▌  hjkl scroll · h back · enter play · space zoom · q back
+```
+
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
+
+Identical to Browse detail pane focused — symmetric two-pane grammar.
+
+#### History — normal, detail pane focused (60 ≤ w < 100, no zoom)
+
+```
+  ▌  enter/space zoom · h back · q back
+```
+
+Underlined: `enter`, `space`, `h`, `q`.
+
+No in-pane grid at this width. Both `Enter` and `Space` drill into the
+full-screen zoom (the only path to the grid here). The help string makes
+that explicit: `enter/space zoom`.
+
+#### Detail (zoom) — normal
+
+```
+  ▌  hjkl scroll · enter play · space/esc back
+```
+
+Underlined: `h`, `j`, `k`, `l`, `enter`, `space`, `esc`.
+
+`space/esc back` reinforces that both keys demote from zoom. `q` also works
+(returns to list) but is not shown — the line stays within budget.
 
 #### History — empty (no records)
 
@@ -1775,108 +1887,135 @@ The bottom bar becomes the command prompt. No changes from §3.5.
 
 ---
 
-### 10.6 State Delta — Fields Added in ROD-72
+### 10.6 State Delta — Fields Added in ROD-72 (amended by ROD-170)
 
 The current `App` struct in `src/tui/app.zig` has these fields:
 `should_quit`, `history`, `history_loading`, `load_error`, `list_cursor`,
 `list_top`, `meta_scratch`.
 
-ROD-72 adds exactly two fields:
+ROD-72 adds exactly two fields (as-built; the enum variant set is extended by
+ROD-170 as noted):
 
 ```zig
 /// Which top-level view is currently displayed.
 /// Defaults to .history — the M3 landing (§9.2).
-active_view: enum { browse, history, settings } = .history,
+/// ROD-170: .detail is now reached from Browse or History (both arms live).
+active_view: enum { browse, history, detail, settings } = .history,
 
 /// Which pane has keyboard focus within the current view.
-/// Only meaningful in Browse (two panes). History and Settings are single-pane
-/// and treat this field as always .list — it still exists so the top-bar `·`
-/// rendering function can read it without a view branch.
+/// ROD-170: History is now a two-pane view. `active_pane` is meaningful in
+/// Browse and History. Settings remains single-pane (.list only).
 active_pane: enum { list, detail } = .list,
 ```
 
-**Do not add** `input_mode`, `search_query`, `results`, `selected`,
-`detail_scroll`, `episode_cursor`, or `cover_image` in this ticket. Those belong
-to ROD-73 (search), ROD-74 (detail pane), and ROD-75 (history filter / progress
-bars). Adding them speculatively in ROD-72 expands the scope and creates
-uninitialized state that the draw functions are not yet prepared to read.
+> **ROD-72 note preserved:** `active_view` previously excluded `.detail` from
+> its enum in the ROD-72 pseudocode because detail navigation was ROD-74 scope.
+> That ticket has since landed. The as-built enum includes `.detail`. The
+> two-field model was kept (not collapsed into a single `mode` enum) — see §10.7.
 
-**Do not add** `mode: enum { browse, history, settings, detail }` from §7.6.
-The §7.6 state machine is the *target* architecture; ROD-72 introduces
-`active_view` and `active_pane` as the minimal increment. The refactor that
-collapses them into `mode` is a future integration step once the downstream
-tickets land.
-
-#### keybind dispatch additions to `onKey`
-
-Add the following to `onKey`, after the existing navigation block:
+**ROD-170 adds one field:**
 
 ```zig
-// View switching — F-keys (discoverable) and H/S (vim-native).
-if (key.matches(vaxis.Key.f2, .{}) or
-    (key.matches('H', .{ .shift = true }) or key.matches('H', .{})))
-{
-    self.active_view = if (self.active_view == .history) .browse else .history;
-    self.active_pane = .list;
-    return;
-}
-if (key.matches(vaxis.Key.f3, .{}) or
-    key.matches('S', .{ .shift = true }) or key.matches('S', .{}))
-{
-    if (self.active_view != .settings) {
-        self.active_view = .settings;
-        self.active_pane = .list;
-    }
-    return;
-}
-if (key.matches(vaxis.Key.f1, .{})) {
-    self.active_view = .browse;
-    self.active_pane = .list;
-    return;
-}
-// h / l pane switching (Browse only).
+/// Records which view opened the full-screen zoom, for Esc/q return.
+/// Both arms are now live (ROD-170): .browse when zoomed from Browse,
+/// .history when zoomed from History.
+detail_origin: enum { browse, history } = .browse,
+```
+
+#### keybind dispatch — ROD-170 amendments to `onKey`
+
+The ROD-72 keybind block is preserved. ROD-170 adds and changes the following:
+
+**History `h`/`l` pane switching (was no-op; now symmetric with Browse):**
+
+```zig
+// h / l pane switching (Browse and History, w >= pane_split_min).
 if (key.matches('h', .{})) {
-    if (self.active_view == .browse) self.active_pane = .list;
+    if (self.active_view == .browse or
+        (self.active_view == .history and self.term_w >= pane_split_min))
+        self.active_pane = .list;
     return;
 }
 if (key.matches('l', .{})) {
-    if (self.active_view == .browse) self.active_pane = .detail;
-    return;
-}
-// Esc chain (§10.4). input_mode is ROD-73 scope; in ROD-72 only the
-// pane-return and view-return branches are wired.
-if (key.matches(vaxis.Key.escape, .{})) {
-    if (self.active_view == .browse and self.active_pane == .detail) {
-        self.active_pane = .list;
-    } else if (self.active_view == .history or self.active_view == .settings) {
-        self.active_view = .browse;
-        self.active_pane = .list;
-    }
-    // Browse + list + normal: no-op. q handles quit.
+    if (self.active_view == .browse or
+        (self.active_view == .history and self.term_w >= pane_split_min))
+        self.active_pane = .detail;
     return;
 }
 ```
 
-**Note on the existing Esc handler:** the current `onKey` fires `should_quit` on
-`Esc`. That must be removed when this block is added — the Esc chain above
-supersedes it. The `Ctrl-C` quit path stays unchanged.
+**`Space` — zoom promote from detail pane, and demote from zoom (toggle):**
 
-#### `q` key behavior by view
+`Space` is a toggle: from the detail pane it promotes to zoom; from zoom it demotes
+back to the detail pane. This makes `Space` behave like a zoom toggle, mirroring
+the common "press the same key to expand/contract" idiom.
 
-`q` currently always sets `should_quit = true`. ROD-72 changes this:
+```zig
+// Space: toggle zoom. Promote from detail pane; demote from zoom.
+if (key.matches(' ', .{})) {
+    if (self.active_view == .detail) {
+        // Demote: same as Esc from zoom.
+        self.active_view = if (self.detail_origin == .browse) .browse else .history;
+        self.active_pane = .detail;
+    } else if (self.active_pane == .detail and self.term_w >= zoom_min and
+        (self.active_view == .browse or self.active_view == .history))
+    {
+        self.detail_origin = if (self.active_view == .browse) .browse else .history;
+        self.active_view = .detail;
+    }
+    return;
+}
+```
 
-| View | `q` action |
-|---|---|
-| Browse | `should_quit = true` (root level — confirm quit) |
-| History | `active_view = .browse` (back one level, no quit) |
-| Settings | `active_view = .browse` (back one level, no quit) |
+**Esc chain — zoom demote and History detail-pane return:**
 
-The `q` handler needs a view branch. Add it before the navigation block:
+```zig
+if (key.matches(vaxis.Key.escape, .{})) {
+    switch (self.active_view) {
+        .detail => {
+            // Demote zoom → two-pane, stay on detail pane.
+            self.active_view = if (self.detail_origin == .browse) .browse else .history;
+            self.active_pane = .detail;
+        },
+        .browse => {
+            if (self.active_pane == .detail) self.active_pane = .list;
+            // Browse list + normal: no-op.
+        },
+        .history => {
+            if (self.active_pane == .detail) {
+                self.active_pane = .list;
+            } else {
+                // History list: go to Browse.
+                self.active_view = .browse;
+                self.active_pane = .list;
+            }
+        },
+        .settings => {
+            self.active_view = .browse;
+            self.active_pane = .list;
+        },
+    }
+    return;
+}
+```
+
+#### `q` key behavior by view (ROD-170 amendment)
+
+| View | `active_pane` | `q` action |
+|---|---|---|
+| Browse | any | `should_quit = true` (root level) |
+| History | any | `active_view = .browse`, `active_pane = .list` (back one level) |
+| Detail (zoom) | — | `active_view = detail_origin`, `active_pane = .list` (full back-out to list) |
+| Settings | any | `active_view = .browse`, `active_pane = .list` (back one level) |
 
 ```zig
 if (key.matches('q', .{})) {
     switch (self.active_view) {
         .browse => self.should_quit = true,
+        .detail => {
+            self.active_view = if (self.detail_origin == .browse) .browse else .history;
+            self.active_pane = .list;
+        },
         .history, .settings => {
             self.active_view = .browse;
             self.active_pane = .list;
@@ -1894,8 +2033,12 @@ if (key.matches('q', .{})) {
 |---|---|---|
 | F-keys are aliases, not primary binds | H/S are already in §6.1 and the codebase. Adding F-keys as separate primary binds would create two authoritative tables to keep in sync. Aliases give discoverability without forking the semantic. | If a future milestone removes H/S (unlikely), promote F-keys to primary. |
 | F-keys appear in help line; H/S do not | The help line targets users who are not already vim-native. Showing H/S alongside F1/F2/F3 doubles the character cost for no benefit — the vim user already knows H/S. If both appear, the line gets crowded and both become less legible. | If user feedback shows H/S are missed, add them as secondary text in a second help mode toggled by `?`. |
-| `·` stays lit at `color.focus` in single-pane views | Dimming or hiding the `·` in History/Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
-| `·` is dim for Browse list, lit for Browse detail | The detail pane is the "deeper" selection — the user has moved into a secondary surface. Lighting the `·` on detail-entry is a confirmation that the focus moved. Keeping it dim on list avoids the indicator fighting with the active row highlight for attention. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
+| `·` stays lit at `color.focus` in single-pane views (Settings) | Dimming or hiding the `·` in Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
+| `·` is dim for Browse/History list, lit for Browse/History detail (ROD-170) | History is now a two-pane view. The `·` follows the same Browse logic: dim on list (default, no secondary selection), lit cyan on detail (user has gone deeper). The prior History rule ("always lit — single-pane") is retired. Color is always cyan; magenta is reserved for the §8 status-bar cursor. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
 | Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
 | `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | **Resolved (ROD-74 / ROD-180):** detail navigation landed and the two-field model was *kept*, not collapsed into `mode`. `.detail` was promoted to a standalone `active_view` (see §10.1) while remaining an `active_pane` value in Browse; `mode` was never introduced. The two fields proved the right shape. |
 | Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | Switch to season/year kanji in `color.focus` when Browse has a real feed to populate (ROD-73 search landing or later). |
+| **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, right pane updates on cursor move) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
+| **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
+| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. `q` provides the full back-out (zoom → list) for users who want to get all the way out. (Exception: at `w < 60` there is no pane to land on, so Esc/`Space`/`h` demote to the single-column list.) | No revisit expected. |
+| **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on focus at any two-pane width, so the zoom's grid is always ready. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | Revisit if a future design gives the 60–99 pane its own usable in-pane grid — that would remove the Enter-drills-to-zoom hop. |
