@@ -33,10 +33,12 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     };
     put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
 
-    // Render the · indicator right-aligned (§10.3b).
+    // Render the · indicator right-aligned (§10.3b). ROD-170: History is now a
+    // two-pane view, so it dims on list focus / lights on detail focus exactly
+    // like Browse. The zoom (.detail) and single-pane Settings stay lit.
     const dot_color = switch (self.active_view) {
-        .browse => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
-        .history, .detail, .settings => self.palette.focus,
+        .browse, .history => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
+        .detail, .settings => self.palette.focus,
     };
     if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
 }
