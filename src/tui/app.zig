@@ -471,9 +471,11 @@ pub const App = struct {
     settings: SettingsState = .{},
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
-    /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
-    /// for labels like "1000a" — silently fell back to "[?]".
-    ep_scratch: [512][8]u8 = undefined,
+    /// 16 bytes/slot (ROD-192): the glyph path "[▸XX]" = 1 + 3 (▸ is 3 UTF-8 bytes)
+    /// + 2 + 1 = 7 bytes — the ▸ only fires for labels < 3 chars — and a plain
+    /// "[1000a]" is 7; [16] leaves headroom. The prior [8] was tight and silently
+    /// fell back to "[?]".
+    ep_scratch: [512][16]u8 = undefined,
     /// Stable storage for the detail-pane score line.
     detail_score_buf: [32]u8 = undefined,
     /// Stable storage for the "N eps" metadata line in drawDetailPane.
@@ -932,12 +934,17 @@ pub const App = struct {
         const next: usize = played_index;
         if (next < eps.len) {
             self.episodes.cursor = next;
+            // ROD-192: the ▸ resume marker advances in-session to the next
+            // episode, tracking the high-water bump above.
+            self.episodes.resume_idx = next;
             var buf: [32]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "episode {d} done", .{played_index}) catch "episode done";
             self.pushToast(.success, msg, false);
         } else {
             // Finale: deliberately leave the cursor where it is (on the last
-            // cell the user played from) — there is no N+1 to move to.
+            // cell the user played from) — there is no N+1 to move to. Caught up,
+            // so there is nothing to resume (ROD-192).
+            self.episodes.resume_idx = null;
             self.pushToast(.success, "all caught up", false);
         }
     }
@@ -1187,6 +1194,7 @@ pub const App = struct {
                 self.episodes.results = ev.episodes;
                 self.episodes.cursor = 0;
                 self.episodes.progress = 0;
+                self.episodes.resume_idx = null;
                 if (self.historyDetailRecord()) |rec| {
                     self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
                 }
