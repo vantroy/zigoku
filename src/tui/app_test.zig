@@ -445,6 +445,42 @@ test "F1 from browse is a no-op and preserves active_pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try st.recordPlay("s", "a", 3, 2000, true); // watching, progress 3
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+
+    // p → paused, in BOTH the in-memory record and the store.
+    try testTick(&app, keyEv('p', .{}));
+    try testing.expectEqual(domain.ListStatus.paused, app.history[0].list_status);
+    try testing.expectEqual(domain.ListStatus.paused, (try st.getAnime(arena, "s", "a")).?.list_status);
+
+    // c → completed, and progress snaps to the finale in memory and store.
+    try testTick(&app, keyEv('c', .{}));
+    try testing.expectEqual(domain.ListStatus.completed, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 12), app.history[0].progress);
+    try testing.expectEqual(@as(i64, 12), (try st.getAnime(arena, "s", "a")).?.progress);
+
+    // x → dropped, w → watching.
+    try testTick(&app, keyEv('x', .{}));
+    try testing.expectEqual(domain.ListStatus.dropped, app.history[0].list_status);
+    try testTick(&app, keyEv('w', .{}));
+    try testing.expectEqual(domain.ListStatus.watching, app.history[0].list_status);
+}
+
 test "q/Esc from History reset the viewport before Browse reads it (ROD-139 H1)" {
     // list_top is a physical-row offset in History but an entry index in Browse —
     // leaving History must clear it so a stale physical value can't leak across.

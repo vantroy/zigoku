@@ -526,6 +526,29 @@ pub const App = struct {
         return history.recordAtCursor(self);
     }
 
+    /// Apply a manual watch-state transition to the focused History entry
+    /// (ROD-139 §1 — the p/x/c/w keybinds). Persists through the store, then
+    /// mutates the in-memory record so the grouped view regroups it on the next
+    /// draw — no full reload. On a store error the in-memory state is left
+    /// untouched so the two never diverge. No-op if nothing is focused.
+    fn setSelectedHistoryStatus(self: *App, status: domain.ListStatus) void {
+        const st = self.store orelse return;
+        const idx = history.indexAtCursor(self) orelse return;
+        const rec = &self.history[idx];
+        st.setListStatus(rec.source, rec.source_id, status) catch |e| {
+            log.debug("setListStatus failed: {s}", .{@errorName(e)});
+            return;
+        };
+        rec.list_status = status;
+        // Mirror the store's force-complete progress snap: a real total fills the
+        // bar; unknown/0 leaves progress as-is (same guard as Store.setListStatus).
+        if (status == .completed) {
+            if (rec.total_episodes) |t| {
+                if (t > 0) rec.progress = t;
+            }
+        }
+    }
+
     /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
     /// missing or out-of-range year collapses the whole date to null (a date with
     /// no year isn't a date); month/day independently degrade to "not provided".
@@ -1549,6 +1572,25 @@ pub const App = struct {
                 self.episodes.cursor = ep_len - 1;
             }
             return;
+        }
+
+        // History: manual watch-state transitions (ROD-139 §1). Act on the focused
+        // entry; the grouped view regroups it on the next draw. `c` is the bare
+        // codepoint — Ctrl-C (quit) is matched and returned earlier, so no clash.
+        if (self.active_view == .history) {
+            if (key.matches('p', .{})) {
+                self.setSelectedHistoryStatus(.paused);
+                return;
+            } else if (key.matches('x', .{})) {
+                self.setSelectedHistoryStatus(.dropped);
+                return;
+            } else if (key.matches('c', .{})) {
+                self.setSelectedHistoryStatus(.completed);
+                return;
+            } else if (key.matches('w', .{})) {
+                self.setSelectedHistoryStatus(.watching);
+                return;
+            }
         }
 
         // List navigation (history + browse list pane).

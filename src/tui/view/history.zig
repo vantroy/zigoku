@@ -47,7 +47,9 @@ const hairline = "─" ** hairline_cols;
 //
 // Per-group physical cost: [1 blank if not first] + 1 header + 1 hairline + 2·N.
 // `ctx` must expose: onBlank(phys), onHeader(phys, status, count),
-// onHairline(phys), onEntry(phys, rec, ordinal, selected). Returns total rows.
+// onHairline(phys), onEntry(phys, rec, idx, ordinal, selected) — where `idx` is
+// the record's index into self.history (for callers that mutate it). Returns
+// total rows.
 //
 // Cost: each walk is O(groups · N) — one `groupCount` scan per group plus the
 // entry scan. A wide History frame drives up to THREE walks (layout→geometry,
@@ -81,9 +83,9 @@ fn walk(self: *const App, ctx: anytype) u16 {
         ctx.onHairline(phys);
         phys += 1;
 
-        for (self.history) |rec| {
+        for (self.history, 0..) |rec, idx| {
             if (rec.list_status != status or !self.historyEntryVisible(rec.title)) continue;
-            ctx.onEntry(phys, rec, ordinal, ordinal == self.list_cursor);
+            ctx.onEntry(phys, rec, idx, ordinal, ordinal == self.list_cursor);
             phys += 2;
             ordinal += 1;
         }
@@ -109,22 +111,24 @@ const ScanCtx = struct {
     // short-circuits (max_top = 0) — so cursor_row=0 is never read as a real row.
     cursor_row: u16 = 0,
     rec: ?AnimeRecord = null,
+    index: ?usize = null, // self.history index of the cursor entry (for mutation)
 
     fn onBlank(_: *ScanCtx, _: u16) void {}
     fn onHeader(_: *ScanCtx, _: u16, _: ListStatus, _: usize) void {}
     fn onHairline(_: *ScanCtx, _: u16) void {}
-    fn onEntry(self: *ScanCtx, phys: u16, rec: AnimeRecord, ordinal: usize, _: bool) void {
+    fn onEntry(self: *ScanCtx, phys: u16, rec: AnimeRecord, idx: usize, ordinal: usize, _: bool) void {
         if (ordinal == self.cursor) {
             self.cursor_row = phys;
             self.rec = rec;
+            self.index = idx;
         }
     }
 };
 
-fn scan(self: *const App) struct { geom: Geometry, rec: ?AnimeRecord } {
+fn scan(self: *const App) struct { geom: Geometry, rec: ?AnimeRecord, index: ?usize } {
     var ctx = ScanCtx{ .cursor = self.list_cursor };
     const total = walk(self, &ctx);
-    return .{ .geom = .{ .cursor_row = ctx.cursor_row, .total = total }, .rec = ctx.rec };
+    return .{ .geom = .{ .cursor_row = ctx.cursor_row, .total = total }, .rec = ctx.rec, .index = ctx.index };
 }
 
 pub fn geometry(self: *const App) Geometry {
@@ -136,6 +140,14 @@ pub fn geometry(self: *const App) Geometry {
 pub fn recordAtCursor(self: *const App) ?AnimeRecord {
     if (self.history.len == 0) return null;
     return scan(self).rec;
+}
+
+/// The cursor entry's index into self.history (grouped order) — for callers that
+/// mutate the record in place (e.g. a manual status change). Null if no entry is
+/// focused (empty history or a filter hiding every row).
+pub fn indexAtCursor(self: *const App) ?usize {
+    if (self.history.len == 0) return null;
+    return scan(self).index;
 }
 
 // ── Paint ────────────────────────────────────────────────────────────────────
@@ -205,7 +217,7 @@ const DrawCtx = struct {
         }
     }
 
-    fn onEntry(c: *DrawCtx, phys: u16, rec: AnimeRecord, _: usize, selected: bool) void {
+    fn onEntry(c: *DrawCtx, phys: u16, rec: AnimeRecord, _: usize, _: usize, selected: bool) void {
         // Both rows (title + bar) must fit; a bottom-edge partial is skipped —
         // app.layout()'s History arm guarantees the cursor's entry is never the
         // partial one (it keeps cursor_row..+2 inside the viewport).
