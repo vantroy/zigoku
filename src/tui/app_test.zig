@@ -925,6 +925,7 @@ test "Enter in a 60-99 detail pane zooms instead of playing (ROD-170)" {
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
     try testing.expectEqual(.detail, app.active_view); // drilled into the zoom
+    try testing.expectEqual(.detail, app.active_pane); // pane focus carried into the zoom
     try testing.expect(!app.playing); // …and did NOT start playback
 
     app.episodes.freeResults(app.gpa);
@@ -940,6 +941,20 @@ test "q from the zoom backs all the way out to the history list (ROD-170)" {
     // ROD-170: q is the full back-out (zoom → list), where Esc/h demote one step.
     try testing.expectEqual(.history, app.active_view);
     try testing.expectEqual(.list, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "q from a focused History detail pane backs to the list, not Browse (ROD-170)" {
+    // Astra D1: q from the two-pane detail pane used to fall through to the
+    // History list-exit and jump to Browse, contradicting the "q back" help line.
+    var app: App = .{};
+    app.active_view = .history;
+    app.active_pane = .detail;
+    app.term_cols = 120;
+
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expectEqual(.history, app.active_view); // stays in History
+    try testing.expectEqual(.list, app.active_pane); // backs one level to the list
     try testing.expect(!app.should_quit);
 }
 
