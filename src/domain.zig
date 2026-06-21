@@ -155,6 +155,22 @@ pub const Season = enum {
             .fall   => "秋",
         };
     }
+
+    /// The cour a calendar month (1–12) falls in, using AniList's own season
+    /// boundaries so the top-bar "current season" fallback (ROD-186) agrees with
+    /// the show chips it sits beside: 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov.
+    /// Note December belongs to the *next* year's Winter cour on AniList — that
+    /// year roll is the caller's concern (see App.currentCour); this is month→season
+    /// only. Out-of-range months can't occur (std clock yields 1–12) but default to
+    /// winter rather than trap.
+    pub fn fromMonth(month: u4) Season {
+        return switch (month) {
+            3, 4, 5 => .spring,
+            6, 7, 8 => .summer,
+            9, 10, 11 => .fall,
+            else => .winter, // 12, 1, 2
+        };
+    }
 };
 
 /// A calendar date at whatever precision the source offered. `year` is always
@@ -345,6 +361,20 @@ test "Season.kanji returns correct glyphs" {
     try std.testing.expectEqualStrings("春", Season.spring.kanji());
     try std.testing.expectEqualStrings("夏", Season.summer.kanji());
     try std.testing.expectEqualStrings("秋", Season.fall.kanji());
+}
+
+test "Season.fromMonth maps months to AniList cours (ROD-186)" {
+    // 冬 Dec–Feb wraps the year boundary.
+    try std.testing.expectEqual(Season.winter, Season.fromMonth(12));
+    try std.testing.expectEqual(Season.winter, Season.fromMonth(1));
+    try std.testing.expectEqual(Season.winter, Season.fromMonth(2));
+    // 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov.
+    try std.testing.expectEqual(Season.spring, Season.fromMonth(3));
+    try std.testing.expectEqual(Season.spring, Season.fromMonth(5));
+    try std.testing.expectEqual(Season.summer, Season.fromMonth(6));
+    try std.testing.expectEqual(Season.summer, Season.fromMonth(8));
+    try std.testing.expectEqual(Season.fall, Season.fromMonth(9));
+    try std.testing.expectEqual(Season.fall, Season.fromMonth(11));
 }
 
 test "ListStatus.fromString parses tags and falls back to planning" {
