@@ -373,11 +373,15 @@ test "paneSplit clamps the list column to a 30-col floor at narrow widths" {
     try testing.expectEqual(@as(u16, 30), sp.list_w); // 60*38/100 = 22 → floored to 30
 }
 
-test "history preview engages only at the split threshold (ROD-113)" {
-    try testing.expectEqual(@as(u16, 100), App.history_split_min);
-    // The gating predicate the .history arm uses: w >= history_split_min.
-    try testing.expect(99 < App.history_split_min);
-    try testing.expect(100 >= App.history_split_min);
+test "two-pane split engages at 60, zoom/grid at 100 (ROD-170)" {
+    // ROD-170 unified Browse + History on pane_split_min and lowered it 100→60.
+    try testing.expectEqual(@as(u16, 60), App.pane_split_min);
+    try testing.expectEqual(@as(u16, 100), App.zoom_min);
+    // The gating predicate the .history arm uses: w >= pane_split_min.
+    try testing.expect(59 < App.pane_split_min);
+    try testing.expect(60 >= App.pane_split_min);
+    // The two-pane preview engages strictly before the interactive grid/zoom.
+    try testing.expect(App.pane_split_min < App.zoom_min);
 }
 
 test "detail two-column gate trips at 100 cols and falls back below (ROD-113)" {
@@ -790,13 +794,13 @@ test "detailSyncTarget tracks the history cursor in wide preview mode, no episod
     app.setHistory(&recs);
     app.active_view = .history;
 
-    // Narrow: no ROD-113 preview pane, so the cover path is inert and the target
-    // defers to currentDetailAnime (null in the history view).
-    app.term_cols = 80;
+    // Narrow (< pane_split_min): no two-pane preview, so the cover path is inert
+    // and the target defers to currentDetailAnime (null in the history view).
+    app.term_cols = 50;
     try testing.expect(app.detailSyncTarget() == null);
 
-    // Wide (>= history_split_min): the preview is on-screen, so the cover tracks
-    // the focused record as the cursor moves.
+    // Wide (>= pane_split_min): the preview is on-screen, so the cover tracks
+    // the focused record as the cursor moves (ROD-170 lowered this gate to 60).
     app.term_cols = 120;
     try testing.expectEqualStrings("Frieren", app.detailSyncTarget().?.name);
     app.list_cursor = 1;
