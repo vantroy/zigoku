@@ -266,6 +266,10 @@ pub const RenderScratch = struct {
     /// Detail-pane cover spinner glyph. Separate from `msg` so the split-pane
     /// frame (Browse list + detail) never aliases one buffer (ROD-155 review).
     detail_msg: [32]u8 = undefined,
+    /// Per-group "(N)" count strings for the History group headers (ROD-139). One
+    /// slot per status group; same outlive-vx.render() contract as `meta`. Sized
+    /// to the status count with headroom — there are only ever a handful of groups.
+    hist_header: [8][24]u8 = undefined,
 };
 
 pub const App = struct {
@@ -515,15 +519,11 @@ pub const App = struct {
         return self.results.items[self.list_cursor];
     }
 
+    /// The focused record, in the History view's §5.4 grouped order. Delegates to
+    /// the renderer's walk so the highlighted row and the focused record share one
+    /// ordering definition (ROD-139).
     pub fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
-        if (self.history.len == 0) return null;
-        var visible_i: usize = 0;
-        for (self.history) |rec| {
-            if (!self.historyEntryVisible(rec.title)) continue;
-            if (visible_i == self.list_cursor) return rec;
-            visible_i += 1;
-        }
-        return null;
+        return history.recordAtCursor(self);
     }
 
     /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
@@ -1696,9 +1696,26 @@ pub const App = struct {
         if (h < 4 or w < 16) return;
         const visible: u16 = h - 3;
         switch (self.active_view) {
-            // @max(1, …) guards visible=1 producing a zero slot count, which
-            // would corrupt list_top via scrollIntoView's arithmetic.
-            .history => self.scrollIntoView(@max(1, visible / 2)),
+            // History: list_top is a physical-row offset (chrome-aware), so scroll
+            // works in physical rows via the renderer's geometry — not the entry
+            // units browse uses (ROD-139). Keep the cursor's whole 2-row entry in
+            // view, then clamp the tail so we never scroll past the last row.
+            .history => {
+                const g = history.geometry(self);
+                const v: usize = visible;
+                if (v == 0) {
+                    self.list_top = 0;
+                } else {
+                    const cur: usize = g.cursor_row;
+                    if (cur < self.list_top) {
+                        self.list_top = cur;
+                    } else if (cur + 2 > self.list_top + v) {
+                        self.list_top = (cur + 2) -| v;
+                    }
+                    const max_top: usize = if (g.total > v) g.total - v else 0;
+                    if (self.list_top > max_top) self.list_top = max_top;
+                }
+            },
             .browse => self.scrollIntoView(visible),
             .detail, .settings => {},
         }

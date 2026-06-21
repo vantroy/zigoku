@@ -64,7 +64,8 @@ pub const ListStatus = enum {
 
     /// History grouping order (ROD-139 §3 / §5.4); lower sorts higher in the list.
     /// Deliberately `planning` before `paused` — Rod's call, overriding Mira's
-    /// active-intent ordering (which put paused first). Not an accident.
+    /// active-intent ordering (which put paused first). Not an accident. This is
+    /// the single source of the order; `group_order` is its materialised inverse.
     pub fn groupRank(self: ListStatus) u8 {
         return switch (self) {
             .watching => 0,
@@ -74,6 +75,17 @@ pub const ListStatus = enum {
             .dropped => 4,
         };
     }
+
+    const count = @typeInfo(ListStatus).@"enum".fields.len;
+
+    /// The §5.4 group display order — `groupRank`'s inverse, materialised at
+    /// comptime so the History renderer can iterate groups top-to-bottom with no
+    /// runtime cost and no second copy of the order to drift out of sync.
+    pub const group_order: [count]ListStatus = blk: {
+        var arr: [count]ListStatus = undefined;
+        for (std.enums.values(ListStatus)) |s| arr[s.groupRank()] = s;
+        break :blk arr;
+    };
 };
 
 /// The user's stream-quality preference (ROD-152). `best`/`worst` are the
@@ -373,4 +385,11 @@ test "ListStatus.groupRank orders watching → planning → paused → completed
     try std.testing.expect(ListStatus.planning.groupRank() < ListStatus.paused.groupRank());
     try std.testing.expect(ListStatus.paused.groupRank() < ListStatus.completed.groupRank());
     try std.testing.expect(ListStatus.completed.groupRank() < ListStatus.dropped.groupRank());
+}
+
+test "ListStatus.group_order is groupRank materialised in display order" {
+    try std.testing.expectEqual(
+        [_]ListStatus{ .watching, .planning, .paused, .completed, .dropped },
+        ListStatus.group_order,
+    );
 }
