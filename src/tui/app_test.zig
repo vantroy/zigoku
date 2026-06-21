@@ -445,6 +445,24 @@ test "F1 from browse is a no-op and preserves active_pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+test "q/Esc from History reset the viewport before Browse reads it (ROD-139 H1)" {
+    // list_top is a physical-row offset in History but an entry index in Browse —
+    // leaving History must clear it so a stale physical value can't leak across.
+    inline for (.{ vaxis.Key.escape, 'q' }) |k| {
+        var app: App = .{};
+        var recs = sampleHistory();
+        app.setHistory(&recs);
+        app.active_view = .history;
+        app.active_pane = .list;
+        app.list_cursor = 4;
+        app.list_top = 12; // a History physical-row offset
+        try testTick(&app, keyEv(k, .{}));
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+        try testing.expectEqual(@as(usize, 0), app.list_top);
+        try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    }
+}
+
 test "H from history toggles to browse" {
     var app: App = .{};
     var recs = sampleHistory();

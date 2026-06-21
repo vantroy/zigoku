@@ -48,6 +48,11 @@ const hairline = "─" ** hairline_cols;
 // Per-group physical cost: [1 blank if not first] + 1 header + 1 hairline + 2·N.
 // `ctx` must expose: onBlank(phys), onHeader(phys, status, count),
 // onHairline(phys), onEntry(phys, rec, ordinal, selected). Returns total rows.
+//
+// Cost: each walk is O(groups · N) — one `groupCount` scan per group plus the
+// entry scan. A wide History frame drives up to THREE walks (layout→geometry,
+// drawContent→recordAtCursor, draw), which is fine for real watchlist sizes.
+// Before adding a fourth caller, cache a single walk per frame instead.
 
 fn groupCount(self: *const App, status: ListStatus) usize {
     var n: usize = 0;
@@ -99,6 +104,9 @@ pub const Geometry = struct {
 /// in one walk. Drawing callbacks are no-ops here.
 const ScanCtx = struct {
     cursor: usize,
+    // Defaults to 0 when the cursor matches no entry (e.g. a filter hides every
+    // row): `rec` stays null and `geometry().total` is 0, which app.layout()
+    // short-circuits (max_top = 0) — so cursor_row=0 is never read as a real row.
     cursor_row: u16 = 0,
     rec: ?AnimeRecord = null,
 
@@ -199,7 +207,8 @@ const DrawCtx = struct {
 
     fn onEntry(c: *DrawCtx, phys: u16, rec: AnimeRecord, _: usize, selected: bool) void {
         // Both rows (title + bar) must fit; a bottom-edge partial is skipped —
-        // scrollIntoView guarantees the cursor's entry is never the partial one.
+        // app.layout()'s History arm guarantees the cursor's entry is never the
+        // partial one (it keeps cursor_row..+2 inside the viewport).
         if (!c.rowVisible(phys) or !c.rowVisible(phys + 1)) return;
         if (c.slot >= c.scratch.bar.len) return; // out of scratch slots
         const self = c.self;

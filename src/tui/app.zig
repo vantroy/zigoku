@@ -267,8 +267,8 @@ pub const RenderScratch = struct {
     /// frame (Browse list + detail) never aliases one buffer (ROD-155 review).
     detail_msg: [32]u8 = undefined,
     /// Per-group "(N)" count strings for the History group headers (ROD-139). One
-    /// slot per status group; same outlive-vx.render() contract as `meta`. Sized
-    /// to the status count with headroom — there are only ever a handful of groups.
+    /// slot per status group; same outlive-vx.render() contract as `meta`. 8 slots:
+    /// 5 statuses today, 3 spare. Headers past the 8th silently drop their count.
     hist_header: [8][24]u8 = undefined,
 };
 
@@ -1372,6 +1372,12 @@ pub const App = struct {
                 .history => {
                     self.active_view = .browse;
                     self.active_pane = .list;
+                    // Reset the viewport on the way out: list_top is a physical-row
+                    // offset in History but an entry index in Browse — carrying a
+                    // stale value across the semantic split is a latent trap. Match
+                    // the F1/F2 view-switch arms (cursor + top both to the top).
+                    self.list_cursor = 0;
+                    self.list_top = 0;
                 },
                 .settings => unreachable,
                 .detail => {
@@ -1507,6 +1513,10 @@ pub const App = struct {
             } else if (self.active_view == .history or self.active_view == .settings) {
                 self.active_view = .browse;
                 self.active_pane = .list;
+                // See the q-from-History arm: clear the viewport so a History
+                // physical-row list_top never leaks into Browse's entry-index space.
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
             // Browse + list + normal: no-op. q handles quit.
             return;
