@@ -471,11 +471,10 @@ pub const App = struct {
     settings: SettingsState = .{},
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
-    /// 8 bytes per slot: "[" + up to 5-char label + "]" + spare = 8. 6 was too tight
-    /// for labels like "1000a" — silently fell back to "[?]".
-    // 16 bytes/slot: the ▸ resume prefix (3 bytes) plus "[" + up to a 3-digit
-    // or short non-numeric label + "]" — with headroom for decimal labels
-    // ("[▸12.5]" = 9 bytes) before bufPrint falls back to "[?]" (ROD-192).
+    /// 16 bytes/slot (ROD-192): the glyph path "[▸XX]" = 1 + 3 (▸ is 3 UTF-8 bytes)
+    /// + 2 + 1 = 7 bytes — the ▸ only fires for labels < 3 chars — and a plain
+    /// "[1000a]" is 7; [16] leaves headroom. The prior [8] was tight and silently
+    /// fell back to "[?]".
     ep_scratch: [512][16]u8 = undefined,
     /// Stable storage for the detail-pane score line.
     detail_score_buf: [32]u8 = undefined,
