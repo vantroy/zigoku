@@ -997,6 +997,22 @@ test "Space promotes a focused History detail pane to the zoom (ROD-170)" {
     try testing.expectEqual(.detail, app.active_pane);
 }
 
+test "Space promotes the Browse detail pane to the zoom too (ROD-170)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.active_pane = .detail; // focused on the Browse detail pane
+    app.term_cols = 120;
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view); // zoomed
+    try testing.expectEqual(.browse, app.detail_origin); // remembers Browse as origin
+
+    // …and Space again demotes back to the Browse detail pane.
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+}
+
 test "Space in the zoom demotes back to the two-pane detail focus (ROD-170)" {
     var app: App = .{};
     app.active_view = .detail;
