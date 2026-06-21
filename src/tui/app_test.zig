@@ -295,10 +295,10 @@ test "layout bails when EITHER too-small arm trips (ROD-155)" {
 
 test "formatMeta degrades when total episodes is unknown" {
     var buf: [48]u8 = undefined;
-    const known = formatMeta(&buf, .{ .source = "s", .source_id = "i", .title = "T", .total_episodes = 12, .progress = 3, .list_status = "watching" });
+    const known = formatMeta(&buf, .{ .source = "s", .source_id = "i", .title = "T", .total_episodes = 12, .progress = 3, .list_status = .watching });
     try testing.expectEqualStrings("ep 3/12 · watching", known);
     var buf2: [48]u8 = undefined;
-    const unknown = formatMeta(&buf2, .{ .source = "s", .source_id = "i", .title = "T", .progress = 0, .list_status = "planning" });
+    const unknown = formatMeta(&buf2, .{ .source = "s", .source_id = "i", .title = "T", .progress = 0, .list_status = .planning });
     try testing.expectEqualStrings("ep 0 · planning", unknown);
 }
 
