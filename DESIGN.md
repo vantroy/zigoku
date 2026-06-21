@@ -1789,21 +1789,12 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `F1`, `F2`, `F3`, `q`.
 
 Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
-Note: this is the Browse detail-pane context (`w ≥ 100`). `q` returns to list,
-not quit. `space zoom` is omitted when `w < 100` (zoom not available below that
-threshold). At 80 cols the string fits within the ~74-char budget:
+Note: `q` returns to list, not quit. Browse uses this string at all two-pane
+widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. At
+`60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the prefetched
+episode and `Space` promotes to the full-screen zoom. At 80 cols the string fits
+within the ~74-char budget:
 `hjkl scroll · h back · enter play · space zoom · q back` = 52 chars + `▌ ` = 54.
-
-#### Browse — normal, detail pane focused (w < 100, no zoom)
-
-```
-  ▌  hjkl scroll · h back · q back
-```
-
-Underlined: `h`, `j`, `k`, `l`, `h`, `q`.
-
-No grid at `60 ≤ w < 100`, so `enter play` and `space zoom` are omitted.
-`Enter` is a no-op in this state.
 
 #### History — normal, list pane focused
 
@@ -1831,12 +1822,14 @@ Identical to Browse detail pane focused — symmetric two-pane grammar.
 #### History — normal, detail pane focused (60 ≤ w < 100, no zoom)
 
 ```
-  ▌  hjkl scroll · h back · q back
+  ▌  enter/space zoom · h back · q back
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `q`.
+Underlined: `enter`, `space`, `h`, `q`.
 
-No grid at this width; `enter play` and `space zoom` are omitted.
+No in-pane grid at this width. Both `Enter` and `Space` drill into the
+full-screen zoom (the only path to the grid here). The help string makes
+that explicit: `enter/space zoom`.
 
 #### Detail (zoom) — normal
 
