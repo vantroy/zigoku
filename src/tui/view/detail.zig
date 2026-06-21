@@ -626,7 +626,7 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
         if (row == chips_row) {
             // No chip was emitted (status absent/unknown) — fall back to the
             // watchlist status label so the preview isn't silent about state.
-            putClipped(win, chips_row, 0, w, rec.list_status, self.s(self.palette.fg2, .{}));
+            putClipped(win, chips_row, 0, w, rec.list_status.str(), self.s(self.palette.fg2, .{}));
             row = chips_row + 1;
         }
     }
