@@ -566,7 +566,12 @@ half-drawn loading row pinned to the top-left.
 ### 4.7 Toast Notifications
 
 Toasts float above the bottom bar, right-aligned, temporary (2.5s auto-dismiss).
-Single line. Max width: 40 chars.
+Single line. Max width: 40 display columns — the whole box, glyph prefix
+included. The `[!] `/`[✓] `/`[~] ` prefix is a fixed 4 columns, so the **copy
+budget is 36 columns**. The single source of truth lives in code as
+`Toast.max_box_cols` / `glyph_cols` / `max_copy_cols`. Dynamic copy that would
+exceed it (only `task_error`'s `@errorName` payload today) is truncated on a
+grapheme boundary with a trailing `…` (ROD-166); static copy is all well under.
 
 > **See §9.3b** — M3 adds a `persistent` toast variant (for source-unreachable)
 > that does not auto-dismiss; it clears on recovery. The auto-dismiss rule below
@@ -657,8 +662,11 @@ state.now` escalation.
 | Settings — no config dir | dir missing, skipped | warn | `no config dir — not saved` | no |
 | Settings save failed | write error | error | `settings save failed` | no |
 
-Copy: ≤40 chars, single line, lowercase, no terminal punctuation — status, not
-prose. **Persistence** is reserved for *ongoing* conditions still true while the
+Copy: single line, lowercase, no terminal punctuation — status, not prose, and
+within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph
+prefix). The one dynamic `(payload)` above — `task_error` — is truncated to fit
+with a `…` (ROD-166). **Persistence** is reserved for *ongoing* conditions still
+true while the
 toast is visible (source unreachable). Point-in-time failures (play, episodes)
 are transient — the condition is already over and the user can retry.
 
