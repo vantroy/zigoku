@@ -1813,7 +1813,7 @@ pub const App = struct {
                     if (self.active_pane == .detail and w >= zoom_min) {
                         detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, visible, w, true);
                     } else {
-                        detail.drawHistoryPreview(self, vx, writer, detail_win, sp.detail_w, visible, w, rec);
+                        detail.drawHistoryPreview(self, vx, writer, detail_win, sp.detail_w, visible, rec);
                     }
                 } else {
                     history.draw(self, &self.scratch, win, top, visible, w, body_w);

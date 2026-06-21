@@ -163,6 +163,7 @@ const DrawCtx = struct {
     show_meta: bool,
     title_w: u16,
     bar_w: u16,
+    bar_avail: u16, // cols from title_col to the list's right edge (clips the frac)
     slot: usize = 0, // RenderScratch meta/bar slot
     header_i: usize = 0, // RenderScratch hist_header slot
 
@@ -264,7 +265,7 @@ const DrawCtx = struct {
         }
 
         // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
-        drawProgressBar(c.win, row + 1, title_col, c.bar_w, rec, row_bg, &c.scratch.bar[c.slot], self.palette);
+        drawProgressBar(c.win, row + 1, title_col, c.bar_w, c.bar_avail, rec, row_bg, &c.scratch.bar[c.slot], self.palette);
         c.slot += 1;
     }
 };
@@ -303,8 +304,12 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
     const show_meta = w >= meta_col + 12;
     const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
     const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
-    // Bar width: clamp to [16, 24] columns — saturating sub avoids underflow.
-    const bar_w: u16 = @min(24, @max(16, w -| 20));
+    // The bar row runs from title_col to the list's right edge. ROD-170: size the
+    // "[bar]  N / M eps" element to that budget so it shrinks at narrow two-pane
+    // widths (60-99) instead of bleeding past the list into the detail pane. Cap
+    // 24; floor 8 keeps the bar readable; reserve ~16 for brackets + the frac.
+    const bar_avail: u16 = w -| (title_col - 2);
+    const bar_w: u16 = @min(24, @max(8, bar_avail -| 16));
 
     var ctx = DrawCtx{
         .self = self,
@@ -317,6 +322,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         .show_meta = show_meta,
         .title_w = title_w,
         .bar_w = bar_w,
+        .bar_avail = bar_avail,
     };
     _ = walk(self, &ctx);
 }

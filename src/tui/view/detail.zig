@@ -29,6 +29,13 @@ pub fn isTwoColumn(w: u16) bool {
     return w >= detail_two_col_min;
 }
 
+/// §3.3 cover-width tier from the effective pane/column width (ROD-170): the
+/// cover scales with the pane it lives in, not the terminal. Hard cap 20; 0 below
+/// 25 cols (no room for a poster). Pure, exposed for tests.
+pub fn coverWidthFor(pane_w: u16) u16 {
+    return if (pane_w >= 40) 20 else if (pane_w >= 25) 14 else 0;
+}
+
 fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
     if (!vx.caps.kitty_graphics) return false;
     if (self.cover.image != null) return true;
@@ -177,10 +184,16 @@ fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {
 /// no cover slot. Shared by the single-/two-column detail layouts and the
 /// History preview pane (ROD-113). Width stays fixed by tier; height derives
 /// from terminal pixel geometry so the panel stays poster-shaped, not cell-tall.
-fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, anime: ?Anime, term_w: u16) u16 {
-    const cover_w: u16 = if (term_w >= 100) 20 else if (term_w >= 80) 14 else 0;
-    const cover_h: u16 = if (term_w >= 100) coverSlotHeight(win, cover_w, 28) else if (term_w >= 80) coverSlotHeight(win, cover_w, 20) else 0;
-    if (cover_w == 0 or cover_h == 0) return 0;
+fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, anime: ?Anime, pane_w: u16) u16 {
+    // ROD-170 §3.3: the cover scales with the pane it lives in (effective column
+    // width), not the terminal — so a persistent two-pane detail gets a poster
+    // sized to it instead of to the whole screen. Tiers per §3.3; hard cap 20
+    // (the hero block stays "ghostly", not gaudy).
+    const cover_w: u16 = coverWidthFor(pane_w);
+    if (cover_w == 0) return 0;
+    const max_h: u16 = if (pane_w >= 40) 28 else 20;
+    const cover_h: u16 = coverSlotHeight(win, cover_w, max_h);
+    if (cover_h == 0) return 0;
 
     const cover_win = win.child(.{ .x_off = 0, .y_off = 0, .width = cover_w, .height = cover_h });
     if (anime) |a| {
@@ -566,7 +579,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         const left_win = win.child(.{ .x_off = 0, .y_off = 0, .width = left_w, .height = h });
         const right_win = win.child(.{ .x_off = @intCast(right_x), .y_off = 0, .width = right_w, .height = h });
 
-        const lrow = drawCover(self, vx, writer, left_win, info.anime, term_w);
+        const lrow = drawCover(self, vx, writer, left_win, info.anime, w);
         _ = drawHeader(self, left_win, left_w, h, info, lrow);
 
         // Two-column: synopsis gets the full right column height minus the grid
@@ -581,7 +594,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     //   cover=8, title=1, [alt_titles≤2], chips≤1, score=1, hl=1, meta=1, hl=1
     //   → header uses ≤16 rows, leaving ≥16 for synopsis+grid at h=32.
     //   synopsisCap reserves 1 spacer + 2 grid rows = 3, so max synopsis = h - header - 3.
-    var row: u16 = drawCover(self, vx, writer, win, info.anime, term_w);
+    var row: u16 = drawCover(self, vx, writer, win, info.anime, w);
     row = drawHeader(self, win, w, h, info, row);
     const cap = synopsisCap(if (h > row) h - row else 0);
     row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
@@ -593,11 +606,11 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
 /// episode grid — that is a detail-view affordance, not a preview one. Fed an
 /// explicit record because `detailRenderInfo` resolves to null in the History
 /// list view (active_view == .history), so the pane cannot read it from state.
-pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16, rec: AnimeRecord) void {
+pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, rec: AnimeRecord) void {
     if (w < 10) return;
     const anime = App.animeFromHistoryRecord(rec);
 
-    var row: u16 = drawCover(self, vx, writer, win, anime, term_w);
+    var row: u16 = drawCover(self, vx, writer, win, anime, w);
 
     if (row < h) {
         if (anime.name.len > 0) {
@@ -786,6 +799,23 @@ test "statusChipFor: null on unknown/empty" {
     try t.expect(statusChipFor("") == null);
     try t.expect(statusChipFor("unknown") == null);
     try t.expect(statusChipFor("AIRING") == null); // not a valid vocab word
+}
+
+test "coverWidthFor: tiers off the pane width, capped at 20 (ROD-170 §3.3)" {
+    const t = std.testing;
+
+    // >= 40 cols → 20-col cover (the hard cap).
+    try t.expectEqual(@as(u16, 20), coverWidthFor(40));
+    try t.expectEqual(@as(u16, 20), coverWidthFor(70));
+    try t.expectEqual(@as(u16, 20), coverWidthFor(200)); // never grows past 20
+
+    // 25..39 → 14-col cover (narrow two-pane detail / preview band).
+    try t.expectEqual(@as(u16, 14), coverWidthFor(25));
+    try t.expectEqual(@as(u16, 14), coverWidthFor(39));
+
+    // < 25 → no cover (no room for a poster).
+    try t.expectEqual(@as(u16, 0), coverWidthFor(24));
+    try t.expectEqual(@as(u16, 0), coverWidthFor(0));
 }
 
 test "synopsisCap: reserves spacer + min grid rows" {

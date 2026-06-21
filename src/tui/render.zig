@@ -22,7 +22,7 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
 /// (bg.surface for the focused entry, bg.base otherwise). `frac_buf` must be
 /// App-owned — vaxis holds a reference until the next render call.
-pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
+pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
     const is_watching = rec.list_status == .watching;
     const is_paused = rec.list_status == .paused;
 
@@ -56,7 +56,12 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: A
         std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ rec.progress, total }) catch ""
     else
         std.fmt.bufPrint(frac_buf, "  {d} / ? eps", .{rec.progress}) catch "";
-    put(win, row, col + 1 + bar_w + 1, frac, style(frac_color, .{ .bg = row_bg }));
+    // Clip the frac to whatever the bar row budget leaves after the bracketed bar,
+    // so a narrow two-pane list never bleeds "N / M eps" into the detail pane
+    // (ROD-170). `avail` is the cols from `col` to the list's right edge.
+    const frac_col = col + 1 + bar_w + 1;
+    const frac_max = avail -| (1 + bar_w + 1);
+    putClipped(win, row, frac_col, frac_max, frac, style(frac_color, .{ .bg = row_bg }));
 }
 
 pub fn put(win: vaxis.Window, row: u16, col: u16, text: []const u8, sty: vaxis.Style) void {
