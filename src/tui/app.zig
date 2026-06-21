@@ -288,6 +288,15 @@ pub fn run(
 
 pub const Toast = struct {
     pub const Kind = enum { info, success, @"error", warn };
+    /// §4.7 width contract, one source of truth for both the push-time truncation
+    /// (`pushToast`) and the render (`chrome.drawToasts`). The toast box is at most
+    /// `max_box_cols` display columns wide *including* the 4-column "[!] " glyph
+    /// prefix, so dynamic copy gets `max_copy_cols` (= 36). The only copy that can
+    /// exceed it today is `task_error`'s `@errorName` payload; it is truncated to
+    /// fit with a trailing "…" (ROD-166).
+    pub const max_box_cols: u16 = 40;
+    pub const glyph_cols: u16 = 4; // "[!] "/"[✓] "/"[~] " all paint 4 cells.
+    pub const max_copy_cols: u16 = max_box_cols - glyph_cols;
     kind: Kind,
     text: [80]u8 = undefined,
     text_len: usize = 0,
@@ -570,9 +579,13 @@ pub const App = struct {
         // returning from mpv's window, eating the first ~1s. Matches the
         // Toast.ttl_ms struct default.
         var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000 };
-        const n = @min(text.len, 79);
-        @memcpy(t.text[0..n], text[0..n]);
-        t.text_len = n;
+        // §4.7: cap the copy to the 36-column budget here, at the single choke
+        // point, so a long dynamic payload (task_error's @errorName) gets a "…"
+        // affordance instead of being silently sheared by the render clip
+        // (ROD-166). Static copies are all well under budget — passed through
+        // verbatim. Writes at most 80 bytes into t.text (truncateToWidth guards).
+        const copy = render.truncateToWidth(&t.text, text, Toast.max_copy_cols);
+        t.text_len = copy.len;
         self.toast_queue[idx] = t;
     }
 
