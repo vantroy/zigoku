@@ -53,6 +53,7 @@ const freeOwnedAnime = workers.freeOwnedAnime;
 const searchTask = workers.searchTask;
 const enrichTask = workers.enrichTask;
 const loadHistoryTask = workers.loadHistoryTask;
+const reloadHistoryTask = workers.reloadHistoryTask;
 const episodesTask = workers.episodesTask;
 const playTask = workers.playTask;
 const tickTask = workers.tickTask;
@@ -143,11 +144,20 @@ pub fn run(
     app.translation = config.translationEnum();
     defer app.deinitOwnedState(&vx, writer);
 
-    // History memory lives in an arena owned here and freed on exit — matching
-    // store.loadHistory's arena-in contract. App only reads the slice; in M3
-    // history loads once (no re-search churn), so wholesale free is exactly right.
-    var hist_arena = std.heap.ArenaAllocator.init(gpa);
-    defer hist_arena.deinit();
+    // History memory lives in a double-buffered pair of arenas owned here and
+    // freed on exit (ROD-191), matching store.loadHistory's arena-in contract.
+    // At any moment one arena backs the live `self.history` slice (`hist_live`);
+    // the other is idle. A post-playback reload fills the idle arena off-thread
+    // and swaps via setHistory once .history_loaded lands — so the old slice stays
+    // valid for vaxis until the new one is ready, and the just-freed arena becomes
+    // the next reload's target. (ROD-141: a slice handed to vaxis must outlive the
+    // frame; that applies to the whole history slice here, not just a chip.)
+    var hist_arenas: [2]std.heap.ArenaAllocator = .{
+        std.heap.ArenaAllocator.init(gpa),
+        std.heap.ArenaAllocator.init(gpa),
+    };
+    defer for (&hist_arenas) |*a| a.deinit();
+    var hist_live: usize = 0;
 
     // The worker→UI seam: load history off a background thread. It posts the
     // result into the same queue the tty reader feeds; tick() drains it. The
@@ -169,10 +179,10 @@ pub fn run(
         t.join();
     };
     if (store) |st| {
-        hist_thread = std.Thread.spawn(.{}, loadHistoryTask, .{ &loop, hist_arena.allocator(), st }) catch blk: {
+        hist_thread = std.Thread.spawn(.{}, loadHistoryTask, .{ &loop, hist_arenas[0].allocator(), st }) catch blk: {
             // Couldn't spawn — fall back to a synchronous load so the user still
             // sees their history.
-            app.setHistory(st.loadHistory(hist_arena.allocator()) catch &.{});
+            app.setHistory(st.loadHistory(hist_arenas[0].allocator()) catch &.{});
             break :blk null;
         };
     } else {
@@ -199,6 +209,14 @@ pub fn run(
         if (tick_thread) |t| t.join();
     }
 
+    // History-reload coordination (ROD-191). The reload worker posts a dedicated
+    // terminal event (success or failure) that bumps `history_reload_settled`; we
+    // detect that, join the worker, and flip `hist_live` only on success. A single
+    // reload runs at a time; a play that finishes mid-reload leaves the dirty flag
+    // set so the next iteration re-arms with the newer store state.
+    var reload_inflight = false;
+    var reload_settled_at_spawn: u32 = 0;
+
     // First paint, then the event loop.
     {
         const win = vx.window();
@@ -212,6 +230,53 @@ pub fn run(
         // a tty. tick() still sees the event; it just doesn't touch the screen.
         if (event == .winsize) try vx.resize(gpa, writer, event.winsize);
         try app.tick(event, &loop, io, provider);
+
+        // ROD-191: reap a finished reload. Its terminal event (success OR failure)
+        // bumped history_reload_settled, so the latch always clears — even when
+        // loadHistory errors (a transient SQLITE_BUSY must not wedge every future
+        // refresh; Elara C1). Flip hist_live to the just-filled arena ONLY on
+        // success: on failure setHistory never ran, so the live slice still points
+        // into the old arena and flipping would dangle it on the next reload.
+        if (reload_inflight and app.history_reload_settled != reload_settled_at_spawn) {
+            if (hist_thread) |t| t.join();
+            hist_thread = null;
+            if (app.history_reload_ok) hist_live = 1 - hist_live;
+            reload_inflight = false;
+        }
+        // Re-arm: a meaningful playback dirtied history. Wait for the initial load
+        // to land first (!history_loading) so a stale initial .history_loaded can't
+        // clobber a reload's slice, and never stack two reloads (!reload_inflight).
+        if (app.history_dirty and !reload_inflight and !app.history_loading) {
+            if (store) |st| {
+                if (hist_thread) |t| t.join(); // reap the (finished) initial/previous load
+                hist_thread = null;
+                const next = 1 - hist_live;
+                // Safe to reset: the previous worker is joined (nothing still
+                // allocates here), and the live slice lives in the *other* arena.
+                _ = hist_arenas[next].reset(.retain_capacity);
+                reload_settled_at_spawn = app.history_reload_settled;
+                hist_thread = std.Thread.spawn(.{}, reloadHistoryTask, .{ &loop, hist_arenas[next].allocator(), st }) catch null;
+                if (hist_thread != null) {
+                    reload_inflight = true;
+                    app.history_dirty = false;
+                } else {
+                    // Spawn failed — load synchronously into the idle arena. Flip
+                    // only on success; on failure keep the current slice (don't wipe
+                    // the watchlist to empty over a transient error) and leave
+                    // hist_live untouched.
+                    if (st.loadHistory(hist_arenas[next].allocator())) |recs| {
+                        app.setHistory(recs);
+                        hist_live = next;
+                    } else |e| {
+                        log.debug("sync history reload failed: {s}", .{@errorName(e)});
+                    }
+                    app.history_dirty = false;
+                }
+            } else {
+                app.history_dirty = false; // no store — nothing to reload
+            }
+        }
+
         // Settle the list viewport before drawing: layout() is the state half
         // of the scroll seam, so draw() reads list_top without writing it
         // (ROD-155). run() owns geometry, so it feeds the terminal size in.
@@ -280,6 +345,20 @@ pub const App = struct {
     history_loading: bool = true,
     /// Set if the background history load failed.
     load_error: ?[]const u8 = null,
+
+    /// ROD-191: a meaningful playback wrote/moved a history row that the in-memory
+    /// `history` slice may not know about (a brand-new show only exists in the store
+    /// after recordPlay). run()'s loop consumes this to fire an off-thread history
+    /// reload at a safe seam — between frames, never mid-render.
+    history_dirty: bool = false,
+    /// Bumped when a reload reaches a terminal state — success (.history_reloaded)
+    /// OR failure (.history_reload_failed). run() watches it to reap the worker and
+    /// clear `reload_inflight`, so a failed reload can never latch the reloader off
+    /// (Elara C1). A wrapping counter — only frame-to-frame equality matters.
+    history_reload_settled: u32 = 0,
+    /// Whether the last settled reload succeeded — gates the double-buffer flip in
+    /// run(): flip the live arena only when setHistory actually swapped the slice.
+    history_reload_ok: bool = false,
 
     history_filter: [128]u8 = undefined,
     history_filter_len: usize = 0,
@@ -814,6 +893,17 @@ pub const App = struct {
         const same_show = self.episodes.for_id != null and self.session.anime_id.len > 0 and
             std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?);
 
+        // ROD-191: a *meaningful* final position is what writes/moves a history row
+        // (and can promote a hidden row into the watchlist). This is a superset of
+        // session.finish's recordPlay gate (which also requires anime_id/episode_raw
+        // set, and episode_index > 0) — so we may occasionally over-reload, but we
+        // never miss a written row. The in-memory `history` slice has no record for a
+        // brand-new show, so mark it dirty; run() reloads at a safe seam. A trivial
+        // quit (no meaningful position) recorded nothing → no reload.
+        if (final_update) |u| {
+            if (u.isMeaningful()) self.history_dirty = true;
+        }
+
         self.session.finish(self.gpa, self.store, final_update, completed);
         self.playing = false;
         self.current_position = 0;
@@ -973,6 +1063,21 @@ pub const App = struct {
             },
             .focus_in, .focus_out => {},
             .history_loaded => |recs| self.setHistory(recs),
+            .history_reloaded => |recs| {
+                // ROD-191: a reload landed. setHistory swaps the slice; run() flips
+                // the live double-buffer arena because history_reload_ok is set.
+                self.setHistory(recs);
+                self.history_reload_ok = true;
+                self.history_reload_settled +%= 1;
+            },
+            .history_reload_failed => {
+                // ROD-191: keep the current slice (a transient store error must not
+                // wipe the watchlist) and signal run() to clear the latch without a
+                // flip. A quiet toast so the user knows the refresh didn't take.
+                self.history_reload_ok = false;
+                self.history_reload_settled +%= 1;
+                self.pushToast(.warn, "watchlist refresh failed", false);
+            },
             .task_error => |msg| {
                 self.load_error = msg;
                 self.history_loading = false;

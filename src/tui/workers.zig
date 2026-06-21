@@ -276,6 +276,20 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
+/// Like loadHistoryTask but for the post-playback refresh (ROD-191): posts
+/// dedicated terminal events so run()'s double-buffer reaper always settles —
+/// .history_reloaded on success, .history_reload_failed on error. The generic
+/// .task_error path would never bump the reload's settle signal, latching the
+/// reloader off after one transient failure (Elara C1).
+pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
+    const recs = store.loadHistory(arena) catch |err| {
+        log.debug("history reload failed: {s}", .{@errorName(err)});
+        loop.postEvent(.{ .history_reload_failed = {} }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return;
+    };
+    loop.postEvent(.{ .history_reloaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+}
+
 /// Background task: fetch episode list and post to UI.
 /// `id` ownership: transferred to episodes_done.for_id on success; freed here on error.
 pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation) void {
