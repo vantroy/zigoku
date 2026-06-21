@@ -8,6 +8,7 @@ const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
 
 const App = app_mod.App;
+const Toast = app_mod.Toast;
 const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
@@ -200,12 +201,15 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
             .info => "[~] ",
         };
         const w = win.width;
-        // §4.7: right-aligned, max 40 display columns.
-        // All prefixes are exactly 4 display cells regardless of UTF-8 byte length
-        // ([✓] = 6 bytes but 4 cells; ASCII variants are 4 bytes = 4 cells).
-        const pre_w: u16 = 4;
+        // §4.7: right-aligned, capped at Toast.max_box_cols display columns (the
+        // box, glyph prefix included). All prefixes are exactly Toast.glyph_cols
+        // display cells regardless of UTF-8 byte length ([✓] = 6 bytes but 4
+        // cells; ASCII variants are 4 bytes = 4 cells). The copy is pre-truncated
+        // to Toast.max_copy_cols in pushToast (ROD-166), so this clip is now just
+        // the physical safety net.
+        const pre_w: u16 = Toast.glyph_cols;
         const txt_len: u16 = @intCast(t.text_len);
-        const toast_w: u16 = @min(pre_w + txt_len, @min(40, w -| 2));
+        const toast_w: u16 = @min(pre_w + txt_len, @min(Toast.max_box_cols, w -| 2));
         const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
         fillRow(win, row, w, self.palette.bg_elevated);
         put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
