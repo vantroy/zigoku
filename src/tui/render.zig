@@ -4,6 +4,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const colors = @import("colors.zig");
 const store_mod = @import("../store.zig");
+const domain = @import("../domain.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 
@@ -19,13 +20,33 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 
 // ── tiny render helpers ─────────────────────────────────────────────────────
 
+/// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) is reserved for the
+/// selection affordance, so it is granted ONLY to the selected row while the list
+/// pane holds keyboard focus. Everything else steps down:
+///   - selected but list unfocused (detail pane active) → fg2 (the row recedes)
+///   - unselected watching/paused → fg2 (status, not selection — can't out-shout
+///     the cursor; the ▸/◐ glyph still carries the status identity)
+///   - unselected planning → chrome (empty-bar tint, §4.5)
+///   - everything else (completed/dropped) → fg3
+/// Pure so the rule can be unit-tested without a render pass.
+pub fn barFillColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *const colors.Palette) vaxis.Color {
+    if (selected) return if (list_focused) pal.focus else pal.fg2;
+    return switch (rec.list_status) {
+        .watching, .paused => pal.fg2,
+        .planning => pal.chrome,
+        else => pal.fg3,
+    };
+}
+
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
-/// (bg.surface for the focused entry, bg.base otherwise). `frac_buf` must be
-/// App-owned — vaxis holds a reference until the next render call. `avail` is the
-/// total columns available for the whole "[bar]  N / M eps" element starting at
-/// `col` (caller-computed against the list's right edge, accounting for the
-/// left margin) — the frac is clipped to it so it can't bleed into a neighbour.
-pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
+/// (bg.surface for the focused entry while the list pane has focus, bg.base
+/// otherwise). `frac_buf` must be App-owned — vaxis holds a reference until the
+/// next render call. `avail` is the total columns available for the whole
+/// "[bar]  N / M eps" element starting at `col` (caller-computed against the
+/// list's right edge, accounting for the left margin) — the frac is clipped to it
+/// so it can't bleed into a neighbour. `selected`/`list_focused` gate the §4.1
+/// selection affordance into the fill (ROD-194).
+pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette, selected: bool, list_focused: bool) void {
     const is_watching = rec.list_status == .watching;
     const is_paused = rec.list_status == .paused;
 
@@ -39,10 +60,10 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail:
         break :blk if (rec.progress > 0) bar_w / 3 else 0;
     };
 
-    // §4.5: planning/not-started uses border.hair for fill (chrome), dim uses fg3.
-    const is_planning = rec.list_status == .planning;
-    const fill_color = if (is_watching or is_paused) pal.focus else if (is_planning) pal.chrome else pal.fg3;
-    const frac_color = if (is_watching or is_paused) pal.fg2 else pal.fg3;
+    const fill_color = barFillColor(rec, selected, list_focused, pal);
+    // The fraction text earns text.muted (fg2) only when the bar is the selected,
+    // list-focused row's; otherwise it stays dim (fg3) so it never competes.
+    const frac_color = if (selected and list_focused and (is_watching or is_paused)) pal.fg2 else pal.fg3;
 
     put(win, row, col, "[", style(pal.fg3, .{ .bg = row_bg }));
     var c: u16 = 0;
@@ -137,4 +158,32 @@ fn style(fg: vaxis.Color, opts: struct {
     dim: bool = false,
 }) vaxis.Style {
     return .{ .fg = fg, .bg = opts.bg, .bold = opts.bold, .italic = opts.italic, .blink = opts.blink, .dim = opts.dim };
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn mkRec(status: domain.ListStatus) AnimeRecord {
+    return .{ .source = "s", .source_id = "i", .title = "t", .list_status = status };
+}
+
+test "barFillColor: focus cyan is reserved for the selected, list-focused row (ROD-194)" {
+    const pal = &colors.terminal_ghost;
+    // The ONE case that earns state.focus: selected AND the list pane has focus.
+    try testing.expectEqual(pal.focus, barFillColor(mkRec(.watching), true, true, pal));
+    try testing.expectEqual(pal.focus, barFillColor(mkRec(.completed), true, true, pal));
+
+    // Selected but the detail pane has focus → the row recedes to fg2.
+    try testing.expectEqual(pal.fg2, barFillColor(mkRec(.watching), true, false, pal));
+    try testing.expectEqual(pal.fg2, barFillColor(mkRec(.completed), true, false, pal));
+
+    // Unselected watching/paused step OFF focus → fg2 (can't impersonate the cursor).
+    try testing.expectEqual(pal.fg2, barFillColor(mkRec(.watching), false, true, pal));
+    try testing.expectEqual(pal.fg2, barFillColor(mkRec(.paused), false, true, pal));
+
+    // Unselected planning keeps the empty-bar chrome tint; the rest are dim.
+    try testing.expectEqual(pal.chrome, barFillColor(mkRec(.planning), false, true, pal));
+    try testing.expectEqual(pal.fg3, barFillColor(mkRec(.completed), false, true, pal));
+    try testing.expectEqual(pal.fg3, barFillColor(mkRec(.dropped), false, true, pal));
 }
