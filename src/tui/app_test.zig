@@ -1178,6 +1178,8 @@ test "history detail episodes_done seeds cursor from progress" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
     try testing.expectEqual(@as(usize, 4), app.episodes.cursor);
+    // ROD-192: no checkpoint → resume marker sits on the next-unwatched cell.
+    try testing.expectEqual(@as(?usize, 4), app.episodes.resume_idx);
 
     app.episodes.freeResults(app.gpa);
     app.episodes.lru.deinit(app.gpa);
@@ -1213,6 +1215,9 @@ test "history detail resume overrides next-episode cursor" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
     try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
+    // ROD-192: the mid-episode checkpoint wins — resume marks the in-progress
+    // cell (current_idx == 2), not the next-unwatched one.
+    try testing.expectEqual(@as(?usize, 2), app.episodes.resume_idx);
 
     app.episodes.freeResults(app.gpa);
     app.episodes.lru.deinit(app.gpa);
@@ -1240,6 +1245,8 @@ test "history detail completed show defaults cursor to episode one" {
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
     try testing.expectEqual(@as(usize, 0), app.episodes.cursor);
+    // ROD-192: a completed show has nothing to resume — no marker.
+    try testing.expectEqual(@as(?usize, null), app.episodes.resume_idx);
 
     app.episodes.freeResults(app.gpa);
     app.episodes.lru.deinit(app.gpa);
@@ -2221,6 +2228,7 @@ test "play_done advances detail cursor to next episode and dims watched" {
     app.gpa = testing.allocator;
     app.episodes.results = try allocEpisodes(6);
     app.episodes.cursor = 2; // on episode 3
+    app.episodes.resume_idx = 2; // resume sat on episode 3 before this watch
     app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
@@ -2231,6 +2239,7 @@ test "play_done advances detail cursor to next episode and dims watched" {
 
     try testing.expectEqual(@as(usize, 3), app.episodes.cursor); // advanced to episode 4
     try testing.expectEqual(@as(u32, 3), app.episodes.progress); // 1..3 now dim
+    try testing.expectEqual(@as(?usize, 3), app.episodes.resume_idx); // ROD-192: resume advanced to ep 4
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
@@ -2243,6 +2252,7 @@ test "play_error with a completed position still advances the detail cursor" {
     app.gpa = testing.allocator;
     app.episodes.results = try allocEpisodes(6);
     app.episodes.cursor = 2; // on episode 3
+    app.episodes.resume_idx = 2; // resume sat on episode 3 before this watch
     app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
@@ -2255,6 +2265,7 @@ test "play_error with a completed position still advances the detail cursor" {
 
     try testing.expectEqual(@as(usize, 3), app.episodes.cursor); // advanced to episode 4
     try testing.expectEqual(@as(u32, 3), app.episodes.progress);
+    try testing.expectEqual(@as(?usize, 3), app.episodes.resume_idx); // ROD-192: resume advanced
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("episode 3 done", t.text[0..t.text_len]);
@@ -2268,6 +2279,7 @@ test "play_done with a partial watch does not advance or dim (ROD-168)" {
     app.gpa = testing.allocator;
     app.episodes.results = try allocEpisodes(6);
     app.episodes.cursor = 2; // on episode 3
+    app.episodes.resume_idx = 2; // resume on episode 3
     app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
@@ -2280,6 +2292,7 @@ test "play_done with a partial watch does not advance or dim (ROD-168)" {
 
     try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
     try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
+    try testing.expectEqual(@as(?usize, 2), app.episodes.resume_idx); // ROD-192: partial watch never advances resume
     try testing.expect(app.toast_queue[0] == null); // clean partial quit is silent
 
     app.episodes.freeResults(app.gpa);
@@ -2290,6 +2303,7 @@ test "play_done on the final episode stays put and toasts all caught up" {
     app.gpa = testing.allocator;
     app.episodes.results = try allocEpisodes(6);
     app.episodes.cursor = 5; // on the last episode
+    app.episodes.resume_idx = 5; // resume sat on the finale before watching it
     app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
     app.playing = true;
     app.session.anime_id = try testing.allocator.dupe(u8, "show1");
@@ -2300,6 +2314,7 @@ test "play_done on the final episode stays put and toasts all caught up" {
 
     try testing.expectEqual(@as(usize, 5), app.episodes.cursor); // no N+1 to move to
     try testing.expectEqual(@as(u32, 6), app.episodes.progress); // whole grid dim
+    try testing.expectEqual(@as(?usize, null), app.episodes.resume_idx); // ROD-192: caught up, nothing to resume
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.success, t.kind);
     try testing.expectEqualStrings("all caught up", t.text[0..t.text_len]);
