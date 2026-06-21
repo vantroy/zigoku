@@ -1206,6 +1206,16 @@ pub const App = struct {
         self.fireEpisodesForId(loop, io, provider, selected.id);
     }
 
+    /// ROD-170: open the full-screen zoom directly on a history record + fetch its
+    /// episodes. Used below pane_split_min, where there is no two-pane to focus
+    /// into, so the zoom is the only detail surface (the grid lives there).
+    fn openHistoryZoom(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, rec: AnimeRecord) void {
+        self.detail_origin = .history;
+        self.active_view = .detail;
+        self.active_pane = .detail;
+        self.fireEpisodesForId(loop, io, provider, rec.source_id);
+    }
+
     fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         const eps = self.episodes.results orelse return;
         if (eps.len == 0 or self.episodes.cursor >= eps.len) return;
@@ -1490,14 +1500,15 @@ pub const App = struct {
         // h/l for parity with the j/k ↔ up/down list-nav block (ROD-156 #1).
         if (self.input_mode == .normal and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) {
             if (self.active_view == .detail) {
-                // ROD-170: from the zoom, h demotes one step back to the two-pane
-                // detail focus (Esc/Space behave the same; q backs all the way out
-                // to the list). detail_origin carries us back to Browse or History.
+                // ROD-170: from the zoom, h demotes one step (Esc/Space behave the
+                // same; q backs all the way out to the list). detail_origin carries
+                // us back to Browse or History; we land on the pane if there's room
+                // for one, otherwise the list (single-column below pane_split_min).
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
                 };
-                self.active_pane = .detail;
+                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
             } else if ((self.active_view == .browse or self.active_view == .history) and
                 self.active_pane == .detail)
             {
@@ -1530,24 +1541,32 @@ pub const App = struct {
                     }
                 },
                 .history => {
-                    // ROD-170: l/Enter mirrors Browse. From the list it focuses
-                    // the detail pane; episodes are fetched only at >= zoom_min,
-                    // where the grid exists (the 60-99 preview has none). Below
-                    // pane_split_min there is no pane to step into → no-op. From
-                    // the detail pane, Enter plays the focused episode. History
-                    // never prefetches episodes (ROD-156), so the fetch fires here
-                    // on focus, against the just-focused record.
+                    // ROD-170: l/Enter mirrors Browse but "drills toward the grid."
+                    // The grid lives in the in-pane view (>= zoom_min) or the zoom
+                    // (any width). History never prefetches (ROD-156), so the fetch
+                    // fires here on focus, against the just-focused record.
                     if (self.active_pane == .list) {
                         if (self.selectedHistoryRecord()) |rec| {
-                            if (self.term_cols >= zoom_min) {
+                            if (self.term_cols >= pane_split_min) {
+                                // Two-pane: focus the detail pane + fetch (ready for
+                                // the in-pane grid at >= zoom_min, or the zoom below).
                                 self.active_pane = .detail;
                                 self.fireEpisodesForId(loop, io, provider, rec.source_id);
-                            } else if (self.term_cols >= pane_split_min) {
-                                self.active_pane = .detail;
+                            } else if (key.matches(vaxis.Key.enter, .{})) {
+                                // Single-column (< 60): no pane — Enter opens the zoom.
+                                self.openHistoryZoom(loop, io, provider, rec);
                             }
                         }
                     } else if (key.matches(vaxis.Key.enter, .{})) {
-                        self.firePlay(loop, io, provider);
+                        if (self.term_cols >= zoom_min) {
+                            // In-pane grid is visible → play the focused episode.
+                            self.firePlay(loop, io, provider);
+                        } else {
+                            // 60-99 preview pane (no in-pane grid): drill into the
+                            // zoom to reach the grid (already fetched on focus).
+                            self.detail_origin = .history;
+                            self.active_view = .detail;
+                        }
                     }
                 },
                 .detail => {
@@ -1558,26 +1577,32 @@ pub const App = struct {
             return;
         }
 
-        // Space: zoom toggle (ROD-170, §10.2). Promote a focused detail pane to
-        // the full-screen zoom; from the zoom, demote back to the pane. Shared by
-        // Browse and History. Promote needs the grid tier (>= zoom_min) — below
-        // that the pane is a gridless preview with nothing to zoom into. Space is
-        // layout-neutral (no Colemak-DH adjacency to p/x/c/w) and toggle-friendly.
+        // Space: zoom toggle (ROD-170, §10.2). The zoom is the full-screen detail
+        // surface that always carries the grid. Promote a focused detail pane to
+        // it; from the zoom, demote back (to the pane if there's room, else the
+        // list). At < pane_split_min there is no pane, so Space opens the zoom
+        // straight from the History list (same as Enter). Space is layout-neutral
+        // (no Colemak-DH adjacency to p/x/c/w) and toggle-friendly.
         if (self.input_mode == .normal and key.matches(vaxis.Key.space, .{})) {
             if (self.active_view == .detail) {
-                // Demote to the two-pane with the detail pane still focused.
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
                 };
-                self.active_pane = .detail;
+                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
             } else if ((self.active_view == .browse or self.active_view == .history) and
-                self.active_pane == .detail and self.term_cols >= zoom_min)
+                self.active_pane == .detail)
             {
-                // Promote: record which list we came from, then zoom. Episodes were
-                // already fetched when the pane took focus, so the grid is live.
+                // Promote a focused detail pane to the zoom. Works at any two-pane
+                // width: at 60-99 the zoom is how you reach the grid the pane omits
+                // (episodes were already fetched when the pane took focus).
                 self.detail_origin = if (self.active_view == .history) .history else .browse;
                 self.active_view = .detail;
+            } else if (self.active_view == .history and self.active_pane == .list and
+                self.term_cols < pane_split_min)
+            {
+                // Single-column History: no pane to toggle — Space opens the zoom.
+                if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, provider, rec);
             }
             return;
         }
@@ -1597,13 +1622,13 @@ pub const App = struct {
                 // ROD-170: detail pane focused → return focus to the list (= h).
                 self.active_pane = .list;
             } else if (self.active_view == .detail) {
-                // ROD-170: zoom → demote one step to the two-pane detail focus
-                // (q backs all the way out to the list instead).
+                // ROD-170: zoom → demote one step (q backs all the way out to the
+                // list instead). Land on the pane if there's room, else the list.
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
                 };
-                self.active_pane = .detail;
+                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
             } else if (self.active_view == .history or self.active_view == .settings) {
                 self.active_view = .browse;
                 self.active_pane = .list;
