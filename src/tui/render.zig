@@ -10,10 +10,11 @@ const AnimeRecord = store_mod.AnimeRecord;
 /// "ep 3/12 · watching" — whatever we actually know. total_episodes can be null
 /// (source didn't say), in which case we drop the denominator.
 pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
+    const status = rec.list_status.str();
     if (rec.total_episodes) |total| {
-        return std.fmt.bufPrint(buf, "ep {d}/{d} · {s}", .{ rec.progress, total, rec.list_status }) catch rec.list_status;
+        return std.fmt.bufPrint(buf, "ep {d}/{d} · {s}", .{ rec.progress, total, status }) catch status;
     }
-    return std.fmt.bufPrint(buf, "ep {d} · {s}", .{ rec.progress, rec.list_status }) catch rec.list_status;
+    return std.fmt.bufPrint(buf, "ep {d} · {s}", .{ rec.progress, status }) catch status;
 }
 
 // ── tiny render helpers ─────────────────────────────────────────────────────
@@ -22,8 +23,8 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 /// (bg.surface for the focused entry, bg.base otherwise). `frac_buf` must be
 /// App-owned — vaxis holds a reference until the next render call.
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette) void {
-    const is_watching = std.mem.eql(u8, rec.list_status, "watching");
-    const is_paused = std.mem.eql(u8, rec.list_status, "paused");
+    const is_watching = rec.list_status == .watching;
+    const is_paused = rec.list_status == .paused;
 
     const filled: u16 = blk: {
         if (rec.total_episodes) |total| {
@@ -36,7 +37,7 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, rec: A
     };
 
     // §4.5: planning/not-started uses border.hair for fill (chrome), dim uses fg3.
-    const is_planning = std.mem.eql(u8, rec.list_status, "planning");
+    const is_planning = rec.list_status == .planning;
     const fill_color = if (is_watching or is_paused) pal.focus else if (is_planning) pal.chrome else pal.fg3;
     const frac_color = if (is_watching or is_paused) pal.fg2 else pal.fg3;
 
