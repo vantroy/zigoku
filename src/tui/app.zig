@@ -300,9 +300,11 @@ pub const App = struct {
     detail_origin: enum { browse, history } = .browse,
 
     /// Which pane has keyboard focus within the current view.
-    /// Only meaningful in Browse (two panes). History and Settings are single-pane
-    /// and treat this field as always .list — it still exists so the top-bar `·`
-    /// rendering function can read it without a view branch.
+    /// Meaningful in both Browse and History (two-pane at `w >= pane_split_min`,
+    /// ROD-170): it drives the `h`/`l` pane toggle, the top-bar `·`, and the
+    /// focus-aware selection step-down (ROD-194 — the list selection recedes when
+    /// the detail pane has focus). Settings is single-pane and pins it to .list;
+    /// History below pane_split_min is clamped to .list (single column).
     active_pane: enum { list, detail } = .list,
 
     /// Current input mode. `.search` = typing a query; `.normal` = list navigation.
@@ -1206,6 +1208,18 @@ pub const App = struct {
         self.fireEpisodesForId(loop, io, provider, selected.id);
     }
 
+    /// Fire a Browse episode fetch for the selected show, unless the split-browse
+    /// prefetch (ROD-156 #3) is already in flight for that same show — re-firing
+    /// would just join and respawn the same fetch. Shared by the two-pane focus
+    /// path and the single-column zoom path so the guard lives in one place.
+    fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const sel = self.selectedAnime() orelse return;
+        const prefetching = self.episodes.loading and
+            self.episodes.for_id != null and
+            std.mem.eql(u8, self.episodes.for_id.?, sel.id);
+        if (!prefetching) self.fireEpisodes(loop, io, provider);
+    }
+
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its
     /// episodes. Used below pane_split_min, where there is no two-pane to focus
     /// into, so the zoom is the only detail surface (the grid lives there).
@@ -1214,6 +1228,18 @@ pub const App = struct {
         self.active_view = .detail;
         self.active_pane = .detail;
         self.fireEpisodesForId(loop, io, provider, rec.source_id);
+    }
+
+    /// ROD-194: open the full-screen zoom directly from the Browse list — the
+    /// Browse twin of openHistoryZoom. Below pane_split_min there is no detail pane
+    /// to focus into, so Enter/Space must reach the grid via the zoom (otherwise
+    /// they only flip active_pane to a pane that isn't drawn — the regression).
+    fn openBrowseZoom(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        if (self.results.items.len == 0) return;
+        self.detail_origin = .browse;
+        self.active_view = .detail;
+        self.active_pane = .detail;
+        self.fireEpisodesBrowse(loop, io, provider);
     }
 
     fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1529,16 +1555,18 @@ pub const App = struct {
             switch (self.active_view) {
                 .browse => {
                     if (self.active_pane == .list and self.results.items.len > 0) {
-                        // If the split-browse prefetch is already in flight for the
-                        // hovered show, don't fireEpisodes again — that would join
-                        // and respawn the same fetch. Just reveal the pane; the
-                        // in-flight result lands through its own event (ROD-156 #3).
-                        const sel = self.selectedAnime();
-                        const prefetching = self.episodes.loading and sel != null and
-                            self.episodes.for_id != null and
-                            std.mem.eql(u8, self.episodes.for_id.?, sel.?.id);
-                        self.active_pane = .detail;
-                        if (!prefetching) self.fireEpisodes(loop, io, provider);
+                        if (self.term_cols >= pane_split_min) {
+                            // Two-pane: reveal/focus the detail pane + fetch (the
+                            // in-flight result lands through its own event; the
+                            // prefetch guard avoids respawning it — ROD-156 #3).
+                            self.active_pane = .detail;
+                            self.fireEpisodesBrowse(loop, io, provider);
+                        } else if (key.matches(vaxis.Key.enter, .{})) {
+                            // Single-column (< 60): no pane — Enter opens the zoom
+                            // (mirrors History; ROD-194 regression fix). `l`/right
+                            // are no-ops here, nothing to focus rightward.
+                            self.openBrowseZoom(loop, io, provider);
+                        }
                     } else if (self.active_pane == .detail) {
                         // Enter on episode in detail pane: play
                         if (key.matches(vaxis.Key.enter, .{})) {
@@ -1610,6 +1638,12 @@ pub const App = struct {
             {
                 // Single-column History: no pane to toggle — Space opens the zoom.
                 if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, provider, rec);
+            } else if (self.active_view == .browse and self.active_pane == .list and
+                self.term_cols < pane_split_min)
+            {
+                // Single-column Browse: no pane to toggle — Space opens the zoom
+                // (mirrors History; ROD-194 regression fix).
+                self.openBrowseZoom(loop, io, provider);
             }
             return;
         }
