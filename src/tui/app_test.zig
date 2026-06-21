@@ -1957,6 +1957,19 @@ test "task_error pushes a persistent error toast" {
     try testing.expectEqualStrings("network down", t.text[0..t.text_len]);
 }
 
+test "task_error truncates an over-long payload to the §4.7 copy budget with … (ROD-166)" {
+    var app: App = .{};
+    // A 50-char @errorName-style payload, well past the 36-col copy budget.
+    try testTick(&app, .{ .task_error = "CertificateBundleLoadFailedAndCouldNotConnectAtAll" });
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    const copy = t.text[0..t.text_len];
+    // Packs the full budget: (max_copy_cols - 1) cols of copy + "…" = max_copy_cols,
+    // ending in the … affordance. The `==` (not `<=`) rejects a degenerate impl
+    // that returns a bare "…".
+    try testing.expectEqual(Toast.max_copy_cols, vaxis.gwidth.gwidth(copy, .unicode));
+    try testing.expect(std.mem.endsWith(u8, copy, "…"));
+}
+
 test "position_update refreshes live playback fields" {
     var app: App = .{};
     app.current_position = 12;
