@@ -702,13 +702,18 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // §5.3 (ROD-192): the resume cell — where the user continues from —
             // carries a `▸` glyph. It is the only cell that earns a glyph: the
             // arrow is the heaviest mark in the grid because resume is the most
-            // actionable cell, and it disambiguates resume from the focus cursor
-            // (both cyan+bold) since only the cursor gets the bg.surface band.
+            // actionable cell (§5.x: "always the most visually prominent cell").
             // Watched cells deliberately stay glyph-free and recede via color —
             // a filled glyph there would weigh *more* than the action arrow,
             // inverting the hierarchy. A launching cell owns the slot outright.
             const is_resume = !launching and
                 (if (self.episodes.resume_idx) |ri| ep_idx == ri else false);
+            // ROD-192 review (Mira NIT-2): the `▸` needs a free column inside the
+            // 5-wide `[..]` shell, which only exists for ≤2-char labels. For a
+            // 3-digit or non-numeric resume label (`123`, `SP1`) the glyph would
+            // clip to a bracket-less `[▸12`, which reads as broken. Drop the glyph
+            // there and lean on the state.now color alone to mark resume.
+            const resume_glyph = is_resume and ep.raw.len < 3;
 
             // Use ep_scratch to avoid dangling stack buffers. Index relative
             // to the viewport start so we never alias two live cells.
@@ -718,27 +723,31 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // its number, in the same `[ ]` shell so it reads as that cell working.
             const cell_text = if (launching)
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{self.spinnerChar()}) catch "[?]"
-            else if (is_resume)
+            else if (resume_glyph)
                 std.fmt.bufPrint(cell_buf, "[▸{s}]", .{ep.raw}) catch "[?]"
             else
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
             // §4.6/§5.3: watched cells (index below the high-water mark) recede to
-            // text.dim; the resume cell lights state.now (cyan) + bold; unwatched
-            // stay text.muted; the cursor always wins (ROD-131). text.dim is `fg3`
-            // alone — matching the completed/dropped convention in history.zig; the
-            // `.dim` SGR attr is reserved for the paused semantic (§2.4), so it is
-            // deliberately not used here. A launching cell escalates focus→hot past
-            // isSlowPath (§4.8), same as every other slow-path spinner; it outranks
-            // focus/resume/watched. Resume sits just under focus: same cyan+bold,
-            // minus the bg.surface band that is the cursor's alone.
+            // text.dim; the resume cell lights state.now (magenta) + bold — the
+            // loudest token in the grid, per §5.x ("most visually prominent cell");
+            // unwatched stay text.muted; the cursor always wins (ROD-131). text.dim
+            // is `fg3` alone — matching the completed/dropped convention in
+            // history.zig; the `.dim` SGR attr is reserved for the paused semantic
+            // (§2.4), so it is deliberately not used here. A launching cell escalates
+            // focus→hot past isSlowPath (§4.8), same as every other slow-path
+            // spinner; it outranks focus/resume/watched. Resume reads apart from the
+            // focus cursor by HUE — resume is state.now (magenta), the cursor is
+            // state.focus (cyan) + the bg.surface band that is the cursor's alone
+            // (§5.x lists bg.surface on resume too, but sharing it would blur the
+            // cursor, so the band stays cursor-only — color carries resume).
             const watched = ep_idx < @as(usize, self.episodes.progress);
             const cell_style = if (launching)
                 self.s(if (self.isSlowPath()) self.palette.hot else self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
             else if (focused)
                 self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
             else if (is_resume)
-                self.s(self.palette.focus, .{ .bold = true })
+                self.s(self.palette.hot, .{ .bold = true })
             else if (watched)
                 self.s(self.palette.fg3, .{})
             else
