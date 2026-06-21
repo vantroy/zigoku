@@ -1213,10 +1213,10 @@ pub const App = struct {
     /// would just join and respawn the same fetch. Shared by the two-pane focus
     /// path and the single-column zoom path so the guard lives in one place.
     fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        const sel = self.selectedAnime();
-        const prefetching = self.episodes.loading and sel != null and
+        const sel = self.selectedAnime() orelse return;
+        const prefetching = self.episodes.loading and
             self.episodes.for_id != null and
-            std.mem.eql(u8, self.episodes.for_id.?, sel.?.id);
+            std.mem.eql(u8, self.episodes.for_id.?, sel.id);
         if (!prefetching) self.fireEpisodes(loop, io, provider);
     }
 
