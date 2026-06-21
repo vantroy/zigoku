@@ -397,7 +397,8 @@ overflow into the score field. Score field is 10 chars wide, right-reserved.
 | Selected, list focused | `bg.surface` | `state.focus` + bold | per score rules (focus overrides nothing) | `▸` in `state.focus` |
 | Selected, list **unfocused** (detail pane active) | `bg.base` | `state.focus` (no bold) | per score rules | `▸` in `state.focus` dim |
 | Watched / completed | `bg.base` | `text.dim` | `text.dim` | `●` in `text.dim` |
-| Currently watching | `bg.base` | `text.primary` | per score rules | `◐` in `text.muted` |
+| Currently watching (unselected) | `bg.base` | `text.primary` | per score rules | `▸` in `text.muted` |
+| Paused (unselected) | `bg.base` | `text.primary` | per score rules | `◐` in `text.muted` + dim |
 | Airing (live) _(Planned, ROD-141 — §2.1; glyph suppressed in M3, §9.1)_ | `bg.base` | `text.primary` | per score rules | `◉` in `state.now` |
 | Search non-match (filtered out) | not rendered | — | — | — |
 
@@ -471,30 +472,33 @@ Used in History/Watchlist view only. Represents episode progress.
 
 Format: `[████████░░░░░░░░]  8 / 28 eps`
 
-- Filled cells: `state.focus` (watching) or `text.dim` (completed/dropped).
+- Filled cells: **selection-aware** (see below) — `state.focus` only on the cursor bar,
+  otherwise the per-status color.
 - Empty cells: `border.hair`.
 - `█` for filled, `░` for empty.
 - Bar width: 16 chars minimum, scales to available space with a max of 24 chars.
-- Episode fraction text: `text.muted`.
+- Episode fraction text: `text.muted` on the cursor bar, else `text.dim`.
 - Resume point: a `▸` in `state.now` color injected at the resume position within
   the bar. e.g. `[████◐░░░░░░░░░░░]` where `◐` is at episode 5 of 28.
 
-The fill color is **selection-aware** (ROD-194): `state.focus` is granted only to the
-selected row while the list pane has focus, so an unselected watching bar can never
-out-shout the cursor. `selected`/`list_focused` are the two axes; the canonical rule is
-`render.barFillColor` (unit-tested).
+The fill color is **selection-aware** (ROD-194): `state.focus` means "the focused cursor
+row" (the same cyan as the `▸`/title, §4.1), so the bar earns it ONLY when the row is
+`selected and list_focused` — and there it OVERRIDES the per-status color, so the cursor
+always owns the single brightest bar (this is the §4.1 repro fix: a selected completed
+row must out-rank an unselected watching one). Off that row the bar drops to the status
+color, and an unselected watching bar can never impersonate the cursor. The two cursor
+rows below override ALL statuses; the canonical rules are `render.barFillColor` /
+`render.barFracColor` (both unit-tested).
 
 | State | Condition | Bar fill color | Fraction color |
 |---|---|---|---|
-| Watching — selected, list focused | `selected and list_focused` | `state.focus` | `text.muted` |
-| Watching — selected, detail focused | `selected and !list_focused` | `text.muted` | `text.dim` |
+| **Cursor — list focused** (any status) | `selected and list_focused` | `state.focus` (`dim` if paused) | `text.muted` for watching/paused, else `text.dim` |
+| **Cursor — detail focused** (any status) | `selected and !list_focused` | `text.muted` (`dim` if paused) | `text.dim` |
 | Watching — unselected | `!selected` | `text.muted` | `text.dim` |
-| Paused — selected, list focused | `selected and list_focused` | `state.focus` dim | `text.muted` |
-| Paused — selected, detail focused | `selected and !list_focused` | `text.muted` dim | `text.dim` |
 | Paused — unselected | `!selected` | `text.muted` dim | `text.dim` |
-| Completed | — | `text.dim` | `text.dim` |
-| Dropped | — | `text.dim` | `text.dim` |
-| Planning | — | `border.hair` (empty bar) | `text.dim` |
+| Completed — unselected | `!selected` | `text.dim` | `text.dim` |
+| Dropped — unselected | `!selected` | `text.dim` | `text.dim` |
+| Planning — unselected | `!selected` | `border.hair` (empty bar) | `text.dim` |
 
 ### 4.6 Episode Grid Cell
 
