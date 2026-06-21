@@ -269,7 +269,7 @@ Sample widths:
 | Constant | File | Value | Meaning |
 |---|---|---|---|
 | `App.pane_split_min` | `app.zig` | `60` | Both Browse and History split to two panes at or above this width. Below this, single-column list only. |
-| `App.zoom_min` | `app.zig` | `100` | Zoom promote (`Space` from detail pane) is available at or above this width. Below this, the interactive episode grid is suppressed. |
+| `App.zoom_min` | `app.zig` | `100` | At or above this width the interactive episode grid renders **in-pane** (and `Enter` plays from it; `Space` promotes to the zoom). Below it the in-pane grid is suppressed — the grid is reached via the full-screen zoom, which `Enter`/`Space` open at any width. |
 | `detail_two_col_min` | `view/detail.zig` | `100` | Full-screen zoom switches to two internal columns at or above this width (§5.4a). Sized for the full canvas, not the ~58% pane. |
 
 The `zoom_min = 100` threshold aligns with the §5.3 episode grid — grid columns
@@ -804,7 +804,8 @@ Notes:
 - The resume indicator `[▸12]` in the row header is the episode the user will resume
   from: `state.now` + bold.
 - `l` or `Enter` from list focus moves to the detail pane (same grammar as Browse).
-  At `w < 60` single-column, `l`/`Enter` are no-ops (no pane to move to).
+  At `w < 60` single-column, `l` is a no-op (no pane to move to), but `Enter`
+  (or `Space`) opens the full-screen zoom — the only detail surface at this width.
 
 ### 5.4a History — Two-Pane (ROD-170)
 
@@ -813,11 +814,17 @@ History now uses the same two-pane grammar as Browse. The section title remains
 
 **Width tiers:**
 
+The grid lives in **one of two places**: the in-pane view (`w ≥ 100`) or the
+full-screen zoom (any width). `Enter`/`Space` "drill toward the grid":
+
 | `w` | Layout |
 |---|---|
-| `w < 60` | Single-column list (§5.4). Clamp `active_pane = .list`. |
-| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + chips + score + synopsis). No interactive episode grid. Pane toggle `h`/`l` works. Zoom promote (`Space`) not available. |
-| `w ≥ 100` | Two panes. Detail = full `drawDetailPane` with interactive grid. Pane toggle + zoom promote both available. |
+| `w < 60` | Single-column list (§5.4). Clamp `active_pane = .list`. No pane to focus, so `Enter`/`Space` open the **zoom** directly (the only detail surface here). |
+| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + chips + score + synopsis). No *in-pane* grid. Pane toggle `h`/`l` works; `Enter`/`Space` from the focused pane promote to the **zoom** to reach the grid. |
+| `w ≥ 100` | Two panes. Detail = full `drawDetailPane` with the interactive grid in-pane. `Enter` plays the focused episode; `Space` promotes to the zoom. |
+
+Episodes fetch on focus at any two-pane width (`w ≥ 60`), so the zoom always has
+its grid ready; below 60 the fetch fires when `Enter`/`Space` open the zoom.
 
 Empty / loading / error states (no focused record) fall back to the §5.4
 single-column layout — no half-empty split. The split only engages when a
@@ -882,11 +889,14 @@ Notes:
 - The detail pane uses `paneSplit(w)` geometry (§3.2). At 120 cols: list_w=45,
   detail_w≈70. Cover tier from `detail_w`: ≥40 → 20-col cover.
 - The focused entry drives the detail pane. Focus change = immediate update.
-- No episode grid at `60 ≤ w < 100`. The grid appears only when `w ≥ 100`
-  and `active_pane = .detail`.
-- `Space` from detail pane focus (when `w ≥ 100`) promotes to full-screen zoom
-  (`active_view = .detail`, §5.3). Esc demotes back to this two-pane,
-  `active_pane = .detail`.
+- No *in-pane* grid at `60 ≤ w < 100`. The in-pane grid appears only when
+  `w ≥ 100` and `active_pane = .detail`; below that the grid is reached via the
+  zoom (`Enter`/`Space` from the focused preview pane).
+- `Space` (any two-pane width) and, at `60 ≤ w < 100`, `Enter` from detail-pane
+  focus promote to the full-screen zoom (`active_view = .detail`, §5.3). At
+  `w ≥ 100` `Enter` plays instead (the grid is in-pane). `Esc`/`Space` demote
+  back to the two-pane (`active_pane = .detail`) when there's room, else to the
+  list (`w < 60`); `q` is the full back-out to the list.
 - The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
   when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
   takes full `list_w` and the badge is omitted.
@@ -1569,7 +1579,7 @@ keybinds.
 |---|---|---|---|
 | Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
 | History | `active_view = .history` | Yes (M3 landing, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
-| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History** (`w ≥ 100`). |
+| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
 **`.detail` is both an `active_pane` value within Browse/History and a standalone `active_view` (the zoom).**
@@ -1603,11 +1613,15 @@ Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
 `Esc` exits Settings.
 
 **Entering the standalone Detail zoom** is not a view-switch keybind — it is a
-promote: `Space` from `active_pane = .detail` (when `w ≥ 100`) in **either Browse
-or History** opens `active_view = .detail` (§10.1). `Esc` demotes back to the
-two-pane with `active_pane = .detail`; `q` returns to `detail_origin` view with
-`active_pane = .list` (§10.4). `Enter`/`l` from the list still step into the
-in-view detail *pane* (§10.3c) — they do not go directly to zoom.
+promote. `Space` from `active_pane = .detail` opens `active_view = .detail` at any
+two-pane width in **either Browse or History**; at `60 ≤ w < 100` `Enter` from the
+focused pane promotes too (no in-pane grid to play), and at `w < 60` `Enter`/`Space`
+from the History list open the zoom directly (no pane to focus). At `w ≥ 100`
+`Enter` from the detail pane plays instead — the grid is in-pane. `Esc`/`Space`
+demote back to the two-pane (`active_pane = .detail`) when there's room, else to
+the list; `q` is the full back-out to `detail_origin` with `active_pane = .list`
+(§10.4). `Enter`/`l` from the list step into the in-view detail *pane* first
+(§10.3c) whenever there is one (`w ≥ 60`).
 
 #### F-key aliases (discoverable navigation)
 
@@ -1722,7 +1736,7 @@ Esc action is listed. Everything not listed is a no-op.
 | Any | `command` | any | _Future (M4+):_ close command prompt, set `input_mode = .normal`. `input_mode` has no `.command` member yet (§7.6), so this row is inert in the current build. |
 | Browse | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
 | Browse | `normal` | `.list` | No-op. `q` handles quit from Browse. Esc does not quit. |
-| Detail (zoom) | `normal` | — | **Demote:** `active_view = detail_origin`, `active_pane = .detail`. Returns to two-pane with detail pane focused (not list). `Space` has the same effect (zoom toggle — same key promotes and demotes). |
+| Detail (zoom) | `normal` | — | **Demote:** `active_view = detail_origin`; `active_pane = .detail` when there's room for the pane (`w ≥ 60`), else `.list` (the zoom was opened from a single-column list at `w < 60`). `Space` and `h` have the same effect (zoom toggle / back). |
 | History (`w ≥ 60`) | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
 | History | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to `H`. |
 | Settings | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to pressing `q` from Settings. |
@@ -1741,7 +1755,8 @@ Esc navigates backward (History → Browse); `q` from Browse prompts quit.
 
 **Why zoom Esc lands on `.detail`, not `.list`:** the user arrived at zoom via
 the detail pane. Esc undoes one step. Skipping back to list would be jarring —
-especially on a long-runner the user was navigating.
+especially on a long-runner the user was navigating. The exception is `w < 60`,
+where there is no pane to land on, so Esc returns to the single-column list.
 
 ---
 
@@ -2032,4 +2047,5 @@ if (key.matches('q', .{})) {
 | Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | Switch to season/year kanji in `color.focus` when Browse has a real feed to populate (ROD-73 search landing or later). |
 | **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, right pane updates on cursor move) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
 | **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
-| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. `q` provides the full back-out (zoom → list) for users who want to get all the way out. | No revisit expected. |
+| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. `q` provides the full back-out (zoom → list) for users who want to get all the way out. (Exception: at `w < 60` there is no pane to land on, so Esc/`Space`/`h` demote to the single-column list.) | No revisit expected. |
+| **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on focus at any two-pane width, so the zoom's grid is always ready. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | Revisit if a future design gives the 60–99 pane its own usable in-pane grid — that would remove the Enter-drills-to-zoom hop. |
