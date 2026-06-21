@@ -628,7 +628,7 @@ pub const App = struct {
         if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
             return self.selectedAnime();
         }
-        if (self.active_view == .history and self.term_cols >= history_split_min) {
+        if (self.active_view == .history and self.term_cols >= pane_split_min) {
             return if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null;
         }
         return self.currentDetailAnime();
@@ -1661,9 +1661,16 @@ pub const App = struct {
         try vx.render(writer);
     }
 
-    /// Width (in cols) at and above which the History list grows a right-side
-    /// preview panel, mirroring the Browse split (ROD-113).
-    pub const history_split_min: u16 = 100;
+    /// Width (in cols) at and above which a list view grows a persistent
+    /// right-side detail pane, mirroring the Browse split. ROD-170 lowered this
+    /// from 100 to 60 and unified Browse + History onto it: both views show the
+    /// two-pane preview from 60 cols up. Below it, a single full-width list.
+    pub const pane_split_min: u16 = 60;
+
+    /// Width (in cols) at and above which the detail pane carries the interactive
+    /// episode grid and the Space-to-zoom affordance (ROD-170). Between
+    /// `pane_split_min` and this, the detail pane is the no-grid preview stack.
+    pub const zoom_min: u16 = 100;
 
     pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
 
@@ -1688,11 +1695,15 @@ pub const App = struct {
 
         switch (self.active_view) {
             .history => {
-                // At wide widths, grow a Browse-style right-side preview for the
-                // focused entry (ROD-113). Only when a record is actually focused
-                // — empty/loading/error states keep the full-width single column,
-                // which also sidesteps the empty-state centering edge case.
-                const rec_opt = if (w >= history_split_min) self.selectedHistoryRecord() else null;
+                // ROD-170: History is a persistent two-pane like Browse. The
+                // split grows a Browse-style right-side preview for the focused
+                // entry from pane_split_min (60) up — only when a record is
+                // actually focused, so empty/loading/error states keep the
+                // full-width single column (which also sidesteps the empty-state
+                // centering edge case). The interactive episode grid + zoom at
+                // >= zoom_min arrive with the input grammar (Phase 2); for now
+                // every two-pane width renders the no-grid preview stack.
+                const rec_opt = if (w >= pane_split_min) self.selectedHistoryRecord() else null;
                 if (rec_opt) |rec| {
                     const sp = paneSplit(w);
                     // List draws into the full window (absolute coords, 2-col left
