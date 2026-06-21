@@ -405,7 +405,9 @@ pub const App = struct {
     detail_season_buf: [16]u8 = undefined,
     /// Stable storage for the "[N]" result count in drawBottomBar search mode.
     cnt_scratch: [16]u8 = undefined,
-    /// Scratch for the animated browse chip text ("⠋ search") in drawTopBar.
+    /// Stable storage for the top-bar season/year chip text (e.g. "冬 2024",
+    /// ROD-186). App-owned so vaxis holds a valid slice after drawTopBar returns
+    /// (the ROD-141 cell-slice lifetime trap).
     chip_buf: [16]u8 = undefined,
 
     // ── async feedback (ROD-76) ───────────────────────────────────────────────
@@ -526,6 +528,88 @@ pub const App = struct {
     /// ordering definition (ROD-139).
     pub fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
         return history.recordAtCursor(self);
+    }
+
+    /// ROD-186: the top-bar season/year chip text (e.g. "冬 2024"), formatted into
+    /// the App-owned `chip_buf`. It MUST be App-owned, not a stack local: vaxis
+    /// cells hold a *slice* into the segment text and the frame isn't emitted until
+    /// after this returns (the same lifetime trap as the detail chip, ROD-141).
+    /// Returns "" when no chip should render.
+    ///
+    /// Content rule (Rod): show the currently selected show's season+year when a
+    /// row is selected and both are known; otherwise the current real-world cour
+    /// from the system clock. The detail zoom is the exception — it is committed to
+    /// one show, so it shows only that show's season with no cour fallback (an
+    /// unenriched show shows no chip, never a misleading season). Settings has no
+    /// show context (Mira header ruling) and shows no chip.
+    pub fn topBarSeasonChip(self: *App) []const u8 {
+        switch (self.active_view) {
+            .settings => return "",
+            .detail => switch (self.detail_origin) {
+                .browse => {
+                    const a = self.selectedAnime() orelse return "";
+                    return self.seasonChipText(a.season, a.year);
+                },
+                .history => {
+                    const r = self.selectedHistoryRecord() orelse return "";
+                    return self.seasonChipText(historySeason(r), historyYear(r));
+                },
+            },
+            .browse => {
+                if (self.selectedAnime()) |a| {
+                    if (a.season != null and a.year != null)
+                        return self.seasonChipText(a.season, a.year);
+                }
+                return self.courChip();
+            },
+            .history => {
+                if (self.selectedHistoryRecord()) |r| {
+                    const sea = historySeason(r);
+                    const yr = historyYear(r);
+                    if (sea != null and yr != null) return self.seasonChipText(sea, yr);
+                }
+                return self.courChip();
+            },
+        }
+    }
+
+    /// Format a season+year into `chip_buf`. "" if either half is unknown — the
+    /// chip is the kanji glyph plus the year; a season with no year (or vice
+    /// versa) isn't renderable as "季 YYYY" (§2.3: never an empty/partial chip).
+    fn seasonChipText(self: *App, season: ?domain.Season, year: ?u32) []const u8 {
+        const sea = season orelse return "";
+        const yr = year orelse return "";
+        return std.fmt.bufPrint(&self.chip_buf, "{s} {d}", .{ sea.kanji(), yr }) catch "";
+    }
+
+    /// The current real-world cour, formatted into `chip_buf` — the no-selection
+    /// fallback for the Browse/History chip. Reads `now_ms` (wall-clock epoch ms,
+    /// refreshed every .tick) rather than re-querying the clock, so the render pass
+    /// stays io-free. Before the first tick `now_ms` is 0; we render no chip then
+    /// rather than flash 冬 1970 for one frame.
+    fn courChip(self: *App) []const u8 {
+        if (self.now_ms <= 0) return "";
+        const c = currentCour(self.now_ms);
+        return self.seasonChipText(c.season, c.year);
+    }
+
+    /// The broadcast cour for an epoch-ms instant, using AniList's season
+    /// boundaries (domain.Season.fromMonth) with December rolled into next year's
+    /// Winter cour — so the ambient chip names the same cour AniList would.
+    fn currentCour(now_ms: i64) struct { season: domain.Season, year: u32 } {
+        const secs: u64 = @intCast(@divFloor(now_ms, std.time.ms_per_s));
+        const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
+        const month = yd.calculateMonthDay().month.numeric();
+        const year: u32 = if (month == 12) @as(u32, yd.year) + 1 else yd.year;
+        return .{ .season = domain.Season.fromMonth(month), .year = year };
+    }
+
+    fn historySeason(r: AnimeRecord) ?domain.Season {
+        return if (r.season) |tag| domain.Season.fromString(tag) else null;
+    }
+
+    fn historyYear(r: AnimeRecord) ?u32 {
+        return if (r.year) |x| std.math.cast(u32, x) else null;
     }
 
     /// Apply a manual watch-state transition to the focused History entry
