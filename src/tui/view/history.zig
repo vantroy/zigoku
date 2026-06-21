@@ -82,10 +82,10 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         // bg.surface (a full-width band), its marker is the ▸ play glyph in
         // focus cyan, and its title goes cyan+bold. Magenta is reserved for
         // the one cursor in the status bar — never a list marker (§8).
-        const is_completed = std.mem.eql(u8, rec.list_status, "completed");
-        const is_dropped = std.mem.eql(u8, rec.list_status, "dropped");
-        const is_watching = std.mem.eql(u8, rec.list_status, "watching");
-        const is_paused = std.mem.eql(u8, rec.list_status, "paused");
+        const is_completed = rec.list_status == .completed;
+        const is_dropped = rec.list_status == .dropped;
+        const is_watching = rec.list_status == .watching;
+        const is_paused = rec.list_status == .paused;
 
         const row_bg = if (selected) self.palette.bg_surface else self.palette.bg_base;
         if (selected) {
