@@ -776,7 +776,7 @@ the canvas is all detail. `Esc` demotes back to the two-pane view with `active_p
                              meets a young girl named Fern…
                             ─────────────────────────────────────────────────────
                              Episodes
-                            [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12]          [h▸ resume, d● watched, m unwatched]
+                            [1][2][3][4][5][6][▸7][8][9][10][11][12]               [d watched, h▸ resume, m unwatched]
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
 
@@ -788,9 +788,16 @@ Notes:
 - `active_view = .detail`. `detail_origin` records the origin (`.browse` or
   `.history`). `Esc` or `Space` demotes back to the two-pane, `active_pane = .detail`.
   `q` returns to `detail_origin` view, `active_pane = .list`.
-- `[▸1]` is the resume cell: `state.now` + bold.
-- `[●2]` through `[●6]` are watched: `text.dim`.
-- `[ 7]` onward are unwatched: `text.muted`.
+- `[▸7]` is the resume cell: `state.now` (cyan) + bold, prefixed with a `▸`
+  glyph (ROD-192). The arrow is the **only** glyph in the grid: it's the heaviest
+  mark because the resume cell is the most actionable one, and it tells resume
+  apart from the focus cursor (both are cyan+bold — only the cursor adds the
+  `bg.surface` band).
+- Watched cells (`1`–`6` here) recede via `text.dim`, **no glyph**. A filled mark
+  like `●` would out-weigh the resume arrow and invert the hierarchy (the done,
+  receding cells shouting louder than the one you should act on), so watched is
+  conveyed by colour alone.
+- Unwatched cells (`8` onward) are `text.muted`.
 - Cover art uses the full left column width for the tier calculation (§3.3). At
   120 cols, `left_w ≈ 44` → 20-col cover applies.
 - `Space` is a zoom toggle: it promotes from detail pane and demotes from zoom.
@@ -917,8 +924,8 @@ record is focused.
       [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────
                                              28 eps · TV · 24 min
     ○ Blue Period                           ─────────────────────────────────
-      [██████◐░░░░░░░░░]  5 / 12 eps        [▸1][●2][●3][●4][●5][●6][ 7][ 8]           [interactive grid; h▸ resume, d● watched, m unwatched]
-  ─────────────────────────────────────     [ 9][10][11][12][13][14][15][16]
+      [██████◐░░░░░░░░░]  5 / 12 eps        [1][2][3][4][5][6][▸7][8]                  [interactive grid; d watched, h▸ resume, m unwatched]
+  ─────────────────────────────────────     [9][10][11][12][13][14][15][16]
                                             [17][18][19][20][21][22][23][24]
   ▸ completed (12)                          [25][26][27][28]
   ─────────────────────────────────────

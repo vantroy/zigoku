@@ -699,6 +699,16 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             const ep = eps[ep_idx];
             const focused = ep_idx == self.episodes.cursor and self.active_pane == .detail;
             const launching = ep_idx == launching_idx;
+            // §5.3 (ROD-192): the resume cell — where the user continues from —
+            // carries a `▸` glyph. It is the only cell that earns a glyph: the
+            // arrow is the heaviest mark in the grid because resume is the most
+            // actionable cell, and it disambiguates resume from the focus cursor
+            // (both cyan+bold) since only the cursor gets the bg.surface band.
+            // Watched cells deliberately stay glyph-free and recede via color —
+            // a filled glyph there would weigh *more* than the action arrow,
+            // inverting the hierarchy. A launching cell owns the slot outright.
+            const is_resume = !launching and
+                (if (self.episodes.resume_idx) |ri| ep_idx == ri else false);
 
             // Use ep_scratch to avoid dangling stack buffers. Index relative
             // to the viewport start so we never alias two live cells.
@@ -708,21 +718,27 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // its number, in the same `[ ]` shell so it reads as that cell working.
             const cell_text = if (launching)
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{self.spinnerChar()}) catch "[?]"
+            else if (is_resume)
+                std.fmt.bufPrint(cell_buf, "[▸{s}]", .{ep.raw}) catch "[?]"
             else
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
-            // §4.6: watched cells (index below the high-water mark) recede to
-            // text.dim; unwatched stay text.muted; the cursor always wins
-            // (ROD-131). text.dim is `fg3` alone — matching the completed/dropped
-            // convention in history.zig; the `.dim` SGR attr is reserved for the
-            // paused semantic (§2.4), so it is deliberately not used here. A
-            // launching cell escalates focus→hot past isSlowPath (§4.8), same as
-            // every other slow-path spinner; it outranks focus/watched.
+            // §4.6/§5.3: watched cells (index below the high-water mark) recede to
+            // text.dim; the resume cell lights state.now (cyan) + bold; unwatched
+            // stay text.muted; the cursor always wins (ROD-131). text.dim is `fg3`
+            // alone — matching the completed/dropped convention in history.zig; the
+            // `.dim` SGR attr is reserved for the paused semantic (§2.4), so it is
+            // deliberately not used here. A launching cell escalates focus→hot past
+            // isSlowPath (§4.8), same as every other slow-path spinner; it outranks
+            // focus/resume/watched. Resume sits just under focus: same cyan+bold,
+            // minus the bg.surface band that is the cursor's alone.
             const watched = ep_idx < @as(usize, self.episodes.progress);
             const cell_style = if (launching)
                 self.s(if (self.isSlowPath()) self.palette.hot else self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
             else if (focused)
                 self.s(self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
+            else if (is_resume)
+                self.s(self.palette.focus, .{ .bold = true })
             else if (watched)
                 self.s(self.palette.fg3, .{})
             else
