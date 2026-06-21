@@ -529,11 +529,19 @@ pub const Store = struct {
     /// never bumps play_count or last_watched_at — moving a show to paused/dropped
     /// is not a watch event. It does make the row history-visible: an explicit
     /// status means the user is tracking it. Force-complete snaps `progress` up to
-    /// `total_episodes` (when known) so the bar reads full; every other transition
-    /// leaves progress untouched. Unknown show → silent no-op.
+    /// `total_episodes` (when it's a real count) so the bar reads full; every other
+    /// transition leaves progress untouched. Unknown show → silent no-op.
     pub fn setListStatus(self: *Store, source: []const u8, source_id: []const u8, status: domain.ListStatus) Error!void {
         const cur = try self.statusRow(source, source_id) orelse return;
-        const new_progress = if (status == .completed) (cur.total orelse cur.progress) else cur.progress;
+        // Snap to the finale on force-complete — but only for a real total. The
+        // `t > 0` guard mirrors `ListStatus.afterPlay`: AllAnime's
+        // `total_episodes = 0` quirk must not reset progress to zero.
+        var new_progress = cur.progress;
+        if (status == .completed) {
+            if (cur.total) |t| {
+                if (t > 0) new_progress = t;
+            }
+        }
 
         const sql =
             \\UPDATE anime
@@ -1282,6 +1290,15 @@ test "setListStatus: force-complete snaps progress to the known finale" {
     const b = (try s.getAnime(arena, T_SOURCE, "b")).?;
     try testing.expectEqual(domain.ListStatus.completed, b.list_status);
     try testing.expectEqual(@as(i64, 3), b.progress); // unchanged, no total to snap to
+
+    // total_episodes = 0 (AllAnime quirk) is NOT a real finale: force-complete
+    // must NOT reset progress to zero (Elara H1 regression — the `t > 0` guard).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "c", .title = "C", .total_episodes = 0 }, 1002, arena);
+    try s.recordPlay(T_SOURCE, "c", 5, 2001, true); // progress 5, total 0
+    try s.setListStatus(T_SOURCE, "c", .completed);
+    const cc = (try s.getAnime(arena, T_SOURCE, "c")).?;
+    try testing.expectEqual(domain.ListStatus.completed, cc.list_status);
+    try testing.expectEqual(@as(i64, 5), cc.progress); // held, not zeroed
 }
 
 test "setListStatus on an unknown show is a silent no-op" {
