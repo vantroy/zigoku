@@ -474,11 +474,17 @@ test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD
     try testing.expectEqual(@as(i64, 12), app.history[0].progress);
     try testing.expectEqual(@as(i64, 12), (try st.getAnime(arena, "s", "a")).?.progress);
 
-    // x → dropped, w → watching.
+    // x → dropped, w → watching (assert store too, not just memory).
     try testTick(&app, keyEv('x', .{}));
     try testing.expectEqual(domain.ListStatus.dropped, app.history[0].list_status);
+    try testing.expectEqual(domain.ListStatus.dropped, (try st.getAnime(arena, "s", "a")).?.list_status);
     try testTick(&app, keyEv('w', .{}));
     try testing.expectEqual(domain.ListStatus.watching, app.history[0].list_status);
+    try testing.expectEqual(domain.ListStatus.watching, (try st.getAnime(arena, "s", "a")).?.list_status);
+    // w (and x before it) leave progress at the completed-snap value by design:
+    // re-watching keeps the full bar until a real play moves the high-water.
+    try testing.expectEqual(@as(i64, 12), app.history[0].progress);
+    try testing.expectEqual(@as(i64, 12), (try st.getAnime(arena, "s", "a")).?.progress);
 }
 
 test "q/Esc from History reset the viewport before Browse reads it (ROD-139 H1)" {
