@@ -373,11 +373,15 @@ test "paneSplit clamps the list column to a 30-col floor at narrow widths" {
     try testing.expectEqual(@as(u16, 30), sp.list_w); // 60*38/100 = 22 → floored to 30
 }
 
-test "history preview engages only at the split threshold (ROD-113)" {
-    try testing.expectEqual(@as(u16, 100), App.history_split_min);
-    // The gating predicate the .history arm uses: w >= history_split_min.
-    try testing.expect(99 < App.history_split_min);
-    try testing.expect(100 >= App.history_split_min);
+test "two-pane split engages at 60, zoom/grid at 100 (ROD-170)" {
+    // ROD-170 unified Browse + History on pane_split_min and lowered it 100→60.
+    try testing.expectEqual(@as(u16, 60), App.pane_split_min);
+    try testing.expectEqual(@as(u16, 100), App.zoom_min);
+    // The gating predicate the .history arm uses: w >= pane_split_min.
+    try testing.expect(59 < App.pane_split_min);
+    try testing.expect(60 >= App.pane_split_min);
+    // The two-pane preview engages strictly before the interactive grid/zoom.
+    try testing.expect(App.pane_split_min < App.zoom_min);
 }
 
 test "detail two-column gate trips at 100 cols and falls back below (ROD-113)" {
@@ -790,13 +794,13 @@ test "detailSyncTarget tracks the history cursor in wide preview mode, no episod
     app.setHistory(&recs);
     app.active_view = .history;
 
-    // Narrow: no ROD-113 preview pane, so the cover path is inert and the target
-    // defers to currentDetailAnime (null in the history view).
-    app.term_cols = 80;
+    // Narrow (< pane_split_min): no two-pane preview, so the cover path is inert
+    // and the target defers to currentDetailAnime (null in the history view).
+    app.term_cols = 50;
     try testing.expect(app.detailSyncTarget() == null);
 
-    // Wide (>= history_split_min): the preview is on-screen, so the cover tracks
-    // the focused record as the cursor moves.
+    // Wide (>= pane_split_min): the preview is on-screen, so the cover tracks
+    // the focused record as the cursor moves (ROD-170 lowered this gate to 60).
     app.term_cols = 120;
     try testing.expectEqualStrings("Frieren", app.detailSyncTarget().?.name);
     app.list_cursor = 1;
@@ -854,12 +858,46 @@ test "h / l in history view are no-ops (single pane)" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
 }
 
-test "Enter in history opens standalone detail view" {
+test "Enter in history focuses the detail pane + fires episodes at zoom width (ROD-170)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
+    app.term_cols = 120; // zoom tier: the grid is live, so focus fires the fetch
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    // ROD-170: no more full-screen jump — we stay in History and focus the pane.
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("a", app.episodes.for_id orelse return error.TestExpectationFailed);
+
+    app.episodes.freeResults(app.gpa);
+}
+
+test "Enter in history at 60-99 focuses the preview pane + fetches (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.term_cols = 80; // preview tier: focus the pane + fetch (so the zoom is ready)
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("a", app.episodes.for_id orelse return error.TestExpectationFailed);
+
+    app.episodes.freeResults(app.gpa);
+}
+
+test "Enter in single-column history (<60) opens the zoom + fetches (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.term_cols = 50; // no two-pane → Enter opens the zoom directly
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
     try testing.expectEqual(.detail, app.active_view);
@@ -870,40 +908,193 @@ test "Enter in history opens standalone detail view" {
     app.episodes.freeResults(app.gpa);
 }
 
-test "q from history-opened detail returns to history" {
+test "Enter in a 60-99 detail pane zooms instead of playing (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .detail; // focused on the gridless preview pane
+    app.term_cols = 80;
+
+    // Episodes are loaded (fetched on focus). If Enter wrongly played, it would
+    // start this episode — the bug ROD reported. It must drill to the zoom instead.
+    app.episodes.results = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "1" }});
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episodes.cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(.detail, app.active_view); // drilled into the zoom
+    try testing.expectEqual(.detail, app.active_pane); // pane focus carried into the zoom
+    try testing.expect(!app.playing); // …and did NOT start playback
+
+    app.episodes.freeResults(app.gpa);
+}
+
+test "q from the zoom backs all the way out to the history list (ROD-170)" {
     var app: App = .{};
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
 
     try testTick(&app, keyEv('q', .{}));
+    // ROD-170: q is the full back-out (zoom → list), where Esc/h demote one step.
     try testing.expectEqual(.history, app.active_view);
     try testing.expectEqual(.list, app.active_pane);
     try testing.expect(!app.should_quit);
 }
 
-test "Esc from history-opened detail returns to history" {
+test "q from a focused History detail pane backs to the list, not Browse (ROD-170)" {
+    // Astra D1: q from the two-pane detail pane used to fall through to the
+    // History list-exit and jump to Browse, contradicting the "q back" help line.
+    var app: App = .{};
+    app.active_view = .history;
+    app.active_pane = .detail;
+    app.term_cols = 120;
+
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expectEqual(.history, app.active_view); // stays in History
+    try testing.expectEqual(.list, app.active_pane); // backs one level to the list
+    try testing.expect(!app.should_quit);
+}
+
+test "Esc from the zoom demotes to two-pane detail focus (ROD-170)" {
     var app: App = .{};
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
+    app.term_cols = 120; // there's room for the pane → demote lands on it
+
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    // ROD-170: Esc demotes ONE step (zoom → pane), not all the way to the list.
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "h from the zoom demotes to two-pane detail focus (ROD-170)" {
+    var app: App = .{};
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.term_cols = 120;
+
+    try testTick(&app, keyEv('h', .{}));
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "demote from the zoom below pane_split_min lands on the list (ROD-170)" {
+    var app: App = .{};
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    app.term_cols = 50; // no pane to demote to → Esc returns to the single-column list
 
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(.history, app.active_view);
     try testing.expectEqual(.list, app.active_pane);
-    try testing.expect(!app.should_quit);
 }
 
-test "h from history-opened detail returns to history" {
+test "Space promotes a focused History detail pane to the zoom (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .detail;
+    app.term_cols = 120; // zoom tier
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view); // full-screen zoom
+    try testing.expectEqual(.history, app.detail_origin); // remembers the origin
+    try testing.expectEqual(.detail, app.active_pane);
+}
+
+test "Space promotes the Browse detail pane to the zoom too (ROD-170)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.active_pane = .detail; // focused on the Browse detail pane
+    app.term_cols = 120;
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view); // zoomed
+    try testing.expectEqual(.browse, app.detail_origin); // remembers Browse as origin
+
+    // …and Space again demotes back to the Browse detail pane.
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+}
+
+test "Space in the zoom demotes back to the two-pane detail focus (ROD-170)" {
     var app: App = .{};
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
+    app.term_cols = 120;
 
-    try testTick(&app, keyEv('h', .{}));
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
+}
+
+test "Space promotes from a 60-99 preview pane to the zoom (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .detail;
+    app.term_cols = 80; // preview tier: the zoom is how you reach the grid
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view); // promoted to the zoom
+    try testing.expectEqual(.history, app.detail_origin);
+}
+
+test "Space in single-column history (<60) opens the zoom (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.term_cols = 50; // no pane to toggle → Space opens the zoom like Enter
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expectEqual(.detail, app.active_view);
+    try testing.expectEqual(.history, app.detail_origin);
+    try testing.expectEqualStrings("a", app.episodes.for_id orelse return error.TestExpectationFailed);
+
+    app.episodes.freeResults(app.gpa);
+}
+
+test "h/l toggle the History detail pane like Browse (ROD-170)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.term_cols = 80; // two-pane preview: l focuses (+ fetch), h returns
+
     try testing.expectEqual(.list, app.active_pane);
-    try testing.expect(!app.should_quit);
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(.detail, app.active_pane);
+    try testTick(&app, keyEv('h', .{}));
+    try testing.expectEqual(.list, app.active_pane);
+
+    app.episodes.freeResults(app.gpa); // l fetched at 60-99; release for_id
+}
+
+test "winsize below pane_split_min clamps History focus back to the list (ROD-170)" {
+    var app: App = .{};
+    app.active_view = .history;
+    app.active_pane = .detail; // was focused at a wide width
+
+    try testTick(&app, .{ .winsize = .{ .rows = 30, .cols = 50, .x_pixel = 0, .y_pixel = 0 } });
+    try testing.expectEqual(.list, app.active_pane);
 }
 
 test "history detail episodes_done seeds cursor from progress" {
@@ -1289,6 +1480,7 @@ test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history; // cursor 0 → Frieren, source_id "a"
+    app.term_cols = 120; // zoom tier: focusing the pane fires the (cached) fetch
 
     const cached = try workers.dupEpisodesOwned(app.gpa, &.{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
@@ -1300,8 +1492,10 @@ test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
 
-    // Synchronous hit: detail opens, episodes present, no spinner, no fetch thread.
-    try testing.expectEqual(.detail, app.active_view);
+    // Synchronous hit: the detail pane focuses, episodes present, no spinner, no
+    // fetch thread. ROD-170: focus is the two-pane detail pane, not a full-screen.
+    try testing.expectEqual(.history, app.active_view);
+    try testing.expectEqual(.detail, app.active_pane);
     try testing.expect(!app.episodes.loading);
     try testing.expect(app.episode_thread == null);
     try testing.expectEqual(@as(usize, 3), app.episodes.results.?.len);
@@ -1343,6 +1537,7 @@ test "episode cache: a stale LRU entry is bypassed, not served (ROD-130)" {
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
+    app.term_cols = 120; // zoom tier: focusing the pane attempts the fetch
 
     // expires_at in the past → must be ignored, forcing the (empty) dummy fetch.
     const stale = try workers.dupEpisodesOwned(app.gpa, &.{
@@ -1372,6 +1567,7 @@ test "episode cache: evicting displayed show A keeps episode_results valid (ROD-
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history; // cursor 0 → Frieren, source_id "a"
+    app.term_cols = 120; // zoom tier: focusing the pane fires the (cached) fetch
 
     const cached = try workers.dupEpisodesOwned(app.gpa, &.{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
