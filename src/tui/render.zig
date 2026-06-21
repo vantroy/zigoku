@@ -20,14 +20,18 @@ pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
 
 // ── tiny render helpers ─────────────────────────────────────────────────────
 
-/// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) is reserved for the
-/// selection affordance, so it is granted ONLY to the selected row while the list
-/// pane holds keyboard focus. Everything else steps down:
-///   - selected but list unfocused (detail pane active) → fg2 (the row recedes)
+/// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) means "the focused
+/// cursor row" everywhere (▸, title, bar), so it is granted ONLY to the selected
+/// row while the list pane holds keyboard focus — and there it OVERRIDES the
+/// status color (a selected completed/planning row's bar is cyan too, so the
+/// cursor always owns the single brightest bar; this is the §4.1 repro fix). Off
+/// that one row everything steps down:
+///   - selected but list unfocused (detail pane active) → fg2, all statuses (the
+///     row recedes but is still "where you are")
 ///   - unselected watching/paused → fg2 (status, not selection — can't out-shout
 ///     the cursor; the ▸/◐ glyph still carries the status identity)
 ///   - unselected planning → chrome (empty-bar tint, §4.5)
-///   - everything else (completed/dropped) → fg3
+///   - unselected completed/dropped → fg3 (text.dim)
 /// Pure so the rule can be unit-tested without a render pass.
 pub fn barFillColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *const colors.Palette) vaxis.Color {
     if (selected) return if (list_focused) pal.focus else pal.fg2;
@@ -36,6 +40,14 @@ pub fn barFillColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *
         .planning => pal.chrome,
         else => pal.fg3,
     };
+}
+
+/// §4.5 + ROD-194: the episode-fraction text color. It earns text.muted (fg2)
+/// only on the selected, list-focused watching/paused row (where the bar is the
+/// bright cursor bar); every other row keeps it dim (fg3) so it never competes.
+pub fn barFracColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *const colors.Palette) vaxis.Color {
+    const is_progressing = rec.list_status == .watching or rec.list_status == .paused;
+    return if (selected and list_focused and is_progressing) pal.fg2 else pal.fg3;
 }
 
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
@@ -47,7 +59,6 @@ pub fn barFillColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *
 /// so it can't bleed into a neighbour. `selected`/`list_focused` gate the §4.1
 /// selection affordance into the fill (ROD-194).
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette, selected: bool, list_focused: bool) void {
-    const is_watching = rec.list_status == .watching;
     const is_paused = rec.list_status == .paused;
 
     const filled: u16 = blk: {
@@ -61,9 +72,7 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail:
     };
 
     const fill_color = barFillColor(rec, selected, list_focused, pal);
-    // The fraction text earns text.muted (fg2) only when the bar is the selected,
-    // list-focused row's; otherwise it stays dim (fg3) so it never competes.
-    const frac_color = if (selected and list_focused and (is_watching or is_paused)) pal.fg2 else pal.fg3;
+    const frac_color = barFracColor(rec, selected, list_focused, pal);
 
     put(win, row, col, "[", style(pal.fg3, .{ .bg = row_bg }));
     var c: u16 = 0;
@@ -168,13 +177,16 @@ fn mkRec(status: domain.ListStatus) AnimeRecord {
     return .{ .source = "s", .source_id = "i", .title = "t", .list_status = status };
 }
 
-test "barFillColor: focus cyan is reserved for the selected, list-focused row (ROD-194)" {
+test "barFillColor: focus cyan is the cursor, and the cursor overrides status (ROD-194)" {
     const pal = &colors.terminal_ghost;
-    // The ONE case that earns state.focus: selected AND the list pane has focus.
+    // The selected, list-focused row owns the brightest bar REGARDLESS of status —
+    // this is the §4.1 repro fix (a selected completed row must out-rank an
+    // unselected watching one). state.focus here means "the cursor", not "watching".
     try testing.expectEqual(pal.focus, barFillColor(mkRec(.watching), true, true, pal));
     try testing.expectEqual(pal.focus, barFillColor(mkRec(.completed), true, true, pal));
+    try testing.expectEqual(pal.focus, barFillColor(mkRec(.planning), true, true, pal));
 
-    // Selected but the detail pane has focus → the row recedes to fg2.
+    // Selected but the detail pane has focus → the row recedes to fg2 (all statuses).
     try testing.expectEqual(pal.fg2, barFillColor(mkRec(.watching), true, false, pal));
     try testing.expectEqual(pal.fg2, barFillColor(mkRec(.completed), true, false, pal));
 
@@ -186,4 +198,17 @@ test "barFillColor: focus cyan is reserved for the selected, list-focused row (R
     try testing.expectEqual(pal.chrome, barFillColor(mkRec(.planning), false, true, pal));
     try testing.expectEqual(pal.fg3, barFillColor(mkRec(.completed), false, true, pal));
     try testing.expectEqual(pal.fg3, barFillColor(mkRec(.dropped), false, true, pal));
+}
+
+test "barFracColor: text.muted only on the selected, list-focused watching/paused row (ROD-194)" {
+    const pal = &colors.terminal_ghost;
+    // The one bright-frac case: it rides along with the bright cursor bar.
+    try testing.expectEqual(pal.fg2, barFracColor(mkRec(.watching), true, true, pal));
+    try testing.expectEqual(pal.fg2, barFracColor(mkRec(.paused), true, true, pal));
+
+    // Cursor row but detail-focused, or a non-progressing status → dim.
+    try testing.expectEqual(pal.fg3, barFracColor(mkRec(.watching), true, false, pal));
+    try testing.expectEqual(pal.fg3, barFracColor(mkRec(.completed), true, true, pal));
+    // Unselected watching → dim (the frac never competes off the cursor row).
+    try testing.expectEqual(pal.fg3, barFracColor(mkRec(.watching), false, true, pal));
 }
