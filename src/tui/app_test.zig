@@ -11,6 +11,7 @@ const domain = @import("../domain.zig");
 const cover_mod = @import("../cover.zig");
 const colors = @import("colors.zig");
 const detail_view = @import("view/detail.zig");
+const history_view = @import("view/history.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -246,16 +247,63 @@ test "layout settles the browse viewport from terminal geometry (ROD-155)" {
     try testing.expectEqual(@as(usize, 14), app.list_top);
 }
 
-test "layout uses History's 2-rows-per-entry budget (ROD-155)" {
+test "layout settles History's viewport in physical rows incl. group chrome (ROD-139)" {
+    // list_top is a physical-row offset now (chrome-aware), not an entry index —
+    // so the scroll math walks the real grouped geometry, not cursor arithmetic.
+    var recs: [10]store_mod.AnimeRecord = undefined;
+    for (&recs) |*r| r.* = .{ .source = "s", .source_id = "x", .title = "T", .list_status = .watching };
+
     var app: App = .{};
     app.active_view = .history;
-    app.list_cursor = 10;
+    app.history = &recs;
+    app.list_cursor = 9; // the last entry
     app.list_top = 0;
-    // h=11 → visible = 8 terminal rows → 4 entry slots (visible/2).
-    // list_top = cursor + 1 - 4 = 7. Pinned so the full-budget (visible, not
-    // visible/2) mutation is caught.
-    app.layout(11, 80);
-    try testing.expectEqual(@as(usize, 7), app.list_top);
+    // One "watching" group: header(row 0) + hairline(row 1) + 10×2 entries → 22
+    // physical rows. Entry 9's title row = 2 + 2·9 = 20. h=13 → visible = 10 rows.
+    // cursor+2 = 22 > 0+10, so list_top = 22 - 10 = 12 (keeps both cursor rows in).
+    app.layout(13, 80);
+    try testing.expectEqual(@as(usize, 12), app.list_top);
+}
+
+test "history cursor walks §5.4 group order, not store load order (ROD-139)" {
+    // Load order (last_watched DESC) is scrambled across groups on purpose; the
+    // cursor must traverse watching → planning → paused → completed → dropped,
+    // preserving load order *within* each group.
+    var recs = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "dropped-A", .list_status = .dropped },
+        .{ .source = "s", .source_id = "2", .title = "watching-A", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "planning-A", .list_status = .planning },
+        .{ .source = "s", .source_id = "4", .title = "watching-B", .list_status = .watching },
+        .{ .source = "s", .source_id = "5", .title = "completed-A", .list_status = .completed },
+    };
+    var app: App = .{};
+    app.active_view = .history;
+    app.history = &recs;
+
+    const expected = [_][]const u8{ "watching-A", "watching-B", "planning-A", "completed-A", "dropped-A" };
+    for (expected, 0..) |title, i| {
+        app.list_cursor = i;
+        const rec = app.selectedHistoryRecord() orelse return error.TestUnexpectedNull;
+        try testing.expectEqualStrings(title, rec.title);
+    }
+}
+
+test "history geometry counts headers, hairlines and the inter-group blank (ROD-139)" {
+    var recs = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "w", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "p1", .list_status = .planning },
+        .{ .source = "s", .source_id = "3", .title = "p2", .list_status = .planning },
+    };
+    var app: App = .{};
+    app.active_view = .history;
+    app.history = &recs;
+
+    // watching: header(0)+hairline(1)+w(2,3) ; blank(4) ; planning: header(5)+
+    // hairline(6)+p1(7,8)+p2(9,10) → 11 rows total. Cursor on p2 (ordinal 2).
+    app.list_cursor = 2;
+    const g = history_view.geometry(&app);
+    try testing.expectEqual(@as(u16, 11), g.total);
+    try testing.expectEqual(@as(u16, 9), g.cursor_row); // p2's title row
 }
 
 test "layout bails when EITHER too-small arm trips (ROD-155)" {
