@@ -702,7 +702,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // §5.3 (ROD-192): the resume cell — where the user continues from —
             // carries a `▸` glyph. It is the only cell that earns a glyph: the
             // arrow is the heaviest mark in the grid because resume is the most
-            // actionable cell (§5.x: "always the most visually prominent cell").
+            // actionable cell (§4.6: "always the most visually prominent cell").
             // Watched cells deliberately stay glyph-free and recede via color —
             // a filled glyph there would weigh *more* than the action arrow,
             // inverting the hierarchy. A launching cell owns the slot outright.
@@ -729,8 +729,8 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
             // §4.6/§5.3: watched cells (index below the high-water mark) recede to
-            // text.dim; the resume cell lights state.now (magenta) + bold — the
-            // loudest token in the grid, per §5.x ("most visually prominent cell");
+            // text.dim; the resume cell lights state.now + bold — the loudest
+            // token in the grid, per §4.6 ("most visually prominent cell");
             // unwatched stay text.muted; the cursor always wins (ROD-131). text.dim
             // is `fg3` alone — matching the completed/dropped convention in
             // history.zig; the `.dim` SGR attr is reserved for the paused semantic
@@ -739,7 +739,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // spinner; it outranks focus/resume/watched. Resume reads apart from the
             // focus cursor by HUE — resume is state.now (magenta), the cursor is
             // state.focus (cyan) + the bg.surface band that is the cursor's alone
-            // (§5.x lists bg.surface on resume too, but sharing it would blur the
+            // (§4.6 lists bg.surface on resume too, but sharing it would blur the
             // cursor, so the band stays cursor-only — color carries resume).
             const watched = ep_idx < @as(usize, self.episodes.progress);
             const cell_style = if (launching)

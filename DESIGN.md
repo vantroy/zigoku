@@ -788,13 +788,13 @@ Notes:
 - `active_view = .detail`. `detail_origin` records the origin (`.browse` or
   `.history`). `Esc` or `Space` demotes back to the two-pane, `active_pane = .detail`.
   `q` returns to `detail_origin` view, `active_pane = .list`.
-- `[▸7]` is the resume cell: `state.now` (magenta) + bold, prefixed with a `▸`
-  glyph (ROD-192) — the most visually prominent cell in the grid (§5.x). The
-  arrow is the **only** glyph in the grid (the most actionable cell earns the
-  loudest mark). Resume reads apart from the focus cursor by **hue**: resume is
-  `state.now` (magenta), the cursor is `state.focus` (cyan) + the `bg.surface`
-  band that stays the cursor's alone. (For 3-digit / non-numeric labels the `▸`
-  drops — no room in the 5-wide cell — and the magenta colour carries resume.)
+- `[▸7]` is the resume cell: `state.now` + bold, prefixed with a `▸` glyph
+  (ROD-192) — the most visually prominent cell in the grid (§4.6). The arrow is
+  the **only** glyph in the grid (the most actionable cell earns the loudest
+  mark). Resume reads apart from the focus cursor by **hue**: resume is
+  `state.now`, the cursor is `state.focus` + the `bg.surface` band that stays the
+  cursor's alone. (For 3-digit / non-numeric labels the `▸` drops — no room in
+  the 5-wide cell — and the `state.now` colour carries resume on its own.)
 - Watched cells (`1`–`6` here) recede via `text.dim`, **no glyph**. A filled mark
   like `●` would out-weigh the resume arrow and invert the hierarchy (the done,
   receding cells shouting louder than the one you should act on), so watched is
