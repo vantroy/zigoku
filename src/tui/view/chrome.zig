@@ -20,18 +20,37 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     put(win, 0, 2, "地獄 zigoku", self.s(self.palette.fg, .{ .bold = true }));
     if (w > 16) put(win, 0, 14, "░", self.s(self.palette.chrome, .{}));
 
-    // Render the chip after the separator (§10.3b).
+    // The view-label chip after the separator (§10.3b). ROD-186: Browse's old
+    // `⠋ search` spinner stub retires — search status lives in the bottom bar — so
+    // every view now reads a static identity chip in state.focus.
     const chip_col: u16 = 16;
     const chip: []const u8 = switch (self.active_view) {
         .history => "Watchlist",
         .detail => switch (self.detail_origin) {
-            .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
+            .browse => "Browse",
             .history => "Watchlist",
         },
         .settings => "Settings",
-        .browse => std.fmt.bufPrint(&self.chip_buf, "{s} search", .{self.spinnerChar()}) catch "⠋ search",
+        .browse => "Browse",
     };
     put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
+
+    // ROD-186: the season/year chip rides two spaces after the view label, in
+    // text.muted (fg2) so it reads as metadata beside the cyan identity chip and
+    // never competes with the cyan `·` dot at the right edge (Mira header ruling).
+    // Content (App.topBarSeasonChip): the selected show's season+year, falling back
+    // to the current cour; "" in Settings and for unenriched shows in the zoom.
+    const season = self.topBarSeasonChip();
+    if (season.len > 0) {
+        // chip is ASCII; one kanji is 3 bytes / 2 display cells, so display width
+        // is byte len minus the kanji's extra byte.
+        const season_w: u16 = @as(u16, @intCast(season.len)) - 1;
+        const season_col: u16 = chip_col + @as(u16, @intCast(chip.len)) + 2;
+        // Drop the chip before it would crowd the `·` at w-2 (keep ≥3 cells of air).
+        if (w > season_col + season_w + 4) {
+            put(win, 0, season_col, season, self.s(self.palette.fg2, .{}));
+        }
+    }
 
     // Render the · indicator right-aligned (§10.3b). ROD-170: History is now a
     // two-pane view, so it dims on list focus / lights on detail focus exactly
