@@ -97,6 +97,49 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail:
     putClipped(win, row, frac_col, frac_max, frac, style(frac_color, .{ .bg = row_bg }));
 }
 
+/// Truncate `text` to at most `max_cols` display columns, copying the result
+/// into `buf` and appending a single-column "…" when (and only when) truncation
+/// actually happened (ROD-166, §4.7). Cuts on grapheme-cluster boundaries via
+/// vaxis's iterator, so a multibyte cluster is never split — and measures real
+/// display width (gwidth), so a wide CJK glyph counts as the 2 columns it paints.
+///
+/// Unlike `putClipped` (which clips silently at the cell grid), this leaves a "…"
+/// affordance so the user knows the copy was cut. Returns the slice of `buf`
+/// written. The copy stops early if the next cluster + "…" would overflow `buf`,
+/// so a [80]u8 caller can never overrun regardless of how byte-dense the input
+/// is (the toast budget is 36 cols / well within 80 bytes for any real copy).
+pub fn truncateToWidth(buf: []u8, text: []const u8, max_cols: u16) []const u8 {
+    if (max_cols == 0) return buf[0..0];
+    // Fast path only when the copy fits BOTH the column budget AND the byte
+    // buffer — a string can be ≤ max_cols columns yet byte-denser than `buf`
+    // (multibyte clusters), and a plain `@min` clip there would shear a cluster
+    // mid-sequence with no "…" affordance. Such input falls through to the
+    // grapheme-walking path below, which cuts on a boundary and appends "…".
+    if (vaxis.gwidth.gwidth(text, .unicode) <= max_cols and text.len <= buf.len) {
+        @memcpy(buf[0..text.len], text);
+        return buf[0..text.len];
+    }
+    const ellipsis = "…"; // U+2026: 1 display column, 3 UTF-8 bytes.
+    if (buf.len < ellipsis.len) return buf[0..0];
+    // Reserve one column for the "…" we are about to append (max_cols ≥ 1 here,
+    // guarded at the top).
+    const budget: u16 = max_cols - 1;
+    var cols: u16 = 0;
+    var len: usize = 0;
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const cluster = g.bytes(text);
+        const gw = vaxis.gwidth.gwidth(cluster, .unicode);
+        if (cols + gw > budget) break;
+        if (len + cluster.len + ellipsis.len > buf.len) break;
+        @memcpy(buf[len .. len + cluster.len], cluster);
+        len += cluster.len;
+        cols += gw;
+    }
+    @memcpy(buf[len .. len + ellipsis.len], ellipsis);
+    return buf[0 .. len + ellipsis.len];
+}
+
 pub fn put(win: vaxis.Window, row: u16, col: u16, text: []const u8, sty: vaxis.Style) void {
     _ = win.printSegment(.{ .text = text, .style = sty }, .{ .row_offset = row, .col_offset = col });
 }
@@ -198,6 +241,50 @@ test "barFillColor: focus cyan is the cursor, and the cursor overrides status (R
     try testing.expectEqual(pal.chrome, barFillColor(mkRec(.planning), false, true, pal));
     try testing.expectEqual(pal.fg3, barFillColor(mkRec(.completed), false, true, pal));
     try testing.expectEqual(pal.fg3, barFillColor(mkRec(.dropped), false, true, pal));
+}
+
+test "truncateToWidth: short copy is passed through verbatim (ROD-166)" {
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("network down", truncateToWidth(&buf, "network down", 36));
+    // Exactly at the budget is not truncation — no ellipsis.
+    try testing.expectEqualStrings("123456", truncateToWidth(&buf, "123456", 6));
+}
+
+test "truncateToWidth: long copy is cut on a boundary with a trailing … (ROD-166)" {
+    var buf: [80]u8 = undefined;
+    // 8 ASCII chars, budget 5 → 4 cols of text + "…" = 5 display columns.
+    try testing.expectEqualStrings("abcd…", truncateToWidth(&buf, "abcdefgh", 5));
+    // The result is one byte longer than the budget (… is 3 bytes) but 5 cols wide.
+    const out = truncateToWidth(&buf, "abcdefgh", 5);
+    try testing.expectEqual(@as(u16, 5), vaxis.gwidth.gwidth(out, .unicode));
+}
+
+test "truncateToWidth: never splits a multibyte cluster, counts display width (ROD-166)" {
+    var buf: [80]u8 = undefined;
+    // Each CJK glyph is 2 display columns / 3 bytes. Budget 5 leaves 4 cols for
+    // text (one reserved for …): two glyphs (4 cols) fit, the third does not.
+    const out = truncateToWidth(&buf, "東京都市", 5);
+    try testing.expectEqualStrings("東京…", out);
+    try testing.expectEqual(@as(u16, 5), vaxis.gwidth.gwidth(out, .unicode));
+}
+
+test "truncateToWidth: byte-dense but column-narrow input falls off the fast path safely (ROD-166)" {
+    // 3 CJK glyphs = 6 display cols / 9 bytes, into an 8-byte buf with a generous
+    // column budget. It fits the columns but NOT the bytes — the fast path's
+    // `text.len <= buf.len` guard rejects it so it cuts on a cluster boundary
+    // with "…" instead of shearing a 3-byte glyph mid-sequence (Elara M1 / Nyra).
+    var buf: [8]u8 = undefined;
+    const out = truncateToWidth(&buf, "東京都", 10);
+    try testing.expect(std.unicode.utf8ValidateSlice(out)); // never mid-cluster
+    try testing.expect(std.mem.endsWith(u8, out, "…"));
+}
+
+test "truncateToWidth: a single grapheme wider than the budget yields just … (ROD-166)" {
+    // A 2-col glyph against a 1-col budget can't fit even one cluster → "…".
+    var buf: [80]u8 = undefined;
+    try testing.expectEqualStrings("…", truncateToWidth(&buf, "東", 1));
+    // max_cols == 0 is a 0-column budget: empty, not even "…".
+    try testing.expectEqualStrings("", truncateToWidth(&buf, "anything", 0));
 }
 
 test "barFracColor: text.muted only on the selected, list-focused watching/paused row (ROD-194)" {
