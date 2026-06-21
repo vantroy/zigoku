@@ -686,6 +686,7 @@ test "Space in single-column browse (<60) opens the zoom (ROD-194)" {
     try testing.expectEqual(.detail, app.active_view);
     try testing.expectEqual(.browse, app.detail_origin);
     try testing.expectEqual(.detail, app.active_pane);
+    try testing.expectEqualStrings("x", app.episodes.for_id orelse return error.TestExpectationFailed);
 }
 
 test "l in single-column browse (<60) is a no-op — no pane to focus, chip stays dim (ROD-194)" {
