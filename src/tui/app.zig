@@ -641,7 +641,7 @@ pub const App = struct {
     /// list cursor, so the cover tracks the cursor like the cheap synchronous
     /// fields already do via renderedDetailAnime:
     ///   - split browse (cols >= 60, list pane active): the results cursor;
-    ///   - wide history (cols >= 100, ROD-113 preview engaged): the focused record.
+    ///   - two-pane history (cols >= pane_split_min, ROD-170): the focused record.
     /// Everywhere else it defers to currentDetailAnime's "actively-focused show"
     /// contract, which is load-bearing for play/cache/stale-check paths and must
     /// not shift (ROD-156).
@@ -1424,14 +1424,21 @@ pub const App = struct {
                 // to save-then-leave. Keep it out of this arm so a future change
                 // can't silently route a settings-q exit past saveSettings.
                 .history => {
-                    self.active_view = .browse;
-                    self.active_pane = .list;
-                    // Reset the viewport on the way out: list_top is a physical-row
-                    // offset in History but an entry index in Browse — carrying a
-                    // stale value across the semantic split is a latent trap. Match
-                    // the F1/F2 view-switch arms (cursor + top both to the top).
-                    self.list_cursor = 0;
-                    self.list_top = 0;
+                    if (self.active_pane == .detail) {
+                        // ROD-170: q from a focused detail pane backs one level to
+                        // the list (the help line reads "q back"). Astra D1: it used
+                        // to fall through to the list-exit below, jumping to Browse.
+                        self.active_pane = .list;
+                    } else {
+                        self.active_view = .browse;
+                        self.active_pane = .list;
+                        // Reset the viewport on the way out: list_top is a physical-row
+                        // offset in History but an entry index in Browse — carrying a
+                        // stale value across the semantic split is a latent trap. Match
+                        // the F1/F2 view-switch arms (cursor + top both to the top).
+                        self.list_cursor = 0;
+                        self.list_top = 0;
+                    }
                 },
                 .settings => unreachable,
                 .detail => {
