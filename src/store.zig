@@ -1185,6 +1185,8 @@ test "recordPlay with completed=false records the play but not the progress" {
     try testing.expectEqual(@as(i64, 1), rows[0].play_count); // play counted
     try testing.expectEqual(@as(?i64, 2000), rows[0].last_watched_at);
     try testing.expectEqual(@as(i64, 0), rows[0].progress); // NOT advanced
+    // A play is a play: even a partial watch flips planning → watching (ROD-139).
+    try testing.expectEqual(domain.ListStatus.watching, rows[0].list_status);
 
     // A subsequent completed watch of episode 4 does advance it.
     try s.recordPlay(T_SOURCE, "x", 4, 2100, true);
@@ -1310,6 +1312,50 @@ test "setListStatus on an unknown show is a silent no-op" {
     defer s.close();
     try s.setListStatus(T_SOURCE, "ghost", .completed); // must not error
     try testing.expect((try s.getAnime(arena, T_SOURCE, "ghost")) == null);
+}
+
+test "recordPlay after a manual drop auto-resumes to watching (ROD-139)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try s.recordPlay(T_SOURCE, "a", 3, 2000, true); // watching
+    try s.setListStatus(T_SOURCE, "a", .dropped);
+    try testing.expectEqual(domain.ListStatus.dropped, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
+
+    // Pressing play on a dropped show means you're watching it again.
+    try s.recordPlay(T_SOURCE, "a", 4, 2001, true);
+    const rec = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.watching, rec.list_status);
+    try testing.expectEqual(@as(i64, 4), rec.progress); // high-water advanced
+}
+
+test "setListStatus resume (.watching) and re-plan (.planning) paths (ROD-139)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try s.recordPlay(T_SOURCE, "a", 6, 2000, true); // watching, progress 6
+    try s.setListStatus(T_SOURCE, "a", .paused);
+
+    // Resume: paused → watching, progress untouched (not a watch event).
+    try s.setListStatus(T_SOURCE, "a", .watching);
+    const resumed = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.watching, resumed.list_status);
+    try testing.expectEqual(@as(i64, 6), resumed.progress);
+    try testing.expectEqual(@as(i64, 1), resumed.play_count); // manual move didn't bump
+
+    // Re-plan: back to planning, progress still preserved (manual, not a reset).
+    try s.setListStatus(T_SOURCE, "a", .planning);
+    const replanned = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.planning, replanned.list_status);
+    try testing.expectEqual(@as(i64, 6), replanned.progress);
 }
 
 test "episode cache: hit, expiry, sub/dub separation" {
