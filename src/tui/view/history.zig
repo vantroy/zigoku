@@ -189,6 +189,9 @@ const DrawCtx = struct {
         if (c.header_i < c.scratch.hist_header.len) {
             const buf = &c.scratch.hist_header[c.header_i];
             const cnt = std.fmt.bufPrint(buf, " ({d})", .{count}) catch "";
+            // `label.len` doubles as the column advance because every ListStatus
+            // tag is ASCII (byte length == display width); revisit if a non-ASCII
+            // status label is ever added.
             put(c.win, row, 4 + @as(u16, @intCast(label.len)), cnt, self.s(self.palette.fg2, .{}));
             c.header_i += 1;
         }
