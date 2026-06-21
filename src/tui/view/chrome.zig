@@ -119,16 +119,24 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
             .list => "hjkl · / search · F1/F2/F3 views · q quit",
-            .detail => "hjkl scroll · h back · enter play · q back",
+            // ROD-170: detail pane can promote to the full-screen zoom with Space.
+            .detail => "hjkl scroll · h back · enter play · space zoom · q back",
         },
+        // ROD-170: History is a two-pane like Browse. List focus keeps the
+        // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
+        // Browse detail line, adding the Space zoom only where the grid lives
+        // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
         .history => if (self.history.len == 0)
             "/ search · F1 browse · q quit"
-        else
-            // p/x/c/w surface the ROD-139 watch-state transitions per §3.5's
-            // contextual help line. F-keys bundled (matches the browse line) to
-            // keep settings discoverable without overflowing the row.
-            "jk move · enter open · p/x/c/w status · F1/F2/F3 views · q quit",
-        .detail => "hjkl scroll · h back · enter play · q back",
+        else switch (self.active_pane) {
+            .list => "jk move · l/enter detail · p/x/c/w status · F1/F2/F3 · q quit",
+            .detail => if (w >= App.zoom_min)
+                "hjkl scroll · h back · enter play · space zoom · q back"
+            else
+                "h back · q back",
+        },
+        // The full-screen zoom: Space or Esc demote back to the pane; q backs out.
+        .detail => "hjkl scroll · enter play · space/esc back · q back",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
