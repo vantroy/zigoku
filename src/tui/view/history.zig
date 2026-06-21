@@ -137,16 +137,16 @@ pub fn geometry(self: *const App) Geometry {
 
 /// The record under the cursor in §5.4 grouped order — the same ordering the
 /// renderer paints, so the highlighted row and the focused record never diverge.
+/// Null when no entry is focused — empty history OR a filter hiding every row;
+/// `scan` reports both as a null `rec` (no early-out needed, see ScanCtx).
 pub fn recordAtCursor(self: *const App) ?AnimeRecord {
-    if (self.history.len == 0) return null;
     return scan(self).rec;
 }
 
 /// The cursor entry's index into self.history (grouped order) — for callers that
-/// mutate the record in place (e.g. a manual status change). Null if no entry is
-/// focused (empty history or a filter hiding every row).
+/// mutate the record in place (e.g. a manual status change). Null when no entry
+/// is focused (empty history OR a filter hiding every row — both via `scan`).
 pub fn indexAtCursor(self: *const App) ?usize {
-    if (self.history.len == 0) return null;
     return scan(self).index;
 }
 
