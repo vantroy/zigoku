@@ -22,6 +22,60 @@ pub const Translation = enum {
     }
 };
 
+/// Watchlist state for a tracked show (ROD-139, §2.4). Persisted as the lowercase
+/// `@tagName` in `anime.list_status` (TEXT NOT NULL DEFAULT 'planning'). This enum
+/// is the single source of valid states — the column carries no CHECK; it trusts us.
+pub const ListStatus = enum {
+    planning,
+    watching,
+    paused,
+    completed,
+    dropped,
+
+    /// Persisted form — the literal stored in `anime.list_status`. `@tagName` keeps
+    /// the column value and the tag in lockstep: add a state, its string comes free.
+    pub fn str(self: ListStatus) []const u8 {
+        return @tagName(self);
+    }
+
+    /// Parse the stored column value. Unknown/empty → `planning` (the column
+    /// default): an absent or corrupt status is "not started", never a wrong
+    /// active state. Exact-match against tag names — we only ever write tag names.
+    pub fn fromString(s: []const u8) ListStatus {
+        return std.meta.stringToEnum(ListStatus, s) orelse .planning;
+    }
+
+    /// The status produced by a play/progress event (ROD-139 §1, auto-transitions
+    /// only). `progress` is the post-play high-water mark; `total` is the show's
+    /// episode count (null = unknown/ongoing). Pure + exhaustive so the state
+    /// machine is unit-testable with no DB. Manual states (pause/drop/force) go
+    /// through `Store.setListStatus`, never here.
+    pub fn afterPlay(current: ListStatus, progress: i64, total: ?i64) ListStatus {
+        // A finished show stays finished — a rewatch must not demote it.
+        if (current == .completed) return .completed;
+        // Reaching the known finale completes it.
+        if (total) |t| {
+            if (t > 0 and progress >= t) return .completed;
+        }
+        // Any play of an unfinished show (planning/watching/paused/dropped) means
+        // it's being watched now.
+        return .watching;
+    }
+
+    /// History grouping order (ROD-139 §3 / §5.4); lower sorts higher in the list.
+    /// Deliberately `planning` before `paused` — Rod's call, overriding Mira's
+    /// active-intent ordering (which put paused first). Not an accident.
+    pub fn groupRank(self: ListStatus) u8 {
+        return switch (self) {
+            .watching => 0,
+            .planning => 1,
+            .paused => 2,
+            .completed => 3,
+            .dropped => 4,
+        };
+    }
+};
+
 /// The user's stream-quality preference (ROD-152). `best`/`worst` are the
 /// open-ended sentinels; the rungs name a vertical-pixel ceiling. The provider
 /// applies a *cap* policy against whatever variants a source actually exposes —
@@ -279,4 +333,44 @@ test "Season.kanji returns correct glyphs" {
     try std.testing.expectEqualStrings("春", Season.spring.kanji());
     try std.testing.expectEqualStrings("夏", Season.summer.kanji());
     try std.testing.expectEqualStrings("秋", Season.fall.kanji());
+}
+
+test "ListStatus.fromString parses tags and falls back to planning" {
+    try std.testing.expectEqual(ListStatus.watching, ListStatus.fromString("watching"));
+    try std.testing.expectEqual(ListStatus.dropped, ListStatus.fromString("dropped"));
+    // Round-trips through the persisted form.
+    try std.testing.expectEqual(ListStatus.completed, ListStatus.fromString(ListStatus.completed.str()));
+    // Unknown/empty/corrupt → planning ("not started"), never a wrong active state.
+    try std.testing.expectEqual(ListStatus.planning, ListStatus.fromString(""));
+    try std.testing.expectEqual(ListStatus.planning, ListStatus.fromString("garbage"));
+    try std.testing.expectEqual(ListStatus.planning, ListStatus.fromString("WATCHING")); // case-sensitive: we only write lowercase
+}
+
+test "ListStatus.afterPlay drives the auto-transition table (ROD-139 §1)" {
+    const S = ListStatus;
+    // planning → watching on first play (no finale reached).
+    try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 1, 12));
+    // watching stays watching mid-run.
+    try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 5, 12));
+    // watching → completed when progress reaches the known finale.
+    try std.testing.expectEqual(S.completed, S.afterPlay(.watching, 12, 12));
+    try std.testing.expectEqual(S.completed, S.afterPlay(.watching, 13, 12)); // overshoot still completes
+    // paused / dropped resume to watching on a play.
+    try std.testing.expectEqual(S.watching, S.afterPlay(.paused, 3, 12));
+    try std.testing.expectEqual(S.watching, S.afterPlay(.dropped, 3, 12));
+    // A finished show stays finished across rewatches — no demotion.
+    try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 1, 12));
+    try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 12, 12));
+    // Unknown total (ongoing): never auto-completes, just marks watching.
+    try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 99, null));
+    // total <= 0 is treated as unknown (guards the AllAnime "0 episodes" quirk).
+    try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 5, 0));
+}
+
+test "ListStatus.groupRank orders watching → planning → paused → completed → dropped" {
+    // Rod's ordering (planning before paused), overriding Mira's active-intent spec.
+    try std.testing.expect(ListStatus.watching.groupRank() < ListStatus.planning.groupRank());
+    try std.testing.expect(ListStatus.planning.groupRank() < ListStatus.paused.groupRank());
+    try std.testing.expect(ListStatus.paused.groupRank() < ListStatus.completed.groupRank());
+    try std.testing.expect(ListStatus.completed.groupRank() < ListStatus.dropped.groupRank());
 }

@@ -164,7 +164,7 @@ pub const AnimeRecord = struct {
     start_month: ?i64 = null,
     start_day: ?i64 = null,
     genres: []const []const u8 = &.{},
-    list_status: []const u8 = "planning",
+    list_status: domain.ListStatus = .planning,
     user_rating: ?f64 = null,
     notes: ?[]const u8 = null,
     play_count: i64 = 0,
@@ -352,7 +352,7 @@ pub const Store = struct {
         bindOptText(stmt, 10, a.description);
         bindOptI64(stmt, 11, a.score);
         bindOptI64(stmt, 12, a.total_episodes);
-        bindText(stmt, 13, a.list_status);
+        bindText(stmt, 13, a.list_status.str());
         bindOptF64(stmt, 14, a.user_rating);
         bindOptText(stmt, 15, a.notes);
         _ = c.sqlite3_bind_int64(stmt, 16, a.play_count);
@@ -408,7 +408,7 @@ pub const Store = struct {
                 .description = try dupeText(arena, stmt, 9),
                 .score = colOptI64(stmt, 10),
                 .total_episodes = colOptI64(stmt, 11),
-                .list_status = try dupeText(arena, stmt, 12) orelse "planning",
+                .list_status = colStatus(stmt, 12),
                 .user_rating = colOptF64(stmt, 13),
                 .notes = try dupeText(arena, stmt, 14),
                 .play_count = c.sqlite3_column_int64(stmt, 15),
@@ -456,7 +456,7 @@ pub const Store = struct {
             .description = try dupeText(arena, stmt, 9),
             .score = colOptI64(stmt, 10),
             .total_episodes = colOptI64(stmt, 11),
-            .list_status = try dupeText(arena, stmt, 12) orelse "planning",
+            .list_status = colStatus(stmt, 12),
             .user_rating = colOptF64(stmt, 13),
             .notes = try dupeText(arena, stmt, 14),
             .play_count = c.sqlite3_column_int64(stmt, 15),
@@ -473,25 +473,79 @@ pub const Store = struct {
         };
     }
 
-    /// Record a play of `episode_index` (1-based): always bumps play_count,
-    /// last_watched_at and history visibility — a play is a play. The `progress`
-    /// high-water mark only advances when `completed` (ROD-168): a partial watch
-    /// belongs in history but must not mark the episode watched-through. When
-    /// `completed` is false the bind is a 0 floor, so `MAX(progress, 0)` is a
-    /// no-op (progress is never negative).
+    /// (status, progress high-water, total episodes) for one show, or null if it
+    /// isn't tracked. The minimal read the watch-state machine needs — no arena, no
+    /// full AnimeRecord — and a uniform unknown-show guard for the transition paths.
+    const StatusRow = struct { status: domain.ListStatus, progress: i64, total: ?i64 };
+    fn statusRow(self: *Store, source: []const u8, source_id: []const u8) Error!?StatusRow {
+        const stmt = try self.prepare("SELECT list_status, progress, total_episodes FROM anime WHERE source = ? AND source_id = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, source);
+        bindText(stmt, 2, source_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .status = colStatus(stmt, 0),
+            .progress = c.sqlite3_column_int64(stmt, 1),
+            .total = colOptI64(stmt, 2),
+        };
+    }
+
+    /// Record a play of `episode_index` (1-based) and advance the watch-state
+    /// machine (ROD-139 §1). Always bumps play_count, last_watched_at and history
+    /// visibility — a play is a play. The `progress` high-water only advances when
+    /// `completed` (ROD-168): a partial watch belongs in history but must not mark
+    /// the episode watched-through.
+    ///
+    /// The new `list_status` is decided by `ListStatus.afterPlay` — a pure function
+    /// of (current status, post-play progress, total). We read the row first so the
+    /// transition lives in testable Zig, not a SQL CASE. Unknown show → silent
+    /// no-op (nothing to play).
     pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64, completed: bool) Error!void {
+        const cur = try self.statusRow(source, source_id) orelse return;
+        const new_progress = if (completed) @max(cur.progress, episode_index) else cur.progress;
+        const new_status = domain.ListStatus.afterPlay(cur.status, new_progress, cur.total);
+
         const sql =
             \\UPDATE anime
             \\SET play_count = play_count + 1,
             \\    last_watched_at = ?,
-            \\    progress = MAX(progress, ?),
+            \\    progress = ?,
+            \\    list_status = ?,
             \\    history_visible = 1
             \\WHERE source = ? AND source_id = ?
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, now);
-        _ = c.sqlite3_bind_int64(stmt, 2, if (completed) episode_index else 0);
+        _ = c.sqlite3_bind_int64(stmt, 2, new_progress);
+        bindText(stmt, 3, new_status.str());
+        bindText(stmt, 4, source);
+        bindText(stmt, 5, source_id);
+        try self.stepDone(stmt);
+    }
+
+    /// Manually set the watch-state (ROD-139 §1 manual transitions: pause / drop /
+    /// force-complete / re-plan / resume-to-watching). Unlike `recordPlay` this
+    /// never bumps play_count or last_watched_at — moving a show to paused/dropped
+    /// is not a watch event. It does make the row history-visible: an explicit
+    /// status means the user is tracking it. Force-complete snaps `progress` up to
+    /// `total_episodes` (when known) so the bar reads full; every other transition
+    /// leaves progress untouched. Unknown show → silent no-op.
+    pub fn setListStatus(self: *Store, source: []const u8, source_id: []const u8, status: domain.ListStatus) Error!void {
+        const cur = try self.statusRow(source, source_id) orelse return;
+        const new_progress = if (status == .completed) (cur.total orelse cur.progress) else cur.progress;
+
+        const sql =
+            \\UPDATE anime
+            \\SET list_status = ?,
+            \\    progress = ?,
+            \\    history_visible = 1
+            \\WHERE source = ? AND source_id = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, status.str());
+        _ = c.sqlite3_bind_int64(stmt, 2, new_progress);
         bindText(stmt, 3, source);
         bindText(stmt, 4, source_id);
         try self.stepDone(stmt);
@@ -759,6 +813,15 @@ fn dupeText(arena: Allocator, stmt: Stmt, idx: c_int) Error!?[]const u8 {
     const n: usize = @intCast(c.sqlite3_column_bytes(stmt, idx));
     return try arena.dupe(u8, ptr[0..n]);
 }
+/// Read a `list_status` column straight into the enum — no arena alloc, since the
+/// status is a fixed vocabulary, not free text. NULL/unknown → `planning` (matches
+/// the column default and `ListStatus.fromString`).
+fn colStatus(stmt: Stmt, idx: c_int) domain.ListStatus {
+    const ptr = c.sqlite3_column_text(stmt, idx);
+    if (ptr == null) return .planning;
+    const n: usize = @intCast(c.sqlite3_column_bytes(stmt, idx));
+    return domain.ListStatus.fromString(ptr[0..n]);
+}
 fn colOptI64(stmt: Stmt, idx: c_int) ?i64 {
     if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
     return c.sqlite3_column_int64(stmt, idx);
@@ -822,7 +885,7 @@ test "upsertAnime + loadHistory round-trips" {
     try testing.expectEqualStrings("abc", rows[0].source_id);
     try testing.expectEqualStrings("Frieren", rows[0].title);
     try testing.expectEqual(@as(?i64, 28), rows[0].total_episodes);
-    try testing.expectEqualStrings("planning", rows[0].list_status);
+    try testing.expectEqual(domain.ListStatus.planning, rows[0].list_status);
     try testing.expectEqual(@as(i64, 0), rows[0].play_count);
     try testing.expect(rows[0].history_visible);
 }
@@ -1120,6 +1183,116 @@ test "recordPlay with completed=false records the play but not the progress" {
     const rows2 = try s.loadHistory(arena);
     try testing.expectEqual(@as(i64, 4), rows2[0].progress);
     try testing.expectEqual(@as(i64, 2), rows2[0].play_count);
+}
+
+test "recordPlay transitions planning → watching and commits to the store" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+
+    // Default state is planning; a play of ep 1 flips it to watching. The
+    // getAnime below is a fresh SELECT against the (autocommitted) DB — it reads
+    // committed state, not the in-memory record, so this is the persistence proof
+    // (under SQLite autocommit a successful UPDATE is durable; a file reopen would
+    // assert nothing more).
+    try s.recordPlay(T_SOURCE, "a", 1, 2000, true);
+    const rec = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.watching, rec.list_status);
+}
+
+test "recordPlay auto-completes at the finale and stays completed on rewatch" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3 }, 1000, arena);
+
+    try s.recordPlay(T_SOURCE, "a", 2, 2000, true); // mid-run → watching
+    try testing.expectEqual(domain.ListStatus.watching, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
+
+    try s.recordPlay(T_SOURCE, "a", 3, 2001, true); // hits finale → completed
+    try testing.expectEqual(domain.ListStatus.completed, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
+
+    // A rewatch of ep 1 must NOT demote a finished show back to watching.
+    try s.recordPlay(T_SOURCE, "a", 1, 2002, true);
+    const rec = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.completed, rec.list_status);
+    try testing.expectEqual(@as(i64, 3), rec.progress); // high-water held
+    try testing.expectEqual(@as(i64, 3), rec.play_count); // every play still counts
+}
+
+test "recordPlay with unknown total never auto-completes" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A" }, 1000, arena); // total NULL
+
+    try s.recordPlay(T_SOURCE, "a", 99, 2000, true);
+    try testing.expectEqual(domain.ListStatus.watching, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
+}
+
+test "setListStatus: manual pause/drop without bumping play stats" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try s.recordPlay(T_SOURCE, "a", 4, 2000, true); // watching, progress 4, play_count 1
+
+    try s.setListStatus(T_SOURCE, "a", .paused);
+    const paused = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.paused, paused.list_status);
+    try testing.expectEqual(@as(i64, 1), paused.play_count); // not a watch event
+    try testing.expectEqual(@as(?i64, 2000), paused.last_watched_at); // untouched
+    try testing.expectEqual(@as(i64, 4), paused.progress); // untouched
+
+    try s.setListStatus(T_SOURCE, "a", .dropped);
+    try testing.expectEqual(domain.ListStatus.dropped, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
+}
+
+test "setListStatus: force-complete snaps progress to the known finale" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // Known total: force-complete should fill progress to the finale.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try s.setListStatus(T_SOURCE, "a", .completed);
+    const a = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.completed, a.list_status);
+    try testing.expectEqual(@as(i64, 12), a.progress);
+
+    // Unknown total: complete is honored but progress can't be snapped — left as-is.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001, arena);
+    try s.recordPlay(T_SOURCE, "b", 3, 2000, true); // progress 3, total unknown
+    try s.setListStatus(T_SOURCE, "b", .completed);
+    const b = (try s.getAnime(arena, T_SOURCE, "b")).?;
+    try testing.expectEqual(domain.ListStatus.completed, b.list_status);
+    try testing.expectEqual(@as(i64, 3), b.progress); // unchanged, no total to snap to
+}
+
+test "setListStatus on an unknown show is a silent no-op" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.setListStatus(T_SOURCE, "ghost", .completed); // must not error
+    try testing.expect((try s.getAnime(arena, T_SOURCE, "ghost")) == null);
 }
 
 test "episode cache: hit, expiry, sub/dub separation" {
