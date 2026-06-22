@@ -202,14 +202,15 @@ pub const AllAnime = struct {
         _ = self;
         // For search, `variables` is a plain object (not stringified — that's the
         // quirk that differs per persisted op). Only the query needs escaping.
-        // We ask AllAnime for 26 candidates (its own page size) regardless of
-        // opts.limit, so the ranking comparator has a full pool to reorder before
-        // we trim to opts.limit below.
+        // Ask AllAnime for exactly one page (`search_page_size`): the server's page
+        // stride then matches the UI's, so `page` always advances by the same count
+        // the load-more footer keys off (ROD-201). We rank the returned page below
+        // and trim to opts.limit (which workers set to the same constant).
         const q = try jsonEscape(arena, query);
         const body = try std.fmt.allocPrint(
             arena,
-            "{{\"variables\":{{\"search\":{{\"query\":\"{s}\"}},\"limit\":26,\"page\":{d},\"translationType\":\"{s}\",\"countryOrigin\":\"ALL\"}},\"extensions\":\"{s}\"}}",
-            .{ q, opts.page, opts.translation.str(), EXT_SEARCH },
+            "{{\"variables\":{{\"search\":{{\"query\":\"{s}\"}},\"limit\":{d},\"page\":{d},\"translationType\":\"{s}\",\"countryOrigin\":\"ALL\"}},\"extensions\":\"{s}\"}}",
+            .{ q, source.search_page_size, opts.page, opts.translation.str(), EXT_SEARCH },
         );
 
         const raw = try post(arena, io, body, REFERER_API);
