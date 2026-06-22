@@ -2189,12 +2189,15 @@ pub const App = struct {
         if (self.list_cursor != prev_cursor and self.detailSyncActive()) {
             self.detail_sync_deadline_ms = nowMs(io) + 300;
         }
-        // Load-more: at last result + j, trigger page+1 if possible.
-        if (key.matches('j', .{}) and
+        // Load-more: at the last result, a downward keystroke pages in the next page.
+        // Must accept the Down arrow too, not just 'j' — the cursor-nav above already
+        // honors both, so a j-only trigger left the ╌ more ╌ footer unreachable for
+        // arrow-key users (ROD-156 parity gap: infinite scroll that wasn't; ROD-201).
+        if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and
             self.active_view == .browse and
             self.list_cursor == nav_len - 1 and
             self.search_page > 0 and
-            nav_len % 26 == 0 and
+            nav_len % source_mod.search_page_size == 0 and
             !self.search_loading)
         {
             self.fireSearch(loop, io, provider, self.search_page + 1);

@@ -16,6 +16,14 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const domain = @import("domain.zig");
 
+/// Canonical search page size — how many results a single page fetches and the UI
+/// appends per load-more. The browse footer (`╌ more ╌`) and the load-more trigger
+/// both key off `results.len % search_page_size == 0`, so this MUST equal the count
+/// a full page actually returns. Workers pass it as `SearchOptions.limit`; the
+/// provider's query asks for exactly this many so the server's page stride matches
+/// the UI's. Change the page size here and nowhere else (ROD-201).
+pub const search_page_size: usize = 26;
+
 pub const SearchOptions = struct {
     translation: domain.Translation = .sub,
     /// Cap on results returned after ranking.
