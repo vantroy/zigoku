@@ -559,6 +559,111 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
+    /// Restore an exact (list_status, progress) pair for undo (ROD-193 §B).
+    /// Unlike `setListStatus`, this writes `progress` verbatim and never applies
+    /// the force-complete snap — undo must reinstate the captured prior value, not
+    /// re-derive it. Mirrors `setListStatus`'s `history_visible = 1` so an undone
+    /// row stays on the watchlist.
+    pub fn restoreListStatus(self: *Store, source: []const u8, source_id: []const u8, status: domain.ListStatus, progress: i64) Error!void {
+        const sql =
+            \\UPDATE anime
+            \\SET list_status = ?,
+            \\    progress = ?,
+            \\    history_visible = 1
+            \\WHERE source = ? AND source_id = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, status.str());
+        _ = c.sqlite3_bind_int64(stmt, 2, progress);
+        bindText(stmt, 3, source);
+        bindText(stmt, 4, source_id);
+        try self.stepDone(stmt);
+    }
+
+    // ── ROD-193: recompute progress from episode_progress ────────────────────
+
+    /// Recompute `anime.progress` for one show from its `episode_progress` rows
+    /// (ROD-193). Returns the new high-water so the caller can patch in-memory
+    /// state without a re-read.
+    ///
+    /// **Strategy A — sorted-index:** collect all `episode_progress` rows for
+    /// (source, source_id, translation), sort them by `EpisodeNumber.sortKey`
+    /// (ascending, matching the detail grid), then set `progress` to the 1-based
+    /// index of the last row whose `fully_watched = 1`. If no row is
+    /// fully-watched the result is 0. Rows for episodes that have never been
+    /// started are not present in `episode_progress`, so the count reflects only
+    /// what was started and finished.
+    ///
+    /// **Named contract:** progress is the 1-based ordinal of the last
+    /// fully-watched episode among the rows present — not a count of total watched
+    /// episodes, not an absolute episode number. Gap-watching (e.g. only eps 3 and
+    /// 5 fully watched, nothing else stored) produces a result of 2 (index of the
+    /// last fully-watched row in the sorted 2-row slice), intentionally
+    /// under-counting. This is the single source of truth for recompute semantics.
+    ///
+    /// Translation-scoped on purpose: `anime.progress` tracks the last-watched
+    /// high-water for the tracked translation; mixing sub and dub rows would give
+    /// a meaningless combined count. Accepted limitation (ROD-193 review): if the
+    /// session's translation has no rows but another does (watched dub, recomputing
+    /// in sub), this returns 0 — single-translation usage, not worth the machinery.
+    ///
+    /// This is recompute-only: no episode_progress rows are deleted. A show with
+    /// no fully_watched rows recomputes to 0.
+    pub fn recomputeProgress(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
+        // 1. Fetch all episode_progress rows for this (source, source_id, translation).
+        const sql_sel =
+            \\SELECT episode, fully_watched FROM episode_progress
+            \\WHERE source = ? AND source_id = ? AND translation = ?
+        ;
+        const stmt = try self.prepare(sql_sel);
+        defer _ = c.sqlite3_finalize(stmt);
+        bindText(stmt, 1, source);
+        bindText(stmt, 2, source_id);
+        bindText(stmt, 3, tt.str());
+
+        // 2. Collect rows into a scratch-allocated list; dupe labels into scratch.
+        const Row = struct { ep: domain.EpisodeNumber, watched: bool };
+        var rows: std.ArrayList(Row) = .empty;
+        while (true) {
+            switch (c.sqlite3_step(stmt)) {
+                c.SQLITE_ROW => {
+                    const label_ptr = c.sqlite3_column_text(stmt, 0);
+                    const label_len: usize = if (label_ptr != null) @intCast(c.sqlite3_column_bytes(stmt, 0)) else 0;
+                    const label = if (label_ptr != null) try scratch.dupe(u8, label_ptr[0..label_len]) else try scratch.dupe(u8, "");
+                    const fw = c.sqlite3_column_int64(stmt, 1) != 0;
+                    try rows.append(scratch, .{ .ep = .{ .raw = label }, .watched = fw });
+                },
+                c.SQLITE_DONE => break,
+                else => return error.Step,
+            }
+        }
+
+        // 3. Sort by EpisodeNumber.sortKey (ascending), matching the detail grid.
+        std.mem.sort(Row, rows.items, {}, struct {
+            fn lessThan(_: void, a: Row, b: Row) bool {
+                return a.ep.sortKey() < b.ep.sortKey();
+            }
+        }.lessThan);
+
+        // 4. high_water = 1-based index of the LAST row with fully_watched=1.
+        var high_water: i64 = 0;
+        for (rows.items, 0..) |row, i| {
+            if (row.watched) high_water = @intCast(i + 1);
+        }
+
+        // 5. UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?
+        const sql_upd = "UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?";
+        const upd = try self.prepare(sql_upd);
+        defer _ = c.sqlite3_finalize(upd);
+        _ = c.sqlite3_bind_int64(upd, 1, high_water);
+        bindText(upd, 2, source);
+        bindText(upd, 3, source_id);
+        try self.stepDone(upd);
+
+        return high_water;
+    }
+
     // ── ROD-67: episode resume read/write ────────────────────────────────────
 
     /// Upsert the resume point for one (show, track, episode). `fully_watched`
@@ -1419,4 +1524,75 @@ test "recordPlay on an unknown show is a silent no-op" {
     // conjure a row.
     try s.recordPlay(T_SOURCE, "ghost", 1, 1000, true);
     try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
+}
+
+test "recomputeProgress: contiguous high-water (ROD-193)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .total_episodes = 5 }, 1000, arena);
+    // Seed eps 1..5 all fully_watched (position_secs / duration_secs >= 0.95).
+    try s.saveProgress(T_SOURCE, "x", .sub, "1", 950, 1000, 1001);
+    try s.saveProgress(T_SOURCE, "x", .sub, "2", 950, 1000, 1002);
+    try s.saveProgress(T_SOURCE, "x", .sub, "3", 950, 1000, 1003);
+    try s.saveProgress(T_SOURCE, "x", .sub, "4", 950, 1000, 1004);
+    try s.saveProgress(T_SOURCE, "x", .sub, "5", 950, 1000, 1005);
+
+    const hw = try s.recomputeProgress(arena, T_SOURCE, "x", .sub);
+    try testing.expectEqual(@as(i64, 5), hw);
+
+    // Confirm the store row was updated too.
+    const rec = (try s.getAnime(arena, T_SOURCE, "x")).?;
+    try testing.expectEqual(@as(i64, 5), rec.progress);
+}
+
+test "recomputeProgress: no episode_progress rows → 0 (ROD-193)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // An anime row with a forced-complete progress (c key clobbers it to total).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .total_episodes = 12 }, 1000, arena);
+    try s.setListStatus(T_SOURCE, "x", .completed); // snaps progress to 12
+
+    const before = (try s.getAnime(arena, T_SOURCE, "x")).?;
+    try testing.expectEqual(@as(i64, 12), before.progress); // confirm clobber
+
+    // No episode_progress rows exist → recompute → 0.
+    const hw = try s.recomputeProgress(arena, T_SOURCE, "x", .sub);
+    try testing.expectEqual(@as(i64, 0), hw);
+
+    const after = (try s.getAnime(arena, T_SOURCE, "x")).?;
+    try testing.expectEqual(@as(i64, 0), after.progress);
+}
+
+test "recomputeProgress: gap-watch documents strategy-A under-count (ROD-193)" {
+    // Strategy A contract: progress = 1-based index of the last fully-watched row
+    // among the rows PRESENT in episode_progress, sorted by sortKey. Rows for
+    // episodes never started are absent from episode_progress — this is by design.
+    // Gap-watching (only eps 3 and 5 in episode_progress, both fully_watched, no
+    // rows for 1/2/4) yields high_water = 2: the 2-row sorted slice has its last
+    // fully-watched entry at index 1 (0-based), i.e. 1-based index 2.
+    // This LOCKS the intentional under-count: strategy A is correct for contiguous
+    // watchers (the DoD case) and deliberately under-counts gaps. Do not change
+    // this expectation without updating the recomputeProgress doc comment.
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .total_episodes = 5 }, 1000, arena);
+    // Only rows for eps 3 and 5; eps 1, 2, 4 were never started (no rows).
+    try s.saveProgress(T_SOURCE, "x", .sub, "3", 950, 1000, 1001);
+    try s.saveProgress(T_SOURCE, "x", .sub, "5", 950, 1000, 1002);
+
+    const hw = try s.recomputeProgress(arena, T_SOURCE, "x", .sub);
+    // Sorted rows: ["3", "5"]. Last fully-watched is index 1 (0-based) → 1-based = 2.
+    try testing.expectEqual(@as(i64, 2), hw);
 }

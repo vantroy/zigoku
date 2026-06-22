@@ -686,6 +686,8 @@ state.now` escalation.
 | Settings saved | write succeeded | success | `settings saved` | no |
 | Settings — no config dir | dir missing, skipped | warn | `no config dir — not saved` | no |
 | Settings save failed | write error | error | `settings save failed` | no |
+| `progress_reset` | selected show present (r key) | success | `progress reset` | no |
+| `undo` | undo of a status mutation (u key) | info | `undone` | no |
 
 Copy: single line, lowercase, no terminal punctuation — status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph
@@ -1114,6 +1116,8 @@ Notes:
 | `:` | Open command prompt in bottom bar |
 | `H` | Switch to History/Watchlist view (or back to Browse) |
 | `S` | Switch to Settings view |
+| `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
+| `u` | Undo last status mutation (single-level, History list pane only) |
 
 Pane focus is indicated by the `·` dot on the right side of the top bar: `state.focus`
 color when the detail pane is active, `text.dim` when the list is active.
@@ -1330,6 +1334,7 @@ revisited without archaeology.
 | Score ≥ 91 earns `state.now` | The 91 threshold maps to AniList's "Favorites" tier. Below 91, scores are metadata. Above, they are a claim. | Adjust threshold if the distribution feels wrong in practice. |
 | List column 38% / detail 62% at default width | Tested against 120-col and 160-col terminals. 38% gives ~45 chars for the list — enough for most anime titles without truncation. Detail gets the rest. | Adjust if common terminal widths expose truncation problems. |
 | `state.focus` (cyan) gated to the selected, list-focused row; status colors step off it (ROD-194) | One token can't mean both "the cursor" and "this show is airing/watching" — a fully-filled watching bar in `state.focus` was out-shouting the selected row, and pane focus was invisible because the selection looked identical focused or not. Reserving cyan for `selected and list_focused` fixes both: unselected watching/paused step down to `text.muted` (the `▸`/`◐` glyph still carries the status), and losing list focus visibly recedes the selected row (band drops, `▸` dims, title un-bolds). The `·` dot stays as low-weight orientation; the list itself now carries the focus signal. Magenta remains reserved for the §8 status-bar cursor. | If watchlist scanning suffers because watching rows no longer read as a cyan "heat signature" at a glance, trial `state.focus` dim (not full) for unselected watching, or widen the `text.muted`↔`text.dim` gap so watching vs completed bars stay distinct. |
+| `r` (not `:reset`) for progress recompute in History (ROD-193) | The keybind ships now rather than being deferred to `:` command mode because single-level undo (`u`) goes stale after any subsequent key — the recovery window is one action. `r` is non-adjacent to `c` on Colemak-DH, so it can't be mis-keyed in the same motion. Recompute uses strategy A (sorted-index, translation-scoped): `progress` = 1-based ordinal of the last fully-watched row among the `episode_progress` rows present, sorted by `EpisodeNumber.sortKey`. Intentionally under-counts gap-watching (only rows that were started are present). `Store.recomputeProgress` is the single source of truth for these semantics. | If users want a "reset to 0" shortcut independently of strategy-A, note that a show with no fully_watched rows already recomputes to 0 — suggest deleting episode_progress rows via a future `:clear progress` command. |
 
 ---
 
