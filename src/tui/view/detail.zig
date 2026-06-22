@@ -184,16 +184,29 @@ fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {
 /// no cover slot. Shared by the single-/two-column detail layouts and the
 /// History preview pane (ROD-113). Width stays fixed by tier; height derives
 /// from terminal pixel geometry so the panel stays poster-shaped, not cell-tall.
-fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, anime: ?Anime, pane_w: u16) u16 {
+fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, anime: ?Anime, pane_w: u16, max_h_override: ?u16) u16 {
     // ROD-170 §3.3: the cover scales with the pane it lives in (effective column
     // width), not the terminal — so a persistent two-pane detail gets a poster
     // sized to it instead of to the whole screen. Tiers per §3.3; hard cap 20
     // (the hero block stays "ghostly", not gaudy).
     const cover_w: u16 = coverWidthFor(pane_w);
     if (cover_w == 0) return 0;
-    const max_h: u16 = if (pane_w >= 40) 28 else 20;
+    const base_max_h: u16 = if (pane_w >= 40) 28 else 20;
+    // ROD-137: the single-column layout passes a grid-protecting cap; clamp the
+    // aesthetic height down to it. Other callers pass null — no grid competes for
+    // height in the two-column left column or the gridless History preview.
+    const max_h: u16 = if (max_h_override) |cap| @min(base_max_h, cap) else base_max_h;
+    if (max_h == 0) return 0;
     const cover_h: u16 = coverSlotHeight(win, cover_w, max_h);
     if (cover_h == 0) return 0;
+    // ROD-137 (Mira): below min_cover_rows the poster is a smear that reads as a
+    // glitch — drop it so the header anchors identity instead. Only in the capped
+    // (single-column) path; unconstrained callers keep their cover at any height.
+    // This is an intentional cliff: at a no-geometry terminal the cover first
+    // appears as you grow the pane past h≈19 (coverHeightCap(19)=6), and the
+    // synopsis correspondingly shrinks in the same step. The alternative — a
+    // squashed sub-6-row sliver — looks broken, so the discrete jump is the buy.
+    if (max_h_override != null and cover_h < min_cover_rows) return 0;
 
     const cover_win = win.child(.{ .x_off = 0, .y_off = 0, .width = cover_w, .height = cover_h });
     if (anime) |a| {
@@ -291,6 +304,35 @@ fn chipColor(self: *const App, chip: StatusChip) vaxis.Color {
 /// Used by synopsisCap to reserve enough rows for a usable episode grid.
 const min_grid_rows: u16 = 2;
 
+/// Worst-case rows `drawHeader` can advance: title(1) + 2 alt titles (english +
+/// native) + chips(1) + score(1) + hairline(1) + meta(1) = 7. A conservative
+/// upper bound used to reserve room below the cover (the cover is drawn before the
+/// header, so its cap can't read the real header height — it assumes the max).
+/// KEEP IN SYNC with `drawHeader`: every row-advancing step there is counted here.
+/// (`drawScore` advances unconditionally — no `row < h` guard — but vaxis clips a
+/// print past the window, so it never advances past 7 or corrupts the frame.)
+const max_header_rows: u16 = 7;
+
+/// Minimum synopsis rows reserved below the cover so a shrunk-cover pane still
+/// reads as a detail view, not a grid with a one-line stub (Mira ROD-137).
+const min_synopsis_rows: u16 = 2;
+
+/// Below this, the 20-col poster degrades to a smear that reads as a render glitch
+/// rather than cover art — the capped (single-column) path drops it (Mira ROD-137).
+const min_cover_rows: u16 = 6;
+
+/// The blank row `drawCover` appends after the poster (folded into its return).
+const cover_spacer_rows: u16 = 1;
+/// The blank row `drawGrid` leads with before the episode grid.
+const grid_spacer_rows: u16 = 1;
+
+/// Rows reserved below the cover in the single-column layout (ROD-137) so the
+/// episode grid always keeps ≥ min_grid_rows visible. Counts top→bottom: the
+/// cover's own trailing spacer + worst-case header + a min synopsis + the grid's
+/// leading spacer + min grid rows. Single source for the whole budget — every
+/// other site (synopsisCap, the invariant test) derives from these same consts.
+const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_spacer_rows + min_grid_rows;
+
 /// How many synopsis rows to allow in the single-column layout, given the
 /// remaining height after all header rows have been placed and the grid's
 /// minimum reservation is subtracted.
@@ -300,9 +342,19 @@ const min_grid_rows: u16 = 2;
 ///     max(1, remaining_h - (1 spacer + min_grid_rows))
 /// where `remaining_h = h - header_rows_so_far`.
 fn synopsisCap(remaining_h: u16) u16 {
-    const reserved: u16 = 1 + min_grid_rows; // 1 spacer + 2 grid rows
+    const reserved: u16 = grid_spacer_rows + min_grid_rows;
     if (remaining_h <= reserved) return 1;
     return remaining_h - reserved;
+}
+
+/// Cap the single-column cover height (ROD-137) so cover + worst-case header + a
+/// 2-line synopsis + the grid's ≥2 rows always fit — even at the worst supported
+/// geometry, where a terminal reporting no pixel size makes coverSlotHeight fall
+/// back to the full 28-row aesthetic cap and starve the grid (synopsisCap can't
+/// rescue that: it clamps the synopsis, never the cover). Returns 0 when the pane
+/// is too short to host a cover under that reservation. Pure, exposed for tests.
+fn coverHeightCap(h: u16) u16 {
+    return if (h > cover_reserve) h - cover_reserve else 0;
 }
 
 // ── draw helpers ─────────────────────────────────────────────────────────────
@@ -579,7 +631,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         const left_win = win.child(.{ .x_off = 0, .y_off = 0, .width = left_w, .height = h });
         const right_win = win.child(.{ .x_off = @intCast(right_x), .y_off = 0, .width = right_w, .height = h });
 
-        const lrow = drawCover(self, vx, writer, left_win, info.anime, w);
+        const lrow = drawCover(self, vx, writer, left_win, info.anime, w, null);
         _ = drawHeader(self, left_win, left_w, h, info, lrow);
 
         // Two-column: synopsis gets the full right column height minus the grid
@@ -589,12 +641,16 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         return;
     }
 
-    // Single-column layout: cap synopsis to leave ≥2 grid rows (ROD-137).
-    // Row budget math (worst case, 35-row terminal, cover ~7 rows + 1 spacer):
-    //   cover=8, title=1, [alt_titles≤2], chips≤1, score=1, hl=1, meta=1, hl=1
-    //   → header uses ≤16 rows, leaving ≥16 for synopsis+grid at h=32.
-    //   synopsisCap reserves 1 spacer + 2 grid rows = 3, so max synopsis = h - header - 3.
-    var row: u16 = drawCover(self, vx, writer, win, info.anime, w);
+    // Single-column layout: two complementary caps keep the grid usable (ROD-137).
+    //   1. coverHeightCap bounds the cover so it can't starve the grid — critical
+    //      when the terminal reports no pixel size and coverSlotHeight would else
+    //      return the full 28-row aesthetic cap (cover+spacer = 29 of 32 rows).
+    //   2. synopsisCap then clamps the synopsis to leave ≥2 grid rows.
+    // Worst case at a 35-row terminal (pane h=32): coverHeightCap(32)=19, so
+    // cover+spacer=20; worst-case header=7 → row 27; synopsisCap(5)=2; grid spacer
+    // → row 30; grid gets the final 2 rows. Cover=19, synopsis=2, grid=2. (Proven
+    // by the "ROD-137 invariant" test below; constants are the single source.)
+    var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
     row = drawHeader(self, win, w, h, info, row);
     const cap = synopsisCap(if (h > row) h - row else 0);
     row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
@@ -610,7 +666,7 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
     if (w < 10) return;
     const anime = App.animeFromHistoryRecord(rec);
 
-    var row: u16 = drawCover(self, vx, writer, win, anime, w);
+    var row: u16 = drawCover(self, vx, writer, win, anime, w, null);
 
     if (row < h) {
         if (anime.name.len > 0) {
@@ -857,4 +913,66 @@ test "synopsisCap: reserves spacer + min grid rows" {
     try t.expectEqual(@as(u16, 1), synopsisCap(0));
     try t.expectEqual(@as(u16, 1), synopsisCap(1));
     try t.expectEqual(@as(u16, 1), synopsisCap(2));
+}
+
+test "coverHeightCap: bounds the cover to protect the grid (ROD-137)" {
+    const t = std.testing;
+
+    // At the worst supported pane height (35-row terminal → pane h = 32) the cap
+    // floors the cover to h - cover_reserve(13) = 19, leaving room below for a
+    // 2-line synopsis and a 2-row grid under a worst-case 7-row header.
+    try t.expectEqual(@as(u16, 19), coverHeightCap(32));
+
+    // Taller panes: the cap grows, but drawCover's aesthetic 28/20 cap wins via
+    // the @min inside drawCover, so the cover never exceeds its design height.
+    try t.expectEqual(@as(u16, 27), coverHeightCap(40));
+
+    // Panes too short to host a cover under the reservation → 0 (caller drops it).
+    try t.expectEqual(@as(u16, 0), coverHeightCap(cover_reserve));
+    try t.expectEqual(@as(u16, 0), coverHeightCap(10));
+    try t.expectEqual(@as(u16, 0), coverHeightCap(0));
+    try t.expectEqual(@as(u16, 1), coverHeightCap(cover_reserve + 1));
+}
+
+/// Replay the no-pixel-geometry single-column budget (the binding case, where
+/// coverSlotHeight returns the full cap) for a given pane height, mirroring
+/// drawDetailPane: cover (capped, or dropped below min_cover_rows) + its spacer,
+/// header (clipped to the pane), synopsis (synopsisCap, clipped to what's left),
+/// the grid spacer, then the grid. Returns the resulting episode-grid row count.
+fn worstCaseGridRows(h: u16) u16 {
+    const cap = coverHeightCap(h);
+    const after_cover: u16 = if (cap < min_cover_rows) 0 else cap + cover_spacer_rows;
+    const header = @min(max_header_rows, h -| after_cover);
+    const after_header = after_cover + header;
+    std.debug.assert(after_header <= h); // a drifted constant would underflow below
+    const remaining = h - after_header;
+    const synopsis = @min(synopsisCap(remaining), remaining);
+    const after_synopsis = after_header + synopsis;
+    const after_spacer = @min(h, after_synopsis + grid_spacer_rows);
+    return h - after_spacer;
+}
+
+test "ROD-137 invariant: worst-case single-column keeps >= min_grid_rows across heights" {
+    const t = std.testing;
+    // The sweep — not a single point — is what pins the budget: shrink any reserve
+    // and some height in here starts failing. h ≥ 11 is the regime where the pane
+    // can physically host a header + synopsis + min_grid_rows; the upper bound runs
+    // well past the aesthetic cover cap (28) so the synopsis-absorbs-slack arm is
+    // exercised too. Covers the cover-drop zone (h ≤ 18) and the h≈19 cliff.
+    var h: u16 = 11;
+    while (h <= 60) : (h += 1) {
+        try t.expect(worstCaseGridRows(h) >= min_grid_rows);
+    }
+}
+
+test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane h=32)" {
+    const t = std.testing;
+    // Documents the precise worst-case decomposition the PTY drive verified:
+    // cover 19 + spacer, 7-row header, 2-line synopsis, grid spacer, 2 grid rows.
+    const h: u16 = 32;
+    try t.expectEqual(@as(u16, 19), coverHeightCap(h));
+    try t.expectEqual(min_grid_rows, worstCaseGridRows(h));
+    // The synopsis lands at exactly its reserved minimum under the worst-case header.
+    const after_header = (coverHeightCap(h) + cover_spacer_rows) + max_header_rows;
+    try t.expectEqual(min_synopsis_rows, synopsisCap(h - after_header));
 }
