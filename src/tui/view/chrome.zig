@@ -151,7 +151,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .history => if (self.history.len == 0)
             "/ search · F1 browse · q quit"
         else switch (self.active_pane) {
-            .list => "jk move · l/enter detail · p/x/c/w status · F1/F2/F3 · q quit",
+            .list => "jk move · l/enter detail · p/x/c/w status · r reset · u undo · F1/F2/F3 · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
             // preview band there is no grid, so enter/space drill into the zoom.
             .detail => if (w >= App.zoom_min)
