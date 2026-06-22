@@ -5,6 +5,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
+const source_mod = @import("../../source.zig");
 
 const App = app_mod.App;
 const RenderScratch = app_mod.RenderScratch;
@@ -93,7 +94,7 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
     // Load-more footer.
     if (row < pane_h and
         self.search_page > 0 and
-        self.results.items.len % 26 == 0 and
+        self.results.items.len % source_mod.search_page_size == 0 and
         self.results.items.len > 0)
     {
         const footer = if (self.search_loading) "⠋ loading…" else "╌ more ╌";
