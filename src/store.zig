@@ -1419,6 +1419,81 @@ test "setListStatus on an unknown show is a silent no-op" {
     try testing.expect((try s.getAnime(arena, T_SOURCE, "ghost")) == null);
 }
 
+// ROD-189 reuses `upsertAnime` for the browse `P` (add-to-watchlist) path
+// rather than a dedicated store method: its ON CONFLICT clause already preserves
+// list_status/progress/play_count and MAX-merges history_visible, which is
+// exactly the upsert-or-reveal-as-planning contract the ticket wants. These two
+// tests lock the behaviors `P` depends on — if a future change to upsertAnime
+// starts clobbering list_status on conflict, `P` breaks and these catch it.
+test "ROD-189: P on an untracked show saves it as planning, not as watched" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // The handler's exact call: fromDomain the highlighted result, upsert it.
+    try s.upsertAnime(AnimeRecord.fromDomain(T_SOURCE, .{ .id = "abc", .name = "Frieren", .eps_sub = 28 }, .sub), 1000, arena);
+
+    const rec = (try s.getAnime(arena, T_SOURCE, "abc")).?;
+    try testing.expectEqual(domain.ListStatus.planning, rec.list_status);
+    try testing.expect(rec.history_visible); // shows up in History
+    // "save for later", not a watch: no progress, no play_count, no timestamp.
+    try testing.expectEqual(@as(i64, 0), rec.progress);
+    try testing.expectEqual(@as(i64, 0), rec.play_count);
+    try testing.expectEqual(@as(?i64, null), rec.last_watched_at);
+}
+
+test "ROD-189: P reveals an existing row without clobbering its user state" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A hidden search-cache row (ROD-185) the user had already moved to paused
+    // with real progress — the state `P` must not trample.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .list_status = .paused, .progress = 5, .history_visible = false }, 1000, arena);
+    try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len); // hidden
+
+    // Pressing P re-upserts the browse result; fromDomain carries list_status
+    // .planning + history_visible true, but the conflict path must keep the
+    // user's paused/5 and only flip the row visible.
+    try s.upsertAnime(AnimeRecord.fromDomain(T_SOURCE, .{ .id = "x", .name = "X" }, .sub), 2000, arena);
+
+    const rec = (try s.getAnime(arena, T_SOURCE, "x")).?;
+    try testing.expect(rec.history_visible); // revealed
+    try testing.expectEqual(domain.ListStatus.paused, rec.list_status); // not demoted
+    try testing.expectEqual(@as(i64, 5), rec.progress); // untouched
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len); // now visible
+}
+
+test "ROD-189: P on an actively-watched show leaves all user state untouched" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A show the user is actively watching: visible, real progress + play_count.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .total_episodes = 12 }, 1000, arena);
+    try s.recordPlay(T_SOURCE, "x", 7, 2000, true); // watching, progress 7, play_count 1
+
+    // Re-adding it from browse (P) must be a pure no-op on user state — a silent
+    // demote to planning here would be the single most destructive regression.
+    try s.upsertAnime(AnimeRecord.fromDomain(T_SOURCE, .{ .id = "x", .name = "X" }, .sub), 3000, arena);
+
+    const rec = (try s.getAnime(arena, T_SOURCE, "x")).?;
+    try testing.expectEqual(domain.ListStatus.watching, rec.list_status); // not demoted
+    try testing.expectEqual(@as(i64, 7), rec.progress); // not zeroed
+    try testing.expectEqual(@as(i64, 1), rec.play_count); // not reset/bumped
+    try testing.expectEqual(@as(?i64, 2000), rec.last_watched_at); // not touched
+    try testing.expect(rec.history_visible);
+}
+
 test "recordPlay after a manual drop auto-resumes to watching (ROD-139)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
