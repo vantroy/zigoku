@@ -10,9 +10,15 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 
 ## What it does today
 
-- **Full TUI** (libvaxis): tabbed shell with search, infinite-scroll results,
-  a detail pane (metadata, reflowed synopsis, episode grid), and a history view
-  with fuzzy filtering and per-episode progress bars. Toasts, spinner, status bar.
+- **Full TUI** (libvaxis): a unified two-pane shell — search with infinite-scroll
+  results, a detail pane (kanji metadata chips, reflowed synopsis, and an episode
+  grid with resume `▸` / watched `●` markers), and a grouped watchlist. Selection
+  and active-pane focus hierarchy, toasts, spinner, status bar.
+- **Watchlist & watch-state**: every show carries a status — planning / watching /
+  paused / dropped / completed — with grouped history headers and fuzzy filtering.
+  Add straight from browse with `P`, move state with `p`/`x`/`c`/`w`/`P`, recompute
+  progress from per-episode history with `r`, and undo the last change with `u`.
+  Progress and the watchlist refresh in-session right after playback.
 - **Cover art** rendered with Kitty graphics where supported, halfblock cells
   everywhere else — fetched and decoded asynchronously, behind LRU caches.
 - **Search → resolve → play**: AllAnime catalog search, episode listing, stream
@@ -22,7 +28,8 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
   and persisted on quit), and a
   status-aware episode-list cache.
 - **AniList enrichment**: AllAnime results are mapped to AniList entries for
-  richer metadata and cover art.
+  richer metadata (season, genres, native title, format) and cover art — surfaced
+  as kanji chips and persisted to the store.
 - **Config & settings**: live-editable settings tab (mpv path, quality, language,
   AniSkip mode, cover art, themes). Persisted to `~/.config/zigoku/config.zon`.
   Three built-in color palettes: `terminal_ghost` (default green-on-void),
@@ -94,7 +101,7 @@ issue IDs in commit messages map back to it.
 | **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
 | **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
 | **M8** | Nice-to-haves: quality selector ✅, wide-terminal history layout ✅, detail/episode caching ✅, post-playback state sync ✅ | ✅ done |
-| **M9** | Polish: DESIGN.md reconciliation ✅, richer detail metadata ✅, code-quality refactors ✅, `:` command mode, grouped watch-state history | 🚧 in progress |
+| **M9** | Polish — *the watchlist Odyssey*: watch-state machine + grouped history ✅, add-to-watchlist from browse ✅, progress recompute + single-level undo ✅, episode resume/watched chips ✅, richer detail metadata as kanji chips ✅, History↔Browse two-pane unification ✅, selection & active-pane focus hierarchy ✅, in-session refresh after playback ✅, four god-file carvings + tick/draw split ✅, DESIGN.md reconciliation ✅ | ✅ done |
 | **M10** | Release: tag-driven builds + GitHub Releases, AUR & Homebrew, macOS CI, README badges & media | 📋 planned |
 
 ## Why this exists
