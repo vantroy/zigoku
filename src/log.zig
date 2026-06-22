@@ -28,8 +28,17 @@ const std = @import("std");
 // ReleaseSafe build), and the std.Io migration removed `std.posix.{open,write,
 // close}`. Plain libc symbols sidestep both. Flag values come from `std.posix.O`
 // so they stay correct per target.
+//
+// `open` MUST be declared variadic (`...`), matching C's real `int open(const
+// char *, int, ...)`. The `mode` arg is a vararg — and the Apple ARM64 ABI passes
+// varargs on the stack while named args go in registers. Declaring `open` with a
+// fixed `mode` parameter puts it in a register, so libSystem reads garbage off
+// the stack and O_CREAT files get junk permissions (ROD-149: the macOS CI job
+// caught this). It's benign on Linux/x86-64 only because that ABI passes both the
+// same way. Pass `mode` as a typed value at the call site so vararg lowering is
+// correct per target.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-extern "c" fn open(path: [*:0]const u8, flags: c_int, mode: c_uint) c_int;
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn close(fd: c_int) c_int;
 
@@ -98,7 +107,7 @@ fn emit(bytes: []const u8) void {
         if (path.len < pbuf.len) {
             @memcpy(pbuf[0..path.len], path);
             pbuf[path.len] = 0;
-            const fd = open((pbuf[0..path.len :0]).ptr, open_append_flags, 0o644);
+            const fd = open((pbuf[0..path.len :0]).ptr, open_append_flags, @as(c_uint, 0o644));
             if (fd >= 0) {
                 defer _ = close(fd);
                 writeAll(fd, bytes);
@@ -134,7 +143,7 @@ const test_libc = struct {
 };
 
 fn readBackAll(path: [:0]const u8, buf: []u8) ?[]const u8 {
-    const fd = open(path.ptr, @bitCast(std.posix.O{ .ACCMODE = .RDONLY }), 0);
+    const fd = open(path.ptr, @bitCast(std.posix.O{ .ACCMODE = .RDONLY })); // RDONLY: no O_CREAT, mode omitted
     if (fd < 0) return null; // file never created
     defer _ = close(fd);
     const n = test_libc.read(fd, buf.ptr, buf.len);
