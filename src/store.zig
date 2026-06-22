@@ -604,7 +604,9 @@ pub const Store = struct {
     ///
     /// Translation-scoped on purpose: `anime.progress` tracks the last-watched
     /// high-water for the tracked translation; mixing sub and dub rows would give
-    /// a meaningless combined count.
+    /// a meaningless combined count. Accepted limitation (ROD-193 review): if the
+    /// session's translation has no rows but another does (watched dub, recomputing
+    /// in sub), this returns 0 — single-translation usage, not worth the machinery.
     ///
     /// This is recompute-only: no episode_progress rows are deleted. A show with
     /// no fully_watched rows recomputes to 0.

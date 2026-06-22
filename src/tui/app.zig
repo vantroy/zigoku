@@ -642,27 +642,30 @@ pub const App = struct {
         }
     }
 
-    /// Store `entry` in the single-level undo slot (ROD-193 §B). If a prior entry
-    /// exists, free it first so we never leak GPA memory at depth > 1.
-    /// Patch `EpisodeState.progress` (and re-seed the cursor) when the detail
-    /// pane is currently bound to `source_id` (ROD-193 §D two-progress-field sync).
-    /// Conservative: if we can't confirm the pane is on this show, we leave it
-    /// alone rather than corrupting unrelated episode state.
-    fn syncEpisodeProgress(self: *App, source_id: []const u8, new_progress: i64) void {
+    /// Patch `EpisodeState.progress` (and re-seed the cursor) when the detail pane
+    /// is currently bound to this exact show (ROD-193 §D two-progress-field sync).
+    /// Matches on the full (source, source_id) pair, so two providers that ever
+    /// share a source_id can't cross-patch. Conservative: if the pane isn't
+    /// confirmably on this show, leave it alone rather than corrupting unrelated
+    /// episode state.
+    fn syncEpisodeProgress(self: *App, source: []const u8, source_id: []const u8, new_progress: i64) void {
         const bound_id = self.episodes.for_id orelse return;
+        const bound_source = self.episodes.for_source orelse return;
         if (!std.mem.eql(u8, bound_id, source_id)) return;
+        if (!std.mem.eql(u8, bound_source, source)) return;
         const clamped: u32 = if (new_progress > 0) std.math.cast(u32, new_progress) orelse std.math.maxInt(u32) else 0;
         self.episodes.progress = clamped;
-        // Re-seed the cursor to the next unwatched episode (same logic as
-        // seedHistoryCursor's no-resume path). Conservative: only move if results
-        // are loaded; if they aren't, the next open will re-seed from the record.
+        // Re-seed the cursor + resume marker exactly as seedHistoryCursor does:
+        // progress 0 means nothing watched, so DON'T plant a resume glyph — the old
+        // `0 < eps.len` branch wrongly marked episode 0 as resumable (ROD-193
+        // review). Only move when results are loaded; else the next open re-seeds.
         if (self.episodes.results) |eps| {
             const progress: usize = @intCast(clamped);
-            if (progress < eps.len) {
+            if (progress > 0 and progress < eps.len) {
                 self.episodes.cursor = progress;
                 self.episodes.resume_idx = progress;
             } else {
-                // Fully caught up or reset to 0: park cursor at 0.
+                // Nothing watched (0) or fully caught up: park cursor, no resume.
                 self.episodes.cursor = 0;
                 self.episodes.resume_idx = null;
             }
@@ -706,7 +709,7 @@ pub const App = struct {
                 rec.progress = e.prev_progress;
 
                 // Sync EpisodeState when the detail pane is bound to this show.
-                syncEpisodeProgress(self, e.source_id, e.prev_progress);
+                syncEpisodeProgress(self, e.source, e.source_id, e.prev_progress);
 
                 self.pushToast(.info, "undone", false);
             },
@@ -835,18 +838,20 @@ pub const App = struct {
             return;
         };
 
-        // Store write succeeded — push the undo entry.
-        if (src_copy) |src| {
-            if (sid_copy) |sid| {
-                self.pushUndo(.{ .set_list_status = .{
-                    .source = src,
-                    .source_id = sid,
-                    .prev_status = prev_status,
-                    .prev_progress = prev_progress,
-                } });
-            } else {
-                self.gpa.free(src);
-            }
+        // Store write succeeded — push the undo entry only if BOTH key copies
+        // exist; otherwise free whichever did allocate (OOM just makes the mutation
+        // non-undoable). The old code leaked sid_copy when only the first dupe
+        // failed (ROD-193 review).
+        if (src_copy != null and sid_copy != null) {
+            self.pushUndo(.{ .set_list_status = .{
+                .source = src_copy.?,
+                .source_id = sid_copy.?,
+                .prev_status = prev_status,
+                .prev_progress = prev_progress,
+            } });
+        } else {
+            if (src_copy) |buf| self.gpa.free(buf);
+            if (sid_copy) |buf| self.gpa.free(buf);
         }
 
         rec.list_status = status;
@@ -1334,6 +1339,13 @@ pub const App = struct {
                     for (old) |ep| self.gpa.free(ep.raw);
                     self.gpa.free(old);
                 }
+                // This is the one site that writes `results` without going through
+                // `applyCached`. `for_id`/`for_source` are intentionally left as
+                // `fireEpisodesForId` set them before spawning the thread (they stay
+                // live across the flight so syncEpisodeProgress can match) — we own
+                // only `ev.episodes` here. If a future caller ever sets `results`
+                // directly, it must keep the (for_id, for_source) pair in lockstep
+                // (ROD-193 review).
                 self.episodes.results = ev.episodes;
                 self.episodes.cursor = 0;
                 self.episodes.progress = 0;
@@ -1528,11 +1540,17 @@ pub const App = struct {
 
         // Two GPA-duped copies: one for episodes.for_id, one for the task (→ event).
         const id_for_app = self.gpa.dupe(u8, source_id) catch return;
-        const id_for_task = self.gpa.dupe(u8, source_id) catch {
+        const src_for_app = self.gpa.dupe(u8, source) catch {
             self.gpa.free(id_for_app);
             return;
         };
+        const id_for_task = self.gpa.dupe(u8, source_id) catch {
+            self.gpa.free(id_for_app);
+            self.gpa.free(src_for_app);
+            return;
+        };
         self.episodes.for_id = id_for_app;
+        self.episodes.for_source = src_for_app;
 
         self.episode_thread = std.Thread.spawn(.{}, episodesTask, .{
             loop, self.gpa, io, provider, id_for_task, self.translation,
@@ -2086,7 +2104,14 @@ pub const App = struct {
                     return;
                 };
                 rec.progress = hw;
-                syncEpisodeProgress(self, rec.source_id, hw);
+                // r overwrites progress, so a stale undo entry (captured pre-`c`)
+                // would revert PAST this recompute on a later `u`. Invalidate it so
+                // `c → r → u` keeps the recomputed value (ROD-193 review).
+                if (self.undo) |u| {
+                    u.free(self.gpa);
+                    self.undo = null;
+                }
+                syncEpisodeProgress(self, rec.source, rec.source_id, hw);
                 self.pushToast(.success, "progress reset", false);
                 return;
             } else if (key.matches('u', .{})) {
