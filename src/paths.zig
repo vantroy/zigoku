@@ -162,6 +162,47 @@ test "resolveRuntime falls back to /tmp" {
     try testing.expectEqualStrings("/tmp/zigoku", b);
 }
 
+test "macOS resolvers use the Apple Library conventions" {
+    // The `.macos` arms are comptime-dead off Darwin, and the resolver-level
+    // functions (configDir/dataDir/cacheDir) are otherwise untested — the unit
+    // tests above exercise only the pure `resolveXdg`/`resolveRuntime` cores. On
+    // macOS CI (ROD-149) this pins the actual Library literals so a green build
+    // proves the paths are *right*, not merely that they compile.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const home = env("HOME") orelse return error.SkipZigTest;
+    if (home.len == 0) return error.SkipZigTest; // empty HOME → resolveXdg errors, not our case under test
+
+    const app_support = try std.fmt.allocPrint(testing.allocator, "{s}/Library/Application Support/zigoku", .{home});
+    defer testing.allocator.free(app_support);
+    const caches = try std.fmt.allocPrint(testing.allocator, "{s}/Library/Caches/zigoku", .{home});
+    defer testing.allocator.free(caches);
+
+    const cfg = try configDir(testing.allocator);
+    defer testing.allocator.free(cfg);
+    try testing.expectEqualStrings(app_support, cfg);
+
+    const data = try dataDir(testing.allocator);
+    defer testing.allocator.free(data);
+    try testing.expectEqualStrings(app_support, data);
+
+    const cache = try cacheDir(testing.allocator);
+    defer testing.allocator.free(cache);
+    try testing.expectEqualStrings(caches, cache);
+
+    // No XDG_RUNTIME_DIR on Darwin → the ephemeral socket dir lands in /tmp.
+    // Assert *both* branches rather than skipping if a runner happens to set it,
+    // so the XDG-wins claim is actually verified instead of assumed.
+    const runtime = try runtimeDir(testing.allocator);
+    defer testing.allocator.free(runtime);
+    if (env("XDG_RUNTIME_DIR")) |xdg| {
+        const expected = try std.fmt.allocPrint(testing.allocator, "{s}/zigoku", .{xdg});
+        defer testing.allocator.free(expected);
+        try testing.expectEqualStrings(expected, runtime);
+    } else {
+        try testing.expectEqualStrings("/tmp/zigoku", runtime);
+    }
+}
+
 test "ensureDir tolerates empty and over-long paths" {
     ensureDir(""); // no-op, must not crash
     var huge: [std.fs.max_path_bytes + 8]u8 = undefined;
