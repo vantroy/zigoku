@@ -2090,6 +2090,14 @@ pub const App = struct {
             } else if (key.matches('w', .{})) {
                 self.setSelectedHistoryStatus(.watching);
                 return;
+            } else if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
+                // ROD-189: re-plan — the missing 5th manual transition, paired with
+                // Browse's P so the key means "plan it" in both views.
+                // setSelectedHistoryStatus routes through setListStatus's re-plan path
+                // and the undo seam, so it's undoable like p/x/c/w. Match shift+'P' and
+                // bare 'P' (terminal compat); lowercase 'p' above is paused — no clash.
+                self.setSelectedHistoryStatus(.planning);
+                return;
             } else if (key.matches('r', .{})) {
                 // ROD-193: recompute progress from episode_progress rows (strategy A).
                 // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
@@ -2119,6 +2127,40 @@ pub const App = struct {
                 self.applyUndo();
                 return;
             }
+        }
+
+        // Browse: P (shift+p) tracks a not-yet-watched result as planning (ROD-189).
+        // upsertAnime's ON CONFLICT preserves list_status/progress/play_count and
+        // MAX-merges history_visible, so one call covers both behaviors the ticket
+        // wants: a brand-new row inserts as planning (the fromDomain defaults), and
+        // a hidden search-cache row (history_visible 0) is revealed (→1) — neither
+        // path clobbers existing user state. Match shift+'P' and bare 'P' for the
+        // same cross-terminal reason as the G nav below.
+        if (self.active_view == .browse and self.active_pane == .list and
+            (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))
+        {
+            const st = self.store orelse return;
+            const anime = self.selectedAnime() orelse return;
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            var rec = AnimeRecord.fromDomain(provider.name(), anime, self.translation);
+            // Explicit, not via the fromDomain struct default: a browse-add is always a
+            // reveal. If AnimeRecord.history_visible's default ever flips to false
+            // (defensible for its search-cache role), this keeps P revealing rows
+            // (ON CONFLICT does MAX(excluded, anime)) instead of silently hiding them.
+            rec.history_visible = true;
+            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| {
+                log.debug("add-to-watchlist failed: {s}", .{@errorName(e)});
+                self.pushToast(.@"error", "couldn't add to watchlist", false);
+                return;
+            };
+            // Unlike the p/x/c/w transitions (which mutate a row already in
+            // self.history in place), P adds a row that isn't in the in-memory
+            // list yet — flag a background reload so it surfaces in History this
+            // session, not just after a restart.
+            self.history_dirty = true;
+            self.pushToast(.success, "added to watchlist", false);
+            return;
         }
 
         // List navigation (history + browse list pane).

@@ -493,6 +493,77 @@ test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD
     try testing.expectEqual(@as(i64, 12), (try st.getAnime(arena, "s", "a")).?.progress);
 }
 
+test "Browse P adds the highlighted result to the watchlist as planning (ROD-189)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+    });
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+        app.episodes.freeResults(app.gpa);
+    }
+
+    try testTick(&app, keyEv('P', .{ .shift = true }));
+
+    // The store row landed as a planning, history-visible save with no watch fields.
+    const rec = (try st.getAnime(arena, "allanime", "x")).?;
+    try testing.expectEqual(domain.ListStatus.planning, rec.list_status);
+    try testing.expect(rec.history_visible);
+    try testing.expectEqual(@as(i64, 0), rec.progress);
+    try testing.expectEqual(@as(i64, 0), rec.play_count);
+    // P adds a row not yet in self.history → it flags the run-loop's background
+    // reload so the show surfaces in History this session.
+    try testing.expect(app.history_dirty);
+    // …and confirms with a success toast.
+    try testing.expect(app.toast_queue[0] != null);
+    try testing.expectEqual(Toast.Kind.success, app.toast_queue[0].?.kind);
+}
+
+test "History P re-plans the focused entry, store + memory + undo (ROD-189)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try st.recordPlay("s", "a", 5, 2000, true); // watching, progress 5
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // P → planning in memory and store; progress preserved (re-plan, not a reset).
+    try testTick(&app, keyEv('P', .{ .shift = true }));
+    try testing.expectEqual(domain.ListStatus.planning, app.history[0].list_status);
+    try testing.expectEqual(domain.ListStatus.planning, (try st.getAnime(arena, "s", "a")).?.list_status);
+    try testing.expectEqual(@as(i64, 5), app.history[0].progress);
+
+    // It's undoable like the other manual transitions.
+    try testTick(&app, keyEv('u', .{}));
+    try testing.expectEqual(domain.ListStatus.watching, app.history[0].list_status);
+}
+
 test "History `u` undoes the last status mutation, store + memory (ROD-193)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
