@@ -245,11 +245,16 @@ Browse and History (ROD-170). Cover art sizing in the detail pane is governed by
 the **effective column width** (`detail_w`), not terminal width, so it scales
 correctly in both the persistent pane and the full-screen zoom:
 
-| `detail_w` (effective col width) | Cover size |
-|---|---|
-| ≥ 40 cols | `20 cols × 7 rows` (max; §3.3 hard cap) |
-| 25–39 cols | `14 cols × 5 rows` |
-| < 25 cols | hidden |
+| `detail_w` (effective col width) | Cover width | Cover height |
+|---|---|---|
+| ≥ 40 cols | `20 cols` (§3.3 hard cap) | geometry-derived (poster aspect), capped at 28 rows |
+| 25–39 cols | `14 cols` | geometry-derived, capped at 20 rows |
+| < 25 cols | hidden | — |
+
+Width is fixed by tier; **height** derives from the terminal's reported pixel
+geometry so the poster stays poster-shaped, capped at the aesthetic max above. In
+the single-column layout that height is *additionally* bounded so it can't starve
+the episode grid — see §3.3 "Cover height yields to the grid" (ROD-137).
 
 Below 60 cols terminal width, collapse to single-column list only (no detail pane).
 
@@ -306,6 +311,26 @@ loading spinner (see Section 5 — Loading).
 full-screen zoom — §5.4a), not terminal width. Hard cap: `cover_w` never exceeds
 20 cols (§0: "ghostly, not gaudy"). The tiers from §3.2 apply. Passing terminal
 width unchanged to `drawCover` is incorrect in the persistent pane context.
+
+**Cover height yields to the grid (ROD-137).** In the single-column detail layout
+the cover, header, synopsis, and episode grid share one vertical column, so a tall
+cover can crowd the grid out — worst case at a 35-row terminal (pane height 32),
+where a terminal reporting *no* pixel geometry makes the cover fall back to its full
+28-row aesthetic cap and leaves the grid no rows. The contract: **the episode grid
+always keeps ≥ 2 visible rows for a ≥ 28-episode show.** Two complementary caps
+enforce it, both in `view/detail.zig` (the single source of truth — do not
+re-derive these numbers elsewhere):
+
+- `coverHeightCap(h)` bounds the cover so `cover + worst-case header + a 2-line
+  synopsis + the grid's spacer + 2 grid rows` always fit (`cover_reserve` rows
+  reserved below the cover). Below `min_cover_rows` (6) the squashed poster is
+  dropped entirely rather than rendered as a sliver.
+- `synopsisCap(remaining)` then clamps the synopsis to leave the grid its 2 rows,
+  appending the italic dim `…` truncation marker (§1.3).
+
+The two-column zoom (§5.4a) and the History preview stack put the cover in a column
+that does **not** contain the grid, so they are exempt — `drawCover` takes a
+`max_h_override` that only the single-column path supplies.
 
 ### 3.4 Top Bar
 
