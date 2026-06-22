@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, rod-149]
   pull_request:
 
 jobs:
@@ -15,6 +15,36 @@ jobs:
       # inherit that linkage, so the dev headers must be present.
       - name: Install libsqlite3
         run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test --summary all
+
+  # First real compile of the Darwin code paths (ROD-149). The `.macos` arms in
+  # src/paths.zig are comptime-dead on Linux, so they've never been analyzed; the
+  # @cImport surface (stdlib.h/sys/stat.h) here resolves against libSystem, not
+  # glibc. mpv isn't needed — nothing in `build`/`test` execs it.
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Homebrew's sqlite is keg-only (Apple ships its own libsqlite3), so it
+      # installs off the default search path. Point PKG_CONFIG_PATH at the keg so
+      # Zig's linkSystemLibrary("sqlite3") → pkg-config resolves *this* sqlite,
+      # not whatever the Xcode SDK happens to expose — otherwise a green build is
+      # coincidental rather than reproducible.
+      - name: Install sqlite
+        run: |
+          brew install sqlite
+          echo "PKG_CONFIG_PATH=$(brew --prefix sqlite)/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Set up Zig
         uses: mlugg/setup-zig@v2
