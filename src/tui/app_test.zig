@@ -461,11 +461,13 @@ test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD
 
     const recs = try st.loadHistory(arena);
     var app: App = .{};
+    app.gpa = testing.allocator; // needed: setSelectedHistoryStatus dupes key strings for undo
     app.store = &st;
     app.active_view = .history;
     app.active_pane = .list;
     app.history = recs;
     app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator); // release undo slot after test
 
     // p → paused, in BOTH the in-memory record and the store.
     try testTick(&app, keyEv('p', .{}));
@@ -489,6 +491,168 @@ test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD
     // re-watching keeps the full bar until a real play moves the high-water.
     try testing.expectEqual(@as(i64, 12), app.history[0].progress);
     try testing.expectEqual(@as(i64, 12), (try st.getAnime(arena, "s", "a")).?.progress);
+}
+
+test "History `u` undoes the last status mutation, store + memory (ROD-193)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try st.recordPlay("s", "a", 3, 2000, true); // progress 3
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // Capture the pre-mutation state — undo must restore exactly this.
+    const before_status = app.history[0].list_status;
+    try testing.expectEqual(@as(i64, 3), app.history[0].progress);
+
+    // c → completed: the fat-finger snaps progress to the finale.
+    try testTick(&app, keyEv('c', .{}));
+    try testing.expectEqual(domain.ListStatus.completed, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 12), app.history[0].progress);
+
+    // u → revert to the captured prior state in BOTH memory and store.
+    try testTick(&app, keyEv('u', .{}));
+    try testing.expectEqual(before_status, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 3), app.history[0].progress);
+    try testing.expectEqual(before_status, (try st.getAnime(arena, "s", "a")).?.list_status);
+    try testing.expectEqual(@as(i64, 3), (try st.getAnime(arena, "s", "a")).?.progress);
+
+    // Single-level: a second u is a silent no-op (the slot is empty).
+    try testTick(&app, keyEv('u', .{}));
+    try testing.expectEqual(before_status, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 3), app.history[0].progress);
+}
+
+test "History `r` recomputes progress from episode_progress after a clobber (ROD-193)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    // The real per-episode truth: eps 1..5 fully watched (0.95 ratio).
+    try st.saveProgress("s", "a", .sub, "1", 950, 1000, 1001);
+    try st.saveProgress("s", "a", .sub, "2", 950, 1000, 1002);
+    try st.saveProgress("s", "a", .sub, "3", 950, 1000, 1003);
+    try st.saveProgress("s", "a", .sub, "4", 950, 1000, 1004);
+    try st.saveProgress("s", "a", .sub, "5", 950, 1000, 1005);
+    // A mis-keyed force-complete clobbers the scalar high-water to the finale.
+    try st.setListStatus("s", "a", .completed); // progress → 12
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.translation = .sub; // recompute is translation-scoped (no column on anime)
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    try testing.expectEqual(@as(i64, 12), app.history[0].progress); // confirm the clobber
+
+    // r → recompute from episode_progress: back to the true high-water (5),
+    // in both memory and store.
+    try testTick(&app, keyEv('r', .{}));
+    try testing.expectEqual(@as(i64, 5), app.history[0].progress);
+    try testing.expectEqual(@as(i64, 5), (try st.getAnime(arena, "s", "a")).?.progress);
+}
+
+test "History `c` then `r` then `u`: recompute survives, undo is a no-op (ROD-193 review)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    // Per-episode truth: eps 1..5 fully watched; scalar high-water 5, watching.
+    try st.saveProgress("s", "a", .sub, "1", 950, 1000, 1001);
+    try st.saveProgress("s", "a", .sub, "2", 950, 1000, 1002);
+    try st.saveProgress("s", "a", .sub, "3", 950, 1000, 1003);
+    try st.saveProgress("s", "a", .sub, "4", 950, 1000, 1004);
+    try st.saveProgress("s", "a", .sub, "5", 950, 1000, 1005);
+    try st.recordPlay("s", "a", 5, 2000, true); // progress 5, watching
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.translation = .sub;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // c → completed, progress snaps to finale (the fat-finger). Pushes undo {watching, 5}.
+    try testTick(&app, keyEv('c', .{}));
+    try testing.expectEqual(domain.ListStatus.completed, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 12), app.history[0].progress);
+
+    // r → recompute to the true high-water (5) AND invalidate the stale undo entry.
+    try testTick(&app, keyEv('r', .{}));
+    try testing.expectEqual(@as(i64, 5), app.history[0].progress);
+
+    // u → undo slot was cleared by r, so this is a no-op: the recompute survives.
+    try testTick(&app, keyEv('u', .{}));
+    try testing.expectEqual(@as(i64, 5), app.history[0].progress);
+    try testing.expectEqual(domain.ListStatus.completed, app.history[0].list_status);
+    try testing.expectEqual(@as(i64, 5), (try st.getAnime(arena, "s", "a")).?.progress);
+}
+
+test "History `r` recompute-to-0 clears the episode resume marker (ROD-193 review)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // No fully_watched rows → recompute yields 0. Clobber first so the row is tracked.
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
+    try st.setListStatus("s", "a", .completed); // progress → 12
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.translation = .sub;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // Bind the episode pane to this exact (source, source_id) with a stale resume
+    // marker pointing at episode 0 and a loaded GPA-owned episode list.
+    app.episodes.for_id = try testing.allocator.dupe(u8, "a");
+    app.episodes.for_source = try testing.allocator.dupe(u8, "s");
+    const labels = [_][]const u8{ "1", "2", "3" };
+    var view = try testing.allocator.alloc(domain.EpisodeNumber, labels.len);
+    for (labels, 0..) |lbl, i| view[i] = .{ .raw = try testing.allocator.dupe(u8, lbl) };
+    app.episodes.results = view;
+    app.episodes.resume_idx = 0; // the stale marker the old code would have left
+    app.episodes.cursor = 0;
+    defer app.episodes.freeResults(testing.allocator);
+
+    // r → progress 0; the resume marker must clear (no ▸ on an unwatched ep 0).
+    try testTick(&app, keyEv('r', .{}));
+    try testing.expectEqual(@as(u32, 0), app.episodes.progress);
+    try testing.expectEqual(@as(?usize, null), app.episodes.resume_idx);
 }
 
 test "q/Esc from History reset the viewport before Browse reads it (ROD-139 H1)" {
