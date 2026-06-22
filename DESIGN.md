@@ -688,6 +688,8 @@ state.now` escalation.
 | Settings save failed | write error | error | `settings save failed` | no |
 | `progress_reset` | selected show present (r key) | success | `progress reset` | no |
 | `undo` | undo of a status mutation (u key) | info | `undone` | no |
+| `add_to_watchlist` | P on a browse result (upsert ok) | success | `added to watchlist` | no |
+| `add_to_watchlist` | P on a browse result (upsert failed) | error | `couldn't add to watchlist` | no |
 
 Copy: single line, lowercase, no terminal punctuation — status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph
@@ -1118,6 +1120,7 @@ Notes:
 | `S` | Switch to Settings view |
 | `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
 | `u` | Undo last status mutation (single-level, History list pane only) |
+| `P` | "Plan it": add highlighted browse result to the watchlist as planning (Browse list pane) / set focused entry's status to planning — the 5th manual transition (History list pane) |
 
 Pane focus is indicated by the `·` dot on the right side of the top bar: `state.focus`
 color when the detail pane is active, `text.dim` when the list is active.
