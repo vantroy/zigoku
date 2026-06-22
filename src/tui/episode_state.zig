@@ -38,6 +38,11 @@ pub const EpisodeState = struct {
     /// GPA-duped id of the show whose episodes are in `results` (or in-flight).
     /// null = nothing requested yet.
     for_id: ?[]const u8 = null,
+    /// GPA-duped source name paired with `for_id` (ROD-193 review): lets a
+    /// (source, source_id) match be exact, so two providers sharing a source_id
+    /// can never cross-patch episode state. Set/freed in lockstep with `for_id`;
+    /// null whenever `for_id` is null.
+    for_source: ?[]const u8 = null,
     /// Whether an episode fetch is in flight.
     loading: bool = false,
     /// Cursor position within the episode grid (0-based index into `results`).
@@ -71,6 +76,10 @@ pub const EpisodeState = struct {
         if (self.for_id) |id| {
             gpa.free(id);
             self.for_id = null;
+        }
+        if (self.for_source) |src| {
+            gpa.free(src);
+            self.for_source = null;
         }
     }
 
@@ -139,11 +148,13 @@ pub const EpisodeState = struct {
         store: ?*Store,
         translation: domain.Translation,
         id: []const u8,
+        source_owned: []const u8,
         view: []domain.EpisodeNumber,
         history_rec: ?AnimeRecord,
     ) void {
         self.results = view;
         self.for_id = id;
+        self.for_source = source_owned;
         self.cursor = 0;
         self.progress = 0;
         self.resume_idx = null;
@@ -178,11 +189,16 @@ pub const EpisodeState = struct {
                 // for_id first (small): on OOM bail before touching results, so a
                 // hit never half-installs (Elara C1).
                 const id = gpa.dupe(u8, source_id) catch return false;
-                const view = workers.dupEpisodesOwned(gpa, entry.episodes) catch {
+                const src = gpa.dupe(u8, source) catch {
                     gpa.free(id);
                     return false;
                 };
-                self.applyCached(store, translation, id, view, history_rec);
+                const view = workers.dupEpisodesOwned(gpa, entry.episodes) catch {
+                    gpa.free(id);
+                    gpa.free(src);
+                    return false;
+                };
+                self.applyCached(store, translation, id, src, view, history_rec);
                 return true;
             }
             // Stale: drop it so a repeatedly-visited stale entry can't squat in
@@ -201,8 +217,13 @@ pub const EpisodeState = struct {
         if (cached.len == 0) return false;
 
         const id = gpa.dupe(u8, source_id) catch return false;
+        const src = gpa.dupe(u8, source) catch {
+            gpa.free(id);
+            return false;
+        };
         const view = workers.dupEpisodesOwned(gpa, cached) catch {
             gpa.free(id);
+            gpa.free(src);
             return false;
         };
         // Promote into the hot LRU (best-effort; on failure the next visit just
@@ -214,7 +235,7 @@ pub const EpisodeState = struct {
             };
         } else |_| {}
 
-        self.applyCached(store, translation, id, view, history_rec);
+        self.applyCached(store, translation, id, src, view, history_rec);
         return true;
     }
 

@@ -1116,8 +1116,8 @@ Notes:
 | `:` | Open command prompt in bottom bar |
 | `H` | Switch to History/Watchlist view (or back to Browse) |
 | `S` | Switch to Settings view |
-| `r` | Recompute progress for selected show (History only; no-op elsewhere) |
-| `u` | Undo last status mutation (single-level, History) |
+| `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
+| `u` | Undo last status mutation (single-level, History list pane only) |
 
 Pane focus is indicated by the `·` dot on the right side of the top bar: `state.focus`
 color when the detail pane is active, `text.dim` when the list is active.
