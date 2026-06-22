@@ -862,6 +862,39 @@ test "l in browse list pane switches to detail pane" {
     app.episodes.freeResults(app.gpa);
 }
 
+test "Browse load-more fires on Down arrow at the last result, not just j (ROD-156 parity)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    // A full page so nav_len % search_page_size == 0 and the cursor can sit at the
+    // last row — the exact state that shows the ╌ more ╌ footer.
+    const page = source_mod.search_page_size;
+    try app.results.ensureTotalCapacity(std.testing.allocator, page);
+    for (0..page) |i| {
+        app.results.appendAssumeCapacity(.{
+            .id = try std.fmt.allocPrint(std.testing.allocator, "id{d}", .{i}),
+            .name = try std.fmt.allocPrint(std.testing.allocator, "n{d}", .{i}),
+        });
+    }
+    app.list_cursor = page - 1;
+    app.search_page = 1;
+    const q = "kimi"; // fireSearch bails on an empty query
+    @memcpy(app.search_query[0..q.len], q);
+    app.search_len = q.len;
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+        app.episodes.freeResults(app.gpa);
+    }
+
+    // The regression: the Down arrow used to walk the cursor to the wall without
+    // triggering page+1 (only 'j' did). fireSearch flips search_loading before it
+    // spawns, so that flag proves the next page was requested.
+    try testTick(&app, keyEv(vaxis.Key.down, .{}));
+    try testing.expect(app.search_loading);
+}
+
 test "h in browse detail pane switches to list pane" {
     var app: App = .{};
     app.active_view = .browse;

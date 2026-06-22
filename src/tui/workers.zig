@@ -160,7 +160,7 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
 
     const raw = provider.search(arena.allocator(), io, query, .{
         .translation = translation,
-        .limit = 26,
+        .limit = source_mod.search_page_size,
         .page = page,
     }) catch |e| {
         log.debug("search failed: {s}", .{@errorName(e)});
