@@ -150,6 +150,19 @@ pub fn indexAtCursor(self: *const App) ?usize {
     return scan(self).index;
 }
 
+/// Linear scan over self.history for the first record matching both `source` and
+/// `source_id`. Returns the index into self.history, or null when not found.
+/// Used by applyUndo (ROD-193 §C) and the `r` recompute handler to resolve a
+/// record when only its key is known (e.g. after the undo entry was captured).
+pub fn indexById(self: *const App, source: []const u8, source_id: []const u8) ?usize {
+    for (self.history, 0..) |rec, i| {
+        if (std.mem.eql(u8, rec.source, source) and std.mem.eql(u8, rec.source_id, source_id)) {
+            return i;
+        }
+    }
+    return null;
+}
+
 // ── Paint ────────────────────────────────────────────────────────────────────
 
 const DrawCtx = struct {

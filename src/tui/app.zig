@@ -346,6 +346,28 @@ pub const RenderScratch = struct {
     hist_header: [8][24]u8 = undefined,
 };
 
+/// Single-level undo record for manual watch-state mutations (ROD-193). Tagged
+/// union only — Zig has no closures. Each variant carries the full revert payload
+/// so `applyUndo` can reconstruct the prior state without re-reading the store.
+pub const UndoEntry = union(enum) {
+    set_list_status: struct {
+        source: []u8, // GPA-owned, duped at push
+        source_id: []u8, // GPA-owned, duped at push
+        prev_status: domain.ListStatus,
+        prev_progress: i64,
+    },
+
+    /// Release GPA-owned slices. Call before discarding an entry.
+    pub fn free(self: UndoEntry, gpa: Allocator) void {
+        switch (self) {
+            .set_list_status => |e| {
+                gpa.free(e.source);
+                gpa.free(e.source_id);
+            },
+        }
+    }
+};
+
 pub const App = struct {
     should_quit: bool = false,
 
@@ -521,6 +543,10 @@ pub const App = struct {
     /// Toast queue (oldest first). null = empty slot.
     toast_queue: [3]?Toast = .{ null, null, null },
 
+    /// Single-level undo slot for manual watch-state mutations (ROD-193 §B).
+    /// Non-null while there is an undoable action. Freed in `deinitOwnedState`.
+    undo: ?UndoEntry = null,
+
     /// Current query as a slice (may be empty).
     pub fn querySlice(self: *const App) []const u8 {
         return self.search_query[0..self.search_len];
@@ -610,6 +636,81 @@ pub const App = struct {
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
         self.cover.deinitCaches(self.gpa);
+        if (self.undo) |u| {
+            u.free(self.gpa);
+            self.undo = null;
+        }
+    }
+
+    /// Store `entry` in the single-level undo slot (ROD-193 §B). If a prior entry
+    /// exists, free it first so we never leak GPA memory at depth > 1.
+    /// Patch `EpisodeState.progress` (and re-seed the cursor) when the detail
+    /// pane is currently bound to `source_id` (ROD-193 §D two-progress-field sync).
+    /// Conservative: if we can't confirm the pane is on this show, we leave it
+    /// alone rather than corrupting unrelated episode state.
+    fn syncEpisodeProgress(self: *App, source_id: []const u8, new_progress: i64) void {
+        const bound_id = self.episodes.for_id orelse return;
+        if (!std.mem.eql(u8, bound_id, source_id)) return;
+        const clamped: u32 = if (new_progress > 0) std.math.cast(u32, new_progress) orelse std.math.maxInt(u32) else 0;
+        self.episodes.progress = clamped;
+        // Re-seed the cursor to the next unwatched episode (same logic as
+        // seedHistoryCursor's no-resume path). Conservative: only move if results
+        // are loaded; if they aren't, the next open will re-seed from the record.
+        if (self.episodes.results) |eps| {
+            const progress: usize = @intCast(clamped);
+            if (progress < eps.len) {
+                self.episodes.cursor = progress;
+                self.episodes.resume_idx = progress;
+            } else {
+                // Fully caught up or reset to 0: park cursor at 0.
+                self.episodes.cursor = 0;
+                self.episodes.resume_idx = null;
+            }
+        }
+    }
+
+    /// Store `entry` in the single-level undo slot (ROD-193 §B). If a prior entry
+    /// exists, free it first so we never leak GPA memory at depth > 1.
+    fn pushUndo(self: *App, entry: UndoEntry) void {
+        if (self.undo) |old| old.free(self.gpa);
+        self.undo = entry;
+    }
+
+    /// Pop the undo slot and revert the last watch-state mutation (ROD-193 §B).
+    /// Looks up the record by (source, source_id) via `history.indexById`; if not
+    /// found (rare: history reloaded between the mutation and `u`), just frees and
+    /// returns silently. Syncs EpisodeState progress when the detail pane is bound
+    /// to the same show (the two-progress-field sync, ROD-193 §D).
+    fn applyUndo(self: *App) void {
+        const entry = self.undo orelse return;
+        self.undo = null; // clear slot before any early-return so we always free
+
+        switch (entry) {
+            .set_list_status => |e| {
+                defer entry.free(self.gpa);
+
+                const st = self.store orelse return;
+                const idx = history.indexById(self, e.source, e.source_id) orelse return;
+                const rec = &self.history[idx];
+
+                // Restore the EXACT captured pair — restoreListStatus writes
+                // progress verbatim, so undoing a force-complete doesn't leave the
+                // store's progress snapped to the finale while memory reverts (the
+                // divergence the app_test caught, ROD-193).
+                st.restoreListStatus(e.source, e.source_id, e.prev_status, e.prev_progress) catch |err| {
+                    log.debug("applyUndo: restoreListStatus failed: {s}", .{@errorName(err)});
+                    return;
+                };
+
+                rec.list_status = e.prev_status;
+                rec.progress = e.prev_progress;
+
+                // Sync EpisodeState when the detail pane is bound to this show.
+                syncEpisodeProgress(self, e.source_id, e.prev_progress);
+
+                self.pushToast(.info, "undone", false);
+            },
+        }
     }
 
     fn selectedAnime(self: *const App) ?Anime {
@@ -711,14 +812,43 @@ pub const App = struct {
     /// mutates the in-memory record so the grouped view regroups it on the next
     /// draw — no full reload. On a store error the in-memory state is left
     /// untouched so the two never diverge. No-op if nothing is focused.
+    ///
+    /// Instruments single-level undo (ROD-193 §B): captures prev_status +
+    /// prev_progress before the store write; pushes the entry only on success.
+    /// All four keys (p/x/c/w) are undoable — this is the shared path for all.
     fn setSelectedHistoryStatus(self: *App, status: domain.ListStatus) void {
         const st = self.store orelse return;
         const idx = history.indexAtCursor(self) orelse return;
         const rec = &self.history[idx];
+
+        // Capture prev state for undo BEFORE the store write.
+        const prev_status = rec.list_status;
+        const prev_progress = rec.progress;
+        // GPA-dupe the key strings now; free them if the store write fails.
+        const src_copy = self.gpa.dupe(u8, rec.source) catch null;
+        const sid_copy = self.gpa.dupe(u8, rec.source_id) catch null;
+
         st.setListStatus(rec.source, rec.source_id, status) catch |e| {
             log.debug("setListStatus failed: {s}", .{@errorName(e)});
+            if (src_copy) |buf| self.gpa.free(buf);
+            if (sid_copy) |buf| self.gpa.free(buf);
             return;
         };
+
+        // Store write succeeded — push the undo entry.
+        if (src_copy) |src| {
+            if (sid_copy) |sid| {
+                self.pushUndo(.{ .set_list_status = .{
+                    .source = src,
+                    .source_id = sid,
+                    .prev_status = prev_status,
+                    .prev_progress = prev_progress,
+                } });
+            } else {
+                self.gpa.free(src);
+            }
+        }
+
         rec.list_status = status;
         // Mirror the store's force-complete progress snap: a real total fills the
         // bar; unknown/0 leaves progress as-is (same guard as Store.setListStatus).
@@ -1941,6 +2071,27 @@ pub const App = struct {
                 return;
             } else if (key.matches('w', .{})) {
                 self.setSelectedHistoryStatus(.watching);
+                return;
+            } else if (key.matches('r', .{})) {
+                // ROD-193: recompute progress from episode_progress rows (strategy A).
+                // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
+                // because single-level undo goes stale after any subsequent key.
+                const st = self.store orelse return;
+                const idx = history.indexAtCursor(self) orelse return;
+                const rec = &self.history[idx];
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const hw = st.recomputeProgress(arena.allocator(), rec.source, rec.source_id, self.translation) catch |e| {
+                    log.debug("recomputeProgress failed: {s}", .{@errorName(e)});
+                    return;
+                };
+                rec.progress = hw;
+                syncEpisodeProgress(self, rec.source_id, hw);
+                self.pushToast(.success, "progress reset", false);
+                return;
+            } else if (key.matches('u', .{})) {
+                // ROD-193: single-level undo of the last watch-state mutation.
+                self.applyUndo();
                 return;
             }
         }
