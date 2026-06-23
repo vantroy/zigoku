@@ -50,7 +50,7 @@ jobs:
           v="${{ steps.version.outputs.version }}"
           grep -qE "^## \[$v\]" CHANGELOG.md \
             || { echo "::error::no '## [$v]' section in CHANGELOG.md — promote [Unreleased] before tagging"; exit 1; }
-          body="$(awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g {print}' CHANGELOG.md)"
+          body="$(awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g && /^\[[^]]+\]:/ {exit} g {print}' CHANGELOG.md)"
           [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] \
             || { echo "::error::'## [$v]' section is empty"; exit 1; }
           echo "CHANGELOG section [$v] present and non-empty"
@@ -130,7 +130,7 @@ jobs:
       - name: Extract release notes from CHANGELOG
         run: |
           v="${{ needs.guard.outputs.version }}"
-          awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g {print}' CHANGELOG.md > notes.md
+          awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g && /^\[[^]]+\]:/ {exit} g {print}' CHANGELOG.md > notes.md
           echo "----- release notes -----"; cat notes.md
 
       - name: Publish GitHub Release
