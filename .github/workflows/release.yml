@@ -1,0 +1,144 @@
+name: Release
+
+# Push a vX.Y.Z tag → build portable static binaries, package them, and publish
+# a GitHub Release with auto-extracted notes + checksums. See ROD-145.
+#
+#   git tag v0.1.0 && git push --tags     # the real thing (Rod's call)
+#   Actions ▸ Release ▸ Run workflow       # rehearsal: builds + packages, no publish
+#
+# Linux musl static only — macOS compiles green but segfaults on real hardware,
+# so no Darwin release bins until there's a testbed to debug it.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}   # manual rehearsal: runs guard + build, never publishes
+
+jobs:
+  # ── Fail fast before burning build minutes ─────────────────────────────────
+  # The version-sync test only catches root.zig↔zon drift, not tag drift or a
+  # missing changelog. These two guards close both gaps (push events only; the
+  # rehearsal path skips them so it can run against an unpromoted CHANGELOG).
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve in-repo version
+        id: version
+        run: |
+          version="$(grep -oP '^\s*\.version = "\K[^"]+' build.zig.zon)"
+          [ -n "$version" ] || { echo "::error::could not parse .version from build.zig.zon"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "in-repo version: $version"
+
+      - name: Guard — tag matches in-repo version
+        if: github.event_name == 'push'
+        run: |
+          expected="v${{ steps.version.outputs.version }}"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' != in-repo version '$expected' — bump build.zig.zon + src/root.zig, or fix the tag"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches in-repo version"
+
+      - name: Guard — CHANGELOG has a non-empty section for this version
+        if: github.event_name == 'push'
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          grep -qE "^## \[$v\]" CHANGELOG.md \
+            || { echo "::error::no '## [$v]' section in CHANGELOG.md — promote [Unreleased] before tagging"; exit 1; }
+          body="$(awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g && /^\[[^]]+\]:/ {exit} g {print}' CHANGELOG.md)"
+          [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] \
+            || { echo "::error::'## [$v]' section is empty"; exit 1; }
+          echo "CHANGELOG section [$v] present and non-empty"
+
+  # ── Build + package one static tarball per target ──────────────────────────
+  build:
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # No libsqlite3-dev step: -Dbundle-sqlite compiles its own SQLite, so the
+      # release build needs nothing from the system beyond what musl static gives.
+      - name: Build (static musl + bundled sqlite + stripped)
+        run: zig build -Dbundle-sqlite -Dstrip -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --prefix out
+
+      - name: Verify the binary is fully static
+        run: |
+          file out/bin/zigoku
+          if readelf -dW out/bin/zigoku 2>/dev/null | grep -q NEEDED; then
+            echo "::error::binary has dynamic NEEDED entries — not static"; exit 1
+          fi
+          echo "static: no dynamic dependencies"
+
+      - name: Smoke-run (x86_64 only — the runner is x86)
+        if: matrix.target == 'x86_64-linux-musl'
+        run: ./out/bin/zigoku --version
+
+      - name: Package tarball
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          name="zigoku-v${v}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp out/bin/zigoku LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+          ( cd dist && sha256sum "$name.tar.gz" )
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Publish — tag pushes only; the rehearsal path stops at `build` ─────────
+  release:
+    needs: [guard, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the release + upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all tarballs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Aggregate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz | tee sha256sums.txt
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          awk -v ver="$v" '$0 ~ "^## \\[" ver "\\]" {g=1; next} g && /^## \[/ {exit} g && /^\[[^]]+\]:/ {exit} g {print}' CHANGELOG.md > notes.md
+          echo "----- release notes -----"; cat notes.md
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: zigoku ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            dist/*.tar.gz
+            dist/sha256sums.txt
+          fail_on_unmatched_files: true

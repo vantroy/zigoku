@@ -4,18 +4,53 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Bundle SQLite: compile the vendored amalgamation straight into the binary
+    // instead of dynamically linking system libsqlite3. Off by default — local/CI
+    // builds use the distro's sqlite (fast, distro owns CVE patches). Release
+    // artifacts flip it on so a static musl build is one self-contained file with
+    // no libsqlite3.so dependency. See ROD-145 → "SQLite bundling in Zig".
+    const bundle_sqlite = b.option(
+        bool,
+        "bundle-sqlite",
+        "Compile the vendored SQLite amalgamation instead of linking system libsqlite3",
+    ) orelse false;
+
+    // Strip debug info — release artifacts only. See exe creation below.
+    const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse false;
+
     const mod = b.addModule("zigoku", .{
         .root_source_file = b.path("src/root.zig"),
         // Needed because this module is also the root of a test executable.
         .target = target,
         // M2 persistence (src/store.zig) talks to libsqlite3 via raw C interop,
-        // so the whole library module links libc + system sqlite3. The exe and
-        // test executables that include this module inherit the linkage.
+        // so the whole library module links libc. The exe and test executables
+        // that include this module inherit the linkage.
         .link_libc = true,
     });
-    mod.linkSystemLibrary("sqlite3", .{});
     mod.addIncludePath(b.path("src/c"));
     mod.addCSourceFile(.{ .file = b.path("src/c/stb_image_impl.c") });
+
+    // store.zig's @cImport(@cInclude("sqlite3.h")) resolves identically either
+    // way — system header vs amalgamation header — so app code never changes.
+    if (bundle_sqlite) {
+        // Lazy dependency: only downloaded when this branch runs, i.e. only for
+        // release builds that pass -Dbundle-sqlite. Returns null on the first
+        // configure pass until the fetch lands, then zig re-runs build().
+        if (b.lazyDependency("sqlite", .{})) |sqlite_dep| {
+            mod.addIncludePath(sqlite_dep.path("."));
+            mod.addCSourceFile(.{
+                .file = sqlite_dep.path("sqlite3.c"),
+                // THREADSAFE=1: the worker pool hits the store off the UI thread.
+                // OMIT_LOAD_EXTENSION: we never load extensions; drops attack surface.
+                .flags = &.{
+                    "-DSQLITE_THREADSAFE=1",
+                    "-DSQLITE_OMIT_LOAD_EXTENSION",
+                },
+            });
+        }
+    } else {
+        mod.linkSystemLibrary("sqlite3", .{});
+    }
 
     // libvaxis (ROD-71) — the M3 TUI toolkit. v0.6.0 targets Zig 0.16's std.Io.
     // The whole zigoku module gets it so src/tui/* can @import("vaxis").
@@ -29,6 +64,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Strip debug info from release artifacts (-Dstrip). Off by default so
+            // local/CI builds keep symbols for backtraces; Zig strips at link time,
+            // which works for cross-compiled targets a host `strip` couldn't touch.
+            .strip = strip,
             .imports = &.{
                 .{ .name = "zigoku", .module = mod },
             },
