@@ -39,7 +39,8 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 
 ## Install
 
-Zigoku is distributed as source — clone it and run the installer:
+Zigoku is distributed as source, or as a prebuilt Linux binary (see below). To
+install from source, clone it and run the installer:
 
 ```sh
 git clone https://github.com/vantroy/zigoku.git
@@ -64,6 +65,51 @@ zigoku frieren                # CLI flow: search → pick → play
 zigoku "cowboy bebop" --dub
 zigoku <query> --debug        # diagnostics to stderr (CLI) or the log file (TUI)
 ```
+
+### Or: grab a prebuilt binary
+
+Fully static, no shared-lib deps — not even glibc. SQLite is compiled in.
+Runs on any Linux of that architecture; no Zig toolchain required.
+
+**One hard runtime dependency that is not bundled and never will be: `mpv`.**
+The binary shells out to whatever `mpv` is on your `PATH` to play video.
+Without it, you get a browser. A very nice browser, but still.
+
+1. Download the tarball for your arch from the [latest release](https://github.com/vantroy/zigoku/releases/latest):
+
+   | Architecture | File |
+   |---|---|
+   | x86_64 (most desktops/servers) | `zigoku-vX.Y.Z-x86_64-linux-musl.tar.gz` |
+   | aarch64 (ARM64) | `zigoku-vX.Y.Z-aarch64-linux-musl.tar.gz` |
+
+2. Verify it against `sha256sums.txt` from the same release page (encouraged):
+
+   ```sh
+   sha256sum -c --ignore-missing sha256sums.txt
+   ```
+
+3. Extract and put it on your `PATH`:
+
+   ```sh
+   tar -xzf zigoku-vX.Y.Z-<target>.tar.gz
+   mv zigoku ~/.local/bin/          # or wherever your PATH points
+   # no chmod needed — tar preserves the executable bit
+   ```
+
+4. Make sure `mpv` is installed and on your `PATH`:
+
+   ```sh
+   command -v mpv
+   ```
+
+5. Run it:
+
+   ```sh
+   zigoku
+   ```
+
+Cover art looks best in a terminal with the Kitty graphics protocol (kitty,
+ghostty, WezTerm); everywhere else you get halfblock cells. Functional either way.
 
 ## Build from source
 
