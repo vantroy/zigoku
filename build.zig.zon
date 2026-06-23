@@ -12,6 +12,14 @@
             .url = "git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd",
             .hash = "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA",
         },
+        // SQLite amalgamation, fetched on demand for static release builds only
+        // (-Dbundle-sqlite). `lazy = true` keeps it out of every normal `zig build`
+        // — the ~9MB source never downloads unless a release asks for it. See ROD-145.
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3530200.zip",
+            .hash = "N-V-__8AALc_rgC04POe18O0LKFRm4ouQpLtL3riscEmWp-Q",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
