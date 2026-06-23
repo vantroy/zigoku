@@ -1,5 +1,11 @@
 # zigoku · 地獄
 
+[![CI](https://github.com/vantroy/zigoku/actions/workflows/ci.yml/badge.svg)](https://github.com/vantroy/zigoku/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/vantroy/zigoku?color=08872B)](https://github.com/vantroy/zigoku/releases/latest)
+[![License: GPL-3.0](https://img.shields.io/github/license/vantroy/zigoku?color=blue)](LICENSE)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux-555)](https://github.com/vantroy/zigoku/releases/latest)
+
 A terminal anime browser & player, built from scratch in [Zig](https://ziglang.org/).
 
 > *Zig + jigoku ("hell").* A ground-up reimagining of the abandoned `ani-nexus-tui`,
