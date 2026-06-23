@@ -1,0 +1,64 @@
+# git-cliff — DRAFT generator for CHANGELOG.md (the hybrid flow).
+#
+# This is an authoring aid, not a source of truth. Run it locally to draft the
+# changes since the last tag, then hand-merge what's worth keeping into the
+# curated `## [Unreleased]` section of CHANGELOG.md:
+#
+#     git cliff --unreleased            # grouped draft → stdout, copy by hand
+#
+# It is deliberately NOT wired into CI: release.yml *extracts* the curated
+# `## [X.Y.Z]` section from the committed CHANGELOG.md, it never regenerates it.
+# See ROD-145 → "Changelog management".
+
+[changelog]
+# Header is owned by CHANGELOG.md itself; --unreleased to stdout omits it anyway.
+header = ""
+body = """
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+## [Unreleased]
+{% endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true   # drop merge commits & anything not type(scope): ...
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+# Strip the trailing Linear ref — (ROD-149), (ROD-156 #1,#4), (ROD-139 phase A) —
+# it's private to the workspace and adds no signal for a reader of the release.
+commit_preprocessors = [
+  { pattern = '\s*\(ROD-\d+[^)]*\)', replace = "" },
+]
+
+# Conventional type → Keep a Changelog group. Skipped types never reach a draft;
+# the catch-all drops anything unmapped so noise can't sneak in.
+commit_parsers = [
+  { message = "^Merge",     skip = true },
+  { message = "^feat",      group = "Added" },
+  { message = "^fix",       group = "Fixed" },
+  { message = "^perf",      group = "Changed" },
+  { message = "^refactor",  group = "Changed" },
+  { message = "^harden",    group = "Changed" },
+  { message = "^revert",    group = "Removed" },
+  { message = "^docs",      skip = true },
+  { message = "^test",      skip = true },
+  { message = "^ci",        skip = true },
+  { message = "^chore",     skip = true },
+  { message = "^style",     skip = true },
+  { message = ".*",         skip = true },
+]
