@@ -14,8 +14,10 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
-The inaugural feature set, awaiting its first tag — a terminal anime browser &
-player built from scratch in Zig. See the [README](README.md) for the full story.
+## [0.1.0] - 2026-06-23
+
+First tagged release — a terminal anime browser & player built from scratch in
+Zig. See the [README](README.md) for the full story.
 
 ### Added
 
@@ -49,4 +51,5 @@ player built from scratch in Zig. See the [README](README.md) for the full story
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/commits/master
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/vantroy/zigoku/releases/tag/v0.1.0
