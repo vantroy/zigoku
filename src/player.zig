@@ -186,6 +186,13 @@ pub fn play(
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));
+    // Window-manager title carries a stable "zigoku - " prefix so hypr-focus
+    // (and taskbars/overviews) can identify the playback window while still
+    // showing the episode. Use mpv's ${media-title} expansion rather than
+    // interpolating `title` directly: media-title is set verbatim above and is
+    // not re-expanded, so a title containing `${...}` can't trigger mpv
+    // property expansion here.
+    try argv.append(arena, "--title=zigoku - ${media-title}");
     try argv.append(arena, try std.fmt.allocPrint(arena, "--input-ipc-server={s}", .{socket_path}));
     if (start_seconds > 0) {
         try argv.append(arena, try std.fmt.allocPrint(arena, "--start={d}", .{start_seconds}));
