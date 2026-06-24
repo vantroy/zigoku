@@ -1132,6 +1132,52 @@ test "browse scrolling fires zero episode fetches; detail entry lazy-loads them 
     try testing.expect(app.episodes.for_id != null);
 }
 
+test "browse scrolling debounces the cover fetch; discrete nav syncs at once (ROD-202)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    inline for (.{ "a", "b", "c" }) |id| {
+        app.results.appendAssumeCapacity(.{
+            .id = try std.testing.allocator.dupe(u8, id),
+            .name = try std.testing.allocator.dupe(u8, id),
+        });
+    }
+    defer {
+        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.results.deinit(std.testing.allocator);
+        app.episodes.freeResults(app.gpa);
+    }
+
+    // Narrow: no preview pane, so the cover doesn't track the cursor — a move must
+    // NOT arm the settle debounce (coverTracksCursor() is false).
+    app.term_cols = 40;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
+
+    // Wide split browse, list focused: a real key-driven cursor move arms the
+    // cover settle instead of fetching on the spot (the ROD-202 fix — a fast
+    // scroll re-arms each move and only the settled show fetches in .tick).
+    app.term_cols = 80;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testing.expect(app.cover_sync_deadline_ms > 0);
+
+    // A no-op move (j at the bottom) doesn't re-arm.
+    app.cover_sync_deadline_ms = 0;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+    try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
+
+    // Discrete nav (focus the detail pane) is not a scroll: it cancels any pending
+    // settle and syncs the cover immediately, so it never lags a deliberate action.
+    app.cover_sync_deadline_ms = 999;
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
+}
+
 test "browse list pane detail render info uses selected anime" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
