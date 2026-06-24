@@ -14,6 +14,27 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-25
+
+### Added
+
+- **Cover-art disk cache**: fetched covers now persist under
+  `$XDG_CACHE_HOME/zigoku/covers/` and survive restarts, so a cold start no
+  longer re-downloads every visible cover.
+- **First-run discoverability**: empty views show actionable guidance and scope
+  tags instead of a blank pane.
+- **macOS support**: SQLite is now bundled (fixing a startup segfault on stock
+  macOS), and releases ship macOS binaries — arm64 and x86_64 — alongside the
+  static Linux musl builds.
+
+### Changed
+
+- **Snappier Browse**: episodes lazy-load on detail entry rather than on hover,
+  and the cover-preview fetch is debounced until the cursor settles.
+- **ESC / q semantics**: ESC peels transient layers (toasts, filter, detail)
+  while q quits — the old q/ESC ambiguity is gone.
+- mpv's window title is now prefixed with `zigoku — `.
+
 ## [0.1.0] - 2026-06-23
 
 First tagged release — a terminal anime browser & player built from scratch in
@@ -51,5 +72,6 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/vantroy/zigoku/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vantroy/zigoku/releases/tag/v0.1.0
