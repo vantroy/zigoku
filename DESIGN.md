@@ -1902,8 +1902,10 @@ Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
 Note: `q` quits the app (ROD-210) — `h`/`Esc` return focus to the list. Browse uses this string at all two-pane
 widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. At
-`60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the prefetched
-episode and `Space` promotes to the full-screen zoom. At 80 cols the string fits
+`60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the loaded
+episode and `Space` promotes to the full-screen zoom. Episodes load on detail
+entry, not on list hover (ROD-202: parity with History — scrolling Browse never
+fires a fetch). At 80 cols the string fits
 within the ~74-char budget:
 `hjkl scroll · h back · enter play · space zoom · q quit` = 52 chars + `▌ ` = 54.
 
