@@ -25,6 +25,7 @@ const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
 const centerText = render.centerText;
+const centerKeyHint = render.centerKeyHint;
 const formatMeta = render.formatMeta;
 const drawProgressBar = render.drawProgressBar;
 const title_col = render.title_col;
@@ -313,13 +314,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         // and added) instead of advertising a dead-end prompt (ROD-211).
         const mid = top + visible / 2;
         centerText(win, mid -| 1, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));
-        const key = "F1";
-        const action = "  find anime in browse";
-        const key_w: u16 = @intCast(key.len);
-        const total: u16 = key_w + @as(u16, @intCast(action.len));
-        const start: u16 = if (w > total) (w - total) / 2 else 0;
-        put(win, mid + 1, start, key, self.s(self.palette.focus, .{ .bold = true }));
-        putClipped(win, mid + 1, start + key_w, w -| (start + key_w), action, self.s(self.palette.fg2, .{}));
+        centerKeyHint(win, mid + 1, w, "F1", self.s(self.palette.focus, .{ .bold = true }), "  find anime in browse", self.s(self.palette.fg2, .{}));
         return;
     }
 
