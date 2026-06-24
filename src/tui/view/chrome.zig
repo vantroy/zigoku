@@ -164,7 +164,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
-            "hjkl navigate · space toggle · enter edit · q save & quit",
+            "hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit",
     };
     putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
 }

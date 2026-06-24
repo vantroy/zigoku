@@ -1777,26 +1777,32 @@ pub const App = struct {
     /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
     /// Stays on App: it owns `config_path` and the toast queue, neither of which
     /// belongs in the settings edit subsystem.
-    fn saveSettings(self: *App, io: std.Io) void {
+    /// Persist the live config to disk. Returns true only when the bytes
+    /// actually landed — both early-outs (no config dir, write error) toast and
+    /// return false so callers can keep the tab dirty for a retry (ROD-210 M1).
+    fn saveSettings(self: *App, io: std.Io) bool {
         const path = self.config_path orelse {
             self.pushToast(.warn, "no config dir — not saved", false);
-            return;
+            return false;
         };
         config_mod.save(io, self.config, path) catch {
             self.pushToast(.@"error", "settings save failed", false);
-            return;
+            return false;
         };
         self.pushToast(.success, "settings saved", false);
+        return true;
     }
 
     /// Persist Settings on the way out — a base-view switch (F1/F2/H) or a quit
     /// (q/Ctrl-C). Saves only when the tab is dirty, so tabbing through Settings
     /// unchanged neither rewrites the config file nor toasts. ROD-210 moved
-    /// persistence here off the retired `q → .save_and_exit` verdict.
+    /// persistence here off the retired `q → .save_and_exit` verdict. `dirty` is
+    /// cleared only on a *successful* write — a failed save (no config dir / I/O
+    /// error) leaves it set, so a later leave/quit retries instead of silently
+    /// dropping the change (ROD-210 M1, matters on the F-key/H switch-away path).
     fn leaveSettings(self: *App, io: std.Io) void {
         if (!self.settings.dirty) return;
-        self.saveSettings(io);
-        self.settings.dirty = false;
+        if (self.saveSettings(io)) self.settings.dirty = false;
     }
 
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1804,10 +1810,10 @@ pub const App = struct {
         // doesn't consume falls through to the global chain below.
         if (self.active_view == .settings and self.onSettingsKey(key)) return;
 
-        // q quits the app — full stop (§10.6, ROD-210). ESC owns the layered
-        // peel; q owns exit, with no back-nav. The `input_mode == .normal` guard
-        // keeps a literal "q" typed into a Browse search or History filter from
-        // quitting: it falls through to onSearchKey below and appends instead.
+        // q quits the app — full stop (§10.6, ROD-210), with no back-nav: unlike
+        // Esc, q never peels a layer. The `input_mode == .normal` guard keeps a
+        // literal "q" typed into a Browse search or History filter from quitting —
+        // it falls through to onSearchKey below and appends instead.
         if (self.input_mode == .normal and key.matches('q', .{})) {
             // Settings persists on the way out — the save that used to ride the
             // q → .save_and_exit verdict now rides quit. leaveSettings is a no-op
