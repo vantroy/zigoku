@@ -971,7 +971,7 @@ record is focused.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  hjkl scroll · h back · enter play · space zoom · q back                           [detail pane focused; space promotes to zoom §5.3]
+  ▌  hjkl scroll · h back · enter play · space zoom · q quit                           [detail pane focused; space promotes to zoom §5.3]
 ```
 
 Notes:
@@ -985,7 +985,7 @@ Notes:
   focus promote to the full-screen zoom (`active_view = .detail`, §5.3). At
   `w ≥ 100` `Enter` plays instead (the grid is in-pane). `Esc`/`Space` demote
   back to the two-pane (`active_pane = .detail`) when there's room, else to the
-  list (`w < 60`); `q` is the full back-out to the list.
+  list (`w < 60`); `q` quits the app (ROD-210 — Esc/Space/`h` own the demote).
 - The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
   when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
   takes full `list_w` and the badge is omitted.
@@ -1050,7 +1050,7 @@ Live-editable. Full width. No cover art.
     kanji chips                 [████ on ████]                 space to toggle
     help line                   [████ on ████]                 space to toggle
 
-  ▌  hjkl navigate · space toggle · enter edit · esc cancel edit · q back
+  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
 Notes:
@@ -1112,8 +1112,8 @@ Notes:
 | `g` | Jump to top of list |
 | `G` | Jump to bottom of list |
 | `Enter` | Select item / enter detail / play episode |
-| `Esc` | Cancel search/command / exit detail to list / exit to Browse |
-| `q` | Quit current view (back one level) / confirm quit from Browse |
+| `Esc` | Peel one transient layer: close search/command, or exit detail/zoom to the list. Never switches base view (ROD-210). |
+| `q` | Quit the app from anywhere — normal mode only, so a literal `q` in a search/filter is text. Persists a dirty Settings tab first (ROD-210). |
 | `/` | Open search prompt in bottom bar |
 | `:` | Open command prompt in bottom bar |
 | `H` | Switch to History/Watchlist view (or back to Browse) |
@@ -1682,8 +1682,8 @@ Browse's and History's right-hand detail *pane* (§10.3, reached with `l`/`Enter
 default "triage scrub" surface. The standalone Detail view is the full-screen zoom (§5.3),
 reached with `Space` from a focused detail pane in **either** Browse or History when `w ≥ 100`.
 `detail_origin` records the entry point (`.browse` or `.history`); both arms are now live.
-`Esc` from zoom demotes back to the two-pane with `active_pane = .detail`. `q` from zoom
-returns to `detail_origin` view with `active_pane = .list`. See §10.4 for the full Esc chain,
+`Esc` from zoom demotes back to the two-pane with `active_pane = .detail` (`Space`/`h`
+do the same). `q` no longer backs out — it quits the app (ROD-210). See §10.4 for the full Esc chain,
 and §10.7 for the decision log.
 
 Browse is not available as a landing view in M3 — there is no feed to populate it.
@@ -1704,8 +1704,9 @@ It becomes live when the user presses `F1` or `H` from History. This is unchange
 dedicated single-key bind of its own — `F1` covers that path, see below). From
 Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
 
-`S` from Settings is a no-op. There is no "toggle Settings" semantic — `q` or
-`Esc` exits Settings.
+`S` from Settings is a no-op. There is no "toggle Settings" semantic. `q` quits
+the app (persisting a dirty tab first); `F1`/`F2`/`F3`/`H` switch away (also
+persisting). `Esc` does **not** leave Settings — it is a no-op there (ROD-210).
 
 **Entering the standalone Detail zoom** is not a view-switch keybind — it is a
 promote. `Space` from `active_pane = .detail` opens `active_view = .detail` at any
@@ -1714,8 +1715,8 @@ focused pane promotes too (no in-pane grid to play), and at `w < 60` `Enter`/`Sp
 from the History list open the zoom directly (no pane to focus). At `w ≥ 100`
 `Enter` from the detail pane plays instead — the grid is in-pane. `Esc`/`Space`
 demote back to the two-pane (`active_pane = .detail`) when there's room, else to
-the list; `q` is the full back-out to `detail_origin` with `active_pane = .list`
-(§10.4). `Enter`/`l` from the list step into the in-view detail *pane* first
+the list; `q` no longer backs out — it quits the app (ROD-210, §10.4).
+`Enter`/`l` from the list step into the in-view detail *pane* first
 (§10.3c) whenever there is one (`w ≥ 60`).
 
 #### F-key aliases (discoverable navigation)
@@ -1837,20 +1838,25 @@ Esc action is listed. Everything not listed is a no-op.
 | Browse | `normal` | `.list` | No-op. `q` handles quit from Browse. Esc does not quit. |
 | Detail (zoom) | `normal` | — | **Demote:** `active_view = detail_origin`; `active_pane = .detail` when there's room for the pane (`w ≥ 60`), else `.list` (the zoom was opened from a single-column list at `w < 60`). `Space` and `h` have the same effect (zoom toggle / back). |
 | History (`w ≥ 60`) | `normal` | `.detail` | Set `active_pane = .list`. (Return focus to list — same as `h`.) |
-| History | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to `H`. |
-| Settings | `normal` | `.list` | Switch to Browse. (`active_view = .browse`.) Equivalent to pressing `q` from Settings. |
+| History | `normal` | `.list` | **No-op** (ROD-210). Esc peels transient layers only; base-view switches go through `F1`/`F2`/`F3` or `H`. `q` quits. |
+| Settings | `normal` | `.list` | **No-op** (ROD-210). Same as History — Esc does not leave Settings. `q` quits (persisting a dirty tab); `F1`/`F2`/`F3`/`H` switch away (also persisting). |
 | Settings | `edit` (field under edit) | `.list` | Cancel field edit. Return to Settings normal. `input_mode` stays `.normal`; the edit buffer is discarded. |
 
-**`q` from zoom vs Esc from zoom:** Esc demotes to two-pane with `active_pane = .detail`
-— the user stays in context with the title. `q` returns to `detail_origin` view
-with `active_pane = .list` — a full back-out. Both work; Esc is "less far back."
+**`q` from zoom vs Esc from zoom (ROD-210):** Esc demotes to two-pane with
+`active_pane = .detail` — the user stays in context with the title; `Space`/`h` do
+the same. `q` no longer backs out at all — it quits the app. The old zoom→list
+"full back-out" on `q` is retired; Esc/Space/`h` own every demote step.
 
 **Why Esc does not quit from Browse normal:** `q` is the quit key throughout
 (§6.1). Esc-as-return is the vim idiom. In Browse list normal with no modal open,
 there is no level back — Esc is a no-op rather than a quit trigger.
 
-**Why Esc from History (.list) goes to Browse:** History is a view, not the root.
-Esc navigates backward (History → Browse); `q` from Browse prompts quit.
+**Why Esc from History/Settings (.list) is a no-op (ROD-210):** Esc means "peel
+one transient layer," never "switch base view." Over a base-view list there is no
+layer to peel, so Esc does nothing — History stays History, Settings stays
+Settings. Base-view changes are explicit: `F1`/`F2`/`F3` and the `H` toggle. This
+retires the old "Esc-mashing dumps you on Browse" behavior, where Esc silently
+switched the base view once the last transient layer was peeled.
 
 **Why zoom Esc lands on `.detail`, not `.list`:** the user arrived at zoom via
 the detail pane. Esc undoes one step. Skipping back to list would be jarring —
@@ -1883,17 +1889,17 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `F1`, `F2`, `F3`, `q`.
 #### Browse — normal, detail pane focused
 
 ```
-  ▌  hjkl scroll · h back · enter play · space zoom · q back
+  ▌  hjkl scroll · h back · enter play · space zoom · q quit
 ```
 
 Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
-Note: `q` returns to list, not quit. Browse uses this string at all two-pane
+Note: `q` quits the app (ROD-210) — `h`/`Esc` return focus to the list. Browse uses this string at all two-pane
 widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. At
 `60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the prefetched
 episode and `Space` promotes to the full-screen zoom. At 80 cols the string fits
 within the ~74-char budget:
-`hjkl scroll · h back · enter play · space zoom · q back` = 52 chars + `▌ ` = 54.
+`hjkl scroll · h back · enter play · space zoom · q quit` = 52 chars + `▌ ` = 54.
 
 #### History — normal, list pane focused
 
@@ -1911,7 +1917,7 @@ context without a hint.
 #### History — normal, detail pane focused (w ≥ 100)
 
 ```
-  ▌  hjkl scroll · h back · enter play · space zoom · q back
+  ▌  hjkl scroll · h back · enter play · space zoom · q quit
 ```
 
 Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
@@ -1921,7 +1927,7 @@ Identical to Browse detail pane focused — symmetric two-pane grammar.
 #### History — normal, detail pane focused (60 ≤ w < 100, no zoom)
 
 ```
-  ▌  enter/space zoom · h back · q back
+  ▌  enter/space zoom · h back · q quit
 ```
 
 Underlined: `enter`, `space`, `h`, `q`.
@@ -1938,8 +1944,8 @@ that explicit: `enter/space zoom`.
 
 Underlined: `h`, `j`, `k`, `l`, `enter`, `space`, `esc`.
 
-`space/esc back` reinforces that both keys demote from zoom. `q` also works
-(returns to list) but is not shown — the line stays within budget.
+`space/esc back` reinforces that both keys demote from zoom. `q` quits the app
+(ROD-210); it is not shown — the line stays within budget.
 
 #### History — empty (no records)
 
@@ -1955,13 +1961,17 @@ This is the §9.2 empty state. Minimal help — the screen itself already says
 #### Settings — normal
 
 ```
-  ▌  jk navigate · space toggle · enter edit · esc cancel · q back
+  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
-Underlined: `j`, `k`, `space`, `enter`, `esc`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `F1`, `F2`, `q`.
 
-This matches the §5.5 mock exactly, with `q back` replacing `q quit` because
-Settings is not root level.
+Settings persists a dirty tab on the way out, so `q` reads `q save+quit`
+(ROD-210; the `+` signals one press does both). `F1`/`F2` are surfaced so
+*leaving without quitting* is discoverable — they switch to Browse/History and
+persist, mirroring how the other views advertise their view-switches. `Esc` is a
+no-op here — the field-edit cancel lives in the edit-mode line below. This
+matches the §5.5 mock.
 
 #### Settings — field under edit
 
@@ -2015,7 +2025,7 @@ active_pane: enum { list, detail } = .list,
 **ROD-170 adds one field:**
 
 ```zig
-/// Records which view opened the full-screen zoom, for Esc/q return.
+/// Records which view opened the full-screen zoom, for Esc/Space/h return.
 /// Both arms are now live (ROD-170): .browse when zoomed from Browse,
 /// .history when zoomed from History.
 detail_origin: enum { browse, history } = .browse,
@@ -2066,60 +2076,43 @@ if (key.matches(' ', .{})) {
 }
 ```
 
-**Esc chain — zoom demote and History detail-pane return:**
+**Esc chain — peel one transient layer (ROD-210 amends ROD-170):**
 
 ```zig
 if (key.matches(vaxis.Key.escape, .{})) {
-    switch (self.active_view) {
-        .detail => {
-            // Demote zoom → two-pane, stay on detail pane.
-            self.active_view = if (self.detail_origin == .browse) .browse else .history;
-            self.active_pane = .detail;
-        },
-        .browse => {
-            if (self.active_pane == .detail) self.active_pane = .list;
-            // Browse list + normal: no-op.
-        },
-        .history => {
-            if (self.active_pane == .detail) {
-                self.active_pane = .list;
-            } else {
-                // History list: go to Browse.
-                self.active_view = .browse;
-                self.active_pane = .list;
-            }
-        },
-        .settings => {
-            self.active_view = .browse;
-            self.active_pane = .list;
-        },
+    if ((self.active_view == .browse or self.active_view == .history) and
+        self.active_pane == .detail)
+    {
+        // Detail pane focused → return focus to the list (= h).
+        self.active_pane = .list;
+    } else if (self.active_view == .detail) {
+        // Zoom → demote one step (Space/h do the same). q quits.
+        self.active_view = if (self.detail_origin == .browse) .browse else .history;
+        self.active_pane = if (self.term_w >= pane_split_min) .detail else .list;
     }
+    // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed the
+    // old History/Settings → Browse jump — base-view switches go through
+    // F1/F2/F3 and the H toggle.
     return;
 }
 ```
 
-#### `q` key behavior by view (ROD-170 amendment)
+#### `q` key behavior (ROD-210: quit, full stop)
 
-| View | `active_pane` | `q` action |
-|---|---|---|
-| Browse | any | `should_quit = true` (root level) |
-| History | any | `active_view = .browse`, `active_pane = .list` (back one level) |
-| Detail (zoom) | — | `active_view = detail_origin`, `active_pane = .list` (full back-out to list) |
-| Settings | any | `active_view = .browse`, `active_pane = .list` (back one level) |
+ROD-210 retired the per-view back-nav. `q` quits from anywhere; the layered peel
+belongs to `Esc`/`Space`/`h`.
+
+| `input_mode` | `q` action |
+|---|---|
+| `normal` | `should_quit = true`, from any view/pane. Settings persists a dirty tab first (`leaveSettings` → save-if-dirty). `q` never navigates. |
+| `search` | Not a quit — `q` is appended to the query/filter as text (the guard below sends it to `onSearchKey`). |
 
 ```zig
-if (key.matches('q', .{})) {
-    switch (self.active_view) {
-        .browse => self.should_quit = true,
-        .detail => {
-            self.active_view = if (self.detail_origin == .browse) .browse else .history;
-            self.active_pane = .list;
-        },
-        .history, .settings => {
-            self.active_view = .browse;
-            self.active_pane = .list;
-        },
-    }
+// q quits the app — full stop (ROD-210). The input_mode guard keeps a literal
+// "q" typed into a search/filter as text instead of quitting.
+if (self.input_mode == .normal and key.matches('q', .{})) {
+    if (self.active_view == .settings) self.leaveSettings(io); // save-if-dirty
+    self.should_quit = true;
     return;
 }
 ```
@@ -2140,5 +2133,5 @@ if (key.matches('q', .{})) {
 | **ROD-186: season chip is an add-on in `text.muted`, not a replacement in `color.focus`** | The original §3.4/§10.3b spec gave the season chip `color.focus` as the *only* chip. The coexistence decision (keep the view label, add the season chip) put two chips side by side — both specced cyan, which would blur into one blob (§2.3: chips are distinguished by color alone, no boxes). Demoting the season chip to `text.muted` (fg2) makes them distinct with zero extra glyphs, matches how season/year already reads in History rows (§5.4), and leaves `color.focus` to mean one thing on the left (view identity) while the cyan `·` owns the right edge. Content rule (Rod): selected show's season+year, falling back to the current cour from the system clock — except the detail zoom, which is committed to one show and shows only its season (no fallback). Rejected: a `░`/`·` separator between the two cyan chips (adds chrome, §0). | If user testing shows the muted season chip is missed, brighten it one step (text.muted → text.primary) before reaching for `color.focus`. |
 | **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, right pane updates on cursor move) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
 | **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
-| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. `q` provides the full back-out (zoom → list) for users who want to get all the way out. (Exception: at `w < 60` there is no pane to land on, so Esc/`Space`/`h` demote to the single-column list.) | No revisit expected. |
+| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse; jumping straight to `.list` would skip a level, jarring on a long episode list the user was navigating. `Space`/`h` demote identically. (Exception: at `w < 60` there is no pane to land on, so they demote to the single-column list.) ROD-210 retired `q` as a "full back-out" — `q` quits now, and Esc/`Space`/`h` are the only demote path. | No revisit expected. |
 | **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on focus at any two-pane width, so the zoom's grid is always ready. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | Revisit if a future design gives the 60–99 pane its own usable in-pane grid — that would remove the Enter-drills-to-zoom hop. |

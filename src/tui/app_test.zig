@@ -726,10 +726,12 @@ test "History `r` recompute-to-0 clears the episode resume marker (ROD-193 revie
     try testing.expectEqual(@as(?usize, null), app.episodes.resume_idx);
 }
 
-test "q/Esc from History reset the viewport before Browse reads it (ROD-139 H1)" {
+test "F1/H from History reset the viewport before Browse reads it (ROD-139 H1, ROD-210)" {
     // list_top is a physical-row offset in History but an entry index in Browse —
     // leaving History must clear it so a stale physical value can't leak across.
-    inline for (.{ vaxis.Key.escape, 'q' }) |k| {
+    // ROD-210 retired the q/Esc → Browse jump; F1 and the H toggle are now the
+    // only History → Browse paths, and they own the reset.
+    inline for (.{ vaxis.Key.f1, 'H' }) |k| {
         var app: App = .{};
         var recs = sampleHistory();
         app.setHistory(&recs);
@@ -778,24 +780,27 @@ test "S from settings is a no-op" {
     try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
 }
 
-test "q from history returns to browse without quitting" {
+test "q from history quits the app — no back-nav (ROD-210)" {
     var app: App = .{};
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
     try testing.expect(!app.should_quit);
     try testTick(&app, keyEv('q', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
-    try testing.expect(!app.should_quit);
+    // q quits in place — it no longer routes History → Browse.
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
 }
 
-test "q from settings returns to browse without quitting" {
+test "q from settings saves and quits, staying in the Settings view (ROD-210)" {
     var app: App = .{};
     app.active_view = .settings;
     try testing.expect(!app.should_quit);
     try testTick(&app, keyEv('q', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
-    try testing.expect(!app.should_quit);
+    // q persists (leaveSettings — a no-op here since nothing is dirty) then
+    // quits; it no longer routes to Browse.
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
 }
 
 test "q from browse quits the app" {
@@ -817,11 +822,74 @@ test "Esc from browse detail pane returns to list pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
-test "Esc from history returns to browse" {
+test "Esc from history list is a no-op — stays in History (ROD-210)" {
     var app: App = .{};
     app.active_view = .history;
+    app.active_pane = .list;
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+    // ROD-210: Esc peels transient layers only; over a base-view list it does
+    // nothing (no more History → Browse jump).
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+    try testing.expect(!app.should_quit);
+}
+
+test "Esc from history detail pane returns to the list pane, not Browse (ROD-210)" {
+    var app: App = .{};
+    app.active_view = .history;
+    app.active_pane = .detail;
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    // Peels the pane layer and stays in History — the old contract jumped to
+    // Browse on the *next* Esc; the new one never does.
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    // A further Esc is a plain no-op.
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+}
+
+test "Esc from settings is a no-op — does not jump to Browse (ROD-210)" {
+    var app: App = .{};
+    app.active_view = .settings;
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
+    try testing.expect(!app.should_quit);
+}
+
+test "q typed into a Browse search appends instead of quitting (ROD-210)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    // Feed 'q' with .text populated, as a real terminal does: the input_mode
+    // guard must route it to onSearchKey (append), never the quit path. (keyEv
+    // leaves .text null, so it can't exercise the append — hence the raw event.)
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'q', .text = "q" } });
+    try testing.expect(!app.should_quit);
+    try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+    try testing.expectEqual(@as(usize, 1), app.search_len);
+    try testing.expectEqual(@as(u8, 'q'), app.search_query[0]);
+}
+
+test "q typed into a History filter appends instead of quitting (ROD-210)" {
+    var app: App = .{};
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.input_mode = .search;
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'q', .text = "q" } });
+    try testing.expect(!app.should_quit);
+    try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+    try testing.expectEqual(@as(usize, 1), app.history_filter_len);
+    try testing.expectEqual(@as(u8, 'q'), app.history_filter[0]);
+}
+
+test "q from a browse detail pane quits — never backs out (ROD-210)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expect(app.should_quit);
 }
 
 test "Esc from browse list pane is a no-op" {
@@ -1258,31 +1326,31 @@ test "Enter in a 60-99 detail pane zooms instead of playing (ROD-170)" {
     app.episodes.freeResults(app.gpa);
 }
 
-test "q from the zoom backs all the way out to the history list (ROD-170)" {
+test "q from the zoom quits — Esc/h own the demote (ROD-170, ROD-210)" {
     var app: App = .{};
     app.active_view = .detail;
     app.detail_origin = .history;
     app.active_pane = .detail;
 
     try testTick(&app, keyEv('q', .{}));
-    // ROD-170: q is the full back-out (zoom → list), where Esc/h demote one step.
-    try testing.expectEqual(.history, app.active_view);
-    try testing.expectEqual(.list, app.active_pane);
-    try testing.expect(!app.should_quit);
+    // ROD-210: q quits from anywhere. The zoom→two-pane→list back-out moved
+    // entirely onto Esc/h (see the Esc-from-zoom tests below).
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(.detail, app.active_view); // unchanged — q didn't nav
 }
 
-test "q from a focused History detail pane backs to the list, not Browse (ROD-170)" {
-    // Astra D1: q from the two-pane detail pane used to fall through to the
-    // History list-exit and jump to Browse, contradicting the "q back" help line.
+test "q from a focused History detail pane quits — never backs out (ROD-170, ROD-210)" {
+    // Pre-ROD-210 this backed one level to the list (the old "q back" help line).
+    // The new contract makes q quit unconditionally; Esc/h do the one-level peel.
     var app: App = .{};
     app.active_view = .history;
     app.active_pane = .detail;
     app.term_cols = 120;
 
     try testTick(&app, keyEv('q', .{}));
-    try testing.expectEqual(.history, app.active_view); // stays in History
-    try testing.expectEqual(.list, app.active_pane); // backs one level to the list
-    try testing.expect(!app.should_quit);
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(.history, app.active_view); // unchanged — q didn't nav
+    try testing.expectEqual(.detail, app.active_pane);
 }
 
 test "Esc from the zoom demotes to two-pane detail focus (ROD-170)" {
@@ -2890,14 +2958,22 @@ test "settings: j/k navigation clamps to the interactive rows" {
     try testing.expectEqual(@as(usize, app_mod.settings_row_count - 1), app.settings.cursor);
 }
 
-test "settings: q with no config path warns and returns to browse" {
+test "settings: q with a dirty tab and no config path warns, then quits (ROD-210)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
     app.config_path = null;
 
+    // Make a real change so the tab is dirty (space toggles cover_art).
+    app.settings.cursor = 5; // cover_art toggle row
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.settings.dirty);
+
+    // q persists on the way out; with no config dir the save warns instead of
+    // writing — then the app quits regardless (ROD-210).
     try testTick(&app, keyEv('q', .{}));
-    try testing.expectEqual(.browse, app.active_view);
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(.settings, app.active_view);
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
     try testing.expectEqual(Toast.Kind.warn, t.kind);
 }
@@ -2967,11 +3043,13 @@ test "astra: settings save round-trip — q writes file, load reads back mutatio
 
     try testing.expectEqualStrings("/alt/mpv", app.config.mpv_path);
 
-    // Drive q — this calls saveSettings → config_mod.save().
+    // Drive q — leaveSettings sees the dirty tab and calls saveSettings →
+    // config_mod.save(), then the app quits (ROD-210).
     try testTick(&app, keyEv('q', .{}));
 
-    // 1. App returned to browse.
-    try testing.expectEqual(.browse, app.active_view);
+    // 1. q quit in place — it no longer routes to Browse.
+    try testing.expect(app.should_quit);
+    try testing.expectEqual(.settings, app.active_view);
 
     // 2. Toast is .success, not .warn (no-path) or .error (write fail).
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
@@ -2995,6 +3073,63 @@ test "astra: settings save round-trip — q writes file, load reads back mutatio
     try testing.expectEqualStrings("/alt/mpv", loaded.mpv_path);
 }
 
+test "F1/F2/H from a dirty Settings tab persist on the way out (ROD-210 H1)" {
+    // Acceptance criterion 2: "switching away via F-key persists settings." With
+    // a null config path the save can't write, but the warn toast proves
+    // leaveSettings (hence saveSettings) ran — i.e. all three call-sites are
+    // wired. Guards against a dropped leaveSettings() on any of F1/F2/H.
+    inline for (.{ vaxis.Key.f1, vaxis.Key.f2, 'H' }) |k| {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        app.active_view = .settings;
+        app.config_path = null;
+        app.settings.cursor = 5; // cover_art toggle row
+        try testTick(&app, keyEv(vaxis.Key.space, .{})); // dirty the tab
+        try testing.expect(app.settings.dirty);
+
+        try testTick(&app, keyEv(k, .{}));
+        try testing.expect(app.active_view != .settings); // switched away
+        const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        try testing.expectEqual(Toast.Kind.warn, t.kind); // save was attempted
+    }
+}
+
+test "astra: Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
+    const cwd_str = std.mem.sliceTo(&cwd_buf, 0);
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/config.zon", .{
+        cwd_str,
+        tmp_dir.sub_path,
+    });
+    defer alloc.free(config_path);
+
+    var app: App = .{};
+    app.gpa = alloc;
+    app.active_view = .settings;
+    app.config_path = config_path;
+    app.settings.cursor = 5; // cover_art toggle (default true → false)
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.settings.dirty);
+
+    // Ctrl-C persists the dirty tab before the hard quit (ROD-210 — leaveSettings
+    // on the Ctrl-C arm), then sets should_quit.
+    try testTick(&app, keyEv('c', .{ .ctrl = true }));
+    try testing.expect(app.should_quit);
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.success, t.kind);
+
+    // File written and the toggle round-tripped to disk.
+    var load_arena = std.heap.ArenaAllocator.init(alloc);
+    defer load_arena.deinit();
+    const loaded = config_mod.load(load_arena.allocator(), testing.io, config_path);
+    try testing.expect(!loaded.cover_art);
+}
+
 test "astra: entering settings resets cursor, editing state, and input_mode" {
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -3012,7 +3147,7 @@ test "astra: entering settings resets cursor, editing state, and input_mode" {
     try testing.expectEqual(.normal, app.input_mode);
 }
 
-test "astra: Esc from settings returns to browse without calling save" {
+test "astra: Esc from settings is a no-op and never saves (ROD-210)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
@@ -3020,7 +3155,9 @@ test "astra: Esc from settings returns to browse without calling save" {
     app.config_path = null;
 
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
-    try testing.expectEqual(.browse, app.active_view);
+    // ROD-210: Esc peels transient layers only; over the Settings list it does
+    // nothing (the old jump to Browse is gone).
+    try testing.expectEqual(.settings, app.active_view);
     // No toast means save was NOT called.
     try testing.expect(app.toast_queue[0] == null);
 }
