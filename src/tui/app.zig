@@ -1754,10 +1754,12 @@ pub const App = struct {
 
     /// Drive a key into the Settings subsystem and project its verdict onto
     /// App-live state. Returns true if the key was consumed; false lets it fall
-    /// through to the global chain (F-keys to switch views, Esc to leave, Ctrl-C
-    /// to quit). The subsystem never touches nav/palette/translation/toasts — it
-    /// reports *what changed* and the projection lives here, in the controller.
-    fn onSettingsKey(self: *App, key: vaxis.Key, io: std.Io) bool {
+    /// through to the global chain (F-keys/H to switch views, q/Ctrl-C to quit;
+    /// Esc is a no-op in Settings under the ROD-210 contract). The subsystem
+    /// never touches nav/palette/translation/toasts — it reports *what changed*
+    /// and the projection lives here, in the controller. Persistence no longer
+    /// rides a key verdict: it moved to App.leaveSettings (ROD-210).
+    fn onSettingsKey(self: *App, key: vaxis.Key) bool {
         switch (self.settings.onKey(key, &self.config)) {
             .ignored => return false,
             .consumed => return true,
@@ -1767,14 +1769,6 @@ pub const App = struct {
                 // `config`, which the subsystem just mutated.
                 self.translation = self.config.translationEnum();
                 self.palette = paletteFromConfig(self.config.palette);
-                return true;
-            },
-            .save_and_exit => {
-                // `q` saves-then-leaves. Persistence + the nav writes stay in the
-                // controller; the subsystem only signals the intent.
-                self.saveSettings(io);
-                self.active_view = .browse;
-                self.active_pane = .list;
                 return true;
             },
         }
@@ -1795,49 +1789,38 @@ pub const App = struct {
         self.pushToast(.success, "settings saved", false);
     }
 
+    /// Persist Settings on the way out — a base-view switch (F1/F2/H) or a quit
+    /// (q/Ctrl-C). Saves only when the tab is dirty, so tabbing through Settings
+    /// unchanged neither rewrites the config file nor toasts. ROD-210 moved
+    /// persistence here off the retired `q → .save_and_exit` verdict.
+    fn leaveSettings(self: *App, io: std.Io) void {
+        if (!self.settings.dirty) return;
+        self.saveSettings(io);
+        self.settings.dirty = false;
+    }
+
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // Settings owns its keys first (cycle/toggle/edit/save); anything it
         // doesn't consume falls through to the global chain below.
-        if (self.active_view == .settings and self.onSettingsKey(key, io)) return;
+        if (self.active_view == .settings and self.onSettingsKey(key)) return;
 
-        // q key behavior by view (§10.6).
-        if (key.matches('q', .{})) {
-            switch (self.active_view) {
-                .browse => self.should_quit = true,
-                // Settings never reaches here: onSettingsKey above intercepts q
-                // to save-then-leave. Keep it out of this arm so a future change
-                // can't silently route a settings-q exit past saveSettings.
-                .history => {
-                    if (self.active_pane == .detail) {
-                        // ROD-170: q from a focused detail pane backs one level to
-                        // the list (the help line reads "q back"). Astra D1: it used
-                        // to fall through to the list-exit below, jumping to Browse.
-                        self.active_pane = .list;
-                    } else {
-                        self.active_view = .browse;
-                        self.active_pane = .list;
-                        // Reset the viewport on the way out: list_top is a physical-row
-                        // offset in History but an entry index in Browse — carrying a
-                        // stale value across the semantic split is a latent trap. Match
-                        // the F1/F2 view-switch arms (cursor + top both to the top).
-                        self.list_cursor = 0;
-                        self.list_top = 0;
-                    }
-                },
-                .settings => unreachable,
-                .detail => {
-                    self.active_view = switch (self.detail_origin) {
-                        .browse => .browse,
-                        .history => .history,
-                    };
-                    self.active_pane = .list;
-                },
-            }
+        // q quits the app — full stop (§10.6, ROD-210). ESC owns the layered
+        // peel; q owns exit, with no back-nav. The `input_mode == .normal` guard
+        // keeps a literal "q" typed into a Browse search or History filter from
+        // quitting: it falls through to onSearchKey below and appends instead.
+        if (self.input_mode == .normal and key.matches('q', .{})) {
+            // Settings persists on the way out — the save that used to ride the
+            // q → .save_and_exit verdict now rides quit. leaveSettings is a no-op
+            // unless the tab is dirty; other views have nothing to flush.
+            if (self.active_view == .settings) self.leaveSettings(io);
+            self.should_quit = true;
             return;
         }
 
-        // Ctrl-C quit (unchanged from before).
+        // Ctrl-C quit. Like q, it persists a dirty Settings tab on the way out
+        // (ROD-210) so an emergency exit doesn't drop just-made changes.
         if (key.matches('c', .{ .ctrl = true })) {
+            if (self.active_view == .settings) self.leaveSettings(io);
             self.should_quit = true;
             return;
         }
@@ -1847,6 +1830,7 @@ pub const App = struct {
         // H = toggle Browse ↔ History (distinct from F2, per Elara H1/M2 fixes).
         if (key.matches(vaxis.Key.f2, .{})) {
             if (self.active_view != .history) {
+                if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .history;
                 self.active_pane = .list;
                 self.list_cursor = 0;
@@ -1855,6 +1839,7 @@ pub const App = struct {
             return;
         }
         if (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))) {
+            if (self.active_view == .settings) self.leaveSettings(io);
             self.active_view = if (self.active_view == .history) .browse else .history;
             self.active_pane = .list;
             self.list_cursor = 0;
@@ -1879,6 +1864,7 @@ pub const App = struct {
         // F1 = "go to Browse" — no-op if already there (spec §10.2 F1 from Browse).
         if (key.matches(vaxis.Key.f1, .{})) {
             if (self.active_view != .browse) {
+                if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .browse;
                 self.active_pane = .list;
                 self.list_cursor = 0;
@@ -1892,9 +1878,10 @@ pub const App = struct {
         if (self.input_mode == .normal and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) {
             if (self.active_view == .detail) {
                 // ROD-170: from the zoom, h demotes one step (Esc/Space behave the
-                // same; q backs all the way out to the list). detail_origin carries
-                // us back to Browse or History; we land on the pane if there's room
-                // for one, otherwise the list (single-column below pane_split_min).
+                // same). q no longer backs out — it quits now (ROD-210).
+                // detail_origin carries us back to Browse or History; we land on
+                // the pane if there's room, otherwise the list (single-column
+                // below pane_split_min).
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
@@ -2013,7 +2000,9 @@ pub const App = struct {
             return;
         }
 
-        // Esc chain (§10.4): only reached in normal mode.
+        // Esc chain (§10.4, ROD-210): peel exactly one transient layer — never
+        // switch the base view. Only reached in normal mode (search-mode Esc is
+        // handled by onSearchKey above).
         if (key.matches(vaxis.Key.escape, .{})) {
             if ((self.active_view == .browse or self.active_view == .history) and
                 self.active_pane == .detail)
@@ -2021,22 +2010,17 @@ pub const App = struct {
                 // ROD-170: detail pane focused → return focus to the list (= h).
                 self.active_pane = .list;
             } else if (self.active_view == .detail) {
-                // ROD-170: zoom → demote one step (q backs all the way out to the
-                // list instead). Land on the pane if there's room, else the list.
+                // ROD-170: zoom → demote one step (q quits instead of backing
+                // out). Land on the pane if there's room, else the list.
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
                 };
                 self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
-            } else if (self.active_view == .history or self.active_view == .settings) {
-                self.active_view = .browse;
-                self.active_pane = .list;
-                // See the q-from-History arm: clear the viewport so a History
-                // physical-row list_top never leaks into Browse's entry-index space.
-                self.list_cursor = 0;
-                self.list_top = 0;
             }
-            // Browse + list + normal: no-op. q handles quit.
+            // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed
+            // the old History/Settings → Browse jump — base-view changes happen
+            // only via F1/F2/F3 and the H toggle. q quits.
             return;
         }
 

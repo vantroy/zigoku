@@ -142,7 +142,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .browse => switch (self.active_pane) {
             .list => "hjkl · / search · P save · F1/F2/F3 views · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
-            .detail => "hjkl scroll · h back · enter play · space zoom · q back",
+            .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
         // ROD-170: History is a two-pane like Browse. List focus keeps the
         // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
@@ -155,16 +155,16 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
             // preview band there is no grid, so enter/space drill into the zoom.
             .detail => if (w >= App.zoom_min)
-                "hjkl scroll · h back · enter play · space zoom · q back"
+                "hjkl scroll · h back · enter play · space zoom · q quit"
             else
-                "enter/space zoom · h back · q back",
+                "enter/space zoom · h back · q quit",
         },
-        // The full-screen zoom: Space or Esc demote back to the pane; q backs out.
-        .detail => "hjkl scroll · enter play · space/esc back · q back",
+        // The full-screen zoom: Space or Esc demote back to the pane; q quits.
+        .detail => "hjkl scroll · enter play · space/esc back · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
-            "hjkl navigate · space toggle · enter edit · esc cancel · q save & back",
+            "hjkl navigate · space toggle · enter edit · q save & quit",
     };
     putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
 }
