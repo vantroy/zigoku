@@ -584,9 +584,10 @@ region resolves one of three non-cell states, which must read as distinct:
 
 The zero-episode case is a real source result, *not* a failure — a fetch error
 toasts instead (`episodes_error`, §4.10) and never reaches the grid. It is
-centered + muted to match the cover/feed/history absent states (`no art yet`,
-`no feed yet`, `nothing here yet`, §9.5) so it reads as "nothing here," not as a
-half-drawn loading row pinned to the top-left.
+centered + dim (text.dim) to match the non-actionable absent states — `no art yet`
+is also text.dim — while the actionable first-run CTAs (`search the catalogue`,
+`nothing watched yet`) sit one tier brighter at text.muted (§9.5). It reads as
+"nothing here," not a half-drawn loading row pinned to the top-left.
 
 ### 4.7 Toast Notifications
 
@@ -780,7 +781,7 @@ The user pressed `/`. The bottom bar becomes the search prompt. The list filters
 
 
 
-  /  fr_                                                                [6 results]    [f+bold /, fg+bold input, m count]
+  /  fr_                                                            [catalogue · 6]    [f+bold /, fg+bold input, m count]
 ```
 
 Notes:
@@ -880,7 +881,7 @@ wide two-pane layout (§5.4a).
       [████████████████]  24 / 24 eps  · completed 2023-11-02
                                                                                      [d bar, d meta]
 
-  ▌  jk move · l/enter detail · F1 browse · F3 settings · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit
 ```
 
 Notes:
@@ -944,7 +945,7 @@ record is focused.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  hjkl · l/enter detail · F1 browse · F3 settings · q quit                          [list focused; help matches Browse §10.5]
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit                          [list focused; help matches Browse §10.5]
 ```
 
 ---
@@ -1427,25 +1428,26 @@ not covered by §5.
 
 
 
-                                 nothing here yet                                    [d + italic, centered]
-                               / to search for a show                               [m, centered]
+                               nothing watched yet                                   [m + italic, centered]
+                            F1  find anime in browse                                 [m, centered]
 
 
 
 
                                                                                      [spacer rows]
-  ▌  hjkl · / search · H browse · q quit
+  ▌  F1 browse · q quit
 ```
 
 Rendering rules:
 
-- `nothing here yet` — centered in the viewport (horizontal and vertical center
-  of the rows between top bar and bottom bar). Color: [d] + italic. This is the
-  only italic English text in the app; it is annotation, not content.
-- `/ to search for a show` — one row below the above, centered. Color: [m].
-  The `/` character is in [f] + bold to visually match its role as the search
-  trigger. Do not underline — the help line already owns the underline treatment
-  for keybinds.
+- `nothing watched yet` — centered in the viewport (horizontal and vertical
+  center of the rows between top bar and bottom bar). Color: [m] + italic. Italic
+  marks absent-state annotation throughout the app (cf. §9.5), not content.
+- `F1  find anime in browse` — one row below the above, centered. Color: [m].
+  The `F1` is in [f] + bold to match its role as the action. ROD-211: an empty
+  watchlist has nothing for `/` to filter, so this first-run line points to Browse
+  (where shows are found and added) instead of advertising a dead-end filter. Do
+  not underline — the help line already owns the underline treatment for keybinds.
 - Bottom bar: idle help line as normal (§3.5 State 1), including the `▌` blink.
   The empty state does not suppress navigation.
 - The two-line message block is treated as a unit for centering: together they
@@ -1462,17 +1464,20 @@ Rendering rules:
 The user submitted a query and AllAnime returned zero edges — the show does not
 exist in AllAnime's index, or the query matched nothing.
 
-**List column:** render the single line `no results` in [d] + italic, positioned
-at the top of the list column (row 0 of the list window). No list rows, no
-section headers.
+**List column:** render `no results for "<query>"` in [m] + italic, **centered**
+(matching the §9.5 absent states — not pinned to the top-left), with
+`try a different spelling` one row below in [d] + italic. No list rows, no section
+headers; the bottom-bar search prompt stays visible so the query is kept (ROD-211).
 
 **Bottom bar (search state):**
 
 ```
-  /  xyzzy_                                                          [0 results]
+  /  xyzzy_                                                      [catalogue · 0]
 ```
 
-The result count `[0 results]` in [m] is already sufficient signal. No toast is
+The result count `[catalogue · 0]` in [m] is already sufficient signal — the
+`catalogue` scope tag also separates it from History's `[watchlist · N]` filter
+(ROD-211). No toast is
 issued for zero results — this is an expected search outcome, not an error.
 
 **Detail pane:** clears to `color.bg` fill. No stale detail from the previous
@@ -1651,6 +1656,7 @@ unreachable rendering.
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
 | Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. `detail_two_col_min = 100` remains for the full-screen zoom's internal two-column split (full canvas, not the ~58% pane). | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
+| First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist points to Browse (its `/` filter has nothing to filter); active search/filter counts carry a `[catalogue · N]` / `[watchlist · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the bonus `P save` line recedes to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | When the v0.2 Discovery Feeds land and Browse auto-populates, revisit the empty-Browse copy so `search the catalogue` and the feed don't relabel twice. |
 
 ---
 
@@ -1802,7 +1808,7 @@ chip after that (ROD-186). The two are differentiated by color, no separator gly
 The season chip sits two spaces after the view label and drops first under width
 pressure (below ~36 cols); the view label and the `·` always survive. ROD-186
 retired the old `.browse` `⠋ search` spinner stub — Browse is a live feed now, and
-search status lives in the bottom bar (`/query_` + `[N results]`), so the top bar
+search status lives in the bottom bar (`/query_` + `[catalogue · N]`), so the top bar
 no longer doubles as a search indicator. The two-cyan problem (view label and
 season chip were both specced `color.focus`) is resolved by demoting the season
 chip to `text.muted`, matching how season/year reads in History rows (§5.4).
@@ -1881,10 +1887,10 @@ and its padding. The strings below are written to fit that budget.
 #### Browse — normal, list pane focused
 
 ```
-  ▌  hjkl · / search · F1/F2/F3 views · q quit
+  ▌  hjkl · / find anime · P save · F1/F2/F3 views · q quit
 ```
 
-Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `F1`, `F2`, `F3`, `q`.
+Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `F1`, `F2`, `F3`, `q`.
 
 #### Browse — normal, detail pane focused
 
@@ -1904,15 +1910,17 @@ within the ~74-char budget:
 #### History — normal, list pane focused
 
 ```
-  ▌  hjkl · l/enter detail · F1 browse · F3 settings · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `l`, `enter`, `F1`, `F3`, `q`.
+Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `F1`, `F2`, `F3`, `q`.
 
-Note: `F2` is not shown (the user is already in History). `H` is not shown
-(help line targets newcomers). `l/enter` is shown explicitly — History now
-uses the same pane grammar as Browse, and `l` may not be obvious in a watchlist
-context without a hint.
+Note: the `F1/F2/F3` group is shown together (matching Browse) even though F2
+from History is a no-op. `H` is not shown (help line targets newcomers).
+`/ filter` and `l/enter detail` are shown explicitly — History shares Browse's
+pane grammar (ROD-170), and its local filter (ROD-211, distinct from Browse's
+catalogue search) isn't obvious in a watchlist without the hint. Over budget at
+80 cols, so the tail clips; `/ filter` sits near the front to survive it.
 
 #### History — normal, detail pane focused (w ≥ 100)
 
@@ -1950,13 +1958,14 @@ Underlined: `h`, `j`, `k`, `l`, `enter`, `space`, `esc`.
 #### History — empty (no records)
 
 ```
-  ▌  / search · F1 browse · q quit
+  ▌  F1 browse · q quit
 ```
 
-Underlined: `/`, `F1`, `q`.
+Underlined: `F1`, `q`.
 
-This is the §9.2 empty state. Minimal help — the screen itself already says
-`/ to search for a show`.
+This is the §9.2 empty state. Minimal help — the `/` filter is suppressed (nothing
+to filter), and the screen itself already names the state and points to Browse
+(`nothing watched yet` / `F1 find anime in browse`).
 
 #### Settings — normal
 
