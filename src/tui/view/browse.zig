@@ -19,13 +19,13 @@ const centerText = render.centerText;
 pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
     const w = pane_w;
     if (self.search_len == 0) {
+        // First-run absent state (§9.5): name the view, then teach its two
+        // actions. Browse is search-first and never auto-fills, so "no feed yet"
+        // read as broken/waiting — this says what to do instead (ROD-211).
         const mid = pane_h / 2;
-        centerText(win, mid -| 1, w, "no feed yet", self.s(self.palette.fg3, .{ .italic = true }));
-        const action = " to start a search";
-        const total: u16 = 1 + @as(u16, @intCast(action.len));
-        const start: u16 = if (w > total) (w - total) / 2 else 0;
-        put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
-        putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
+        centerText(win, mid -| 2, w, "search the catalogue", self.s(self.palette.fg2, .{ .italic = true }));
+        keyHint(self, win, mid, w, "/", "  type a show name to begin", self.palette.fg2);
+        keyHint(self, win, mid + 2, w, "P", "  save a result to your watchlist", self.palette.fg3);
         return;
     }
     const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
@@ -35,9 +35,14 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         return;
     }
     if (!search_pending and self.results.items.len == 0) {
+        // Centered to match the §9.5 absent state (ROD-211), not stranded
+        // top-left. The bottom-bar search prompt stays visible (chrome.zig), so
+        // the user keeps their query and the next-step hint sits under it.
         const q = self.querySlice();
+        const mid = pane_h / 2;
         const msg = std.fmt.bufPrint(&scratch.msg, "no results for \"{s}\"", .{q}) catch "no results";
-        putClipped(win, 0, 0, w, msg, self.s(self.palette.fg3, .{ .italic = true }));
+        centerText(win, mid -| 1, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
+        centerText(win, mid + 1, w, "try a different spelling", self.s(self.palette.fg3, .{ .italic = true }));
         return;
     }
 
@@ -101,4 +106,16 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const footer_color = if (self.search_loading) self.palette.focus else self.palette.fg3;
         centerText(win, row, w, footer, self.s(footer_color, .{}));
     }
+}
+
+/// Draw a centered "<key><rest>" first-run hint (ROD-211): the key glyph in
+/// state.focus bold, the trailing text in `rest_color`, positioned as one
+/// centered unit. Shared by the empty-Browse action lines so the two stay
+/// aligned with each other.
+fn keyHint(self: *const App, win: vaxis.Window, row: u16, w: u16, key: []const u8, rest: []const u8, rest_color: vaxis.Color) void {
+    const total: u16 = @intCast(key.len + rest.len);
+    const start: u16 = if (w > total) (w - total) / 2 else 0;
+    const key_w: u16 = @intCast(key.len);
+    put(win, row, start, key, self.s(self.palette.focus, .{ .bold = true }));
+    putClipped(win, row, start + key_w, w -| (start + key_w), rest, self.s(rest_color, .{}));
 }

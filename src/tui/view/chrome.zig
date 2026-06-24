@@ -80,9 +80,9 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
             "…"
         else if (self.results.items.len > 0)
-            std.fmt.bufPrint(&self.cnt_scratch, "[{d} results]", .{self.results.items.len}) catch ""
+            std.fmt.bufPrint(&self.cnt_scratch, "[catalogue · {d}]", .{self.results.items.len}) catch ""
         else if (self.search_len > 0)
-            "[0 results]"
+            "[catalogue · 0]"
         else
             "";
         if (cnt.len > 0) {
@@ -108,9 +108,9 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         const cnt: []const u8 = if (q.len == 0)
             ""
         else if (n > 0)
-            std.fmt.bufPrint(&self.cnt_scratch, "[{d}]", .{n}) catch ""
+            std.fmt.bufPrint(&self.cnt_scratch, "[watchlist · {d}]", .{n}) catch ""
         else
-            "[0]";
+            "[watchlist · 0]";
         if (cnt.len > 0) {
             const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
             if (cnt_col > cursor_col + 1) {
@@ -140,7 +140,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
-            .list => "hjkl · / search · P save · F1/F2/F3 views · q quit",
+            .list => "hjkl · / find anime · P save · F1/F2/F3 views · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
             .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
@@ -149,7 +149,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         // Browse detail line, adding the Space zoom only where the grid lives
         // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
         .history => if (self.history.len == 0)
-            "/ search · F1 browse · q quit"
+            "F1 browse · q quit"
         else switch (self.active_pane) {
             .list => "jk move · l/enter detail · p/x/c/w/P status · r reset · u undo · F1/F2/F3 · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
