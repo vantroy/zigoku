@@ -5,15 +5,27 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Bundle SQLite: compile the vendored amalgamation straight into the binary
-    // instead of dynamically linking system libsqlite3. Off by default — local/CI
-    // builds use the distro's sqlite (fast, distro owns CVE patches). Release
-    // artifacts flip it on so a static musl build is one self-contained file with
-    // no libsqlite3.so dependency. See ROD-145 → "SQLite bundling in Zig".
+    // instead of dynamically linking system libsqlite3. The default is keyed to
+    // the *target* OS:
+    //
+    //   * Linux  → OFF. Link the distro's libsqlite3 (fast builds, distro owns
+    //     CVE patches). CI installs libsqlite3-dev for this.
+    //   * macOS  → ON. Apple's system libsqlite3 is built SQLITE_THREADSAFE=2
+    //     (multi-thread), but store.zig shares one connection handle across the
+    //     UI loop and the history worker — safe only under *serialized* mode. A
+    //     default macOS build thus links a non-serialized SQLite, trips the
+    //     assert in store.zig open(), and crashes on startup (ROD-212). The
+    //     vendored amalgamation is compiled THREADSAFE=1 below, so bundling is
+    //     the fix — and it frees macOS from whatever SQLite Apple ships next.
+    //
+    // Release artifacts force it on for every target (-Dbundle-sqlite) so a
+    // static musl build is one self-contained file with no libsqlite3.so
+    // dependency. See ROD-145 → "SQLite bundling in Zig".
     const bundle_sqlite = b.option(
         bool,
         "bundle-sqlite",
         "Compile the vendored SQLite amalgamation instead of linking system libsqlite3",
-    ) orelse false;
+    ) orelse (target.result.os.tag == .macos);
 
     // Strip debug info — release artifacts only. See exe creation below.
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse false;
