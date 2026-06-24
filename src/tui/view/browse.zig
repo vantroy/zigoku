@@ -13,6 +13,7 @@ const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
 const centerText = render.centerText;
+const centerKeyHint = render.centerKeyHint;
 
 // `self` is `*const App`: this pass reads list state (cursor/viewport/results)
 // and writes only `scratch` — the compiler proves it mutates no app state (ROD-155).
@@ -24,8 +25,8 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         // read as broken/waiting — this says what to do instead (ROD-211).
         const mid = pane_h / 2;
         centerText(win, mid -| 2, w, "search the catalogue", self.s(self.palette.fg2, .{ .italic = true }));
-        keyHint(self, win, mid, w, "/", "  type a show name to begin", self.palette.fg2);
-        keyHint(self, win, mid + 2, w, "P", "  save a result to your watchlist", self.palette.fg3);
+        centerKeyHint(win, mid, w, "/", self.s(self.palette.focus, .{ .bold = true }), "  type a show name to begin", self.s(self.palette.fg2, .{}));
+        centerKeyHint(win, mid + 2, w, "P", self.s(self.palette.focus, .{ .bold = true }), "  save a result to your watchlist", self.s(self.palette.fg3, .{}));
         return;
     }
     const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
@@ -106,16 +107,4 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const footer_color = if (self.search_loading) self.palette.focus else self.palette.fg3;
         centerText(win, row, w, footer, self.s(footer_color, .{}));
     }
-}
-
-/// Draw a centered "<key><rest>" first-run hint (ROD-211): the key glyph in
-/// state.focus bold, the trailing text in `rest_color`, positioned as one
-/// centered unit. Shared by the empty-Browse action lines so the two stay
-/// aligned with each other.
-fn keyHint(self: *const App, win: vaxis.Window, row: u16, w: u16, key: []const u8, rest: []const u8, rest_color: vaxis.Color) void {
-    const total: u16 = @intCast(key.len + rest.len);
-    const start: u16 = if (w > total) (w - total) / 2 else 0;
-    const key_w: u16 = @intCast(key.len);
-    put(win, row, start, key, self.s(self.palette.focus, .{ .bold = true }));
-    putClipped(win, row, start + key_w, w -| (start + key_w), rest, self.s(rest_color, .{}));
 }

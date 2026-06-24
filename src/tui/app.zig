@@ -517,7 +517,8 @@ pub const App = struct {
     detail_season_buf: [16]u8 = undefined,
     /// Stable storage for the scope-tagged result count in drawBottomBar search
     /// mode — e.g. "[catalogue · 128]" / "[watchlist · 12]" (ROD-211). Sized for
-    /// the longest tag + a multi-digit count (the "·" is 2 bytes in UTF-8).
+    /// the longest tag + a multi-digit count ("·" is 2 UTF-8 bytes; the full
+    /// " · " separator is 4 — [16] fell one byte short for "[catalogue · NN]").
     cnt_scratch: [32]u8 = undefined,
     /// Stable storage for the top-bar season/year chip text (e.g. "冬 2024",
     /// ROD-186). App-owned so vaxis holds a valid slice after drawTopBar returns
