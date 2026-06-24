@@ -8,6 +8,7 @@ const anilist = @import("../anilist.zig");
 const cover_mod = @import("../cover.zig");
 const player_mod = @import("../player.zig");
 const aniskip = @import("../aniskip.zig");
+const paths = @import("../paths.zig");
 const lru_mod = @import("../util/lru.zig");
 const event_mod = @import("event.zig");
 const log = @import("../log.zig");
@@ -446,6 +447,84 @@ fn postCoverDoneCloned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, f
     postCoverDoneOwned(loop, gpa, .{ .rgba = rgba, .w = decoded.w, .h = decoded.h }, for_id);
 }
 
+// ── On-disk raw cover cache (ROD-171) ────────────────────────────────────────
+// A persistence layer one level below `RawCoverCache`: covers fetched in a prior
+// run are served from `<cacheDir>/covers/<hash>.jpg` on a cold start, sparing the
+// network. Every operation is best-effort — any failure degrades to "not
+// persisted" / "cache miss", never to a crash or a stalled cover pipeline.
+
+/// hex-16 SHA-256 of `url`: the on-disk cover filename stem. Truncating the
+/// 32-byte digest to 8 bytes is ample for a content-addressed personal cache —
+/// a (vanishingly unlikely) collision costs a single spurious re-fetch, nothing
+/// worse.
+fn coverCacheStem(url: []const u8) [16]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
+    return std.fmt.bytesToHex(digest[0..8].*, .lower);
+}
+
+/// Absolute on-disk path for `url`'s cover, allocated in `arena`:
+/// `<cacheDir>/covers/<hex-16>.jpg`. Propagates the cache-dir resolution error
+/// when no cache home can be located (no `$XDG_CACHE_HOME`/`$HOME`).
+fn coverCachePath(arena: Allocator, url: []const u8) ![]u8 {
+    const dir = try paths.cacheDir(arena);
+    const stem = coverCacheStem(url);
+    return std.fmt.allocPrint(arena, "{s}/covers/{s}.jpg", .{ dir, &stem });
+}
+
+/// Read previously-persisted raw cover bytes for `url`, owned by `gpa`, or null
+/// on any miss (no cache dir, file absent, oversized, read error).
+fn readCoverDisk(gpa: Allocator, io: std.Io, url: []const u8) ?[]u8 {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const path = coverCachePath(arena_state.allocator(), url) catch return null;
+
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
+    defer file.close(io);
+
+    var reader = file.reader(io, &.{});
+    return reader.interface.allocRemaining(gpa, std.Io.Limit.limited(max_cover_encoded_bytes)) catch null;
+}
+
+/// Persist raw cover `body` for `url` to disk, best-effort. A failure (read-only
+/// dir, full disk, no cache home) is logged at debug and otherwise ignored — the
+/// cover still renders from the in-memory bytes this run.
+fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8) void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = coverCachePath(arena, url) catch {
+        log.debug("cover disk-cache: no cache dir", .{});
+        return;
+    };
+    if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
+
+    // Write to a temp sibling then atomically rename into place: a crash, full
+    // disk, or second instance racing mid-write can never leave a torn `.jpg`
+    // that a later cold start would read back as a corrupt cover (ROD-171 review).
+    const tmp_path = std.fmt.allocPrint(arena, "{s}.tmp", .{path}) catch return;
+    var file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |e| {
+        log.debug("cover disk-cache create failed: {s}", .{@errorName(e)});
+        return;
+    };
+    const wrote = blk: {
+        defer file.close(io);
+        file.writeStreamingAll(io, body) catch |e| {
+            log.debug("cover disk-cache write failed: {s}", .{@errorName(e)});
+            break :blk false;
+        };
+        break :blk true;
+    };
+    if (!wrote) {
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+        return;
+    }
+    std.Io.Dir.renameAbsolute(tmp_path, path, io) catch |e| {
+        log.debug("cover disk-cache rename failed: {s}", .{@errorName(e)});
+        std.Io.Dir.deleteFileAbsolute(io, tmp_path) catch {};
+    };
+}
+
 fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
     const dims = cover_mod.probeDimensions(body) orelse return error.DecodeFailed;
     if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) {
@@ -460,6 +539,11 @@ fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
 /// `url` is task-owned and freed before return. `for_id` is transferred to the
 /// event on success/error and freed by the UI thread there. Cache ownership stays
 /// on the worker side; events get their own RGBA slice.
+///
+/// Runs as the single per-`CoverState` worker — `cover_state.zig` joins the prior
+/// thread before spawning the next — so the raw/decoded LRUs (not thread-safe) and
+/// the disk layer need no lock. A future prefetch pool that breaks that one-at-a-
+/// time invariant must add synchronization here.
 pub fn coverTask(
     loop: *Loop,
     gpa: Allocator,
@@ -489,6 +573,26 @@ pub fn coverTask(
         }
         postCoverDoneCloned(loop, gpa, decoded, for_id);
         return;
+    }
+
+    // ROD-171: a raw-LRU miss falls through to disk before the network. A hit
+    // warms both in-memory caches so the rest of this session is a raw hit.
+    if (readCoverDisk(gpa, io, url)) |disk_body| {
+        if (decodeCoverBody(gpa, disk_body)) |decoded| {
+            const raw_cached = raw_cache.putOwnedBounded(gpa, url, disk_body, max_cover_raw_cache_bytes) catch false;
+            if (!raw_cached) gpa.free(disk_body);
+            const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
+            if (!cached) {
+                postCoverDoneOwned(loop, gpa, decoded, for_id);
+                return;
+            }
+            postCoverDoneCloned(loop, gpa, decoded, for_id);
+            return;
+        } else |e| {
+            // A corrupt/truncated cache file: drop it and refetch from network.
+            log.debug("cover disk-cache decode failed: {s}", .{@errorName(e)});
+            gpa.free(disk_body);
+        }
     }
 
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
@@ -524,6 +628,7 @@ pub fn coverTask(
         postCoverError(loop, gpa, for_id);
         return;
     };
+    writeCoverDisk(gpa, io, url, body); // ROD-171: persist for the next cold start
     if (gpa.dupe(u8, body)) |raw_copy| {
         const cached = raw_cache.putOwnedBounded(gpa, url, raw_copy, max_cover_raw_cache_bytes) catch false;
         if (!cached) gpa.free(raw_copy);
@@ -549,6 +654,24 @@ pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+test "coverCacheStem is a stable hex-16 SHA-256 truncation (ROD-171)" {
+    const stem = coverCacheStem("https://example.com/cover.jpg");
+    // Pin the truncation: first 8 bytes of SHA-256, lowercase hex.
+    try std.testing.expectEqual(@as(usize, 16), stem.len);
+    try std.testing.expectEqualStrings("f8ebf6e202ed59a9", &stem);
+    for (stem) |c| try std.testing.expect(std.ascii.isHex(c) and !std.ascii.isUpper(c));
+    // Distinct URLs map to distinct stems.
+    const other = coverCacheStem("https://example.com/cover.png");
+    try std.testing.expect(!std.mem.eql(u8, &stem, &other));
+}
+
+test "coverCachePath nests the stem under covers/ with a .jpg suffix (ROD-171)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const path = try coverCachePath(arena.allocator(), "https://example.com/cover.jpg");
+    try std.testing.expect(std.mem.endsWith(u8, path, "/covers/f8ebf6e202ed59a9.jpg"));
 }
 
 test "dupeOwnedAnime round-trips the widened metadata fields leak-clean (ROD-140)" {
