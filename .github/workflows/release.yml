@@ -6,8 +6,11 @@ name: Release
 #   git tag v0.1.0 && git push --tags     # the real thing (Rod's call)
 #   Actions ▸ Release ▸ Run workflow       # rehearsal: builds + packages, no publish
 #
-# Linux musl static only — macOS compiles green but segfaults on real hardware,
-# so no Darwin release bins until there's a testbed to debug it.
+# Linux: static musl (x86_64 + aarch64), cross-built on ubuntu.
+# macOS: both arches off the arm64 macos-14 runner with bundled SQLite —
+# aarch64 native (built + smoke-run), x86_64 cross (-Dtarget, otool-verified).
+# GitHub is sunsetting the Intel macos-13 runner, so we don't depend on it.
+# The unbundled-sqlite segfault that kept Darwin out is fixed (ROD-212).
 
 on:
   push:
@@ -58,11 +61,18 @@ jobs:
   # ── Build + package one static tarball per target ──────────────────────────
   build:
     needs: guard
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-linux-musl, aarch64-linux-musl]
+        # `smoke` flags targets we can actually execute on their runner (native
+        # arch). Cross builds (aarch64-linux on x86 ubuntu; x86_64-macos on the
+        # arm64 macos-14 runner) are built + linkage-verified but not run.
+        include:
+          - { target: x86_64-linux-musl,  runner: ubuntu-latest, smoke: true  }
+          - { target: aarch64-linux-musl, runner: ubuntu-latest, smoke: false }
+          - { target: aarch64-macos,      runner: macos-14,      smoke: true  }
+          - { target: x86_64-macos,       runner: macos-14,      smoke: false }
     steps:
       - uses: actions/checkout@v4
 
@@ -73,10 +83,11 @@ jobs:
 
       # No libsqlite3-dev step: -Dbundle-sqlite compiles its own SQLite, so the
       # release build needs nothing from the system beyond what musl static gives.
-      - name: Build (static musl + bundled sqlite + stripped)
+      - name: Build (bundled sqlite + stripped; static musl on Linux)
         run: zig build -Dbundle-sqlite -Dstrip -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} --prefix out
 
-      - name: Verify the binary is fully static
+      - name: Verify Linux binary is fully static
+        if: runner.os == 'Linux'
         run: |
           file out/bin/zigoku
           if readelf -dW out/bin/zigoku 2>/dev/null | grep -q NEEDED; then
@@ -84,8 +95,21 @@ jobs:
           fi
           echo "static: no dynamic dependencies"
 
-      - name: Smoke-run (x86_64 only — the runner is x86)
-        if: matrix.target == 'x86_64-linux-musl'
+      # macOS can't be fully static (libSystem is always dynamic), so the gate
+      # checks the thing that actually mattered for ROD-212: sqlite is compiled
+      # in, not dynamically linked against a (possibly missing) libsqlite3.dylib.
+      - name: Verify macOS binary bundles sqlite (no external libsqlite3)
+        if: runner.os == 'macOS'
+        run: |
+          otool -L out/bin/zigoku
+          if otool -L out/bin/zigoku | grep -qi libsqlite3; then
+            echo "::error::macOS binary links libsqlite3 dynamically — bundled-sqlite regression (the ROD-212 segfault cause)"; exit 1
+          fi
+          echo "sqlite is bundled: no external libsqlite3 dependency"
+
+      # Only the native-arch targets can execute on their runner (see `smoke`).
+      - name: Smoke-run on native targets
+        if: matrix.smoke
         run: ./out/bin/zigoku --version
 
       - name: Package tarball
@@ -96,7 +120,13 @@ jobs:
           cp out/bin/zigoku LICENSE README.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
-          ( cd dist && sha256sum "$name.tar.gz" )
+          # Informational only (the release job re-aggregates on ubuntu); macOS
+          # runners ship `shasum`, not GNU `sha256sum`.
+          if command -v sha256sum >/dev/null 2>&1; then
+            ( cd dist && sha256sum "$name.tar.gz" )
+          else
+            ( cd dist && shasum -a 256 "$name.tar.gz" )
+          fi
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
