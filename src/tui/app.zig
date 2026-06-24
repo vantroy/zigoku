@@ -515,8 +515,11 @@ pub const App = struct {
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack
     /// local would dangle by `render()` and emit garbage.
     detail_season_buf: [16]u8 = undefined,
-    /// Stable storage for the "[N]" result count in drawBottomBar search mode.
-    cnt_scratch: [16]u8 = undefined,
+    /// Stable storage for the scope-tagged result count in drawBottomBar search
+    /// mode — e.g. "[catalogue · 128]" / "[watchlist · 12]" (ROD-211). Sized for
+    /// the longest tag + a multi-digit count ("·" is 2 UTF-8 bytes; the full
+    /// " · " separator is 4 — [16] fell one byte short for "[catalogue · NN]").
+    cnt_scratch: [32]u8 = undefined,
     /// Stable storage for the top-bar season/year chip text (e.g. "冬 2024",
     /// ROD-186). App-owned so vaxis holds a valid slice after drawTopBar returns
     /// (the ROD-141 cell-slice lifetime trap).
