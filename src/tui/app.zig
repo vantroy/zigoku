@@ -532,6 +532,12 @@ pub const App = struct {
     async_start_ms: i64 = 0,
     /// Deadline for search debounce (ms). 0 = no pending debounce.
     debounce_deadline_ms: i64 = 0,
+    /// Deadline for the cover-preview settle debounce (ms). Armed when the list
+    /// cursor moves in a context where the cover tracks the cursor (split browse /
+    /// wide history); fired in .tick. Stops a fast j/k scroll from fetching — and
+    /// blocking the UI thread on the cover joinThread for — every row's art it
+    /// scrolls past (ROD-202). 0 = no pending settle.
+    cover_sync_deadline_ms: i64 = 0,
     /// Last-seen terminal width (columns). Seeded in layout() every frame from
     /// real geometry so onKey/tick can gate split-browse and wide-history
     /// behaviour without being passed the winsize event.
@@ -968,6 +974,34 @@ pub const App = struct {
         return self.currentDetailAnime();
     }
 
+    /// Whether a list-cursor move changes detailSyncTarget — i.e. the cover preview
+    /// is on-screen and tracks the cursor (the two cursor-driven branches above).
+    /// Elsewhere the cover follows the focused detail, which a cursor move doesn't
+    /// touch, so no settle debounce is needed. Gates the cover-settle timer (ROD-202).
+    fn coverTracksCursor(self: *const App) bool {
+        if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
+            return self.results.items.len > 0;
+        }
+        return self.active_view == .history and self.term_cols >= pane_split_min;
+    }
+
+    /// Resolve the cover target from nav state and hand the primitives to the
+    /// subsystem (CoverState never reaches into selection state itself — ROD-160).
+    /// Called immediately for discrete nav (pane/view switch) and from the .tick
+    /// settle for cursor-tracked scrolling (ROD-202).
+    fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
+        const anime = self.detailSyncTarget();
+        const started = self.cover.sync(
+            self.gpa,
+            loop,
+            io,
+            self.now_ms,
+            if (anime) |a| a.id else null,
+            if (anime) |a| a.thumb else null,
+        );
+        if (started) self.async_start_ms = self.now_ms;
+    }
+
     pub const DetailRenderInfo = struct {
         anime: ?Anime,
         title: []const u8,
@@ -1188,6 +1222,9 @@ pub const App = struct {
 
     // ── tick: fold one event into state ──────────────────────────────────────
     pub fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, provider: SourceProvider) !void {
+        // Snapshot the cursor so the post-dispatch cover sync can tell a cursor
+        // move (debounce) from discrete nav (sync now) — ROD-202.
+        const cursor_before = self.list_cursor;
         switch (event) {
             .key_press => |key| self.onKey(key, loop, io, provider),
             .winsize => |ws| {
@@ -1224,6 +1261,7 @@ pub const App = struct {
                 self.history_loading = false;
                 self.search_loading = false;
                 self.debounce_deadline_ms = 0;
+                self.cover_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
             },
@@ -1426,6 +1464,14 @@ pub const App = struct {
                     self.clearResults();
                     self.fireSearch(loop, io, provider, 1);
                 }
+                // The cursor settled: fetch the cover for the show it landed on
+                // (ROD-202). cover.sync's up_to_date short-circuit makes a re-fire
+                // for the same show a no-op, so a settle that didn't change the
+                // target costs nothing.
+                if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
+                    self.cover_sync_deadline_ms = 0;
+                    self.syncCover(loop, io);
+                }
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |*t| {
                         if (!t.persistent) {
@@ -1438,22 +1484,27 @@ pub const App = struct {
         }
 
         if (event != .tick) {
-            // Resolve the cover target from navigation state here (the controller's
-            // job) and hand the primitives to the subsystem — CoverState never
-            // reaches into selection state itself (ROD-160). detailSyncTarget lets
-            // the cover track the list cursor in split browse; CoverState's own
-            // up_to_date short-circuit is the debounce, so no deadline needed here
-            // (ROD-156 #2).
-            const anime = self.detailSyncTarget();
-            const started = self.cover.sync(
-                self.gpa,
-                loop,
-                io,
-                self.now_ms,
-                if (anime) |a| a.id else null,
-                if (anime) |a| a.thumb else null,
-            );
-            if (started) self.async_start_ms = self.now_ms;
+            // ROD-202 cover-settle debounce. Three cases for a non-tick event:
+            const key_scroll = event == .key_press and self.list_cursor != cursor_before;
+            if (key_scroll and self.coverTracksCursor()) {
+                // 1. Key-driven scroll where the cover tracks the cursor: only arm
+                //    (re-arm) the settle — the actual fetch fires from .tick once the
+                //    cursor stops. Without this a fast j/k scroll calls cover.sync per
+                //    row, each blocking the UI thread on joinThread for the prior row's
+                //    decode before respawning — the stutter.
+                self.cover_sync_deadline_ms = nowMs(io) + cover_settle_ms;
+            } else if (event == .key_press) {
+                // 2. Discrete key nav (pane/view switch, a settled cursor): sync now
+                //    and cancel any pending settle — the cover must never lag a
+                //    deliberate keystroke.
+                self.cover_sync_deadline_ms = 0;
+                self.syncCover(loop, io);
+            } else {
+                // 3. Async completion / resize: refresh the cover, but don't stomp a
+                //    pending scroll settle — let the cursor settle drive it instead of
+                //    fetching the row we happen to be mid-scroll over.
+                if (self.cover_sync_deadline_ms == 0) self.syncCover(loop, io);
+            }
         }
     }
 
@@ -2197,6 +2248,14 @@ pub const App = struct {
     /// episode grid and the Space-to-zoom affordance (ROD-170). Between
     /// `pane_split_min` and this, the detail pane is the no-grid preview stack.
     pub const zoom_min: u16 = 100;
+
+    /// Cursor-settle window (ms) before a cursor-tracked cover preview actually
+    /// fetches (ROD-202). Shorter than the 300 ms search debounce on purpose: the
+    /// cover is a preview the user watches *while* navigating, so it should feel
+    /// responsive on a single step, yet still collapse a held-key turbo scroll
+    /// (key repeat ~30 ms) into one fetch at the settle instead of one per row.
+    /// The 100 ms tick is the real floor, so this lands ~150–250 ms after settle.
+    pub const cover_settle_ms: i64 = 150;
 
     pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
 
