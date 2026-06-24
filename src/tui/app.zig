@@ -974,6 +974,16 @@ pub const App = struct {
         return self.currentDetailAnime();
     }
 
+    /// The incremental list-scroll keys — j/k and ↓/↑. The cover-settle debounce
+    /// arms only for these: jump keys (g/G), filter input, and view/pane switches
+    /// all move the cursor too, but they're *discrete settle points*, so the cover
+    /// should sync at once rather than wait out the scroll debounce (ROD-202 review:
+    /// the cursor-delta proxy alone misfired on all three — Elara M1 / Nyra E1,E2).
+    fn isListScrollKey(key: vaxis.Key) bool {
+        return key.matches('j', .{}) or key.matches('k', .{}) or
+            key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.up, .{});
+    }
+
     /// Whether a list-cursor move changes detailSyncTarget — i.e. the cover preview
     /// is on-screen and tracks the cursor (the two cursor-driven branches above).
     /// Elsewhere the cover follows the focused detail, which a cursor move doesn't
@@ -1485,17 +1495,23 @@ pub const App = struct {
 
         if (event != .tick) {
             // ROD-202 cover-settle debounce. Three cases for a non-tick event:
-            const key_scroll = event == .key_press and self.list_cursor != cursor_before;
+            // A scroll is a j/k/↓/↑ step in normal mode that actually moved the
+            // cursor — NOT a jump key, filter keystroke, or view switch (those move
+            // the cursor too but are discrete settle points: review M1/E1/E2).
+            const key_scroll = event == .key_press and
+                self.input_mode == .normal and
+                isListScrollKey(event.key_press) and
+                self.list_cursor != cursor_before;
             if (key_scroll and self.coverTracksCursor()) {
-                // 1. Key-driven scroll where the cover tracks the cursor: only arm
-                //    (re-arm) the settle — the actual fetch fires from .tick once the
-                //    cursor stops. Without this a fast j/k scroll calls cover.sync per
-                //    row, each blocking the UI thread on joinThread for the prior row's
-                //    decode before respawning — the stutter.
+                // 1. Scroll step where the cover tracks the cursor: only arm (re-arm)
+                //    the settle — the actual fetch fires from .tick once the cursor
+                //    stops (the next tick ≥ cover_settle_ms later). Without this a fast
+                //    j/k scroll calls cover.sync per row, each blocking the UI thread on
+                //    joinThread for the prior row's decode before respawning — the stutter.
                 self.cover_sync_deadline_ms = nowMs(io) + cover_settle_ms;
             } else if (event == .key_press) {
-                // 2. Discrete key nav (pane/view switch, a settled cursor): sync now
-                //    and cancel any pending settle — the cover must never lag a
+                // 2. Discrete key nav (jump, pane/view switch, a settled cursor): sync
+                //    now and cancel any pending settle — the cover must never lag a
                 //    deliberate keystroke.
                 self.cover_sync_deadline_ms = 0;
                 self.syncCover(loop, io);
