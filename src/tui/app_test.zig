@@ -1171,10 +1171,40 @@ test "browse scrolling debounces the cover fetch; discrete nav syncs at once (RO
     try testing.expectEqual(@as(usize, 2), app.list_cursor);
     try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
 
-    // Discrete nav (focus the detail pane) is not a scroll: it cancels any pending
-    // settle and syncs the cover immediately, so it never lags a deliberate action.
+    // A jump key (g/G) moves the cursor but is a deliberate settle point, NOT a
+    // scroll — it must sync the cover at once, not arm the debounce (review fix:
+    // Elara M1 / Nyra E1; only j/k/↓/↑ in normal mode arm). Arm a settle, then
+    // jump to top: the jump cancels it.
+    app.cover_sync_deadline_ms = 999;
+    try testTick(&app, keyEv('g', .{}));
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
+
+    // Discrete nav (focus the detail pane) is not a scroll either: it cancels any
+    // pending settle and syncs the cover immediately, so it never lags a keystroke.
     app.cover_sync_deadline_ms = 999;
     try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
+}
+
+test "cover settle arms in wide history and fires on .tick (ROD-202)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .list;
+
+    // Wide history carries the cursor-tracked preview too, so a scroll arms the
+    // same settle as Browse — coverTracksCursor() covers history (ROD-113/170).
+    app.term_cols = 120;
+    try testTick(&app, keyEv('j', .{}));
+    try testing.expect(app.cover_sync_deadline_ms > 0);
+
+    // The .tick that finds the deadline due consumes it (fires syncCover — a no-op
+    // under builtin.is_test, so the deadline-clear is the observable contract).
+    app.cover_sync_deadline_ms = 1; // due in the past
+    try testTick(&app, .tick);
     try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
 }
 
