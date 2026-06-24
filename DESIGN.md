@@ -780,7 +780,7 @@ The user pressed `/`. The bottom bar becomes the search prompt. The list filters
 
 
 
-  /  fr_                                                                [6 results]    [f+bold /, fg+bold input, m count]
+  /  fr_                                                            [catalogue · 6]    [f+bold /, fg+bold input, m count]
 ```
 
 Notes:

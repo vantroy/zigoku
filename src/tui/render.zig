@@ -168,6 +168,19 @@ pub fn centerText(win: vaxis.Window, row: u16, w: u16, text: []const u8, sty: va
     putClipped(win, row, col, w, text, sty);
 }
 
+/// Draw a centered "<key><rest>" hint as one unit: the `key` glyph in `key_sty`,
+/// the trailing `rest` in `rest_sty`, centred together by combined *display*
+/// width (gwidth, so a wide glyph counts the cells it paints — no ASCII-only
+/// assumption). The first-run absent states use this for their "<key>  <action>"
+/// lines (ROD-211).
+pub fn centerKeyHint(win: vaxis.Window, row: u16, w: u16, key: []const u8, key_sty: vaxis.Style, rest: []const u8, rest_sty: vaxis.Style) void {
+    const key_w: u16 = @intCast(vaxis.gwidth.gwidth(key, .unicode));
+    const total: u16 = key_w + @as(u16, @intCast(vaxis.gwidth.gwidth(rest, .unicode)));
+    const start: u16 = if (w > total) (w - total) / 2 else 0;
+    put(win, row, start, key, key_sty);
+    putClipped(win, row, start + key_w, w -| (start + key_w), rest, rest_sty);
+}
+
 pub fn drawWrappedText(win: vaxis.Window, start_row: u16, start_col: u16, max_w: u16, max_rows: u16, text: []const u8, sty: vaxis.Style) u16 {
     if (max_w == 0 or max_rows == 0 or text.len == 0) return 0;
 
