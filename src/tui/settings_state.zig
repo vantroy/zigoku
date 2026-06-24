@@ -10,10 +10,11 @@
 //! Keystone (per Theta): the subsystem owns its own state transitions but never
 //! the *projections* of those transitions onto App-live state. `onKey` returns a
 //! `KeyResult` verdict; the controller (App.onSettingsKey) maps `.config_changed`
-//! to a palette/translation re-sync and `.save_and_exit` to persist + nav, so the
-//! settings struct stays free of `App`, `palette`, `translation`, toasts, and the
-//! `active_view`/`active_pane` writes. Embed by value (`settings: SettingsState =
-//! .{}`); no back-reference, no `@fieldParentPtr`.
+//! to a palette/translation re-sync, so the settings struct stays free of `App`,
+//! `palette`, `translation`, toasts, and the `active_view`/`active_pane` writes.
+//! Persistence rides leave/quit, not a key verdict (ROD-210): a `dirty` flag here
+//! tells the controller whether `App.leaveSettings` owes a write. Embed by value
+//! (`settings: SettingsState = .{}`); no back-reference, no `@fieldParentPtr`.
 //!
 //! The view (`view/settings.zig`) renders this state; the data model
 //! (`SettingId`/`SettingRow`/`settings_rows`) is re-exported from app.zig so
@@ -157,6 +158,12 @@ pub const SettingsState = struct {
     /// reference until render — a stack buffer would dangle.
     value_buf: [16]u8 = undefined,
 
+    /// Whether an edit has mutated `config` since the tab was entered or last
+    /// saved. The controller persists on leave/quit only when this is set
+    /// (ROD-210), so tabbing through Settings unchanged neither rewrites the
+    /// config file nor toasts.
+    dirty: bool = false,
+
     /// What a settings keypress means to the controller. Keeps the subsystem
     /// free of App-live projections: it reports *what changed*, the controller
     /// decides how that lands on palette/translation/nav state.
@@ -168,8 +175,6 @@ pub const SettingsState = struct {
         /// Consumed and `config` mutated in a way App projects live (palette /
         /// translation). Controller re-syncs those from config.
         config_changed,
-        /// `q` — controller persists config and leaves to Browse.
-        save_and_exit,
     };
 
     /// Reset to a clean entry state (top row, not editing). Called by the
@@ -178,6 +183,7 @@ pub const SettingsState = struct {
     pub fn reset(self: *SettingsState) void {
         self.cursor = 0;
         self.editing = false;
+        self.dirty = false;
     }
 
     /// Handle a key while the Settings tab is active. Returns a `KeyResult` the
@@ -198,6 +204,7 @@ pub const SettingsState = struct {
         if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
             if (row.kind == .cycle) {
                 cycle(config, row.id, 1);
+                self.dirty = true;
                 return .config_changed;
             }
             return .consumed;
@@ -205,12 +212,16 @@ pub const SettingsState = struct {
         if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
             if (row.kind == .cycle) {
                 cycle(config, row.id, -1);
+                self.dirty = true;
                 return .config_changed;
             }
             return .consumed;
         }
         if (key.matches(vaxis.Key.space, .{})) {
-            if (row.kind == .toggle) toggle(config, row.id);
+            if (row.kind == .toggle) {
+                toggle(config, row.id);
+                self.dirty = true;
+            }
             // `.consumed`, not `.config_changed`: the toggle fields (cover_art,
             // kanji_chips) have no App-live projection — nothing mirrors them the
             // way `translation`/`palette` mirror their cycle fields, so no
@@ -222,7 +233,9 @@ pub const SettingsState = struct {
             if (row.kind == .text) self.beginEdit(config, row.id);
             return .consumed;
         }
-        if (key.matches('q', .{})) return .save_and_exit;
+        // `q` is no longer a settings verdict (ROD-210): it falls through to the
+        // global key chain, which quits. Persistence moved to leave/quit (see
+        // App.leaveSettings); the `dirty` flag set above drives whether it writes.
         return .ignored;
     }
 
@@ -275,6 +288,7 @@ pub const SettingsState = struct {
         if (n == 0) return;
         @memcpy(self.text_buf[0..n], self.edit_buf[0..n]);
         config.mpv_path = self.text_buf[0..n];
+        self.dirty = true;
     }
 
     /// Display string for a setting's current value. Scalar values (resume
