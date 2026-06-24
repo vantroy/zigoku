@@ -532,11 +532,6 @@ pub const App = struct {
     async_start_ms: i64 = 0,
     /// Deadline for search debounce (ms). 0 = no pending debounce.
     debounce_deadline_ms: i64 = 0,
-    /// Deadline for the split-browse detail prefetch debounce (ms). Armed when
-    /// the list cursor moves while the detail pane is on-screen; fired in .tick
-    /// to prefetch the hovered show's episodes. Separate from the search debounce
-    /// so the two never stomp each other (ROD-156 #2,#3).
-    detail_sync_deadline_ms: i64 = 0,
     /// Last-seen terminal width (columns). Seeded in layout() every frame from
     /// real geometry so onKey/tick can gate split-browse and wide-history
     /// behaviour without being passed the winsize event.
@@ -973,18 +968,6 @@ pub const App = struct {
         return self.currentDetailAnime();
     }
 
-    /// Whether split browse is on-screen with the list pane focused — the
-    /// condition under which the *episode* prefetch debounce should arm/fire.
-    /// Browse-only: the wide-history preview (ROD-113) shows a cover but no
-    /// episode grid, so history needs cover sync (via detailSyncTarget) but no
-    /// episode prefetch (ROD-156).
-    pub fn detailSyncActive(self: *const App) bool {
-        return self.active_view == .browse and
-            self.active_pane == .list and
-            self.term_cols >= 60 and
-            self.results.items.len > 0;
-    }
-
     pub const DetailRenderInfo = struct {
         anime: ?Anime,
         title: []const u8,
@@ -1241,7 +1224,6 @@ pub const App = struct {
                 self.history_loading = false;
                 self.search_loading = false;
                 self.debounce_deadline_ms = 0;
-                self.detail_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
             },
@@ -1374,11 +1356,6 @@ pub const App = struct {
             .episodes_error => {
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
-                // Uphold the "a task error clears pending deadlines" invariant that
-                // task_error holds for the search debounce. Harmless today (the
-                // episodes.for_id guard already suppresses a re-fire), but leaving
-                // it armed is a trap for any future change to for_id's lifecycle.
-                self.detail_sync_deadline_ms = 0;
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
                 // failure so the blank pane isn't a silent dead end.
@@ -1448,20 +1425,6 @@ pub const App = struct {
                     self.debounce_deadline_ms = 0;
                     self.clearResults();
                     self.fireSearch(loop, io, provider, 1);
-                }
-                // Split-browse detail prefetch: the cursor settled, so fetch the
-                // hovered show's episodes. Fired after search so a same-tick search
-                // that cleared results suppresses this via detailSyncActive (ROD-156
-                // #3). The episodes.for_id guard skips a show already loaded/in-flight.
-                if (self.detail_sync_deadline_ms > 0 and now >= self.detail_sync_deadline_ms) {
-                    self.detail_sync_deadline_ms = 0;
-                    if (self.detailSyncActive()) {
-                        if (self.selectedAnime()) |target| {
-                            const already = self.episodes.for_id != null and
-                                std.mem.eql(u8, self.episodes.for_id.?, target.id);
-                            if (!already) self.fireEpisodesForId(loop, io, provider, target.id);
-                        }
-                    }
                 }
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |*t| {
@@ -1569,16 +1532,18 @@ pub const App = struct {
         self.fireEpisodesForId(loop, io, provider, selected.id);
     }
 
-    /// Fire a Browse episode fetch for the selected show, unless the split-browse
-    /// prefetch (ROD-156 #3) is already in flight for that same show — re-firing
-    /// would just join and respawn the same fetch. Shared by the two-pane focus
-    /// path and the single-column zoom path so the guard lives in one place.
+    /// Fire a Browse episode fetch for the selected show, unless a fetch for that
+    /// same show is already in flight — re-firing would just join and respawn the
+    /// same fetch. (Pre-ROD-202 the in-flight fetch came from the hover prefetch;
+    /// now it can only be a prior detail-entry the user backed out of and re-entered
+    /// before it finished.) Shared by the two-pane focus path and the single-column
+    /// zoom path so the guard lives in one place.
     fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         const sel = self.selectedAnime() orelse return;
-        const prefetching = self.episodes.loading and
+        const in_flight = self.episodes.loading and
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, sel.id);
-        if (!prefetching) self.fireEpisodes(loop, io, provider);
+        if (!in_flight) self.fireEpisodes(loop, io, provider);
     }
 
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its
@@ -1910,9 +1875,10 @@ pub const App = struct {
                 .browse => {
                     if (self.active_pane == .list and self.results.items.len > 0) {
                         if (self.term_cols >= pane_split_min) {
-                            // Two-pane: reveal/focus the detail pane + fetch (the
-                            // in-flight result lands through its own event; the
-                            // prefetch guard avoids respawning it — ROD-156 #3).
+                            // Two-pane: reveal/focus the detail pane + lazy-load the
+                            // episode grid (ROD-202). The fetch lands through its own
+                            // event; fireEpisodesBrowse's in-flight guard avoids
+                            // respawning a fetch already running for this same show.
                             self.active_pane = .detail;
                             self.fireEpisodesBrowse(loop, io, provider);
                         } else if (key.matches(vaxis.Key.enter, .{})) {
@@ -2164,7 +2130,6 @@ pub const App = struct {
         };
         if (nav_len == 0) return;
 
-        const prev_cursor = self.list_cursor;
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
             if (self.list_cursor + 1 < nav_len) self.list_cursor += 1;
         } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
@@ -2176,12 +2141,12 @@ pub const App = struct {
             // above): terminals disagree on whether shift is reported separately.
             self.list_cursor = nav_len - 1;
         }
-        // The cursor moved in split browse: (re)arm the detail prefetch debounce.
-        // Re-arming on each move means only the settled show fetches after a fast
-        // j/k scroll; a no-op move (j at the bottom) doesn't re-arm (ROD-156 #2,#3).
-        if (self.list_cursor != prev_cursor and self.detailSyncActive()) {
-            self.detail_sync_deadline_ms = nowMs(io) + 300;
-        }
+        // ROD-202: a cursor move never prefetches episodes. The grid loads lazily
+        // on detail entry (l/→/Enter → fireEpisodesBrowse), matching History, so
+        // scrolling the results list stays smooth and fires zero episode fetches.
+        // The cover preview still tracks the cursor — that's detailSyncTarget,
+        // resolved every frame, not an episode fetch (ROD-156's cover half stays).
+        //
         // Load-more: at the last result, a downward keystroke pages in the next page.
         // Must accept the Down arrow too, not just 'j' — the cursor-nav above already
         // honors both, so a j-only trigger left the ╌ more ╌ footer unreachable for
