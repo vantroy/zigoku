@@ -861,11 +861,14 @@ test "q typed into a Browse search appends instead of quitting (ROD-210)" {
     var app: App = .{};
     app.active_view = .browse;
     app.input_mode = .search;
-    try testTick(&app, keyEv('q', .{}));
-    // The input_mode guard sends 'q' to onSearchKey, not the quit path; search
-    // mode stays active.
+    // Feed 'q' with .text populated, as a real terminal does: the input_mode
+    // guard must route it to onSearchKey (append), never the quit path. (keyEv
+    // leaves .text null, so it can't exercise the append — hence the raw event.)
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'q', .text = "q" } });
     try testing.expect(!app.should_quit);
     try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+    try testing.expectEqual(@as(usize, 1), app.search_len);
+    try testing.expectEqual(@as(u8, 'q'), app.search_query[0]);
 }
 
 test "q typed into a History filter appends instead of quitting (ROD-210)" {
@@ -874,9 +877,11 @@ test "q typed into a History filter appends instead of quitting (ROD-210)" {
     app.setHistory(&recs);
     app.active_view = .history;
     app.input_mode = .search;
-    try testTick(&app, keyEv('q', .{}));
+    try testTick(&app, .{ .key_press = .{ .codepoint = 'q', .text = "q" } });
     try testing.expect(!app.should_quit);
     try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+    try testing.expectEqual(@as(usize, 1), app.history_filter_len);
+    try testing.expectEqual(@as(u8, 'q'), app.history_filter[0]);
 }
 
 test "q from a browse detail pane quits — never backs out (ROD-210)" {
@@ -3066,6 +3071,63 @@ test "astra: settings save round-trip — q writes file, load reads back mutatio
     try testing.expectEqualStrings("720", loaded.default_quality);
     try testing.expectEqual(@as(u32, 10), loaded.resume_offset_sec);
     try testing.expectEqualStrings("/alt/mpv", loaded.mpv_path);
+}
+
+test "F1/F2/H from a dirty Settings tab persist on the way out (ROD-210 H1)" {
+    // Acceptance criterion 2: "switching away via F-key persists settings." With
+    // a null config path the save can't write, but the warn toast proves
+    // leaveSettings (hence saveSettings) ran — i.e. all three call-sites are
+    // wired. Guards against a dropped leaveSettings() on any of F1/F2/H.
+    inline for (.{ vaxis.Key.f1, vaxis.Key.f2, 'H' }) |k| {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        app.active_view = .settings;
+        app.config_path = null;
+        app.settings.cursor = 5; // cover_art toggle row
+        try testTick(&app, keyEv(vaxis.Key.space, .{})); // dirty the tab
+        try testing.expect(app.settings.dirty);
+
+        try testTick(&app, keyEv(k, .{}));
+        try testing.expect(app.active_view != .settings); // switched away
+        const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        try testing.expectEqual(Toast.Kind.warn, t.kind); // save was attempted
+    }
+}
+
+test "astra: Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)" {
+    const alloc = testing.allocator;
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
+    const cwd_str = std.mem.sliceTo(&cwd_buf, 0);
+    const config_path = try std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}/config.zon", .{
+        cwd_str,
+        tmp_dir.sub_path,
+    });
+    defer alloc.free(config_path);
+
+    var app: App = .{};
+    app.gpa = alloc;
+    app.active_view = .settings;
+    app.config_path = config_path;
+    app.settings.cursor = 5; // cover_art toggle (default true → false)
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.settings.dirty);
+
+    // Ctrl-C persists the dirty tab before the hard quit (ROD-210 — leaveSettings
+    // on the Ctrl-C arm), then sets should_quit.
+    try testTick(&app, keyEv('c', .{ .ctrl = true }));
+    try testing.expect(app.should_quit);
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.success, t.kind);
+
+    // File written and the toggle round-tripped to disk.
+    var load_arena = std.heap.ArenaAllocator.init(alloc);
+    defer load_arena.deinit();
+    const loaded = config_mod.load(load_arena.allocator(), testing.io, config_path);
+    try testing.expect(!loaded.cover_art);
 }
 
 test "astra: entering settings resets cursor, editing state, and input_mode" {

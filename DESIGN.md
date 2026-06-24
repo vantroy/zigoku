@@ -1050,7 +1050,7 @@ Live-editable. Full width. No cover art.
     kanji chips                 [████ on ████]                 space to toggle
     help line                   [████ on ████]                 space to toggle
 
-  ▌  hjkl navigate · space toggle · enter edit · q save & quit
+  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
 Notes:
@@ -1961,14 +1961,17 @@ This is the §9.2 empty state. Minimal help — the screen itself already says
 #### Settings — normal
 
 ```
-  ▌  hjkl navigate · space toggle · enter edit · q save & quit
+  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `F1`, `F2`, `q`.
 
-Settings persists a dirty tab on the way out, so `q` reads `q save & quit`
-(ROD-210). `Esc` is a no-op here — the field-edit cancel lives in the edit-mode
-line below. This matches the §5.5 mock.
+Settings persists a dirty tab on the way out, so `q` reads `q save+quit`
+(ROD-210; the `+` signals one press does both). `F1`/`F2` are surfaced so
+*leaving without quitting* is discoverable — they switch to Browse/History and
+persist, mirroring how the other views advertise their view-switches. `Esc` is a
+no-op here — the field-edit cancel lives in the edit-mode line below. This
+matches the §5.5 mock.
 
 #### Settings — field under edit
 
@@ -2130,5 +2133,5 @@ if (self.input_mode == .normal and key.matches('q', .{})) {
 | **ROD-186: season chip is an add-on in `text.muted`, not a replacement in `color.focus`** | The original §3.4/§10.3b spec gave the season chip `color.focus` as the *only* chip. The coexistence decision (keep the view label, add the season chip) put two chips side by side — both specced cyan, which would blur into one blob (§2.3: chips are distinguished by color alone, no boxes). Demoting the season chip to `text.muted` (fg2) makes them distinct with zero extra glyphs, matches how season/year already reads in History rows (§5.4), and leaves `color.focus` to mean one thing on the left (view identity) while the cyan `·` owns the right edge. Content rule (Rod): selected show's season+year, falling back to the current cour from the system clock — except the detail zoom, which is committed to one show and shows only its season (no fallback). Rejected: a `░`/`·` separator between the two cyan chips (adds chrome, §0). | If user testing shows the muted season chip is missed, brighten it one step (text.muted → text.primary) before reaching for `color.focus`. |
 | **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, right pane updates on cursor move) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
 | **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
-| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse. Jumping all the way back to `.list` would skip a level, which is jarring for long episode lists the user was navigating in zoom. (Exception: at `w < 60` there is no pane to land on, so Esc/`Space`/`h` demote to the single-column list.) ROD-210 note: `q` no longer provides a "full back-out" — it quits; Esc/`Space`/`h` are the only demote path. | No revisit expected. |
+| **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse; jumping straight to `.list` would skip a level, jarring on a long episode list the user was navigating. `Space`/`h` demote identically. (Exception: at `w < 60` there is no pane to land on, so they demote to the single-column list.) ROD-210 retired `q` as a "full back-out" — `q` quits now, and Esc/`Space`/`h` are the only demote path. | No revisit expected. |
 | **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on focus at any two-pane width, so the zoom's grid is always ready. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | Revisit if a future design gives the 60–99 pane its own usable in-pane grid — that would remove the Enter-drills-to-zoom hop. |
