@@ -308,15 +308,18 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         return;
     }
     if (self.history.len == 0) {
-        // First-run empty state (§9.2): the void, one quiet line, one
-        // invitation — both centered. `/` wires up in ROD-73.
+        // First-run absent state (§9.5): on an empty watchlist the `/` filter has
+        // nothing to filter, so point the user to Browse (where shows are found
+        // and added) instead of advertising a dead-end prompt (ROD-211).
         const mid = top + visible / 2;
-        centerText(win, mid -| 1, w, "nothing here yet", self.s(self.palette.fg3, .{ .italic = true }));
-        const action = " to search for a show";
-        const total: u16 = 1 + @as(u16, @intCast(action.len));
+        centerText(win, mid -| 1, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));
+        const key = "F1";
+        const action = "  find anime in browse";
+        const key_w: u16 = @intCast(key.len);
+        const total: u16 = key_w + @as(u16, @intCast(action.len));
         const start: u16 = if (w > total) (w - total) / 2 else 0;
-        put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
-        putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
+        put(win, mid + 1, start, key, self.s(self.palette.focus, .{ .bold = true }));
+        putClipped(win, mid + 1, start + key_w, w -| (start + key_w), action, self.s(self.palette.fg2, .{}));
         return;
     }
 
