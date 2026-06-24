@@ -13,19 +13,20 @@ const put = render.put;
 const putClipped = render.putClipped;
 const fillRow = render.fillRow;
 const centerText = render.centerText;
+const centerKeyHint = render.centerKeyHint;
 
 // `self` is `*const App`: this pass reads list state (cursor/viewport/results)
 // and writes only `scratch` — the compiler proves it mutates no app state (ROD-155).
 pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
     const w = pane_w;
     if (self.search_len == 0) {
+        // First-run absent state (§9.5): name the view, then teach its two
+        // actions. Browse is search-first and never auto-fills, so "no feed yet"
+        // read as broken/waiting — this says what to do instead (ROD-211).
         const mid = pane_h / 2;
-        centerText(win, mid -| 1, w, "no feed yet", self.s(self.palette.fg3, .{ .italic = true }));
-        const action = " to start a search";
-        const total: u16 = 1 + @as(u16, @intCast(action.len));
-        const start: u16 = if (w > total) (w - total) / 2 else 0;
-        put(win, mid + 1, start, "/", self.s(self.palette.focus, .{ .bold = true }));
-        putClipped(win, mid + 1, start + 1, w -| (start + 1), action, self.s(self.palette.fg2, .{}));
+        centerText(win, mid -| 2, w, "search the catalogue", self.s(self.palette.fg2, .{ .italic = true }));
+        centerKeyHint(win, mid, w, "/", self.s(self.palette.focus, .{ .bold = true }), "  type a show name to begin", self.s(self.palette.fg2, .{}));
+        centerKeyHint(win, mid + 2, w, "P", self.s(self.palette.focus, .{ .bold = true }), "  save a result to your watchlist", self.s(self.palette.fg3, .{}));
         return;
     }
     const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
@@ -35,9 +36,14 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         return;
     }
     if (!search_pending and self.results.items.len == 0) {
+        // Centered to match the §9.5 absent state (ROD-211), not stranded
+        // top-left. The bottom-bar search prompt stays visible (chrome.zig), so
+        // the user keeps their query and the next-step hint sits under it.
         const q = self.querySlice();
+        const mid = pane_h / 2;
         const msg = std.fmt.bufPrint(&scratch.msg, "no results for \"{s}\"", .{q}) catch "no results";
-        putClipped(win, 0, 0, w, msg, self.s(self.palette.fg3, .{ .italic = true }));
+        centerText(win, mid -| 1, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
+        centerText(win, mid + 1, w, "try a different spelling", self.s(self.palette.fg3, .{ .italic = true }));
         return;
     }
 
