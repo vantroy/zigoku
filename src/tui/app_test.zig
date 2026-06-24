@@ -203,6 +203,17 @@ test "quit keys: q from browse and Ctrl-C" {
     try testing.expect(app.should_quit);
 }
 
+test "scope-tagged count fits cnt_scratch (ROD-211)" {
+    // Guards the [16]->[32] bump: the Browse/History count tags bufPrint into
+    // App.cnt_scratch, which must hold the longest tag + a multi-digit count (the
+    // "·" is 2 bytes). bufPrint errors if the buffer is too small, so a future
+    // shrink or a longer label trips this test instead of silently dropping the
+    // count at runtime. Buffer is sized from the real field so the two can't drift.
+    var buf: @FieldType(App, "cnt_scratch") = undefined;
+    _ = try std.fmt.bufPrint(&buf, "[catalogue · {d}]", .{999999});
+    _ = try std.fmt.bufPrint(&buf, "[watchlist · {d}]", .{999999});
+}
+
 test "navigation is a no-op with empty history" {
     var app: App = .{};
     app.setHistory(&.{});
