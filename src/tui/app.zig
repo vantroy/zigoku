@@ -1824,6 +1824,26 @@ pub const App = struct {
             return;
         }
 
+        // Search mode intercepts every remaining key (including Esc) before the
+        // normal-mode chain — onKey owns the normal-vs-search split, onSearchKey
+        // owns the query buffer (the ROD-219 verdict glue).
+        if (self.input_mode == .search) {
+            self.onSearchKey(key, loop, io, provider);
+            return;
+        }
+
+        // Anything past the globals + search dispatch is normal-mode navigation.
+        self.onNormalListKey(key, loop, io, provider);
+    }
+
+    /// Normal-mode (non-search) key handling: the h/l pane + Space zoom + Esc
+    /// navigation cluster, '/' search entry, the episode-grid and result-list
+    /// cursors, Browse's P add-to-watchlist, and the History p/x/c/w/P/r/u cluster
+    /// (delegated to onHistoryMutationKey). Reached only when input_mode == .normal
+    /// — onKey runs the search dispatch first — so the `input_mode == .normal`
+    /// guards left inside the pane/Space blocks are now always true, kept verbatim
+    /// as local documentation of the move (ROD-218, pure decompose of onKey).
+    fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // h / l pane switching (Browse only) (§10.3c). Left/right arrows mirror
         // h/l for parity with the j/k ↔ up/down list-nav block (ROD-156 #1).
         if (self.input_mode == .normal and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) {
@@ -1945,16 +1965,9 @@ pub const App = struct {
             return;
         }
 
-        // Search mode intercepts all keys (including Esc) before the view chain.
-        // Esc in search mode clears the query; Esc in normal mode runs the view chain.
-        if (self.input_mode == .search) {
-            self.onSearchKey(key, loop, io, provider);
-            return;
-        }
-
         // Esc chain (§10.4, ROD-210): peel exactly one transient layer — never
         // switch the base view. Only reached in normal mode (search-mode Esc is
-        // handled by onSearchKey above).
+        // handled by onSearchKey, dispatched from onKey).
         if (key.matches(vaxis.Key.escape, .{})) {
             if ((self.active_view == .browse or self.active_view == .history) and
                 self.active_pane == .detail)
@@ -2010,60 +2023,11 @@ pub const App = struct {
             return;
         }
 
-        // History: manual watch-state transitions (ROD-139 §1). Act on the focused
-        // entry; the grouped view regroups it on the next draw. `c` is the bare
-        // codepoint — Ctrl-C (quit) is matched and returned earlier, so no clash.
-        if (self.active_view == .history) {
-            if (key.matches('p', .{})) {
-                self.setSelectedHistoryStatus(.paused);
-                return;
-            } else if (key.matches('x', .{})) {
-                self.setSelectedHistoryStatus(.dropped);
-                return;
-            } else if (key.matches('c', .{})) {
-                self.setSelectedHistoryStatus(.completed);
-                return;
-            } else if (key.matches('w', .{})) {
-                self.setSelectedHistoryStatus(.watching);
-                return;
-            } else if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
-                // ROD-189: re-plan — the missing 5th manual transition, paired with
-                // Browse's P so the key means "plan it" in both views.
-                // setSelectedHistoryStatus routes through setListStatus's re-plan path
-                // and the undo seam, so it's undoable like p/x/c/w. Match shift+'P' and
-                // bare 'P' (terminal compat); lowercase 'p' above is paused — no clash.
-                self.setSelectedHistoryStatus(.planning);
-                return;
-            } else if (key.matches('r', .{})) {
-                // ROD-193: recompute progress from episode_progress rows (strategy A).
-                // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
-                // because single-level undo goes stale after any subsequent key.
-                const st = self.store orelse return;
-                const idx = history.indexAtCursor(self) orelse return;
-                const rec = &self.history[idx];
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
-                defer arena.deinit();
-                const hw = st.recomputeProgress(arena.allocator(), rec.source, rec.source_id, self.translation) catch |e| {
-                    log.debug("recomputeProgress failed: {s}", .{@errorName(e)});
-                    return;
-                };
-                rec.progress = hw;
-                // r overwrites progress, so a stale undo entry (captured pre-`c`)
-                // would revert PAST this recompute on a later `u`. Invalidate it so
-                // `c → r → u` keeps the recomputed value (ROD-193 review).
-                if (self.undo) |u| {
-                    u.free(self.gpa);
-                    self.undo = null;
-                }
-                syncEpisodeProgress(self, rec.source, rec.source_id, hw);
-                self.pushToast(.success, "progress reset", false);
-                return;
-            } else if (key.matches('u', .{})) {
-                // ROD-193: single-level undo of the last watch-state mutation.
-                self.applyUndo();
-                return;
-            }
-        }
+        // History: manual watch-state transitions (ROD-139 §1). The p/x/c/w/P/r/u
+        // status / re-plan / recompute / undo cluster lives in onHistoryMutationKey;
+        // it returns true when it consumed the key, so we stop before the list-nav
+        // fallthrough below (ROD-218).
+        if (self.active_view == .history and self.onHistoryMutationKey(key)) return;
 
         // Browse: P (shift+p) tracks a not-yet-watched result as planning (ROD-189).
         // upsertAnime's ON CONFLICT preserves list_status/progress/play_count and
@@ -2137,6 +2101,66 @@ pub const App = struct {
         {
             self.fireSearch(loop, io, provider, self.search.page + 1);
         }
+    }
+
+    /// History watch-state cluster (ROD-139/189/193): p paused · x dropped · c
+    /// completed · w watching · P planning (re-plan) · r recompute-progress · u
+    /// undo. Returns true when it consumed `key`, so onNormalListKey stops before
+    /// the list-nav fallthrough; false leaves the key to that nav. Acts on the
+    /// cursor-focused entry; the grouped view regroups on the next draw. `c` is the
+    /// bare codepoint — Ctrl-C (quit) is matched earlier in onKey, so no clash.
+    /// Extracted from onKey verbatim (ROD-218, no behavior change).
+    fn onHistoryMutationKey(self: *App, key: vaxis.Key) bool {
+        if (key.matches('p', .{})) {
+            self.setSelectedHistoryStatus(.paused);
+            return true;
+        } else if (key.matches('x', .{})) {
+            self.setSelectedHistoryStatus(.dropped);
+            return true;
+        } else if (key.matches('c', .{})) {
+            self.setSelectedHistoryStatus(.completed);
+            return true;
+        } else if (key.matches('w', .{})) {
+            self.setSelectedHistoryStatus(.watching);
+            return true;
+        } else if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
+            // ROD-189: re-plan — the missing 5th manual transition, paired with
+            // Browse's P so the key means "plan it" in both views.
+            // setSelectedHistoryStatus routes through setListStatus's re-plan path
+            // and the undo seam, so it's undoable like p/x/c/w. Match shift+'P' and
+            // bare 'P' (terminal compat); lowercase 'p' above is paused — no clash.
+            self.setSelectedHistoryStatus(.planning);
+            return true;
+        } else if (key.matches('r', .{})) {
+            // ROD-193: recompute progress from episode_progress rows (strategy A).
+            // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
+            // because single-level undo goes stale after any subsequent key.
+            const st = self.store orelse return true;
+            const idx = history.indexAtCursor(self) orelse return true;
+            const rec = &self.history[idx];
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const hw = st.recomputeProgress(arena.allocator(), rec.source, rec.source_id, self.translation) catch |e| {
+                log.debug("recomputeProgress failed: {s}", .{@errorName(e)});
+                return true;
+            };
+            rec.progress = hw;
+            // r overwrites progress, so a stale undo entry (captured pre-`c`)
+            // would revert PAST this recompute on a later `u`. Invalidate it so
+            // `c → r → u` keeps the recomputed value (ROD-193 review).
+            if (self.undo) |u| {
+                u.free(self.gpa);
+                self.undo = null;
+            }
+            syncEpisodeProgress(self, rec.source, rec.source_id, hw);
+            self.pushToast(.success, "progress reset", false);
+            return true;
+        } else if (key.matches('u', .{})) {
+            // ROD-193: single-level undo of the last watch-state mutation.
+            self.applyUndo();
+            return true;
+        }
+        return false;
     }
 
     // ── draw: pure render from state ─────────────────────────────────────────
