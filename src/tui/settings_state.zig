@@ -40,7 +40,7 @@ const Config = config_mod.Config;
 pub const SettingId = enum {
     mpv_path,
     default_quality,
-    subtitle_language,
+    translation,
     resume_offset,
     skip_mode,
     cover_art,
@@ -60,7 +60,7 @@ pub const SettingRow = struct {
 pub const settings_rows = [_]SettingRow{
     .{ .id = .mpv_path, .label = "mpv path", .kind = .text, .hint = "enter to edit" },
     .{ .id = .default_quality, .label = "default quality", .kind = .cycle, .hint = "hjkl to cycle" },
-    .{ .id = .subtitle_language, .label = "subtitle language", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .translation, .label = "translation", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space to toggle" },
@@ -82,7 +82,7 @@ comptime {
 }
 
 const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
-const language_presets = [_][]const u8{ "sub", "dub" };
+const translation_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
 const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord" };
@@ -120,7 +120,7 @@ fn cyclePresetU32(presets: []const u32, current: u32, dir: i8) u32 {
 fn cycle(config: *Config, id: SettingId, dir: i8) void {
     switch (id) {
         .default_quality => config.default_quality = cyclePreset(&quality_presets, config.default_quality, dir),
-        .subtitle_language => config.translation = cyclePreset(&language_presets, config.translation, dir),
+        .translation => config.translation = cyclePreset(&translation_presets, config.translation, dir),
         .skip_mode => config.skip_mode = cyclePreset(&skip_presets, config.skip_mode, dir),
         .resume_offset => config.resume_offset_sec = cyclePresetU32(&resume_presets, config.resume_offset_sec, dir),
         .palette => config.palette = cyclePreset(&palette_presets, config.palette, dir),
@@ -298,7 +298,7 @@ pub const SettingsState = struct {
         return switch (id) {
             .mpv_path => config.mpv_path,
             .default_quality => config.default_quality,
-            .subtitle_language => config.translation,
+            .translation => config.translation,
             .skip_mode => config.skip_mode,
             .resume_offset => std.fmt.bufPrint(&self.value_buf, "{d}s", .{config.resume_offset_sec}) catch "?",
             .cover_art => if (config.cover_art) "on" else "off",
