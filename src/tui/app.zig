@@ -1638,6 +1638,448 @@ pub const App = struct {
         self.async_start_ms = self.now_ms;
     }
 
+    fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Settings owns its keys first (cycle/toggle/edit/save); anything it
+        // doesn't consume falls through to the global chain below.
+        if (self.active_view == .settings and self.onSettingsKey(key)) return;
+
+        // q quits the app — full stop (§10.6, ROD-210), with no back-nav: unlike
+        // Esc, q never peels a layer. The `input_mode == .normal` guard keeps a
+        // literal "q" typed into a Browse search or History filter from quitting —
+        // it falls through to onSearchKey below and appends instead.
+        if (self.input_mode == .normal and key.matches('q', .{})) {
+            // Settings persists on the way out — the save that used to ride the
+            // q → .save_and_exit verdict now rides quit. leaveSettings is a no-op
+            // unless the tab is dirty; other views have nothing to flush.
+            if (self.active_view == .settings) self.leaveSettings(io);
+            self.should_quit = true;
+            return;
+        }
+
+        // Ctrl-C quit. Like q, it persists a dirty Settings tab on the way out
+        // (ROD-210) so an emergency exit doesn't drop just-made changes.
+        if (key.matches('c', .{ .ctrl = true })) {
+            if (self.active_view == .settings) self.leaveSettings(io);
+            self.should_quit = true;
+            return;
+        }
+
+        // View switching — F-keys (discoverable, §10.2) and H/S (vim-native, §6.1).
+        // F2 = "go to History" — no-op if already there (spec §10.2 F2 from History).
+        // H = toggle Browse ↔ History (distinct from F2, per Elara H1/M2 fixes).
+        if (key.matches(vaxis.Key.f2, .{})) {
+            if (self.active_view != .history) {
+                if (self.active_view == .settings) self.leaveSettings(io);
+                self.active_view = .history;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+            return;
+        }
+        if (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))) {
+            if (self.active_view == .settings) self.leaveSettings(io);
+            self.active_view = if (self.active_view == .history) .browse else .history;
+            self.active_pane = .list;
+            self.list_cursor = 0;
+            self.list_top = 0;
+            return;
+        }
+        if (key.matches(vaxis.Key.f3, .{}) or
+            key.matches('S', .{ .shift = true }) or key.matches('S', .{}))
+        {
+            if (self.active_view != .settings) {
+                self.active_view = .settings;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+                // Land on a clean Settings state: top row, not editing, and
+                // never inheriting a stray search mode from the prior view.
+                self.settings.reset();
+                self.input_mode = .normal;
+            }
+            return;
+        }
+        // F1 = "go to Browse" — no-op if already there (spec §10.2 F1 from Browse).
+        if (key.matches(vaxis.Key.f1, .{})) {
+            if (self.active_view != .browse) {
+                if (self.active_view == .settings) self.leaveSettings(io);
+                self.active_view = .browse;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+            return;
+        }
+
+        // Search mode intercepts every remaining key (including Esc) before the
+        // normal-mode chain — onKey owns the normal-vs-search split, onSearchKey
+        // owns the query buffer (the ROD-219 verdict glue).
+        if (self.input_mode == .search) {
+            self.onSearchKey(key, loop, io, provider);
+            return;
+        }
+
+        // Anything past the globals + search dispatch is normal-mode navigation.
+        self.onNormalListKey(key, loop, io, provider);
+    }
+
+    /// Normal-mode (non-search) key dispatch (ROD-218). onKey handles the global
+    /// keys and routes search-mode keys to onSearchKey before calling this, so
+    /// normal mode is guaranteed here — the per-block `input_mode == .normal` guards
+    /// from the original onKey were dropped from the extracted handlers (always true
+    /// at this call site, and pure noise inside per-intent functions). Delegates to
+    /// the handlers below; the only inline arm is '/' search-mode entry.
+    fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Spatial pane/zoom navigation (ROD-170 focus model). These keys —
+        // l/→/Enter, h/←/Esc, Space — are mutually exclusive by keycode, so the
+        // order among the three handlers is immaterial.
+        if (self.onDrillKey(key, loop, io, provider)) return; // l / → / Enter — drill in / play
+        if (self.onPaneFocusKey(key)) return; // h / ← / Esc — peel focus back one layer
+        if (self.onZoomKey(key, loop, io, provider)) return; // Space — zoom toggle
+
+        // '/' enters search/filter mode in Browse and History.
+        if (key.matches('/', .{})) {
+            if (self.active_view == .browse or self.active_view == .history) self.input_mode = .search;
+            return;
+        }
+
+        // j/k/g/G is shared by the episode grid and the list, so the grid (any
+        // focused detail surface) must run before the list-cursor fallthrough.
+        // The P/p/x/c/w/r/u actions sit between them, view-gated.
+        if (self.onEpisodeGridKey(key)) return; // j/k/g/G — episode grid (detail surfaces)
+        if (self.active_view == .history and self.onHistoryMutationKey(key)) return; // p/x/c/w/P/r/u
+        if (self.onBrowseAddKey(key, provider)) return; // P — add result to watchlist
+        self.onListCursorKey(key, loop, io, provider); // j/k/g/G — list cursor + load-more
+    }
+
+    /// Drill forward (ROD-170 focus model): l/→/Enter reveal+focus the detail pane
+    /// (lazy-loading the episode grid), play the focused episode, or open the zoom
+    /// in single-column. Per-view because each surface drills differently. Returns
+    /// true when `key` is l/→/Enter (consumed). Normal mode only (onKey gates
+    /// search keys), so no input_mode guard is needed.
+    fn onDrillKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
+        if (!(key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}))) return false;
+        switch (self.active_view) {
+            .browse => {
+                if (self.active_pane == .list and self.search.results.items.len > 0) {
+                    if (self.term_cols >= pane_split_min) {
+                        // Two-pane: reveal/focus the detail pane + lazy-load the
+                        // episode grid (ROD-202). The fetch lands through its own
+                        // event; fireEpisodesBrowse's in-flight guard avoids
+                        // respawning a fetch already running for this same show.
+                        self.active_pane = .detail;
+                        self.fireEpisodesBrowse(loop, io, provider);
+                    } else if (key.matches(vaxis.Key.enter, .{})) {
+                        // Single-column (< 60): no pane — Enter opens the zoom
+                        // (mirrors History; ROD-194 regression fix). `l`/right
+                        // are no-ops here, nothing to focus rightward.
+                        self.openBrowseZoom(loop, io, provider);
+                    }
+                } else if (self.active_pane == .detail) {
+                    // Enter on episode in detail pane: play
+                    if (key.matches(vaxis.Key.enter, .{})) {
+                        self.firePlay(loop, io, provider);
+                    }
+                    // l in detail: no-op (already rightmost)
+                }
+            },
+            .history => {
+                // ROD-170: l/Enter mirrors Browse but "drills toward the grid."
+                // The grid lives in the in-pane view (>= zoom_min) or the zoom
+                // (any width). History never prefetches (ROD-156), so the fetch
+                // fires here on focus, against the just-focused record.
+                if (self.active_pane == .list) {
+                    if (self.selectedHistoryRecord()) |rec| {
+                        if (self.term_cols >= pane_split_min) {
+                            // Two-pane: focus the detail pane + fetch (ready for
+                            // the in-pane grid at >= zoom_min, or the zoom below).
+                            self.active_pane = .detail;
+                            self.fireEpisodesForId(loop, io, provider, rec.source_id);
+                        } else if (key.matches(vaxis.Key.enter, .{})) {
+                            // Single-column (< 60): no pane — Enter opens the zoom.
+                            self.openHistoryZoom(loop, io, provider, rec);
+                        }
+                    }
+                } else if (key.matches(vaxis.Key.enter, .{})) {
+                    if (self.term_cols >= zoom_min) {
+                        // In-pane grid is visible → play the focused episode.
+                        self.firePlay(loop, io, provider);
+                    } else {
+                        // 60-99 preview pane (no in-pane grid): drill into the
+                        // zoom to reach the grid (already fetched on focus).
+                        self.detail_origin = .history;
+                        self.active_view = .detail;
+                    }
+                }
+            },
+            .detail => {
+                if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, provider);
+            },
+            .settings => {},
+        }
+        return true;
+    }
+
+    /// Peel focus back one layer (ROD-170 focus model): h/← and Esc both demote a
+    /// step — zoom → origin pane (or list if there's no room) → list. A base-view
+    /// list is a no-op (base-view changes go through F1/F2/F3 + H; q quits). The
+    /// two keys share this transition; they stay distinct blocks (verbatim from
+    /// onKey) rather than dedup, so a behavior change would show as a real diff.
+    /// Returns true when `key` is h/←/Esc (consumed). Search-mode Esc never reaches
+    /// here — onSearchKey handles it, dispatched from onKey.
+    fn onPaneFocusKey(self: *App, key: vaxis.Key) bool {
+        // h / ← : pane switching (Browse/History) + zoom demote (§10.3c). Left/right
+        // arrows mirror h/l for parity with the j/k ↔ up/down list-nav (ROD-156 #1).
+        if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            if (self.active_view == .detail) {
+                // ROD-170: from the zoom, h demotes one step (Esc/Space behave the
+                // same). q no longer backs out — it quits now (ROD-210).
+                // detail_origin carries us back to Browse or History; we land on
+                // the pane if there's room, otherwise the list (single-column
+                // below pane_split_min).
+                self.active_view = switch (self.detail_origin) {
+                    .browse => .browse,
+                    .history => .history,
+                };
+                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
+            } else if ((self.active_view == .browse or self.active_view == .history) and
+                self.active_pane == .detail)
+            {
+                self.active_pane = .list;
+            }
+            return true;
+        }
+        // Esc chain (§10.4, ROD-210): peel exactly one transient layer — never
+        // switch the base view.
+        if (key.matches(vaxis.Key.escape, .{})) {
+            if ((self.active_view == .browse or self.active_view == .history) and
+                self.active_pane == .detail)
+            {
+                // ROD-170: detail pane focused → return focus to the list (= h).
+                self.active_pane = .list;
+            } else if (self.active_view == .detail) {
+                // ROD-170: zoom → demote one step (q quits instead of backing
+                // out). Land on the pane if there's room, else the list.
+                self.active_view = switch (self.detail_origin) {
+                    .browse => .browse,
+                    .history => .history,
+                };
+                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
+            }
+            // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed
+            // the old History/Settings → Browse jump — base-view changes happen
+            // only via F1/F2/F3 and the H toggle. q quits.
+            return true;
+        }
+        return false;
+    }
+
+    /// Space — zoom toggle (ROD-170, §10.2): promote a focused detail pane to the
+    /// full-screen zoom (the surface that always carries the grid), or demote the
+    /// zoom back (to the pane if there's room, else the list). At < pane_split_min
+    /// there is no pane, so Space opens the zoom straight from the list (same as
+    /// Enter). Space is layout-neutral (no Colemak-DH adjacency to p/x/c/w) and
+    /// toggle-friendly. Returns true when `key` is Space (consumed).
+    fn onZoomKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
+        if (!key.matches(vaxis.Key.space, .{})) return false;
+        if (self.active_view == .detail) {
+            self.active_view = switch (self.detail_origin) {
+                .browse => .browse,
+                .history => .history,
+            };
+            self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
+        } else if ((self.active_view == .browse or self.active_view == .history) and
+            self.active_pane == .detail)
+        {
+            // Promote a focused detail pane to the zoom. Works at any two-pane
+            // width: at 60-99 the zoom is how you reach the grid the pane omits
+            // (episodes were already fetched when the pane took focus).
+            self.detail_origin = if (self.active_view == .history) .history else .browse;
+            self.active_view = .detail;
+        } else if (self.active_view == .history and self.active_pane == .list and
+            self.term_cols < pane_split_min)
+        {
+            // Single-column History: no pane to toggle — Space opens the zoom.
+            if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, provider, rec);
+        } else if (self.active_view == .browse and self.active_pane == .list and
+            self.term_cols < pane_split_min)
+        {
+            // Single-column Browse: no pane to toggle — Space opens the zoom
+            // (mirrors History; ROD-194 regression fix).
+            self.openBrowseZoom(loop, io, provider);
+        }
+        return true;
+    }
+
+    /// Episode-grid cursor (ROD-170): while any detail surface is focused, j/k/g/G
+    /// move the episode cursor. Consumes *every* key in that context (returns true)
+    /// — non-nav keys are inert there, matching the pre-split fallthrough. At 60-99
+    /// History has no in-pane grid (ep_len == 0), so j/k are inert and h returns to
+    /// the list. Returns false when no detail surface is focused, leaving j/k/g/G
+    /// to onListCursorKey.
+    fn onEpisodeGridKey(self: *App, key: vaxis.Key) bool {
+        const in_grid = (self.active_view == .browse and self.active_pane == .detail) or
+            self.active_view == .detail or
+            (self.active_view == .history and self.active_pane == .detail);
+        if (!in_grid) return false;
+        const ep_len: usize = if (self.episodes.results) |eps| eps.len else 0;
+        if (ep_len == 0) return true;
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            if (self.episodes.cursor + 1 < ep_len) self.episodes.cursor += 1;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            if (self.episodes.cursor > 0) self.episodes.cursor -= 1;
+        } else if (key.matches('g', .{})) {
+            self.episodes.cursor = 0;
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            // libvaxis delivers shift+g inconsistently across terminals: some
+            // report the 'G' codepoint with .shift set, others report bare 'G'
+            // (already-uppercased) with no modifier. Match both so G lands
+            // regardless of terminal.
+            self.episodes.cursor = ep_len - 1;
+        }
+        return true;
+    }
+
+    /// Browse P (shift+P): track a not-yet-watched result as planning (ROD-189).
+    /// upsertAnime's ON CONFLICT preserves list_status/progress/play_count and
+    /// MAX-merges history_visible, so a brand-new row inserts as planning and a
+    /// hidden search-cache row (history_visible 0) is revealed (→1) — neither
+    /// clobbers existing user state. Match shift+'P' and bare 'P' for the same
+    /// cross-terminal reason as the G nav. Returns true when P is pressed on a
+    /// focused Browse result (consumed), false otherwise.
+    fn onBrowseAddKey(self: *App, key: vaxis.Key, provider: SourceProvider) bool {
+        if (!(self.active_view == .browse and self.active_pane == .list and
+            (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))) return false;
+        const st = self.store orelse return true;
+        const anime = self.selectedAnime() orelse return true;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        var rec = AnimeRecord.fromDomain(provider.name(), anime, self.translation);
+        // Explicit, not via the fromDomain struct default: a browse-add is always a
+        // reveal. If AnimeRecord.history_visible's default ever flips to false
+        // (defensible for its search-cache role), this keeps P revealing rows
+        // (ON CONFLICT does MAX(excluded, anime)) instead of silently hiding them.
+        rec.history_visible = true;
+        st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| {
+            log.debug("add-to-watchlist failed: {s}", .{@errorName(e)});
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return true;
+        };
+        // Unlike the p/x/c/w transitions (which mutate a row already in
+        // self.history in place), P adds a row that isn't in the in-memory
+        // list yet — flag a background reload so it surfaces in History this
+        // session, not just after a restart.
+        self.history_dirty = true;
+        self.pushToast(.success, "added to watchlist", false);
+        return true;
+    }
+
+    /// List-cursor navigation (Browse results + History list): j/k/g/G move the
+    /// list cursor, and a downward step at the last Browse result pages in the next
+    /// page (ROD-201 load-more). The tail of onNormalListKey's dispatch — Settings
+    /// and the zoom have no list here and bail. Reached only after onEpisodeGridKey,
+    /// so a focused detail surface never lands here (it consumes j/k/g/G first).
+    fn onListCursorKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const nav_len: usize = switch (self.active_view) {
+            .history => self.filteredHistoryLen(),
+            .browse => self.search.results.items.len,
+            .detail, .settings => return,
+        };
+        if (nav_len == 0) return;
+
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            if (self.list_cursor + 1 < nav_len) self.list_cursor += 1;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            if (self.list_cursor > 0) self.list_cursor -= 1;
+        } else if (key.matches('g', .{})) {
+            self.list_cursor = 0;
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            // Match both shift+'G' and bare uppercase 'G' (see episode-grid nav
+            // above): terminals disagree on whether shift is reported separately.
+            self.list_cursor = nav_len - 1;
+        }
+        // ROD-202: a cursor move never prefetches episodes. The grid loads lazily
+        // on detail entry (l/→/Enter → fireEpisodesBrowse), matching History, so
+        // scrolling the results list stays smooth and fires zero episode fetches.
+        // The cover preview still tracks the cursor — that's detailSyncTarget,
+        // resolved every frame, not an episode fetch (ROD-156's cover half stays).
+        //
+        // Load-more: at the last result, a downward keystroke pages in the next page.
+        // Must accept the Down arrow too, not just 'j' — the cursor-nav above already
+        // honors both, so a j-only trigger left the ╌ more ╌ footer unreachable for
+        // arrow-key users (ROD-156 parity gap: infinite scroll that wasn't; ROD-201).
+        if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and
+            self.active_view == .browse and
+            self.list_cursor == nav_len - 1 and
+            self.search.page > 0 and
+            nav_len % source_mod.search_page_size == 0 and
+            !self.search.loading)
+        {
+            self.fireSearch(loop, io, provider, self.search.page + 1);
+        }
+    }
+
+    /// History watch-state cluster (ROD-139/189/193): p paused · x dropped · c
+    /// completed · w watching · P planning (re-plan) · r recompute-progress · u
+    /// undo. Returns true when it consumed `key`, so onNormalListKey stops before
+    /// the list-nav fallthrough; false leaves the key to that nav. Acts on the
+    /// cursor-focused entry; the grouped view regroups on the next draw. `c` is the
+    /// bare codepoint — Ctrl-C (quit) is matched earlier in onKey, so no clash.
+    /// Extracted from onKey verbatim (ROD-218, no behavior change).
+    fn onHistoryMutationKey(self: *App, key: vaxis.Key) bool {
+        if (key.matches('p', .{})) {
+            self.setSelectedHistoryStatus(.paused);
+            return true;
+        } else if (key.matches('x', .{})) {
+            self.setSelectedHistoryStatus(.dropped);
+            return true;
+        } else if (key.matches('c', .{})) {
+            self.setSelectedHistoryStatus(.completed);
+            return true;
+        } else if (key.matches('w', .{})) {
+            self.setSelectedHistoryStatus(.watching);
+            return true;
+        } else if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
+            // ROD-189: re-plan — the missing 5th manual transition, paired with
+            // Browse's P so the key means "plan it" in both views.
+            // setSelectedHistoryStatus routes through setListStatus's re-plan path
+            // and the undo seam, so it's undoable like p/x/c/w. Match shift+'P' and
+            // bare 'P' (terminal compat); lowercase 'p' above is paused — no clash.
+            self.setSelectedHistoryStatus(.planning);
+            return true;
+        } else if (key.matches('r', .{})) {
+            // ROD-193: recompute progress from episode_progress rows (strategy A).
+            // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
+            // because single-level undo goes stale after any subsequent key.
+            const st = self.store orelse return true;
+            const idx = history.indexAtCursor(self) orelse return true;
+            const rec = &self.history[idx];
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const hw = st.recomputeProgress(arena.allocator(), rec.source, rec.source_id, self.translation) catch |e| {
+                log.debug("recomputeProgress failed: {s}", .{@errorName(e)});
+                return true;
+            };
+            rec.progress = hw;
+            // r overwrites progress, so a stale undo entry (captured pre-`c`)
+            // would revert PAST this recompute on a later `u`. Invalidate it so
+            // `c → r → u` keeps the recomputed value (ROD-193 review).
+            if (self.undo) |u| {
+                u.free(self.gpa);
+                self.undo = null;
+            }
+            syncEpisodeProgress(self, rec.source, rec.source_id, hw);
+            self.pushToast(.success, "progress reset", false);
+            return true;
+        } else if (key.matches('u', .{})) {
+            // ROD-193: single-level undo of the last watch-state mutation.
+            self.applyUndo();
+            return true;
+        }
+        return false;
+    }
+
     /// Drive a key into the search prompt and project the controller's verdict
     /// (ROD-219, the SettingsState keystone). History view filters the in-memory
     /// watchlist — nav state, so it stays here in `onHistoryFilterKey`. Browse
@@ -1719,12 +2161,11 @@ pub const App = struct {
         }
     }
 
-    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
-    /// Stays on App: it owns `config_path` and the toast queue, neither of which
-    /// belongs in the settings edit subsystem.
-    /// Persist the live config to disk. Returns true only when the bytes
-    /// actually landed — both early-outs (no config dir, write error) toast and
-    /// return false so callers can keep the tab dirty for a retry (ROD-210 M1).
+    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome. Stays
+    /// on App: it owns `config_path` and the toast queue, neither of which belongs
+    /// in the settings edit subsystem. Returns true only when the bytes actually
+    /// landed — both early-outs (no config dir, write error) toast and return false
+    /// so callers can keep the tab dirty for a retry (ROD-210 M1).
     fn saveSettings(self: *App, io: std.Io) bool {
         const path = self.config_path orelse {
             self.pushToast(.warn, "no config dir — not saved", false);
@@ -1748,395 +2189,6 @@ pub const App = struct {
     fn leaveSettings(self: *App, io: std.Io) void {
         if (!self.settings.dirty) return;
         if (self.saveSettings(io)) self.settings.dirty = false;
-    }
-
-    fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        // Settings owns its keys first (cycle/toggle/edit/save); anything it
-        // doesn't consume falls through to the global chain below.
-        if (self.active_view == .settings and self.onSettingsKey(key)) return;
-
-        // q quits the app — full stop (§10.6, ROD-210), with no back-nav: unlike
-        // Esc, q never peels a layer. The `input_mode == .normal` guard keeps a
-        // literal "q" typed into a Browse search or History filter from quitting —
-        // it falls through to onSearchKey below and appends instead.
-        if (self.input_mode == .normal and key.matches('q', .{})) {
-            // Settings persists on the way out — the save that used to ride the
-            // q → .save_and_exit verdict now rides quit. leaveSettings is a no-op
-            // unless the tab is dirty; other views have nothing to flush.
-            if (self.active_view == .settings) self.leaveSettings(io);
-            self.should_quit = true;
-            return;
-        }
-
-        // Ctrl-C quit. Like q, it persists a dirty Settings tab on the way out
-        // (ROD-210) so an emergency exit doesn't drop just-made changes.
-        if (key.matches('c', .{ .ctrl = true })) {
-            if (self.active_view == .settings) self.leaveSettings(io);
-            self.should_quit = true;
-            return;
-        }
-
-        // View switching — F-keys (discoverable, §10.2) and H/S (vim-native, §6.1).
-        // F2 = "go to History" — no-op if already there (spec §10.2 F2 from History).
-        // H = toggle Browse ↔ History (distinct from F2, per Elara H1/M2 fixes).
-        if (key.matches(vaxis.Key.f2, .{})) {
-            if (self.active_view != .history) {
-                if (self.active_view == .settings) self.leaveSettings(io);
-                self.active_view = .history;
-                self.active_pane = .list;
-                self.list_cursor = 0;
-                self.list_top = 0;
-            }
-            return;
-        }
-        if (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))) {
-            if (self.active_view == .settings) self.leaveSettings(io);
-            self.active_view = if (self.active_view == .history) .browse else .history;
-            self.active_pane = .list;
-            self.list_cursor = 0;
-            self.list_top = 0;
-            return;
-        }
-        if (key.matches(vaxis.Key.f3, .{}) or
-            key.matches('S', .{ .shift = true }) or key.matches('S', .{}))
-        {
-            if (self.active_view != .settings) {
-                self.active_view = .settings;
-                self.active_pane = .list;
-                self.list_cursor = 0;
-                self.list_top = 0;
-                // Land on a clean Settings state: top row, not editing, and
-                // never inheriting a stray search mode from the prior view.
-                self.settings.reset();
-                self.input_mode = .normal;
-            }
-            return;
-        }
-        // F1 = "go to Browse" — no-op if already there (spec §10.2 F1 from Browse).
-        if (key.matches(vaxis.Key.f1, .{})) {
-            if (self.active_view != .browse) {
-                if (self.active_view == .settings) self.leaveSettings(io);
-                self.active_view = .browse;
-                self.active_pane = .list;
-                self.list_cursor = 0;
-                self.list_top = 0;
-            }
-            return;
-        }
-
-        // h / l pane switching (Browse only) (§10.3c). Left/right arrows mirror
-        // h/l for parity with the j/k ↔ up/down list-nav block (ROD-156 #1).
-        if (self.input_mode == .normal and (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{}))) {
-            if (self.active_view == .detail) {
-                // ROD-170: from the zoom, h demotes one step (Esc/Space behave the
-                // same). q no longer backs out — it quits now (ROD-210).
-                // detail_origin carries us back to Browse or History; we land on
-                // the pane if there's room, otherwise the list (single-column
-                // below pane_split_min).
-                self.active_view = switch (self.detail_origin) {
-                    .browse => .browse,
-                    .history => .history,
-                };
-                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
-            } else if ((self.active_view == .browse or self.active_view == .history) and
-                self.active_pane == .detail)
-            {
-                self.active_pane = .list;
-            }
-            return;
-        }
-        // Enter is only handled here in normal mode. In search mode it must fall
-        // through to the search mode check below so onSearchKey can lock the results.
-        if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}))) {
-            switch (self.active_view) {
-                .browse => {
-                    if (self.active_pane == .list and self.search.results.items.len > 0) {
-                        if (self.term_cols >= pane_split_min) {
-                            // Two-pane: reveal/focus the detail pane + lazy-load the
-                            // episode grid (ROD-202). The fetch lands through its own
-                            // event; fireEpisodesBrowse's in-flight guard avoids
-                            // respawning a fetch already running for this same show.
-                            self.active_pane = .detail;
-                            self.fireEpisodesBrowse(loop, io, provider);
-                        } else if (key.matches(vaxis.Key.enter, .{})) {
-                            // Single-column (< 60): no pane — Enter opens the zoom
-                            // (mirrors History; ROD-194 regression fix). `l`/right
-                            // are no-ops here, nothing to focus rightward.
-                            self.openBrowseZoom(loop, io, provider);
-                        }
-                    } else if (self.active_pane == .detail) {
-                        // Enter on episode in detail pane: play
-                        if (key.matches(vaxis.Key.enter, .{})) {
-                            self.firePlay(loop, io, provider);
-                        }
-                        // l in detail: no-op (already rightmost)
-                    }
-                },
-                .history => {
-                    // ROD-170: l/Enter mirrors Browse but "drills toward the grid."
-                    // The grid lives in the in-pane view (>= zoom_min) or the zoom
-                    // (any width). History never prefetches (ROD-156), so the fetch
-                    // fires here on focus, against the just-focused record.
-                    if (self.active_pane == .list) {
-                        if (self.selectedHistoryRecord()) |rec| {
-                            if (self.term_cols >= pane_split_min) {
-                                // Two-pane: focus the detail pane + fetch (ready for
-                                // the in-pane grid at >= zoom_min, or the zoom below).
-                                self.active_pane = .detail;
-                                self.fireEpisodesForId(loop, io, provider, rec.source_id);
-                            } else if (key.matches(vaxis.Key.enter, .{})) {
-                                // Single-column (< 60): no pane — Enter opens the zoom.
-                                self.openHistoryZoom(loop, io, provider, rec);
-                            }
-                        }
-                    } else if (key.matches(vaxis.Key.enter, .{})) {
-                        if (self.term_cols >= zoom_min) {
-                            // In-pane grid is visible → play the focused episode.
-                            self.firePlay(loop, io, provider);
-                        } else {
-                            // 60-99 preview pane (no in-pane grid): drill into the
-                            // zoom to reach the grid (already fetched on focus).
-                            self.detail_origin = .history;
-                            self.active_view = .detail;
-                        }
-                    }
-                },
-                .detail => {
-                    if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, provider);
-                },
-                .settings => {},
-            }
-            return;
-        }
-
-        // Space: zoom toggle (ROD-170, §10.2). The zoom is the full-screen detail
-        // surface that always carries the grid. Promote a focused detail pane to
-        // it; from the zoom, demote back (to the pane if there's room, else the
-        // list). At < pane_split_min there is no pane, so Space opens the zoom
-        // straight from the History list (same as Enter). Space is layout-neutral
-        // (no Colemak-DH adjacency to p/x/c/w) and toggle-friendly.
-        if (self.input_mode == .normal and key.matches(vaxis.Key.space, .{})) {
-            if (self.active_view == .detail) {
-                self.active_view = switch (self.detail_origin) {
-                    .browse => .browse,
-                    .history => .history,
-                };
-                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
-            } else if ((self.active_view == .browse or self.active_view == .history) and
-                self.active_pane == .detail)
-            {
-                // Promote a focused detail pane to the zoom. Works at any two-pane
-                // width: at 60-99 the zoom is how you reach the grid the pane omits
-                // (episodes were already fetched when the pane took focus).
-                self.detail_origin = if (self.active_view == .history) .history else .browse;
-                self.active_view = .detail;
-            } else if (self.active_view == .history and self.active_pane == .list and
-                self.term_cols < pane_split_min)
-            {
-                // Single-column History: no pane to toggle — Space opens the zoom.
-                if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, provider, rec);
-            } else if (self.active_view == .browse and self.active_pane == .list and
-                self.term_cols < pane_split_min)
-            {
-                // Single-column Browse: no pane to toggle — Space opens the zoom
-                // (mirrors History; ROD-194 regression fix).
-                self.openBrowseZoom(loop, io, provider);
-            }
-            return;
-        }
-
-        // Search mode intercepts all keys (including Esc) before the view chain.
-        // Esc in search mode clears the query; Esc in normal mode runs the view chain.
-        if (self.input_mode == .search) {
-            self.onSearchKey(key, loop, io, provider);
-            return;
-        }
-
-        // Esc chain (§10.4, ROD-210): peel exactly one transient layer — never
-        // switch the base view. Only reached in normal mode (search-mode Esc is
-        // handled by onSearchKey above).
-        if (key.matches(vaxis.Key.escape, .{})) {
-            if ((self.active_view == .browse or self.active_view == .history) and
-                self.active_pane == .detail)
-            {
-                // ROD-170: detail pane focused → return focus to the list (= h).
-                self.active_pane = .list;
-            } else if (self.active_view == .detail) {
-                // ROD-170: zoom → demote one step (q quits instead of backing
-                // out). Land on the pane if there's room, else the list.
-                self.active_view = switch (self.detail_origin) {
-                    .browse => .browse,
-                    .history => .history,
-                };
-                self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
-            }
-            // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed
-            // the old History/Settings → Browse jump — base-view changes happen
-            // only via F1/F2/F3 and the H toggle. q quits.
-            return;
-        }
-
-        // Normal mode — view-gated navigation.
-        // '/' enters search/filter mode in Browse and History.
-        if (key.matches('/', .{})) {
-            if (self.active_view == .browse or self.active_view == .history) {
-                self.input_mode = .search;
-            }
-            return;
-        }
-
-        // In detail pane: j/k/g/G navigate the episode grid. ROD-170 adds the
-        // History detail pane (grid live only at >= zoom_min; at 60-99 there are
-        // no episodes, so ep_len == 0 below makes j/k inert — h returns to list).
-        if ((self.active_view == .browse and self.active_pane == .detail) or
-            self.active_view == .detail or
-            (self.active_view == .history and self.active_pane == .detail))
-        {
-            const ep_len: usize = if (self.episodes.results) |eps| eps.len else 0;
-            if (ep_len == 0) return;
-            if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-                if (self.episodes.cursor + 1 < ep_len) self.episodes.cursor += 1;
-            } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-                if (self.episodes.cursor > 0) self.episodes.cursor -= 1;
-            } else if (key.matches('g', .{})) {
-                self.episodes.cursor = 0;
-            } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-                // libvaxis delivers shift+g inconsistently across terminals: some
-                // report the 'G' codepoint with .shift set, others report bare 'G'
-                // (already-uppercased) with no modifier. Match both so G lands
-                // regardless of terminal.
-                self.episodes.cursor = ep_len - 1;
-            }
-            return;
-        }
-
-        // History: manual watch-state transitions (ROD-139 §1). Act on the focused
-        // entry; the grouped view regroups it on the next draw. `c` is the bare
-        // codepoint — Ctrl-C (quit) is matched and returned earlier, so no clash.
-        if (self.active_view == .history) {
-            if (key.matches('p', .{})) {
-                self.setSelectedHistoryStatus(.paused);
-                return;
-            } else if (key.matches('x', .{})) {
-                self.setSelectedHistoryStatus(.dropped);
-                return;
-            } else if (key.matches('c', .{})) {
-                self.setSelectedHistoryStatus(.completed);
-                return;
-            } else if (key.matches('w', .{})) {
-                self.setSelectedHistoryStatus(.watching);
-                return;
-            } else if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
-                // ROD-189: re-plan — the missing 5th manual transition, paired with
-                // Browse's P so the key means "plan it" in both views.
-                // setSelectedHistoryStatus routes through setListStatus's re-plan path
-                // and the undo seam, so it's undoable like p/x/c/w. Match shift+'P' and
-                // bare 'P' (terminal compat); lowercase 'p' above is paused — no clash.
-                self.setSelectedHistoryStatus(.planning);
-                return;
-            } else if (key.matches('r', .{})) {
-                // ROD-193: recompute progress from episode_progress rows (strategy A).
-                // Non-adjacent to `c` on Colemak-DH; ships as a keybind (not `:reset`)
-                // because single-level undo goes stale after any subsequent key.
-                const st = self.store orelse return;
-                const idx = history.indexAtCursor(self) orelse return;
-                const rec = &self.history[idx];
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
-                defer arena.deinit();
-                const hw = st.recomputeProgress(arena.allocator(), rec.source, rec.source_id, self.translation) catch |e| {
-                    log.debug("recomputeProgress failed: {s}", .{@errorName(e)});
-                    return;
-                };
-                rec.progress = hw;
-                // r overwrites progress, so a stale undo entry (captured pre-`c`)
-                // would revert PAST this recompute on a later `u`. Invalidate it so
-                // `c → r → u` keeps the recomputed value (ROD-193 review).
-                if (self.undo) |u| {
-                    u.free(self.gpa);
-                    self.undo = null;
-                }
-                syncEpisodeProgress(self, rec.source, rec.source_id, hw);
-                self.pushToast(.success, "progress reset", false);
-                return;
-            } else if (key.matches('u', .{})) {
-                // ROD-193: single-level undo of the last watch-state mutation.
-                self.applyUndo();
-                return;
-            }
-        }
-
-        // Browse: P (shift+p) tracks a not-yet-watched result as planning (ROD-189).
-        // upsertAnime's ON CONFLICT preserves list_status/progress/play_count and
-        // MAX-merges history_visible, so one call covers both behaviors the ticket
-        // wants: a brand-new row inserts as planning (the fromDomain defaults), and
-        // a hidden search-cache row (history_visible 0) is revealed (→1) — neither
-        // path clobbers existing user state. Match shift+'P' and bare 'P' for the
-        // same cross-terminal reason as the G nav below.
-        if (self.active_view == .browse and self.active_pane == .list and
-            (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))
-        {
-            const st = self.store orelse return;
-            const anime = self.selectedAnime() orelse return;
-            var arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena.deinit();
-            var rec = AnimeRecord.fromDomain(provider.name(), anime, self.translation);
-            // Explicit, not via the fromDomain struct default: a browse-add is always a
-            // reveal. If AnimeRecord.history_visible's default ever flips to false
-            // (defensible for its search-cache role), this keeps P revealing rows
-            // (ON CONFLICT does MAX(excluded, anime)) instead of silently hiding them.
-            rec.history_visible = true;
-            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| {
-                log.debug("add-to-watchlist failed: {s}", .{@errorName(e)});
-                self.pushToast(.@"error", "couldn't add to watchlist", false);
-                return;
-            };
-            // Unlike the p/x/c/w transitions (which mutate a row already in
-            // self.history in place), P adds a row that isn't in the in-memory
-            // list yet — flag a background reload so it surfaces in History this
-            // session, not just after a restart.
-            self.history_dirty = true;
-            self.pushToast(.success, "added to watchlist", false);
-            return;
-        }
-
-        // List navigation (history + browse list pane).
-        const nav_len: usize = switch (self.active_view) {
-            .history => self.filteredHistoryLen(),
-            .browse => self.search.results.items.len,
-            .detail, .settings => return,
-        };
-        if (nav_len == 0) return;
-
-        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
-            if (self.list_cursor + 1 < nav_len) self.list_cursor += 1;
-        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
-            if (self.list_cursor > 0) self.list_cursor -= 1;
-        } else if (key.matches('g', .{})) {
-            self.list_cursor = 0;
-        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
-            // Match both shift+'G' and bare uppercase 'G' (see episode-grid nav
-            // above): terminals disagree on whether shift is reported separately.
-            self.list_cursor = nav_len - 1;
-        }
-        // ROD-202: a cursor move never prefetches episodes. The grid loads lazily
-        // on detail entry (l/→/Enter → fireEpisodesBrowse), matching History, so
-        // scrolling the results list stays smooth and fires zero episode fetches.
-        // The cover preview still tracks the cursor — that's detailSyncTarget,
-        // resolved every frame, not an episode fetch (ROD-156's cover half stays).
-        //
-        // Load-more: at the last result, a downward keystroke pages in the next page.
-        // Must accept the Down arrow too, not just 'j' — the cursor-nav above already
-        // honors both, so a j-only trigger left the ╌ more ╌ footer unreachable for
-        // arrow-key users (ROD-156 parity gap: infinite scroll that wasn't; ROD-201).
-        if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and
-            self.active_view == .browse and
-            self.list_cursor == nav_len - 1 and
-            self.search.page > 0 and
-            nav_len % source_mod.search_page_size == 0 and
-            !self.search.loading)
-        {
-            self.fireSearch(loop, io, provider, self.search.page + 1);
-        }
     }
 
     // ── draw: pure render from state ─────────────────────────────────────────
