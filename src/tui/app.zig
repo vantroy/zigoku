@@ -26,6 +26,7 @@ const event_mod = @import("event.zig");
 const render = @import("render.zig");
 const workers = @import("workers.zig");
 const config_mod = @import("../config.zig");
+const paths = @import("../paths.zig");
 const log = @import("../log.zig");
 
 // Per-view render passes, extracted along the tick/draw seam (ROD-144).
@@ -146,6 +147,14 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    // Resolve the cover-cache path once for the Settings "cover art cache" row,
+    // HOME-collapsed for display. Best-effort: a missing cache home leaves this
+    // null and the row falls back to a literal (ROD-225).
+    app.cover_cache_display = blk: {
+        const abs = workers.coverCacheDir(gpa) catch break :blk null;
+        defer gpa.free(abs);
+        break :blk paths.collapseHome(gpa, abs) catch null;
+    };
     app.palette = paletteFromConfig(config.palette);
     // The configured sub/dub default seeds the search translation; the user can
     // still toggle it live in-session (ROD-85).
@@ -553,6 +562,15 @@ pub const App = struct {
     /// Non-null while there is an undoable action. Freed in `deinitOwnedState`.
     undo: ?UndoEntry = null,
 
+    /// GPA-owned display string for the Settings "cover art cache" inert row:
+    /// the real `<cacheDir>/covers` path (honours `$XDG_CACHE_HOME`), with the
+    /// `$HOME` prefix collapsed to `~`. Resolved once in `run()`; null when no
+    /// cache home resolves, in which case the row falls back to a literal. vaxis
+    /// holds the printed slice by reference until render, so this must be
+    /// App-owned, not a draw-local stack buffer (ROD-225). Freed in
+    /// `deinitOwnedState`.
+    cover_cache_display: ?[]const u8 = null,
+
     /// Palette-aware style: `bg` defaults to `self.palette.bg_base` when null.
     /// All draw methods use this instead of the plain `style()` import so that
     /// switching palettes re-colors every cell, not just ones with explicit bg.
@@ -629,6 +647,10 @@ pub const App = struct {
         if (self.undo) |u| {
             u.free(self.gpa);
             self.undo = null;
+        }
+        if (self.cover_cache_display) |p| {
+            self.gpa.free(p);
+            self.cover_cache_display = null;
         }
     }
 
