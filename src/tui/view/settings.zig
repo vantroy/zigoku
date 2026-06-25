@@ -49,7 +49,10 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y = drawSettingsHeader(self, win, y, w, "Catalog");
     drawInertRow(self, win, y, w, "enrichment sync", "automatic");
     y += 1;
-    drawInertRow(self, win, y, w, "cover art cache", "~/.cache/zigoku/covers");
+    // Real resolved cover-cache path (honours $XDG_CACHE_HOME), resolved once in
+    // run() and HOME-collapsed; falls back to the default literal only when no
+    // cache home could be located (ROD-225).
+    drawInertRow(self, win, y, w, "cover art cache", self.cover_cache_display orelse "~/.cache/zigoku/covers");
     y += 1;
     y += 1;
 
