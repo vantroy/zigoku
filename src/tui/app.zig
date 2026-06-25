@@ -348,6 +348,11 @@ pub const RenderScratch = struct {
     /// Per-row progress-bar fraction strings ("N / M eps"). Same lifetime
     /// contract as `meta` — must outlive vx.render().
     bar: [256][32]u8 = undefined,
+    /// Per-row Browse score badges (compact "[NN]" list form, no `/100`),
+    /// right-anchored in the list meta column (ROD-226). Separate from `meta`
+    /// (the eps count) because both render on the same row at different columns
+    /// and so must coexist until vx.render(). [8] covers "[100]" with slack.
+    score: [256][8]u8 = undefined,
     /// Single-line scratch for the list passes' spinners and empty-state
     /// messages. Safe to share between Browse and History because only one view
     /// is active per frame. NOT for the detail pane: detail co-renders with
@@ -591,6 +596,20 @@ pub const App = struct {
             .blink = opts.blink,
             .dim = opts.dim,
         };
+    }
+
+    /// §2.2 score-tier colour. Canonical mapping shared by the detail pane
+    /// (`drawScore`) and the Browse list-row meta (ROD-226) so the two surfaces
+    /// can never drift. Only the tier→style mapping lives here; the `[NN/100]`
+    /// text and the detail-only `✦` prefix stay per-surface. `bg` threads the
+    /// row background (null → the palette default, via `s`).
+    pub fn scoreStyle(self: *const App, score: ?u32, bg: ?vaxis.Color) vaxis.Style {
+        if (score) |sc| {
+            if (sc >= 91) return self.s(self.palette.hot, .{ .bold = true, .bg = bg });
+            if (sc >= 76) return self.s(self.palette.fg, .{ .bg = bg });
+            if (sc >= 51) return self.s(self.palette.fg2, .{ .bg = bg });
+        }
+        return self.s(self.palette.fg3, .{ .bg = bg });
     }
 
     const spinner_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"; // 10 × 3 UTF-8 bytes
