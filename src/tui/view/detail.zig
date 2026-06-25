@@ -613,6 +613,14 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
 
     const info = self.detailRenderInfo();
 
+    // ROD-222: the episode grid is a focused-detail affordance, not a preview one.
+    // The Browse two-pane draws this pass on every frame (list focus included), so
+    // without this gate a stale grid from a prior detail visit bleeds into the
+    // list-focused preview. episodeGridVisible is false exactly when no detail show
+    // is focused (matches the gridless History preview); the synopsis then reclaims
+    // the grid's rows below.
+    const show_grid = self.episodeGridVisible();
+
     // Two-column layout (ROD-113): cover + header on the left (~38%), synopsis +
     // episode grid on the right. Only engaged for History-opened detail at wide
     // widths; the narrow Browse preview and sub-100-col terminals keep the
@@ -636,8 +644,11 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
 
         // Two-column: synopsis gets the full right column height minus the grid
         // reservation — no synopsis cap needed here, the column is dedicated.
+        // (Unlike the single-column path below, there's no synopsis-reclaim branch
+        // when !show_grid: the synopsis already owns the full column, so dropping
+        // the grid just leaves the bottom rows empty — no relayout needed.)
         const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
-        drawGrid(self, right_win, right_w, h, rrow);
+        if (show_grid) drawGrid(self, right_win, right_w, h, rrow);
         return;
     }
 
@@ -652,9 +663,16 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     // by the "ROD-137 invariant" test below; constants are the single source.)
     var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
     row = drawHeader(self, win, w, h, info, row);
-    const cap = synopsisCap(if (h > row) h - row else 0);
-    row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
-    drawGrid(self, win, w, h, row);
+    if (show_grid) {
+        const cap = synopsisCap(if (h > row) h - row else 0);
+        row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
+        drawGrid(self, win, w, h, row);
+    } else {
+        // Preview (no focused detail): no grid to reserve for, so the synopsis
+        // takes the full remaining column — same as the History preview, no dead
+        // space below (ROD-222).
+        _ = drawSynopsis(self, win, w, h, info.anime, row);
+    }
 }
 
 /// History list preview pane (ROD-113): cover + title + score + status +
