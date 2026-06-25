@@ -33,12 +33,17 @@ Every release pins `version` + two `url`/`sha256` pairs, so each one needs an up
    cp zigoku.rb ../homebrew-zigoku/Formula/zigoku.rb
    ```
 
-> **Automation TODO:** fold steps 1–2 into `release.yml` (patch this file + push to
-> the tap) so the formula can't drift from the published `sha256sums.txt`.
+> **Automated:** `release.yml`'s `update-tap` job runs steps 1–2 on every tagged
+> release — it reads `sha256sums.txt`, bumps `version` + both `sha256`s in the tap's
+> `Formula/zigoku.rb`, and pushes via a write-scoped deploy key. Hand-bumping here is
+> only for out-of-band fixes; keep this file and the tap copy in sync.
 
 ## Signing note
 
 The release workflow ad-hoc signs both mac binaries (`codesign --force --sign -`)
-and gates on `codesign --verify`. Before that gate existed, the cross-built
-`x86_64-macos` binary shipped **unsigned** — the `on_intel` bottle must point at a
-release built *after* that gate landed, or the Intel artifact won't verify.
+and gates on `codesign --verify` — but that lands from the **next** release on.
+**v0.1.1's `x86_64-macos` binary is unsigned** (Zig's linker only signs the native
+arm64 build). This formula ships it anyway, by decision (ROD-150): it still runs
+(verified under Rosetta) and brew strips quarantine on install. From the first
+release built after the signing gate, refresh the Intel `sha256` to the signed
+artifact — then `codesign --verify` passes for both arches.
