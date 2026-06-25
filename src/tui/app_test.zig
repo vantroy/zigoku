@@ -1277,8 +1277,38 @@ test "Browse preview hides a stale episode grid carried over from History detail
     app.list_cursor = 0;
     try testing.expect(!app.episodeGridVisible());
 
-    // Drilling into the result focuses the detail pane (ROD-202) — the grid returns.
+    // Focusing the detail pane (the drill state — the l/Enter→.detail transition
+    // itself is covered by "l in browse list pane switches to detail pane") makes
+    // the grid eligible again. Set focus directly, matching the detailSyncTarget
+    // predicate test; here we assert only what the predicate does given that focus.
     app.active_pane = .detail;
+    try testing.expect(app.episodeGridVisible());
+}
+
+test "episodeGridVisible is true in the full-screen zoom detail view (ROD-222)" {
+    // The third drawDetailPane callsite is the zoom (active_view == .detail), where
+    // currentDetailAnime resolves via detail_origin (not active_pane). The grid must
+    // stay visible there — the gate only suppresses the unfocused Browse preview.
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .detail;
+    app.detail_origin = .history;
+    app.active_pane = .detail;
+    try testing.expect(app.episodeGridVisible());
+
+    // Browse-origin zoom resolves via selectedAnime — also eligible.
+    app.detail_origin = .browse;
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "z"),
+        .name = try std.testing.allocator.dupe(u8, "Zoku"),
+    });
+    defer {
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
+    }
     try testing.expect(app.episodeGridVisible());
 }
 
