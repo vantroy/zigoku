@@ -69,6 +69,31 @@ pub fn runtimeDir(gpa: Allocator) Error![]u8 {
     };
 }
 
+/// Collapse a leading `$HOME/` in `abs` to `~` for display, returning a fresh
+/// slice owned by `gpa`. Paths outside `$HOME` — e.g. a custom `$XDG_CACHE_HOME`
+/// pointed at another volume — are duped verbatim, so the caller always frees
+/// exactly one slice regardless of which branch hit. Display-only: lets the
+/// Settings view (ROD-225) show the real, XDG-aware path without leaking the
+/// absolute home prefix.
+pub fn collapseHome(gpa: Allocator, abs: []const u8) Allocator.Error![]u8 {
+    return collapseHomeWith(gpa, abs, env("HOME"));
+}
+
+/// Pure core of `collapseHome` with `home` injected, so the prefix logic is
+/// unit-testable without touching process env (mirrors `resolveXdg`).
+fn collapseHomeWith(gpa: Allocator, abs: []const u8, home: ?[]const u8) Allocator.Error![]u8 {
+    if (home) |h| {
+        // Require the `/` after HOME so `/home/rod` can't swallow a sibling
+        // like `/home/rodney/...`.
+        if (h.len > 0 and abs.len > h.len and abs[h.len] == '/' and
+            std.mem.startsWith(u8, abs, h))
+        {
+            return std.fmt.allocPrint(gpa, "~{s}", .{abs[h.len..]});
+        }
+    }
+    return gpa.dupe(u8, abs);
+}
+
 /// `mkdir -p`, best-effort. Walks `path` creating each component, ignoring every
 /// error — "already exists" is the common case, and a real failure surfaces
 /// later when the caller tries to open a file underneath. No `io` required.
@@ -144,6 +169,43 @@ test "resolveXdg falls back to HOME when XDG is empty" {
 test "resolveXdg errors with neither XDG nor HOME" {
     try testing.expectError(error.NoHomeDir, resolveXdg(testing.allocator, null, null, ".config/zigoku"));
     try testing.expectError(error.NoHomeDir, resolveXdg(testing.allocator, "", "", ".config/zigoku"));
+}
+
+test "collapseHomeWith collapses a $HOME prefix to ~" {
+    const got = try collapseHomeWith(testing.allocator, "/home/rod/.cache/zigoku/covers", "/home/rod");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("~/.cache/zigoku/covers", got);
+}
+
+test "collapseHomeWith leaves a path outside $HOME verbatim" {
+    // A custom $XDG_CACHE_HOME on another volume — must show the real absolute path.
+    const got = try collapseHomeWith(testing.allocator, "/mnt/fast/zigoku/covers", "/home/rod");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("/mnt/fast/zigoku/covers", got);
+}
+
+test "collapseHomeWith requires a path boundary after $HOME" {
+    // `/home/rodney/...` must not be collapsed against HOME `/home/rod`.
+    const got = try collapseHomeWith(testing.allocator, "/home/rodney/.cache/zigoku", "/home/rod");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("/home/rodney/.cache/zigoku", got);
+}
+
+test "collapseHomeWith tolerates a null or empty HOME" {
+    const a = try collapseHomeWith(testing.allocator, "/home/rod/.cache/zigoku", null);
+    defer testing.allocator.free(a);
+    try testing.expectEqualStrings("/home/rod/.cache/zigoku", a);
+
+    const b = try collapseHomeWith(testing.allocator, "/home/rod/.cache/zigoku", "");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings("/home/rod/.cache/zigoku", b);
+}
+
+test "collapseHomeWith leaves a bare $HOME (no trailing slash) verbatim" {
+    // Exactly HOME with nothing after it: no `/`, so no collapse — duped as-is.
+    const got = try collapseHomeWith(testing.allocator, "/home/rod", "/home/rod");
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("/home/rod", got);
 }
 
 test "resolveRuntime prefers XDG_RUNTIME_DIR" {
