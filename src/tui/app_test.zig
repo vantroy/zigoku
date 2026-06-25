@@ -1232,6 +1232,56 @@ test "browse list pane detail render info uses selected anime" {
     app.search.results.deinit(std.testing.allocator);
 }
 
+test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
+    // Repro: a focused History detail loads an episode grid; pressing H toggles to
+    // Browse and resets pane focus to .list, but leaves episodes.results loaded
+    // (the fetch/clear is lazy — it fires on the next detail entry). The Browse
+    // two-pane draws drawDetailPane on every frame, so the grid must be gated on a
+    // *focused* detail show or the leftover grid bleeds into the list preview.
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.active_pane = .detail; // focused on the History detail — grid is its surface
+    app.term_cols = 120;
+
+    // Episodes loaded for the focused History show (as a real fetch would leave them).
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "a");
+    app.episodes.for_source = try std.testing.allocator.dupe(u8, "allanime");
+    app.episodes.results = try workers.dupEpisodesOwned(app.gpa, &.{ .{ .raw = "1" }, .{ .raw = "2" } });
+    defer app.episodes.freeResults(std.testing.allocator);
+
+    // Focused History detail → the grid is its own surface, so it renders.
+    try testing.expect(app.episodeGridVisible());
+
+    // H toggles to Browse and resets focus to the list. The stale episodes survive.
+    try testTick(&app, keyEv('H', .{ .shift = true }));
+    try testing.expectEqual(.browse, app.active_view);
+    try testing.expectEqual(.list, app.active_pane);
+    try testing.expect(app.episodes.results != null); // stale state still present…
+
+    // …but with the list focused (a preview), the grid must NOT render — even once
+    // Browse results arrive under the cursor. This is the bug: previously the grid
+    // painted the leftover History episodes against the focused Browse result.
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "z"),
+        .name = try std.testing.allocator.dupe(u8, "Zoku"),
+        .eps_sub = 12,
+    });
+    defer {
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
+    }
+    app.list_cursor = 0;
+    try testing.expect(!app.episodeGridVisible());
+
+    // Drilling into the result focuses the detail pane (ROD-202) — the grid returns.
+    app.active_pane = .detail;
+    try testing.expect(app.episodeGridVisible());
+}
+
 test "detailSyncTarget tracks the list cursor in split browse, defers elsewhere (ROD-156)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
