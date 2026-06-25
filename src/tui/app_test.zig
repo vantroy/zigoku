@@ -3073,6 +3073,18 @@ test "settings: palette cycle re-points the live app palette" {
     try testTick(&app, keyEv('l', .{})); // terminal_ghost -> phosphor
     try testing.expectEqualStrings("phosphor", app.config.palette);
     try testing.expectEqual(&colors.phosphor, app.palette);
+
+    try testTick(&app, keyEv('l', .{})); // phosphor -> nord
+    try testing.expectEqualStrings("nord", app.config.palette);
+    try testing.expectEqual(&colors.nord, app.palette);
+
+    try testTick(&app, keyEv('l', .{})); // nord -> tokyonight
+    try testing.expectEqualStrings("tokyonight", app.config.palette);
+    try testing.expectEqual(&colors.tokyonight, app.palette);
+
+    try testTick(&app, keyEv('l', .{})); // tokyonight -> terminal_ghost (wrap)
+    try testing.expectEqualStrings("terminal_ghost", app.config.palette);
+    try testing.expectEqual(&colors.terminal_ghost, app.palette);
 }
 
 test "settings: space toggles a bool field" {
