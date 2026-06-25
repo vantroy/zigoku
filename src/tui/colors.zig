@@ -77,6 +77,22 @@ pub const nord: Palette = .{
     .warn = Color{ .rgb = .{ 0xeb, 0xcb, 0x8b } }, // nord13
 };
 
+/// TokyoNight ("night" variant) — Rod's daily-driver theme elsewhere, so it
+/// should feel native here too. Semantic tokens mapped to the canonical
+/// TokyoNight palette (https://github.com/folke/tokyonight.nvim).
+pub const tokyonight: Palette = .{
+    .bg_base = Color{ .rgb = .{ 0x1a, 0x1b, 0x26 } }, // night bg
+    .bg_surface = Color{ .rgb = .{ 0x24, 0x28, 0x3b } }, // storm bg (focused-row band)
+    .bg_elevated = Color{ .rgb = .{ 0x29, 0x2e, 0x42 } }, // bg_highlight (toasts)
+    .chrome = Color{ .rgb = .{ 0x3b, 0x42, 0x61 } }, // border
+    .fg = Color{ .rgb = .{ 0xc0, 0xca, 0xf5 } }, // fg
+    .fg2 = Color{ .rgb = .{ 0x9a, 0xa5, 0xce } }, // muted fg — tuned between TN fg_dark #a9b1d6 and dark5 #737aa2 for even fg/fg2/fg3 spacing
+    .fg3 = Color{ .rgb = .{ 0x56, 0x5f, 0x89 } }, // comment (dim text)
+    .focus = Color{ .rgb = .{ 0xb0, 0xe8, 0xff } }, // lifted cyan — TN cyan #7dcfff (L≈0.56) reads dimmer than fg; brightened (L≈0.75) so the focused row out-reads fg per §1.4
+    .hot = Color{ .rgb = .{ 0xf7, 0x76, 0x8e } }, // red — urgency/resume
+    .warn = Color{ .rgb = .{ 0xe0, 0xaf, 0x68 } }, // yellow
+};
+
 // ── Backgrounds ─────────────────────────────────────────────────────────────
 /// Void. The base canvas everything floats on.
 pub const bg_base = Color{ .rgb = .{ 0x02, 0x0d, 0x06 } };
