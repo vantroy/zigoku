@@ -1,0 +1,41 @@
+# Source-of-truth for the Homebrew formula (ROD-150).
+#
+# This file is reviewed here, then copied to the tap repo
+# (github.com/vantroy/homebrew-zigoku) as Formula/zigoku.rb, where users reach
+# it via `brew install vantroy/zigoku/zigoku`.
+#
+# Binary formula: it downloads the prebuilt, sqlite-bundled release tarballs
+# (ROD-216) per arch — no zig toolchain, no compile on the user's machine.
+# See packaging/homebrew/README.md for the per-release bump steps.
+class Zigoku < Formula
+  desc "Terminal anime browser & player"
+  homepage "https://github.com/vantroy/zigoku"
+  version "0.1.1"
+  license "GPL-3.0-or-later"
+
+  depends_on :macos             # binary formula; Linux installs via the AUR package (ROD-146)
+  depends_on "mpv"              # runtime: playback shells out to it (src/player.zig)
+
+  on_macos do
+    on_arm do
+      url "https://github.com/vantroy/zigoku/releases/download/v#{version}/zigoku-v#{version}-aarch64-macos.tar.gz"
+      sha256 "ec9047d032351219ae36213edd833bcd3eaa35e60989e1923affb1f7d5ded1d6"
+    end
+    on_intel do
+      url "https://github.com/vantroy/zigoku/releases/download/v#{version}/zigoku-v#{version}-x86_64-macos.tar.gz"
+      sha256 "73f3d1ca85272df4923ef71815c971c1bc791f5dab52cde602f321b27c488411"
+    end
+  end
+
+  def install
+    # The tarball is zigoku-v{ver}-{target}/{zigoku,LICENSE,README.md}; brew
+    # strips the single top-level dir, so the binary is at the staging root.
+    bin.install "zigoku"
+  end
+
+  test do
+    # `--version` prints the banner with the version string and exits 0
+    # (same invocation the release workflow smoke-tests).
+    assert_match version.to_s, shell_output("#{bin}/zigoku --version")
+  end
+end
