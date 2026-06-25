@@ -453,6 +453,22 @@ fn postCoverDoneCloned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, f
 // network. Every operation is best-effort — any failure degrades to "not
 // persisted" / "cache miss", never to a crash or a stalled cover pipeline.
 
+/// The on-disk cover-cache subdirectory under `paths.cacheDir`. Single source of
+/// truth: both `coverCachePath` (where covers are read/written) and the Settings
+/// "cover art cache" display row (via `coverCacheDir`) derive from this one name,
+/// so the two can never drift (ROD-225).
+const cover_subdir = "covers";
+
+/// Absolute path to the cover-cache directory — `<cacheDir>/covers` — allocated
+/// in `alloc`. The Settings view renders this so the displayed path honours
+/// `$XDG_CACHE_HOME` instead of a hardcoded literal (ROD-225). Propagates the
+/// cache-dir resolution error when no cache home can be located.
+pub fn coverCacheDir(alloc: Allocator) ![]u8 {
+    const dir = try paths.cacheDir(alloc);
+    defer alloc.free(dir);
+    return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, cover_subdir });
+}
+
 /// hex-16 SHA-256 of `url`: the on-disk cover filename stem. Truncating the
 /// 32-byte digest to 8 bytes is ample for a content-addressed personal cache —
 /// a (vanishingly unlikely) collision costs a single spurious re-fetch, nothing
@@ -469,7 +485,7 @@ fn coverCacheStem(url: []const u8) [16]u8 {
 fn coverCachePath(arena: Allocator, url: []const u8) ![]u8 {
     const dir = try paths.cacheDir(arena);
     const stem = coverCacheStem(url);
-    return std.fmt.allocPrint(arena, "{s}/covers/{s}.jpg", .{ dir, &stem });
+    return std.fmt.allocPrint(arena, "{s}/{s}/{s}.jpg", .{ dir, cover_subdir, &stem });
 }
 
 /// Read previously-persisted raw cover bytes for `url`, owned by `gpa`, or null
