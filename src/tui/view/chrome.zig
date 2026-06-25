@@ -200,6 +200,16 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
             .success => "[✓] ",
             .info => "[~] ",
         };
+        // §4.7 styling table: success (state.success) and error (state.now) carry
+        // bold across the whole toast — glyph *and* body; info/warn are plain.
+        // Was prefix-only-bold for every kind (ROD-76), which under-bolded the
+        // success/error bodies (ROD-163) and over-bolded the info/warn glyphs.
+        // One foreground treatment per kind now. (The ticket cited "success only",
+        // but §4.7 mandates bold for error too — the table is the source of truth.)
+        const bold = switch (t.kind) {
+            .success, .@"error" => true,
+            .info, .warn => false,
+        };
         const w = win.width;
         // §4.7: right-aligned, capped at Toast.max_box_cols display columns (the
         // box, glyph prefix included). All prefixes are exactly Toast.glyph_cols
@@ -212,10 +222,10 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
         const toast_w: u16 = @min(pre_w + txt_len, @min(Toast.max_box_cols, w -| 2));
         const pre_col: u16 = if (w > toast_w + 1) w - toast_w - 1 else 0;
         fillRow(win, row, w, self.palette.bg_elevated);
-        put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = true, .bg = self.palette.bg_elevated }));
+        put(win, row, pre_col, prefix, self.s(fg_color, .{ .bold = bold, .bg = self.palette.bg_elevated }));
         const txt_col: u16 = pre_col + pre_w;
         const txt_w: u16 = if (toast_w > pre_w) toast_w - pre_w else 0;
-        putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bg = self.palette.bg_elevated }));
+        putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bold = bold, .bg = self.palette.bg_elevated }));
         row -|= 1;
     }
 }
