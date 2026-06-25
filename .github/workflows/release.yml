@@ -223,9 +223,11 @@ jobs:
             echo "::error::missing macOS checksums in sha256sums.txt"; exit 1
           fi
           f=tap/Formula/zigoku.rb
-          # version, then per-arch sha256. Each arch's url line (it contains the
-          # target triple) marks which arch the *following* sha256 line belongs to.
-          sed -i -E "s/^  version \"[^\"]+\"/  version \"${v}\"/" "$f"
+          # Bump the version embedded in both URLs (no `version` stanza — Homebrew
+          # scans it from the URL; a redundant stanza fails `brew audit --strict`).
+          sed -i -E "/^[[:space:]]*url /s/v[0-9]+\.[0-9]+\.[0-9]+/v${v}/g" "$f"
+          # Per-arch sha256: each arch's url line (it carries the target triple)
+          # marks which arch the *following* sha256 line belongs to.
           awk -v arm="$arm" -v intel="$intel" '
             /aarch64-macos/ { cur="arm" }
             /x86_64-macos/  { cur="intel" }
