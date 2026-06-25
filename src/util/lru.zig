@@ -24,7 +24,7 @@ pub fn SliceValueOps(comptime Slice: type) type {
 /// Tiny ownership-taking LRU for byte-slice keys and small fixed capacities.
 ///
 /// Ownership for values is explicit: callers provide `Hooks.freeValue` and
-/// `Hooks.valueBytes` for `V`. That keeps reuse honest instead of pretending the
+/// `Hooks.valueBytes` for `V`. That keeps reuse truthful instead of pretending the
 /// cache can magically infer whether a struct field is owned or borrowed.
 pub fn LruCache(comptime K: type, comptime V: type, comptime cap: usize, comptime Hooks: type) type {
     if (cap == 0) @compileError("LruCache cap must be > 0");

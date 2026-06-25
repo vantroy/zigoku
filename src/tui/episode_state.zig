@@ -8,7 +8,7 @@
 //! dependencies (`gpa`/`store`/`source`/`translation`/`status`); it never reaches
 //! back into App or navigation state.
 //!
-//! The honest line (mirroring PlaybackSession's): this struct owns the episode
+//! Where the boundary sits (mirroring PlaybackSession's): this struct owns the episode
 //! *record + cache*, not the *transport*. `episode_thread` (the handle run()
 //! joins on teardown) and `async_start_ms` (the shared slow-path timer, not
 //! episode-scoped) stay on App. The controller (`tick`'s episode-event handlers +
