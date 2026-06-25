@@ -26,11 +26,8 @@ const putClipped = render.putClipped;
 const fillRow = render.fillRow;
 const centerText = render.centerText;
 const centerKeyHint = render.centerKeyHint;
-const formatMeta = render.formatMeta;
 const drawProgressBar = render.drawProgressBar;
 const title_col = render.title_col;
-const meta_col = render.meta_col;
-const title_meta_gap = render.title_meta_gap;
 
 /// Static-lifetime hairline source for the group rules — mirrors
 /// settings.zig's `settings_hairline`: vaxis keeps the slice by reference until
@@ -174,11 +171,10 @@ const DrawCtx = struct {
     visible: u16, // viewport height in physical rows
     list_top: u16, // physical-row offset of the viewport into the full list
     w: u16, // effective list width (narrowed in the wide-preview split)
-    show_meta: bool,
     title_w: u16,
     bar_w: u16,
     bar_avail: u16, // cols from title_col to the list's right edge (clips the frac)
-    slot: usize = 0, // RenderScratch meta/bar slot
+    slot: usize = 0, // RenderScratch bar slot
     header_i: usize = 0, // RenderScratch hist_header slot
 
     fn rowVisible(c: *const DrawCtx, phys: u16) bool {
@@ -281,10 +277,10 @@ const DrawCtx = struct {
             self.s(self.palette.fg, .{ .bg = row_bg });
         putClipped(c.win, row, title_col, c.title_w, rec.title, title_style);
 
-        if (c.show_meta and c.slot < c.scratch.meta.len) {
-            const meta = formatMeta(&c.scratch.meta[c.slot], rec);
-            putClipped(c.win, row, meta_col, c.w - meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
-        }
+        // Row 1 is title-only: the episode count is on the bar row below, not
+        // duplicated here (ROD-227). §5.4's richer right-meta — resume indicator
+        // `[▸N]`, season chip, status kanji — is deferred (data's in the store, the
+        // spec just isn't settled yet); it would return in this column.
 
         // Row 2: §4.5 progress bar (inherits row_bg for the focus band).
         drawProgressBar(c.win, row + 1, title_col, c.bar_w, c.bar_avail, rec, row_bg, &c.scratch.bar[c.slot], self.palette, selected, list_focused);
@@ -318,11 +314,9 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         return;
     }
 
-    // Meta only earns its column when the terminal is wide enough to hold it
-    // without colliding the title — otherwise the title takes the full width.
-    const show_meta = w >= meta_col + 12;
-    const title_right: u16 = if (show_meta) meta_col - title_meta_gap else w;
-    const title_w: u16 = if (title_right > title_col) title_right - title_col else 0;
+    // Row 1 is title-only (the count is on the bar row, ROD-227), so the title
+    // takes the full pane width — no right-meta column to clip against.
+    const title_w: u16 = if (w > title_col) w - title_col else 0;
     // The bar row runs from title_col to the list's right edge. ROD-170: size the
     // "[bar]  N / M eps" element to that budget so it shrinks at narrow two-pane
     // widths (60-99) instead of bleeding past the list into the detail pane. Cap
@@ -338,7 +332,6 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         .visible = visible,
         .list_top = @intCast(self.list_top),
         .w = w,
-        .show_meta = show_meta,
         .title_w = title_w,
         .bar_w = bar_w,
         .bar_avail = bar_avail,
