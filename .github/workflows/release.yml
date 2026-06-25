@@ -95,6 +95,19 @@ jobs:
           fi
           echo "static: no dynamic dependencies"
 
+      # Ad-hoc sign both mac binaries. Zig's linker ad-hoc-signs the native
+      # aarch64-macos build (Apple Silicon's kernel mandates a signature to
+      # exec at all) but leaves the cross-built x86_64-macos binary UNSIGNED —
+      # inconsistent, fails `codesign --verify`, and invites Gatekeeper friction
+      # outside brew's quarantine-stripping. The ROD-150 Homebrew formula's
+      # on_intel bottle needs a verifiable artifact, so sign + gate both arches.
+      - name: Ad-hoc sign + verify macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - out/bin/zigoku
+          codesign --verify --verbose out/bin/zigoku
+          echo "ad-hoc signature present and valid"
+
       # macOS can't be fully static (libSystem is always dynamic), so the gate
       # checks the thing that actually mattered for ROD-212: sqlite is compiled
       # in, not dynamically linked against a (possibly missing) libsqlite3.dylib.
