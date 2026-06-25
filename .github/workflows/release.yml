@@ -199,7 +199,10 @@ jobs:
       - name: Fetch release checksums
         run: |
           v="${{ needs.guard.outputs.version }}"
-          curl -fsSL "https://github.com/vantroy/zigoku/releases/download/v${v}/sha256sums.txt" -o sha256sums.txt
+          # --retry-all-errors covers the transient 404 window where the release
+          # is published (API) but the download CDN hasn't caught up yet.
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://github.com/vantroy/zigoku/releases/download/v${v}/sha256sums.txt" -o sha256sums.txt
           cat sha256sums.txt
 
       - name: Set up tap deploy key

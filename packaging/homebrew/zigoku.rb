@@ -17,7 +17,7 @@ class Zigoku < Formula
   homepage "https://github.com/vantroy/zigoku"
   license "GPL-3.0-or-later"
 
-  depends_on :macos             # binary formula; Linux installs via the AUR package (ROD-146)
+  depends_on :macos             # binary formula; Linux uses the prebuilt tarball / source (AUR pkg planned, ROD-146)
   depends_on "mpv"              # runtime: playback shells out to it (src/player.zig)
 
   on_macos do
