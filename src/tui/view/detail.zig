@@ -290,11 +290,11 @@ pub fn statusChipFor(status: []const u8) ?StatusChip {
 /// Resolve a StatusChip's color from the active palette.
 fn chipColor(self: *const App, chip: StatusChip) vaxis.Color {
     return switch (chip.color_field) {
-        .hot   => self.palette.hot,
-        .fg2   => self.palette.fg2,
+        .hot => self.palette.hot,
+        .fg2 => self.palette.fg2,
         .focus => self.palette.focus,
-        .fg3   => self.palette.fg3,
-        .warn  => self.palette.warn,
+        .fg3 => self.palette.fg3,
+        .warn => self.palette.warn,
     };
 }
 
@@ -924,7 +924,7 @@ test "synopsisCap: reserves spacer + min grid rows" {
     try t.expectEqual(@as(u16, 1), synopsisCap(3)); // 3 == 1 spacer + 2 grid rows
 
     // Normal case: cap = remaining - reservation.
-    try t.expectEqual(@as(u16, 5), synopsisCap(8));  // 8 - 3 = 5
+    try t.expectEqual(@as(u16, 5), synopsisCap(8)); // 8 - 3 = 5
     try t.expectEqual(@as(u16, 12), synopsisCap(15)); // 15 - 3 = 12
 
     // Edge: remaining less than reservation → floor to 1.
