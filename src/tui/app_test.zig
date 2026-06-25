@@ -3058,11 +3058,11 @@ test "settings: l/h cycle a preset field and wrap around" {
     try testing.expectEqualStrings("best", app.config.default_quality); // wrap back worst -> best
 }
 
-test "settings: subtitle-language cycle keeps live translation in sync" {
+test "settings: translation cycle keeps live translation in sync" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = 2; // subtitle_language, defaults to "sub"
+    app.settings.cursor = 2; // translation, defaults to "sub"
 
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqualStrings("dub", app.config.translation);
