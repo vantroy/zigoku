@@ -914,6 +914,17 @@ pub const App = struct {
         };
     }
 
+    /// Whether the interactive episode grid should render in the detail pane — true
+    /// only for an actively-focused detail show (currentDetailAnime), not a mere
+    /// preview. A list-focused preview is null there, so a stale grid from a prior
+    /// detail visit can't bleed in (ROD-222: H from a focused History detail into
+    /// Browse leaves episodes.results loaded, and the Browse two-pane draws every
+    /// frame). Mirrors the gridless History preview and ROD-202's "grid on detail
+    /// entry, not on list hover." A render decision lifted to a testable predicate.
+    pub fn episodeGridVisible(self: *const App) bool {
+        return self.currentDetailAnime() != null;
+    }
+
     fn renderedDetailAnime(self: *const App) ?Anime {
         return switch (self.active_view) {
             .browse => self.selectedAnime(),
@@ -1810,6 +1821,12 @@ pub const App = struct {
                         // zoom to reach the grid (already fetched on focus).
                         self.detail_origin = .history;
                         self.active_view = .detail;
+                        // active_pane is already .detail here (this is the
+                        // active_pane != .list arm), but set it explicitly to match
+                        // openHistoryZoom/openBrowseZoom — the zoom's grid render now
+                        // reads the focus model via episodeGridVisible (ROD-222), so
+                        // no zoom-entry path should leave it to entry-state luck.
+                        self.active_pane = .detail;
                     }
                 }
             },
