@@ -75,23 +75,67 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
             self.s(self.palette.focus, .{ .bg = row_bg, .bold = list_focused })
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
-        // Meta (eps) if pane is wide enough — rarely true in split view.
-        const list_meta_col: u16 = 46;
-        const show_list_meta = w >= list_meta_col + 8;
-        // Title clips short enough to leave room for the meta column. The 2-char
-        // gap (title_meta_gap) prevents the last title char from touching the first
-        // meta char. Without this guard the title fills the full pane width and
-        // its tail bleeds through the meta text (vaxis writes cells; later write wins).
-        const title_w: u16 = if (show_list_meta)
-            list_meta_col -| list_title_col -| 2
+        // ── Meta zone: AniList score (right) + episode count (left) ──────────
+        // §4.1/§4.3: the row is glyph + title + score, the score taking the
+        // rightmost `score_w` cols, right-anchored and §2.2 tier-coloured. All
+        // columns are PANE-RELATIVE: the dominant Browse layout is the split list
+        // pane (~38% of the terminal, `PaneSplit.list_w`), so a fixed meta column
+        // would fall outside it.
+        //
+        // Priority on a tight pane is title > score > eps. The title is the primary
+        // identifier, so it falls off last; the eps count is the first meta to drop
+        // (it gets two floors below). The score is a tiny, high-value badge worth
+        // clipping a long title slightly for, so it persists down to a small title
+        // floor (`min_title`). The eps count, by contrast, only appears once the
+        // title still clears a *comfortable* width (`comfort_title`) — so it drops
+        // before the title gets squeezed, never the other way round (ROD-226).
+        //
+        // Compact list form `[NN]` (no `/100`): the denominator is redundant in a
+        // tight row — the tier colour already reads it as a score. The detail pane
+        // keeps the full §4.3 `[NN/100]`, where the line has room.
+        const score_w: u16 = 5; // "[100]" = 5 chars
+        const eps_w: u16 = 9; // "1000 sub" worst case + slack
+        const meta_gap: u16 = 2; // keeps the title/eps/score fields from touching
+        const min_title: u16 = 12; // score may clip the title down to this (it's tiny + high-value)
+        const comfort_title: u16 = 28; // eps appears only while the title still clears this
+        // Fixed left edges of the score / eps fields (independent of the per-row
+        // score-string length, so the title width never jitters between rows).
+        const score_zone: u16 = w -| score_w;
+        const show_score = score_zone >= list_title_col + min_title + meta_gap;
+        const eps_zone: u16 = score_zone -| meta_gap -| eps_w;
+        const show_eps = show_score and eps_zone >= list_title_col + comfort_title + meta_gap;
+        // Title clips before the leftmost meta field it has to make room for. The
+        // gap prevents the last title char from touching the meta (vaxis writes
+        // cells; the later write wins, so without it the title tail bleeds through).
+        const title_right: u16 = if (show_eps) eps_zone else if (show_score) score_zone else w;
+        const title_w: u16 = if (show_score or show_eps)
+            title_right -| list_title_col -| meta_gap
         else if (w > list_title_col) w - list_title_col else 0;
         putClipped(win, row, list_title_col, title_w, a.name, title_style);
 
-        if (show_list_meta and slot < scratch.meta.len) {
-            const tt = self.translation;
-            const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
-            const meta = std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
-            putClipped(win, row, list_meta_col, w - list_meta_col, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
+        if (show_score and slot < scratch.score.len) {
+            // Score, right-anchored against the pane edge. A null score (unenriched
+            // / no AniList hit) degrades to a static "[--]" — no buffer needed; the
+            // tier colour comes from the shared App.scoreStyle so the detail pane
+            // and this row can never drift.
+            const score_str: []const u8 = if (a.score) |sc|
+                std.fmt.bufPrint(&scratch.score[slot], "[{d}]", .{sc}) catch "[--]"
+            else
+                "[--]";
+            const score_at: u16 = w -| @as(u16, @intCast(score_str.len));
+            put(win, row, score_at, score_str, self.scoreStyle(a.score, row_bg));
+
+            // Episode count, right-aligned within its field so it clusters against
+            // the score instead of leaving a loose gap before it (Mira, ROD-226).
+            // Only rendered when the pane seats it (the `show_eps` floor).
+            if (show_eps and slot < scratch.meta.len) {
+                const tt = self.translation;
+                const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
+                const meta = std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
+                const eps_len: u16 = @min(@as(u16, @intCast(meta.len)), eps_w);
+                const eps_at: u16 = eps_zone + (eps_w - eps_len); // right-align within [eps_zone, eps_zone+eps_w)
+                putClipped(win, row, eps_at, eps_len, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
+            }
             slot += 1;
         }
         row += 1;
