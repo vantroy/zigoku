@@ -152,7 +152,7 @@ pub const Season = enum {
             .winter => "冬",
             .spring => "春",
             .summer => "夏",
-            .fall   => "秋",
+            .fall => "秋",
         };
     }
 
