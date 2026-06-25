@@ -1077,6 +1077,20 @@ pub const App = struct {
         return null;
     }
 
+    /// Resolve the record that seeds the detail grid's §4.6 watched-dim + resume
+    /// cursor, for EITHER detail origin (ROD-163). History-origin reuses the
+    /// in-memory history record (slices live in `self.history`); browse-origin
+    /// reads the show's stored row so a Browse-opened show dims its already-watched
+    /// episodes exactly as a History-opened one does — the asymmetry ROD-131 left.
+    /// `arena` backs the browse-origin store read, so the returned record is valid
+    /// only until the caller frees the arena: seed synchronously. Null when there's
+    /// no detail show or no stored row (an unwatched show → nothing to dim).
+    fn detailSeedRecord(self: *App, arena: Allocator, source: []const u8, source_id: []const u8) ?AnimeRecord {
+        if (self.historyDetailRecord()) |rec| return rec;
+        const st = self.store orelse return null;
+        return st.getAnime(arena, source, source_id) catch null;
+    }
+
     /// Controller glue for the playback-event handlers (ROD-162): hand the final
     /// state to the session for persistence + clear, then reset the App-owned
     /// transport. The session owns the record; the shell owns playing/current_*.
@@ -1359,8 +1373,19 @@ pub const App = struct {
                 self.episodes.cursor = 0;
                 self.episodes.progress = 0;
                 self.episodes.resume_idx = null;
-                if (self.historyDetailRecord()) |rec| {
-                    self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
+                // Seed the §4.6 watched-dim + resume cursor for either origin
+                // (ROD-163): history reuses the in-memory record, browse reads
+                // stored progress. for_source/for_id are the authoritative
+                // (source, source_id) for this result — held live across the
+                // flight (see the note above) — so the browse lookup keys off them
+                // rather than re-reading live UI state (the H2 caveat below).
+                {
+                    var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer seed_arena.deinit();
+                    const seed_src = self.episodes.for_source orelse "";
+                    if (self.detailSeedRecord(seed_arena.allocator(), seed_src, ev.for_id)) |rec| {
+                        self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
+                    }
                 }
                 // ROD-130: mirror the fresh fetch into the DB + hot LRU so the
                 // next visit to this show is a synchronous cache hit. Source/status
@@ -1539,7 +1564,14 @@ pub const App = struct {
         // no async op is now running.
         const source = self.currentDetailSourceName(provider);
         const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-        if (self.episodes.tryCacheHit(self.gpa, self.store, source, source_id, self.translation, status, self.historyDetailRecord())) {
+        // ROD-163: resolve the seed record for either origin (history in-memory /
+        // browse from the store). The arena backs a browse-origin store read and
+        // outlives the synchronous tryCacheHit → applyCached → seedHistoryCursor
+        // call below.
+        var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer seed_arena.deinit();
+        const seed_rec = self.detailSeedRecord(seed_arena.allocator(), source, source_id);
+        if (self.episodes.tryCacheHit(self.gpa, self.store, source, source_id, self.translation, status, seed_rec)) {
             self.async_start_ms = 0;
             return;
         }
