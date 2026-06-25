@@ -2356,7 +2356,7 @@ pub const App = struct {
     ///
     /// This is the *state* half of the scroll seam (ROD-155): it used to live
     /// inside the `view/` draw passes, which made a render pass mutate
-    /// `list_top` and quietly broke the "draw is a pure function of state"
+    /// `list_top` and silently broke the "draw is a pure function of state"
     /// contract. run() now calls it between tick() and draw(), so the viewport
     /// settles as an explicit state transition and draw() only ever *reads*
     /// `list_top`. `h`/`w` are the full terminal size; the per-view budget math

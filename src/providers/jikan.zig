@@ -6,7 +6,7 @@
 //! REST API — no auth, free — and is our fallback to turn a title into a MAL id.
 //!
 //! This is a side rail, not the playback path. On any failure (network, empty
-//! results, junk JSON) we return `error.NotFound` and callers degrade quietly.
+//! results, junk JSON) we return `error.NotFound` and callers degrade gracefully.
 //!
 //! Rate limit: Jikan enforces ~3 req/s. Interactive single calls need no throttle.
 //! Batched callers should `std.Thread.sleep(400 * std.time.ns_per_ms)` between hits.
