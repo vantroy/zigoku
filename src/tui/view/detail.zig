@@ -465,14 +465,10 @@ fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u1
         }
         break :blk "[--/100]";
     } else "[--/100]";
-    const score_style = if (anime) |a| blk: {
-        if (a.score) |score| {
-            if (score >= 91) break :blk self.s(self.palette.hot, .{ .bold = true });
-            if (score >= 76) break :blk self.s(self.palette.fg, .{});
-            if (score >= 51) break :blk self.s(self.palette.fg2, .{});
-        }
-        break :blk self.s(self.palette.fg3, .{});
-    } else self.s(self.palette.fg3, .{});
+    // §2.2 tier colour via the shared App.scoreStyle (ROD-226) — the Browse
+    // list row uses the same mapping, so the two surfaces can't drift. Detail
+    // renders on the palette default bg (null).
+    const score_style = self.scoreStyle(if (anime) |a| a.score else null, null);
 
     // Render the score, then genres, as chained `win.print`s, advancing by the
     // print's *returned* cursor column. Tracking columns by slice length drifts:
