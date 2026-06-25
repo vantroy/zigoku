@@ -69,7 +69,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
     // Search mode in Browse: suppress ▌, show /query_ + count.
     if (self.active_view == .browse and self.input_mode == .search) {
-        const q = self.querySlice();
+        const q = self.search.querySlice();
         put(win, row, 1, "/", self.s(self.palette.focus, .{ .bold = true }));
         const cursor_col: u16 = 2 + @as(u16, @intCast(q.len));
         if (q.len > 0) {
@@ -77,11 +77,11 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         }
         if (cursor_col < w) put(win, row, cursor_col, "_", self.s(self.palette.focus, .{ .bold = true }));
         // Right-aligned count (text.muted = fg2 per §3.5).
-        const cnt: []const u8 = if ((self.search_loading or self.debounce_deadline_ms > 0) and self.results.items.len == 0)
+        const cnt: []const u8 = if ((self.search.loading or self.debounce_deadline_ms > 0) and self.search.results.items.len == 0)
             "…"
-        else if (self.results.items.len > 0)
-            std.fmt.bufPrint(&self.cnt_scratch, "[catalogue · {d}]", .{self.results.items.len}) catch ""
-        else if (self.search_len > 0)
+        else if (self.search.results.items.len > 0)
+            std.fmt.bufPrint(&self.cnt_scratch, "[catalogue · {d}]", .{self.search.results.items.len}) catch ""
+        else if (self.search.len > 0)
             "[catalogue · 0]"
         else
             "";
@@ -124,7 +124,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     // §4.10: `playing` is the secondary signal — the episode-cell spinner (§4.6)
     // is the primary affordance — but folding it in keeps the ▌ from sitting idle
     // while playback resolves, and gives the bar one coherent busy story.
-    const any_loading = self.search_loading or self.history_loading or
+    const any_loading = self.search.loading or self.history_loading or
         self.episodes.loading or self.cover.loading or self.debounce_deadline_ms > 0 or
         self.playing;
     if (any_loading) {
