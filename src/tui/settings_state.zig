@@ -85,7 +85,7 @@ const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
 const translation_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
-const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord" };
+const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord", "tokyonight" };
 
 /// Step through a preset list to the value after (`dir > 0`) or before the
 /// current one, wrapping. An unrecognized current value starts from index 0.
