@@ -914,6 +914,21 @@ pub const App = struct {
         };
     }
 
+    /// Whether the interactive episode grid should render in the detail pane.
+    /// The grid is a *focused-detail* affordance, not a preview one — the History
+    /// preview pane (drawHistoryPreview) deliberately omits it for the same reason.
+    /// Gating on currentDetailAnime (the actively-focused detail show — null in a
+    /// list-focused preview) stops a stale grid from a prior detail visit bleeding
+    /// into the Browse preview: pressing H from a focused History detail into Browse
+    /// leaves episodes.results loaded, and the unconditional Browse two-pane draw
+    /// would otherwise paint that leftover grid against the newly-hovered result
+    /// (ROD-222). Restores ROD-202's intent — load/show the grid on detail entry,
+    /// never on list hover. Twin of coverTracksCursor: a render decision lifted to a
+    /// testable predicate the draw pass reads but never second-guesses.
+    pub fn episodeGridVisible(self: *const App) bool {
+        return self.currentDetailAnime() != null;
+    }
+
     fn renderedDetailAnime(self: *const App) ?Anime {
         return switch (self.active_view) {
             .browse => self.selectedAnime(),
