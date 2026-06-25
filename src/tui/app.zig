@@ -1724,13 +1724,12 @@ pub const App = struct {
         self.onNormalListKey(key, loop, io, provider);
     }
 
-    /// Normal-mode (non-search) key handling: the h/l pane + Space zoom + Esc
-    /// navigation cluster, '/' search entry, the episode-grid and result-list
-    /// cursors, Browse's P add-to-watchlist, and the History p/x/c/w/P/r/u cluster
-    /// (delegated to onHistoryMutationKey). Reached only when input_mode == .normal
-    /// — onKey runs the search dispatch first — so the `input_mode == .normal`
-    /// guards left inside the pane/Space blocks are now always true, kept verbatim
-    /// as local documentation of the move (ROD-218, pure decompose of onKey).
+    /// Normal-mode (non-search) key dispatch (ROD-218). onKey handles the global
+    /// keys and routes search-mode keys to onSearchKey before calling this, so
+    /// normal mode is guaranteed here — the per-block `input_mode == .normal` guards
+    /// from the original onKey were dropped from the extracted handlers (always true
+    /// at this call site, and pure noise inside per-intent functions). Delegates to
+    /// the handlers below; the only inline arm is '/' search-mode entry.
     fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // Spatial pane/zoom navigation (ROD-170 focus model). These keys —
         // l/→/Enter, h/←/Esc, Space — are mutually exclusive by keycode, so the
@@ -2162,12 +2161,11 @@ pub const App = struct {
         }
     }
 
-    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
-    /// Stays on App: it owns `config_path` and the toast queue, neither of which
-    /// belongs in the settings edit subsystem.
-    /// Persist the live config to disk. Returns true only when the bytes
-    /// actually landed — both early-outs (no config dir, write error) toast and
-    /// return false so callers can keep the tab dirty for a retry (ROD-210 M1).
+    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome. Stays
+    /// on App: it owns `config_path` and the toast queue, neither of which belongs
+    /// in the settings edit subsystem. Returns true only when the bytes actually
+    /// landed — both early-outs (no config dir, write error) toast and return false
+    /// so callers can keep the tab dirty for a retry (ROD-210 M1).
     fn saveSettings(self: *App, io: std.Io) bool {
         const path = self.config_path orelse {
             self.pushToast(.warn, "no config dir — not saved", false);
