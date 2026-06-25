@@ -134,7 +134,7 @@ pub const AllAnime = struct {
     /// whose path is an image id, not a usable anime id) and any unrecognised
     /// shape — the caller then falls back to title matching.
     ///
-    /// TRUST: this assumes AllAnime's thumbnail honestly names the show it
+    /// TRUST: this assumes AllAnime's thumbnail truthfully names the show it
     /// describes. A compromised provider (or a TLS MITM) could embed a wrong-but-
     /// valid id and mis-enrich one row's cover/synopsis. That is the same trust we
     /// already place in AllAnime — it picks the title we'd otherwise match on and
