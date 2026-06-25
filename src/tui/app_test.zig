@@ -1638,6 +1638,47 @@ test "history detail episodes_done seeds cursor from progress" {
     app.episodes.lru.deinit(app.gpa);
 }
 
+test "browse detail episodes_done seeds watched-dim from store progress (ROD-163)" {
+    // ROD-131 dimmed already-watched cells only on a history-origin open; a show
+    // opened from Browse showed progress 0 (no dim) even with real store history.
+    // ROD-163 seeds detail_progress from the store on the browse path too, so both
+    // origins surface the same watch state. No history record is set — the seed
+    // must come from the store, keyed off episodes.for_source / for_id.
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "browse-show", .title = "Browse Show", .total_episodes = 6, .progress = 3 }, 1000, std.testing.allocator);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &store;
+    app.active_view = .detail;
+    app.detail_origin = .browse; // the path ROD-131 left unseeded
+    app.active_pane = .detail;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "browse-show");
+    app.episodes.for_source = try std.testing.allocator.dupe(u8, "allanime");
+    app.episodes.loading = true;
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 6);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try std.testing.allocator.dupe(u8, "2") };
+    eps[2] = .{ .raw = try std.testing.allocator.dupe(u8, "3") };
+    eps[3] = .{ .raw = try std.testing.allocator.dupe(u8, "4") };
+    eps[4] = .{ .raw = try std.testing.allocator.dupe(u8, "5") };
+    eps[5] = .{ .raw = try std.testing.allocator.dupe(u8, "6") };
+    const for_id = try std.testing.allocator.dupe(u8, "browse-show");
+
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+
+    // progress 3 → episodes 1..3 dim (the high-water mark), cursor parks on the
+    // next-unwatched cell (idx 3); no saved checkpoint → resume marker sits there.
+    try testing.expectEqual(@as(u32, 3), app.episodes.progress);
+    try testing.expectEqual(@as(usize, 3), app.episodes.cursor);
+    try testing.expectEqual(@as(?usize, 3), app.episodes.resume_idx);
+
+    app.episodes.freeResults(app.gpa);
+    app.episodes.lru.deinit(app.gpa);
+}
+
 test "history detail resume overrides next-episode cursor" {
     var store = try store_mod.Store.openMemory();
     defer store.close();
