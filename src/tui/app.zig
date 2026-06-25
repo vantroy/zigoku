@@ -1638,118 +1638,6 @@ pub const App = struct {
         self.async_start_ms = self.now_ms;
     }
 
-    /// Drive a key into the search prompt and project the controller's verdict
-    /// (ROD-219, the SettingsState keystone). History view filters the in-memory
-    /// watchlist — nav state, so it stays here in `onHistoryFilterKey`. Browse
-    /// drives `SearchController.onKey`, which owns the query + results; App then
-    /// applies the verdict onto nav mode, the debounce timer, and the fire
-    /// transport — the three things the controller deliberately never touches.
-    fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        // History view: local in-memory filter — no network, no search controller.
-        if (self.active_view == .history) return self.onHistoryFilterKey(key);
-
-        const debounce_pending = self.debounce_deadline_ms > 0;
-        switch (self.search.onKey(self.gpa, key, debounce_pending)) {
-            .ignored => {},
-            .edited => self.debounce_deadline_ms = nowMs(io) + 300,
-            .cleared => |c| {
-                self.debounce_deadline_ms = 0;
-                if (c.exit) self.input_mode = .normal;
-            },
-            .submit => |sub| {
-                if (sub.fire) {
-                    self.debounce_deadline_ms = 0;
-                    self.fireSearch(loop, io, provider, 1);
-                }
-                self.input_mode = .normal;
-            },
-        }
-    }
-
-    /// History view's in-memory watchlist filter (no network). Owns the
-    /// `history_filter` buffer + the cursor/viewport reset that keeps the
-    /// selection valid as the filtered set shrinks. Stays on App: this is
-    /// history/nav state, never search — the search half moved to
-    /// `SearchController.onKey` when ROD-219 split the fused handler.
-    fn onHistoryFilterKey(self: *App, key: vaxis.Key) void {
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.history_filter_len = 0;
-            self.list_cursor = 0;
-            self.list_top = 0;
-            self.input_mode = .normal;
-        } else if (key.matches(vaxis.Key.enter, .{})) {
-            self.input_mode = .normal;
-        } else if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.history_filter_len > 0) {
-                self.history_filter_len -= 1;
-                self.list_cursor = 0;
-                self.list_top = 0;
-            }
-        } else if (key.text) |text| {
-            if (text.len > 0 and self.history_filter_len + text.len <= 127) {
-                @memcpy(self.history_filter[self.history_filter_len..][0..text.len], text);
-                self.history_filter_len += text.len;
-                self.list_cursor = 0;
-                self.list_top = 0;
-            }
-        }
-    }
-
-    // ── Settings tab (ROD-86, controller glue for ROD-161 SettingsState) ─────
-
-    /// Drive a key into the Settings subsystem and project its verdict onto
-    /// App-live state. Returns true if the key was consumed; false lets it fall
-    /// through to the global chain (F-keys/H to switch views, q/Ctrl-C to quit;
-    /// Esc is a no-op in Settings under the ROD-210 contract). The subsystem
-    /// never touches nav/palette/translation/toasts — it reports *what changed*
-    /// and the projection lives here, in the controller. Persistence no longer
-    /// rides a key verdict: it moved to App.leaveSettings (ROD-210).
-    fn onSettingsKey(self: *App, key: vaxis.Key) bool {
-        switch (self.settings.onKey(key, &self.config)) {
-            .ignored => return false,
-            .consumed => return true,
-            .config_changed => {
-                // Re-derive the App-live values the settings change projects to.
-                // Idempotent for non-projecting fields; the source of truth is
-                // `config`, which the subsystem just mutated.
-                self.translation = self.config.translationEnum();
-                self.palette = paletteFromConfig(self.config.palette);
-                return true;
-            },
-        }
-    }
-
-    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
-    /// Stays on App: it owns `config_path` and the toast queue, neither of which
-    /// belongs in the settings edit subsystem.
-    /// Persist the live config to disk. Returns true only when the bytes
-    /// actually landed — both early-outs (no config dir, write error) toast and
-    /// return false so callers can keep the tab dirty for a retry (ROD-210 M1).
-    fn saveSettings(self: *App, io: std.Io) bool {
-        const path = self.config_path orelse {
-            self.pushToast(.warn, "no config dir — not saved", false);
-            return false;
-        };
-        config_mod.save(io, self.config, path) catch {
-            self.pushToast(.@"error", "settings save failed", false);
-            return false;
-        };
-        self.pushToast(.success, "settings saved", false);
-        return true;
-    }
-
-    /// Persist Settings on the way out — a base-view switch (F1/F2/H) or a quit
-    /// (q/Ctrl-C). Saves only when the tab is dirty, so tabbing through Settings
-    /// unchanged neither rewrites the config file nor toasts. ROD-210 moved
-    /// persistence here off the retired `q → .save_and_exit` verdict. `dirty` is
-    /// cleared only on a *successful* write — a failed save (no config dir / I/O
-    /// error) leaves it set, so a later leave/quit retries instead of silently
-    /// dropping the change (ROD-210 M1, matters on the F-key/H switch-away path).
-    fn leaveSettings(self: *App, io: std.Io) void {
-        if (!self.settings.dirty) return;
-        if (self.saveSettings(io)) self.settings.dirty = false;
-    }
-
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // Settings owns its keys first (cycle/toggle/edit/save); anything it
         // doesn't consume falls through to the global chain below.
@@ -2191,6 +2079,118 @@ pub const App = struct {
             return true;
         }
         return false;
+    }
+
+    /// Drive a key into the search prompt and project the controller's verdict
+    /// (ROD-219, the SettingsState keystone). History view filters the in-memory
+    /// watchlist — nav state, so it stays here in `onHistoryFilterKey`. Browse
+    /// drives `SearchController.onKey`, which owns the query + results; App then
+    /// applies the verdict onto nav mode, the debounce timer, and the fire
+    /// transport — the three things the controller deliberately never touches.
+    fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // History view: local in-memory filter — no network, no search controller.
+        if (self.active_view == .history) return self.onHistoryFilterKey(key);
+
+        const debounce_pending = self.debounce_deadline_ms > 0;
+        switch (self.search.onKey(self.gpa, key, debounce_pending)) {
+            .ignored => {},
+            .edited => self.debounce_deadline_ms = nowMs(io) + 300,
+            .cleared => |c| {
+                self.debounce_deadline_ms = 0;
+                if (c.exit) self.input_mode = .normal;
+            },
+            .submit => |sub| {
+                if (sub.fire) {
+                    self.debounce_deadline_ms = 0;
+                    self.fireSearch(loop, io, provider, 1);
+                }
+                self.input_mode = .normal;
+            },
+        }
+    }
+
+    /// History view's in-memory watchlist filter (no network). Owns the
+    /// `history_filter` buffer + the cursor/viewport reset that keeps the
+    /// selection valid as the filtered set shrinks. Stays on App: this is
+    /// history/nav state, never search — the search half moved to
+    /// `SearchController.onKey` when ROD-219 split the fused handler.
+    fn onHistoryFilterKey(self: *App, key: vaxis.Key) void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.history_filter_len = 0;
+            self.list_cursor = 0;
+            self.list_top = 0;
+            self.input_mode = .normal;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            self.input_mode = .normal;
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.history_filter_len > 0) {
+                self.history_filter_len -= 1;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+        } else if (key.text) |text| {
+            if (text.len > 0 and self.history_filter_len + text.len <= 127) {
+                @memcpy(self.history_filter[self.history_filter_len..][0..text.len], text);
+                self.history_filter_len += text.len;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+        }
+    }
+
+    // ── Settings tab (ROD-86, controller glue for ROD-161 SettingsState) ─────
+
+    /// Drive a key into the Settings subsystem and project its verdict onto
+    /// App-live state. Returns true if the key was consumed; false lets it fall
+    /// through to the global chain (F-keys/H to switch views, q/Ctrl-C to quit;
+    /// Esc is a no-op in Settings under the ROD-210 contract). The subsystem
+    /// never touches nav/palette/translation/toasts — it reports *what changed*
+    /// and the projection lives here, in the controller. Persistence no longer
+    /// rides a key verdict: it moved to App.leaveSettings (ROD-210).
+    fn onSettingsKey(self: *App, key: vaxis.Key) bool {
+        switch (self.settings.onKey(key, &self.config)) {
+            .ignored => return false,
+            .consumed => return true,
+            .config_changed => {
+                // Re-derive the App-live values the settings change projects to.
+                // Idempotent for non-projecting fields; the source of truth is
+                // `config`, which the subsystem just mutated.
+                self.translation = self.config.translationEnum();
+                self.palette = paletteFromConfig(self.config.palette);
+                return true;
+            },
+        }
+    }
+
+    /// Persist the live config to disk (ROD-85 `save`), toasting the outcome.
+    /// Stays on App: it owns `config_path` and the toast queue, neither of which
+    /// belongs in the settings edit subsystem.
+    /// Persist the live config to disk. Returns true only when the bytes
+    /// actually landed — both early-outs (no config dir, write error) toast and
+    /// return false so callers can keep the tab dirty for a retry (ROD-210 M1).
+    fn saveSettings(self: *App, io: std.Io) bool {
+        const path = self.config_path orelse {
+            self.pushToast(.warn, "no config dir — not saved", false);
+            return false;
+        };
+        config_mod.save(io, self.config, path) catch {
+            self.pushToast(.@"error", "settings save failed", false);
+            return false;
+        };
+        self.pushToast(.success, "settings saved", false);
+        return true;
+    }
+
+    /// Persist Settings on the way out — a base-view switch (F1/F2/H) or a quit
+    /// (q/Ctrl-C). Saves only when the tab is dirty, so tabbing through Settings
+    /// unchanged neither rewrites the config file nor toasts. ROD-210 moved
+    /// persistence here off the retired `q → .save_and_exit` verdict. `dirty` is
+    /// cleared only on a *successful* write — a failed save (no config dir / I/O
+    /// error) leaves it set, so a later leave/quit retries instead of silently
+    /// dropping the change (ROD-210 M1, matters on the F-key/H switch-away path).
+    fn leaveSettings(self: *App, io: std.Io) void {
+        if (!self.settings.dirty) return;
+        if (self.saveSettings(io)) self.settings.dirty = false;
     }
 
     // ── draw: pure render from state ─────────────────────────────────────────
