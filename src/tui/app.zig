@@ -1085,10 +1085,15 @@ pub const App = struct {
     /// `arena` backs the browse-origin store read, so the returned record is valid
     /// only until the caller frees the arena: seed synchronously. Null when there's
     /// no detail show or no stored row (an unwatched show → nothing to dim).
-    fn detailSeedRecord(self: *App, arena: Allocator, source: []const u8, source_id: []const u8) ?AnimeRecord {
+    /// `source` is optional for the browse path only: history-origin never needs it
+    /// (the in-memory record carries its own), and a null source can't key a store
+    /// read, so we return null explicitly rather than query with an empty string —
+    /// a silent masked miss (Elara M1).
+    fn detailSeedRecord(self: *App, arena: Allocator, source: ?[]const u8, source_id: []const u8) ?AnimeRecord {
         if (self.historyDetailRecord()) |rec| return rec;
         const st = self.store orelse return null;
-        return st.getAnime(arena, source, source_id) catch null;
+        const src = source orelse return null;
+        return st.getAnime(arena, src, source_id) catch null;
     }
 
     /// Controller glue for the playback-event handlers (ROD-162): hand the final
@@ -1375,17 +1380,17 @@ pub const App = struct {
                 self.episodes.resume_idx = null;
                 // Seed the §4.6 watched-dim + resume cursor for either origin
                 // (ROD-163): history reuses the in-memory record, browse reads
-                // stored progress. for_source/for_id are the authoritative
-                // (source, source_id) for this result — held live across the
-                // flight (see the note above) — so the browse lookup keys off them
-                // rather than re-reading live UI state (the H2 caveat below).
+                // stored progress keyed off for_source/for_id — the authoritative
+                // (source, source_id) for this result, set together at fire time
+                // (line ~1593) and held live across the flight, not live UI state
+                // (the H2 caveat below). detailSeedRecord handles a null source.
                 {
                     var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
                     defer seed_arena.deinit();
-                    const seed_src = self.episodes.for_source orelse "";
-                    if (self.detailSeedRecord(seed_arena.allocator(), seed_src, ev.for_id)) |rec| {
+                    if (self.detailSeedRecord(seed_arena.allocator(), self.episodes.for_source, ev.for_id)) |rec| {
                         self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
                     }
+                    // seed_arena (and rec's browse-origin slices) freed here.
                 }
                 // ROD-130: mirror the fresh fetch into the DB + hot LRU so the
                 // next visit to this show is a synchronous cache hit. Source/status
