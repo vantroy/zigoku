@@ -915,6 +915,11 @@ Notes:
   de-emphasis.
 - The resume indicator `[▸12]` in the row header is the episode the user will resume
   from: `state.now` + bold.
+- **Deferred (ROD-227):** the row-1 right-meta shown here (`[▸12] 冬 2024 放映中` —
+  resume indicator + season + status chips) is **not yet rendered**; row 1 currently
+  shows the title only, and the episode count lives on the bar row. The data is present
+  in the store/cache — this mock is the target the column would return to, on Rod's
+  say-so, once the spec is settled. The count is never duplicated into row 1.
 - `l` or `Enter` from list focus moves to the detail pane (same grammar as Browse).
   At `w < 60` single-column, `l` is a no-op (no pane to move to), but `Enter`
   (or `Space`) opens the full-screen zoom — the only detail surface at this width.
@@ -1009,9 +1014,9 @@ Notes:
   `w ≥ 100` `Enter` plays instead (the grid is in-pane). `Esc`/`Space` demote
   back to the two-pane (`active_pane = .detail`) when there's room, else to the
   list (`w < 60`); `q` quits the app (ROD-210 — Esc/Space/`h` own the demote).
-- The meta column (`[▸12]`, `○`, `◐` episode badge) renders on the list side only
-  when `list_w ≥ 60` (i.e., at ≥160-col terminals). At 100/120 cols the title
-  takes full `list_w` and the badge is omitted.
+- The row-1 right-meta column (`[▸12]`, `○`, `◐` episode badge) is **deferred**
+  (ROD-227): row 1 is title-only at every width, so the title takes full `list_w`.
+  When the §5.4 meta returns it would re-earn its column on the wider terminals.
 - Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
   `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
   in [m]+italic when synopsis is null; chips omitted when null.
@@ -1453,7 +1458,7 @@ aliases.
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
 | **Detail · episode count** | AllAnime `eps_sub` / `eps_dub`; AniList `total_episodes` | `N eps` for the active translation | `? eps` in `[d]` when both sources are absent; `kind` / `studios` segments omitted |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
-| **History · row meta** | DB `progress`, `total_episodes`, `list_status` | `ep N/M · status` (`render.formatMeta`) | `ep N · status` when `total_episodes` is null — see the N7 note below |
+| **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
 | **History · season chip** | — | not rendered | the history row is title + progress bar + meta; no chip |
 | **History · score badge** | — | not rendered | the `[NN]` badge from §5.4 is omitted; the space is reclaimed by the title |
@@ -1477,10 +1482,15 @@ AllAnime nor AniList supplied a URL) is distinct from the §4.8 loading spinner 
 in-flight fetch). The two must not be conflated in code: the spinner means "fetching",
 `no art yet` means "nothing to fetch".
 
-**History row meta (N7, ROD-138).** The History list's right-meta column renders
-`ep N/M · status` (e.g. `ep 6/13 · planning`) via `render.formatMeta`. When
-`total_episodes` is null it degrades to `ep N · status` (progress only, no
-denominator). This is the canonical meta format for the column.
+**History row meta (N7, ROD-138 → ROD-227).** A History entry is two physical rows:
+row 1 is the **title only**, row 2 is the §4.5 progress bar carrying the episode
+count (`[████░░]  N / M eps`, `render.drawProgressBar`; `N / ? eps` when
+`total_episodes` is null). The count is **not** duplicated into a row-1 meta column —
+the original `ep N/M · status` (`formatMeta`) treatment was removed in ROD-227 because
+the count already rides the bar and the status is already carried by the group header
+plus the row glyph. §5.4 specs a richer row-1 right-meta (resume indicator `[▸N]`,
+season chip, status kanji); that is **deferred** — the data is in the store/cache, the
+spec just isn't settled — and would return in the title's row when added.
 
 ---
 
