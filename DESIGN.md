@@ -156,12 +156,19 @@ against common terminal setups.
 
 ### 2.2 Score Format
 
-Scores are integer 0–100 from AniList. Display format: `[NN/100]` or `[NNN/100]`.
+Scores are integer 0–100 from AniList. Two display forms share one colour scale:
 
-- Score 91–100: `state.now` + bold + `✦` prefix → `✦ [97/100]`
-- Score 76–90: `text.primary` → `[82/100]`
-- Score 51–75: `text.muted` → `[68/100]`
-- Score 0–50 or unscored: `text.dim` → `[--/100]`
+- **Detail pane** — the full `[NN/100]` / `[NNN/100]`, with the `✦` prefix for the
+  top tier. The score has a whole line to breathe.
+- **List rows** — a compact `[NN]` badge: no `/100` (redundant in a tight row — the
+  tier colour already reads it as a score) and **no `✦`** (ROD-226).
+
+Tier colours apply to both forms (detail token shown, then list token):
+
+- Score 91–100: `state.now` + bold; `✦` prefix in the detail pane → `✦ [97/100]` · `[97]`
+- Score 76–90: `text.primary` → `[82/100]` · `[82]`
+- Score 51–75: `text.muted` → `[68/100]` · `[68]`
+- Score 0–50 or unscored: `text.dim` → `[--/100]` · `[--]`
 
 ### 2.3 Kanji Status Chips
 
@@ -427,8 +434,12 @@ No other box-drawing anywhere.
 
 A list row is 1 cell tall. Content: `[STATUS_GLYPH] [TITLE…truncated] [SCORE]`
 
-Score is right-aligned within the list column. Title truncates with `…` if it would
-overflow into the score field. Score field is 10 chars wide, right-reserved.
+Score is right-aligned within the list column as the compact `[NN]` badge (≤5 cols,
+§2.2), right-anchored against the *pane* edge — not a fixed column, so it survives
+the split list pane. Title truncates with `…` if it would overflow the score field.
+In Browse an episode-count field may sit to the score's left when the pane is wide;
+priority is **title > score > eps**, so a tight pane drops the count first and never
+squeezes the title to keep it (§4.3, ROD-226).
 
 | State | Background | Title color | Score color | Left glyph |
 |---|---|---|---|---|
@@ -471,9 +482,12 @@ character takes its visual position.
 
 ### 4.3 Score Display
 
-Full spec in Section 2.2. In a list row, score occupies the rightmost 10 chars of the
-row. In the detail pane, score is rendered larger by adding whitespace and the `✦`
-prefix for top-tier entries.
+Full spec in Section 2.2. In a list row, the score is the compact `[NN]` badge
+(≤5 cols, no `/100`, no `✦`), right-anchored against the list pane's right edge.
+Geometry is pane-relative (the dominant Browse layout is the ~38 %-width split list
+pane), and an episode-count field may share the meta zone to its left on a wide pane
+(title > score > eps, ROD-226). In the detail pane, score is rendered larger by
+adding whitespace and the `✦` prefix for top-tier entries.
 
 Detail pane score line format:
 ```
@@ -760,6 +774,13 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
                                                                                          [spacer]
   ▌  hjkl · / search · : command · q quit                                               [h▌ blink, d text, m+underline keys]
 ```
+
+> **Score tokens in the Browse wireframes (§5.1, §5.2) are drawn in the long
+> `[NN/100]` form for column legibility.** Shipped list rows render the compact
+> `[NN]` badge (no `/100`, no `✦` — both detail-pane only) per §2.2/§4.3, right-
+> anchored against the list pane edge, with the episode count seated to its left on
+> a wide pane (title > score > eps, ROD-226). The grids are not re-rendered to the
+> compact form; this note is the reconciliation.
 
 ### 5.2 Browse — Search Active
 
@@ -1423,7 +1444,7 @@ aliases.
 
 | Surface · Field | Source | Rendered when present | Fallback when missing |
 |---|---|---|---|
-| **Browse · score** | AllAnime / AniList `score` | *(planned — ROD-226)* | not rendered yet — the score is already on the record (AllAnime fills it at search time); only the render is missing. Browse meta shows `N sub` / `N dub` |
+| **Browse · score** | AllAnime / AniList `score` | compact `[NN]` badge, right-anchored against the pane edge, §2.2 tier colour (ROD-226) | `[--]` in list-row dim (`fg3`); the episode count seats to the badge's left on a wide pane (title > score > eps) |
 | **Detail · title + alt titles** | AllAnime `name` / `english_name` / `native_name`; AniList fills missing alts | romaji bold, then english + native (italic) alt lines when present and distinct (`drawAltTitles`) | romaji only — no empty alt lines |
 | **Detail · status chip** | AniList `status` (enrichment-only) | kanji status chip (`statusChipFor`) | omitted — no empty chip or placeholder span |
 | **Detail · season chip** | AllAnime `season` / `year`; AniList fills if null | `冬 2026`-style chip when both season and year are known | omitted — never an empty chip |
@@ -1447,9 +1468,9 @@ no watch-state — a glyph there would need a per-row local-DB (or cache) lookup
 search path doesn't otherwise do. Terminal Ghost keeps the search path fast (see the
 §9.5 no-glyph decision).
 
-**Score fallback.** `[--/100]` is the fallback when `score` is null; it does not
-participate in the §2.2 score-tier rules (those apply to real integer scores only).
-A null score is not a score of 0.
+**Score fallback.** `[--/100]` (detail pane) / `[--]` (list rows, §2.2) is the
+fallback when `score` is null; it does not participate in the §2.2 score-tier rules
+(those apply to real integer scores only). A null score is not a score of 0.
 
 **Cover fallback.** The `no art yet` state (rendered when `thumb` is null — neither
 AllAnime nor AniList supplied a URL) is distinct from the §4.8 loading spinner (an
@@ -1718,7 +1739,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Decision | Rationale | Revisit trigger |
 |---|---|---|
 | Cover block renders "no art yet" (persistent absent) not a spinner | A spinner implies a fetch is in flight. When there is no cover URL to fetch, a spinner would be a lie. The absent state must be visually distinct from loading. | With covers live, the block uses the §4.8 spinner then the image when a URL is known, and falls back to "no art yet" only when `thumb` stays null. No code change needed at the cover block — it keys off the URL. |
-| Score placeholder `[--/100]` in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
+| Score placeholder `[--/100]` (detail) / `[--]` (list) in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
 | Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | Now that enrichment fills `status`, chips appear automatically; the omission is the per-anime fallback for shows with no AniList hit. |
 | No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand — that is why History ships status chips (§5.4). Browse results come from AllAnime over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time — results joined against the store in one pass, or membership held in an in-memory cache — the glyph becomes nearly free; revisit then. |
 | History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land). History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
