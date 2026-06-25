@@ -1084,7 +1084,11 @@ Notes:
   annotation in the mock marks this treatment. `enrichment sync` reads `automatic`
   (enrichment is live as of M4 — the §9.4 "not available until M4" note is
   superseded). `cover art cache` shows the cache path read-only; it was `enter to
-  edit` in the original spec but shipped inert.
+  edit` in the original spec but shipped inert. The path is **resolved at runtime**
+  from `paths.cacheDir()` + the `covers` subdir, so it honours `$XDG_CACHE_HOME`
+  (ROD-225); the `$HOME` prefix is collapsed to `~` for display. The mock below
+  shows the default-home case — a custom `$XDG_CACHE_HOME` on another volume renders
+  its real absolute path.
 - **translation** cycles `sub`/`dub` (`config.translation`), default `sub` — the
   sub-vs-dub selector. Renamed from `subtitle language` in ROD-138: the old label
   read like a human-language picker but only ever drove the translation track, and
@@ -1636,8 +1640,10 @@ so the Catalog section ships the read-only state documented in §5.5:
 
 Both rows are non-interactive (`drawInertRow`: `palette.fg3` + italic, no marker,
 no hint) and skipped by `j`/`k` navigation. `enrichment sync` now reads `automatic`;
-`cover art cache` is read-only (was `enter to edit` in the original spec). The old
-`preferred title` row is deferred to ROD-205 and not rendered.
+`cover art cache` is read-only (was `enter to edit` in the original spec) and shows
+the runtime-resolved cache path (`$XDG_CACHE_HOME`-aware, `$HOME` collapsed to `~`,
+ROD-225) — the mock shows the default-home case. The old `preferred title` row is
+deferred to ROD-205 and not rendered.
 
 #### §5.6 Loading / Now Resolving — startup copy
 
