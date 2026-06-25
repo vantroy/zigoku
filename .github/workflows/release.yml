@@ -95,6 +95,19 @@ jobs:
           fi
           echo "static: no dynamic dependencies"
 
+      # Ad-hoc sign both mac binaries. Zig's linker ad-hoc-signs the native
+      # aarch64-macos build (Apple Silicon's kernel mandates a signature to
+      # exec at all) but leaves the cross-built x86_64-macos binary UNSIGNED —
+      # inconsistent, fails `codesign --verify`, and invites Gatekeeper friction
+      # outside brew's quarantine-stripping. The ROD-150 Homebrew formula's
+      # on_intel bottle needs a verifiable artifact, so sign + gate both arches.
+      - name: Ad-hoc sign + verify macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - out/bin/zigoku
+          codesign --verify --verbose out/bin/zigoku
+          echo "ad-hoc signature present and valid"
+
       # macOS can't be fully static (libSystem is always dynamic), so the gate
       # checks the thing that actually mattered for ROD-212: sqlite is compiled
       # in, not dynamically linked against a (possibly missing) libsqlite3.dylib.
@@ -172,3 +185,69 @@ jobs:
             dist/*.tar.gz
             dist/sha256sums.txt
           fail_on_unmatched_files: true
+
+  # ── Homebrew tap auto-bump — tag pushes only ──────────────────────────────
+  # Push the new version + per-arch sha256 into vantroy/homebrew-zigoku so
+  # `brew install vantroy/zigoku/zigoku` tracks the release. Uses a write
+  # deploy key (HOMEBREW_TAP_DEPLOY_KEY) scoped to the tap alone — the default
+  # GITHUB_TOKEN can't push cross-repo. Source-of-truth: packaging/homebrew/. (ROD-150)
+  update-tap:
+    needs: [guard, release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch release checksums
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          # --retry-all-errors covers the transient 404 window where the release
+          # is published (API) but the download CDN hasn't caught up yet.
+          curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors \
+            "https://github.com/vantroy/zigoku/releases/download/v${v}/sha256sums.txt" -o sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Set up tap deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Bump formula in tap + push
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          git clone git@github.com:vantroy/homebrew-zigoku.git tap
+          arm=$(awk '/aarch64-macos/ {print $1}' sha256sums.txt)
+          intel=$(awk '/x86_64-macos/ {print $1}' sha256sums.txt)
+          if [ -z "$arm" ] || [ -z "$intel" ]; then
+            echo "::error::missing macOS checksums in sha256sums.txt"; exit 1
+          fi
+          f=tap/Formula/zigoku.rb
+          # Bump the version embedded in both URLs (no `version` stanza — Homebrew
+          # scans it from the URL; a redundant stanza fails `brew audit --strict`).
+          sed -i -E "/^[[:space:]]*url /s/v[0-9]+\.[0-9]+\.[0-9]+/v${v}/g" "$f"
+          # Per-arch sha256: each arch's url line (it carries the target triple)
+          # marks which arch the *following* sha256 line belongs to.
+          awk -v arm="$arm" -v intel="$intel" '
+            /aarch64-macos/ { cur="arm" }
+            /x86_64-macos/  { cur="intel" }
+            /^[[:space:]]*sha256 / {
+              if (cur=="arm")   { sub(/sha256 "[^"]*"/, "sha256 \"" arm "\"") }
+              if (cur=="intel") { sub(/sha256 "[^"]*"/, "sha256 \"" intel "\"") }
+            }
+            { print }
+          ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          echo "----- bumped formula -----"; cat "$f"
+          cd tap
+          git config user.name "zigoku-release"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/zigoku.rb
+          if git diff --cached --quiet; then
+            echo "formula already current for v${v} — nothing to push"
+          else
+            git commit -m "zigoku v${v}"
+            git push origin main
+          fi
