@@ -644,6 +644,9 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
 
         // Two-column: synopsis gets the full right column height minus the grid
         // reservation — no synopsis cap needed here, the column is dedicated.
+        // (Unlike the single-column path below, there's no synopsis-reclaim branch
+        // when !show_grid: the synopsis already owns the full column, so dropping
+        // the grid just leaves the bottom rows empty — no relayout needed.)
         const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
         if (show_grid) drawGrid(self, right_win, right_w, h, rrow);
         return;
