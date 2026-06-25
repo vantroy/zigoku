@@ -1665,6 +1665,8 @@ test "browse detail episodes_done seeds watched-dim from store progress (ROD-163
     eps[3] = .{ .raw = try std.testing.allocator.dupe(u8, "4") };
     eps[4] = .{ .raw = try std.testing.allocator.dupe(u8, "5") };
     eps[5] = .{ .raw = try std.testing.allocator.dupe(u8, "6") };
+    // Separate dup from episodes.for_id above: the event owns its copy (the real
+    // tick() contract), freed by the handler's `defer gpa.free(ev.for_id)`.
     const for_id = try std.testing.allocator.dupe(u8, "browse-show");
 
     try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
@@ -1677,6 +1679,40 @@ test "browse detail episodes_done seeds watched-dim from store progress (ROD-163
 
     app.episodes.freeResults(app.gpa);
     app.episodes.lru.deinit(app.gpa);
+}
+
+test "browse detail cache-hit seeds watched-dim from store progress (ROD-163)" {
+    // M2 companion to the episodes_done test above: the SYNCHRONOUS
+    // tryCacheHit → applyCached → seedHistoryCursor path must seed the
+    // browse-origin dim too. Without it, a second (cached) open from Browse would
+    // show nothing dimmed even though the first (async) open did.
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "x", .title = "X", .total_episodes = 6, .progress = 3 }, 1000, std.testing.allocator);
+
+    var app: App = .{};
+    try singleColumnBrowse(&app); // browse result id "x"; source resolves to provider "allanime"
+    defer teardownBrowse(&app);
+    defer app.episodes.lru.deinit(app.gpa);
+    app.store = &store;
+
+    // Warm LRU hit so the open is synchronous (no fetch thread), exercising the
+    // tryCacheHit seed path rather than episodes_done.
+    const cached = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" }, .{ .raw = "5" }, .{ .raw = "6" },
+    });
+    try app.episodes.lru.putOwned(app.gpa, "allanime\x00x\x00sub", .{
+        .episodes = cached,
+        .expires_at = std.math.maxInt(i64),
+    });
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{})); // browse → detail, synchronous cache hit
+
+    try testing.expectEqual(.browse, app.detail_origin);
+    try testing.expect(app.episode_thread == null); // cache hit, not a fetch
+    // The browse-origin dim seeded from the store: progress 3 → 1..3 dim, cursor 3.
+    try testing.expectEqual(@as(u32, 3), app.episodes.progress);
+    try testing.expectEqual(@as(usize, 3), app.episodes.cursor);
 }
 
 test "history detail resume overrides next-episode cursor" {
