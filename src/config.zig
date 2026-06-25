@@ -36,7 +36,7 @@ pub const Config = struct {
     image_protocol: []const u8 = "auto", // "auto" | "kitty" | "halfblock" | "off"
     cover_art: bool = true,
     kanji_chips: bool = true,
-    palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord"
+    palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord" | "tokyonight"
 
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.

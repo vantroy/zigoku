@@ -330,6 +330,7 @@ pub const Toast = struct {
 fn paletteFromConfig(name: []const u8) *const colors.Palette {
     if (std.mem.eql(u8, name, "phosphor")) return &colors.phosphor;
     if (std.mem.eql(u8, name, "nord")) return &colors.nord;
+    if (std.mem.eql(u8, name, "tokyonight")) return &colors.tokyonight;
     return &colors.terminal_ghost;
 }
 
@@ -2446,6 +2447,7 @@ test "paletteFromConfig resolves known names and falls back for unknowns" {
     try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig("terminal_ghost"));
     try testing.expectEqual(&colors.phosphor, paletteFromConfig("phosphor"));
     try testing.expectEqual(&colors.nord, paletteFromConfig("nord"));
+    try testing.expectEqual(&colors.tokyonight, paletteFromConfig("tokyonight"));
     try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig("garbage"));
     try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig(""));
 }
