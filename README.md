@@ -45,8 +45,8 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 
 ## Install
 
-Zigoku is distributed as source, or as a prebuilt Linux binary (see below). To
-install from source, clone it and run the installer:
+Zigoku is distributed as source, as a prebuilt Linux binary, or via Homebrew on
+macOS (all below). To install from source, clone it and run the installer:
 
 ```sh
 git clone https://github.com/vantroy/zigoku.git
@@ -71,6 +71,17 @@ zigoku frieren                # CLI flow: search → pick → play
 zigoku "cowboy bebop" --dub
 zigoku <query> --debug        # diagnostics to stderr (CLI) or the log file (TUI)
 ```
+
+### macOS: Homebrew
+
+```sh
+brew install vantroy/zigoku/zigoku
+```
+
+The fully-qualified name taps [`vantroy/homebrew-zigoku`](https://github.com/vantroy/homebrew-zigoku)
+implicitly — no separate `brew tap` needed. You get a prebuilt, SQLite-bundled
+binary for your arch (Apple Silicon or Intel), and Homebrew pulls `mpv` as a
+dependency. Upgrades ride `brew upgrade`.
 
 ### Or: grab a prebuilt binary
 
