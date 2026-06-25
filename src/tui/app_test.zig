@@ -25,7 +25,6 @@ const CoverState = app_mod.CoverState;
 const CoverDecision = app_mod.CoverState.Decision;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
-const formatMeta = @import("render.zig").formatMeta;
 const RawCoverCache = workers.RawCoverCache;
 const DecodedCoverCache = workers.DecodedCoverCache;
 const max_cover_raw_cache_bytes = workers.max_cover_raw_cache_bytes;
@@ -351,15 +350,6 @@ test "layout bails when EITHER too-small arm trips (ROD-155)" {
         app.layout(20, 10);
         try testing.expectEqual(@as(usize, 0), app.list_top);
     }
-}
-
-test "formatMeta degrades when total episodes is unknown" {
-    var buf: [48]u8 = undefined;
-    const known = formatMeta(&buf, .{ .source = "s", .source_id = "i", .title = "T", .total_episodes = 12, .progress = 3, .list_status = .watching });
-    try testing.expectEqualStrings("ep 3/12 · watching", known);
-    var buf2: [48]u8 = undefined;
-    const unknown = formatMeta(&buf2, .{ .source = "s", .source_id = "i", .title = "T", .progress = 0, .list_status = .planning });
-    try testing.expectEqualStrings("ep 0 · planning", unknown);
 }
 
 test "paneSplit holds the §3.2 38% list / remainder detail geometry (ROD-113)" {

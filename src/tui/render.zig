@@ -8,16 +8,6 @@ const domain = @import("../domain.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 
-/// "ep 3/12 · watching" — whatever we actually know. total_episodes can be null
-/// (source didn't say), in which case we drop the denominator.
-pub fn formatMeta(buf: []u8, rec: AnimeRecord) []const u8 {
-    const status = rec.list_status.str();
-    if (rec.total_episodes) |total| {
-        return std.fmt.bufPrint(buf, "ep {d}/{d} · {s}", .{ rec.progress, total, status }) catch status;
-    }
-    return std.fmt.bufPrint(buf, "ep {d} · {s}", .{ rec.progress, status }) catch status;
-}
-
 // ── tiny render helpers ─────────────────────────────────────────────────────
 
 /// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) means "the focused
@@ -206,11 +196,10 @@ pub fn drawWrappedText(win: vaxis.Window, start_row: u16, start_col: u16, max_w:
     return row;
 }
 
-// History-row layout columns. The detail/responsive layout is ROD-72+; this is
-// the fixed two-column (title | meta) skeleton.
+// History-row layout column. Row 1 is title-only (the episode count lives on the
+// row-2 progress bar, not duplicated up here — ROD-227); the §5.4 right-meta
+// (resume/season/status chips) is deferred, so there is no meta column to reserve.
 pub const title_col: u16 = 4;
-pub const meta_col: u16 = 48;
-pub const title_meta_gap: u16 = 2;
 
 // Style helper for drawProgressBar. Always call with an explicit `bg` — the
 // default is pinned to terminal_ghost and is not palette-aware. App draw methods
