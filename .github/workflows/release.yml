@@ -185,3 +185,64 @@ jobs:
             dist/*.tar.gz
             dist/sha256sums.txt
           fail_on_unmatched_files: true
+
+  # ── Homebrew tap auto-bump — tag pushes only ──────────────────────────────
+  # Push the new version + per-arch sha256 into vantroy/homebrew-zigoku so
+  # `brew install vantroy/zigoku/zigoku` tracks the release. Uses a write
+  # deploy key (HOMEBREW_TAP_DEPLOY_KEY) scoped to the tap alone — the default
+  # GITHUB_TOKEN can't push cross-repo. Source-of-truth: packaging/homebrew/. (ROD-150)
+  update-tap:
+    needs: [guard, release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch release checksums
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          curl -fsSL "https://github.com/vantroy/zigoku/releases/download/v${v}/sha256sums.txt" -o sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Set up tap deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/tap_key
+          chmod 600 ~/.ssh/tap_key
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Bump formula in tap + push
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          git clone git@github.com:vantroy/homebrew-zigoku.git tap
+          arm=$(awk '/aarch64-macos/ {print $1}' sha256sums.txt)
+          intel=$(awk '/x86_64-macos/ {print $1}' sha256sums.txt)
+          if [ -z "$arm" ] || [ -z "$intel" ]; then
+            echo "::error::missing macOS checksums in sha256sums.txt"; exit 1
+          fi
+          f=tap/Formula/zigoku.rb
+          # version, then per-arch sha256. Each arch's url line (it contains the
+          # target triple) marks which arch the *following* sha256 line belongs to.
+          sed -i -E "s/^  version \"[^\"]+\"/  version \"${v}\"/" "$f"
+          awk -v arm="$arm" -v intel="$intel" '
+            /aarch64-macos/ { cur="arm" }
+            /x86_64-macos/  { cur="intel" }
+            /^[[:space:]]*sha256 / {
+              if (cur=="arm")   { sub(/sha256 "[^"]*"/, "sha256 \"" arm "\"") }
+              if (cur=="intel") { sub(/sha256 "[^"]*"/, "sha256 \"" intel "\"") }
+            }
+            { print }
+          ' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          echo "----- bumped formula -----"; cat "$f"
+          cd tap
+          git config user.name "zigoku-release"
+          git config user.email "actions@users.noreply.github.com"
+          git add Formula/zigoku.rb
+          if git diff --cached --quiet; then
+            echo "formula already current for v${v} — nothing to push"
+          else
+            git commit -m "zigoku v${v}"
+            git push origin main
+          fi
