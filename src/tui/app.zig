@@ -91,6 +91,14 @@ pub const PlaybackSession = @import("playback_session.zig").PlaybackSession;
 /// resolving.
 pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 
+/// Search + enrich controller subsystem (ROD-219). Owns the catalogue-search
+/// record (query / results / page / loading + the queued enrich request) in its
+/// own module; transport (the worker threads, `async_start_ms`, debounce) and
+/// the `fireSearch` / `fireEnrich` spawns stay on App, matching the EpisodeState
+/// carve. Re-exported here so existing `app_mod.SearchController` references keep
+/// resolving.
+pub const SearchController = @import("search_state.zig").SearchController;
+
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
 pub fn run(
@@ -420,19 +428,13 @@ pub const App = struct {
     /// Current input mode. `.search` = typing a query; `.normal` = list navigation.
     input_mode: enum { normal, search } = .normal,
 
-    /// Fixed-width query buffer. 127 usable bytes + null sentinel = 128 total.
-    search_query: [128]u8 = undefined,
-    search_len: usize = 0,
-
-    /// Whether a search HTTP request is in flight.
-    search_loading: bool = false,
-
-    /// Page count of loaded results (0 = no search run yet, 1 = first page, etc.).
-    search_page: u32 = 0,
-
-    /// Accumulated search results. Backed by gpa — strings owned, must be freed on query reset.
-    /// Access via `self.results.items`.
-    results: std.ArrayListUnmanaged(Anime) = .empty,
+    /// Catalogue-search controller (ROD-219): the query buffer, accumulated
+    /// (owned) results, loaded-page count, in-flight flag, and queued enrich
+    /// request. Transport — the worker threads below, `async_start_ms`, and the
+    /// search debounce — stays on App; the controller owns only the record + its
+    /// clear/hydrate/persist helpers. Embedded by value so `App{}` stays trivially
+    /// constructible. See `SearchController`.
+    search: SearchController = .{},
 
     /// GPA reference for freeing search results. Set in run() before the event loop.
     /// Intentionally not zero-initialised — only valid after run() sets it.
@@ -443,10 +445,10 @@ pub const App = struct {
     /// preventing use-after-free of `loop` and `gpa` on fast quit.
     search_thread: ?std.Thread = null,
     /// Handle for the most recent AniList enrichment thread.
-    /// At most one joinable AniList enrichment worker is active at a time. A
-    /// later search can queue one follow-up enrich request without blocking the UI.
+    /// At most one joinable AniList enrichment worker is active at a time; a later
+    /// search queues one follow-up via `search.pending_enrich` without blocking
+    /// the UI.
     enrich_thread: ?std.Thread = null,
-    pending_enrich: ?struct { offset: usize, count: usize } = null,
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -551,11 +553,6 @@ pub const App = struct {
     /// Non-null while there is an undoable action. Freed in `deinitOwnedState`.
     undo: ?UndoEntry = null,
 
-    /// Current query as a slice (may be empty).
-    pub fn querySlice(self: *const App) []const u8 {
-        return self.search_query[0..self.search_len];
-    }
-
     /// Palette-aware style: `bg` defaults to `self.palette.bg_base` when null.
     /// All draw methods use this instead of the plain `style()` import so that
     /// switching palettes re-colors every cell, not just ones with explicit bg.
@@ -619,22 +616,11 @@ pub const App = struct {
         self.toast_queue[idx] = t;
     }
 
-    /// Free all accumulated search results and reset search state.
-    /// Call before a new page-1 search and when Esc clears the query.
-    fn clearResults(self: *App) void {
-        self.pending_enrich = null;
-        for (self.results.items) |r| freeOwnedAnime(self.gpa, r);
-        self.results.clearRetainingCapacity();
-        self.search_page = 0;
-    }
-
     /// Unified teardown for app-owned runtime state. Thread joins live in
     /// run() and must execute before this cleanup touches anything workers can
     /// still reference.
     pub fn deinitOwnedState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
-        self.clearResults();
-        self.results.deinit(self.gpa);
-        self.results = .empty;
+        self.search.deinit(self.gpa);
         self.episodes.freeResults(self.gpa);
         self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
@@ -721,8 +707,8 @@ pub const App = struct {
     }
 
     fn selectedAnime(self: *const App) ?Anime {
-        if (self.results.items.len == 0 or self.list_cursor >= self.results.items.len) return null;
-        return self.results.items[self.list_cursor];
+        if (self.search.results.items.len == 0 or self.list_cursor >= self.search.results.items.len) return null;
+        return self.search.results.items[self.list_cursor];
     }
 
     /// The focused record, in the History view's §5.4 grouped order. Delegates to
@@ -873,19 +859,6 @@ pub const App = struct {
         }
     }
 
-    /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
-    /// missing or out-of-range year collapses the whole date to null (a date with
-    /// no year isn't a date); month/day independently degrade to "not provided".
-    fn dateFromRecord(rec: AnimeRecord) ?domain.Date {
-        const y = rec.start_year orelse return null;
-        const year = std.math.cast(u32, y) orelse return null;
-        return .{
-            .year = year,
-            .month = if (rec.start_month) |m| std.math.cast(u32, m) else null,
-            .day = if (rec.start_day) |d| std.math.cast(u32, d) else null,
-        };
-    }
-
     /// A borrowed view: the returned `Anime`'s slice fields (name, genres,
     /// status, …) alias `rec`'s arena memory — this is NOT an ownership transfer.
     /// Used transiently on the stack within render/nav; never store it past the
@@ -903,7 +876,7 @@ pub const App = struct {
             .total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null,
             .year = if (rec.year) |x| std.math.cast(u32, x) else null,
             .season = if (rec.season) |tag| domain.Season.fromString(tag) else null,
-            .start_date = dateFromRecord(rec),
+            .start_date = rec.startDate(),
             .status = rec.status,
             .description = rec.description,
             .genres = rec.genres,
@@ -990,7 +963,7 @@ pub const App = struct {
     /// touch, so no settle debounce is needed. Gates the cover-settle timer (ROD-202).
     fn coverTracksCursor(self: *const App) bool {
         if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
-            return self.results.items.len > 0;
+            return self.search.results.items.len > 0;
         }
         return self.active_view == .history and self.term_cols >= pane_split_min;
     }
@@ -1129,21 +1102,21 @@ pub const App = struct {
 
     fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
         if (builtin.is_test) return;
-        if (count == 0 or offset >= self.results.items.len) return;
+        if (count == 0 or offset >= self.search.results.items.len) return;
 
         if (self.enrich_thread != null) {
-            self.pending_enrich = .{ .offset = offset, .count = count };
+            self.search.pending_enrich = .{ .offset = offset, .count = count };
             return;
         }
 
-        const slice = self.results.items[offset..@min(self.results.items.len, offset + count)];
+        const slice = self.search.results.items[offset..@min(self.search.results.items.len, offset + count)];
         var unresolved: usize = 0;
         for (slice) |a| {
             if (a.anilist_id == null or a.thumb == null or a.description == null or a.score == null) unresolved += 1;
         }
         if (unresolved == 0) return;
 
-        const q_copy = self.gpa.dupe(u8, self.querySlice()) catch return;
+        const q_copy = self.gpa.dupe(u8, self.search.querySlice()) catch return;
         var copied = std.ArrayListUnmanaged(Anime).empty;
         copied.ensureTotalCapacity(self.gpa, slice.len) catch {
             self.gpa.free(q_copy);
@@ -1178,56 +1151,6 @@ pub const App = struct {
         // pointing past the visible range when history reloads.
         const cap = self.filteredHistoryLen();
         if (self.list_cursor >= cap) self.list_cursor = if (cap == 0) 0 else cap - 1;
-    }
-
-    fn hydrateAnimeFromRecord(self: *App, a: *Anime, rec: AnimeRecord) void {
-        if (a.english_name == null) a.english_name = dupeOptText(self.gpa, rec.title_english) catch a.english_name;
-        if (a.native_name == null) a.native_name = dupeOptText(self.gpa, rec.native_name) catch a.native_name;
-        if (a.thumb == null) a.thumb = dupeOptText(self.gpa, rec.cover_url) catch a.thumb;
-        if (a.status == null) a.status = dupeOptText(self.gpa, rec.status) catch a.status;
-        if (a.description == null) a.description = dupeOptText(self.gpa, rec.description) catch a.description;
-        if (a.kind == null) a.kind = dupeOptText(self.gpa, rec.kind) catch a.kind;
-        if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
-        if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
-        if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
-        if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
-        if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
-        // Season/start_date are pure values (no heap); genres is deep-copied into
-        // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
-        if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
-        if (a.start_date == null) a.start_date = dateFromRecord(rec);
-        if (a.genres.len == 0) a.genres = dupeOwnedStrList(self.gpa, rec.genres) catch a.genres;
-    }
-
-    fn hydrateResultsFromStore(self: *App, source_name: []const u8, offset: usize, count: usize) void {
-        const st = self.store orelse return;
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
-
-        const end = @min(self.results.items.len, offset + count);
-        var i = offset;
-        while (i < end) : (i += 1) {
-            const source_id = self.results.items[i].id;
-            const rec = st.getAnime(arena.allocator(), source_name, source_id) catch null orelse continue;
-            self.hydrateAnimeFromRecord(&self.results.items[i], rec);
-        }
-    }
-
-    fn persistResults(self: *App, source_name: []const u8, offset: usize, count: usize, visible: bool) void {
-        const st = self.store orelse return;
-        // Scratch arena for the per-row genres-blob join (reset each iteration so
-        // it can't grow across a whole search page). Reset-retaining keeps the
-        // backing capacity, so it's one alloc amortized over the page.
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
-        const end = @min(self.results.items.len, offset + count);
-        var i = offset;
-        while (i < end) : (i += 1) {
-            var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], self.translation);
-            rec.history_visible = visible;
-            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
-            _ = arena.reset(.retain_capacity);
-        }
     }
 
     // ── tick: fold one event into state ──────────────────────────────────────
@@ -1269,7 +1192,7 @@ pub const App = struct {
             .task_error => |msg| {
                 self.load_error = msg;
                 self.history_loading = false;
-                self.search_loading = false;
+                self.search.loading = false;
                 self.debounce_deadline_ms = 0;
                 self.cover_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
@@ -1277,13 +1200,13 @@ pub const App = struct {
             },
             .search_done => |ev| {
                 // Stale check: ignore if query has changed since this search was fired.
-                if (!std.mem.eql(u8, ev.for_query, self.querySlice())) {
+                if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.for_query);
                     self.gpa.free(ev.results);
                     return;
                 }
-                self.search_loading = false;
+                self.search.loading = false;
                 self.async_start_ms = 0;
                 // Clear persistent search-error toasts on a good result.
                 for (&self.toast_queue) |*slot| {
@@ -1292,13 +1215,13 @@ pub const App = struct {
                     }
                 }
                 if (ev.page == 1) {
-                    self.clearResults(); // free old data
+                    self.search.clearResults(self.gpa); // free old data
                 }
-                const offset = self.results.items.len;
-                self.search_page = ev.page;
-                // Take ownership: append results into self.results, which already holds
+                const offset = self.search.results.items.len;
+                self.search.page = ev.page;
+                // Take ownership: append results into self.search.results, which already holds
                 // old page(s) for page > 1. The strings are already gpa-owned.
-                self.results.appendSlice(self.gpa, ev.results) catch |e| {
+                self.search.results.appendSlice(self.gpa, ev.results) catch |e| {
                     // OOM appending this page — the duped Anime in ev.results would
                     // otherwise leak (we free the outer slice but not the elements).
                     log.debug("appending search results failed: {s}", .{@errorName(e)});
@@ -1311,14 +1234,14 @@ pub const App = struct {
                     self.list_cursor = 0;
                     self.list_top = 0;
                 }
-                const added = self.results.items.len - offset;
+                const added = self.search.results.items.len - offset;
                 const source_name = provider.name();
-                self.hydrateResultsFromStore(source_name, offset, added);
-                self.persistResults(source_name, offset, added, false);
+                self.search.hydrateResultsFromStore(self.gpa, self.store, source_name, offset, added);
+                self.search.persistResults(self.gpa, self.store, source_name, self.translation, offset, added, false);
                 self.fireEnrich(loop, io, offset, added);
             },
             .search_enriched => |ev| {
-                if (!std.mem.eql(u8, ev.for_query, self.querySlice())) {
+                if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.results);
                     self.gpa.free(ev.for_query);
@@ -1326,8 +1249,8 @@ pub const App = struct {
                         t.join();
                         self.enrich_thread = null;
                     }
-                    if (self.pending_enrich) |p| {
-                        self.pending_enrich = null;
+                    if (self.search.pending_enrich) |p| {
+                        self.search.pending_enrich = null;
                         self.fireEnrich(loop, io, p.offset, p.count);
                     }
                     return;
@@ -1335,7 +1258,7 @@ pub const App = struct {
                 const source_name = provider.name();
                 for (ev.results) |enriched| {
                     var replaced = false;
-                    for (self.results.items[ev.offset..@min(self.results.items.len, ev.offset + ev.results.len)]) |*live| {
+                    for (self.search.results.items[ev.offset..@min(self.search.results.items.len, ev.offset + ev.results.len)]) |*live| {
                         if (std.mem.eql(u8, live.id, enriched.id)) {
                             freeOwnedAnime(self.gpa, live.*);
                             live.* = enriched;
@@ -1347,13 +1270,13 @@ pub const App = struct {
                 }
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
-                self.persistResults(source_name, ev.offset, ev.results.len, false);
+                self.search.persistResults(self.gpa, self.store, source_name, self.translation, ev.offset, ev.results.len, false);
                 if (self.enrich_thread) |t| {
                     t.join();
                     self.enrich_thread = null;
                 }
-                if (self.pending_enrich) |p| {
-                    self.pending_enrich = null;
+                if (self.search.pending_enrich) |p| {
+                    self.search.pending_enrich = null;
                     self.fireEnrich(loop, io, p.offset, p.count);
                 }
             },
@@ -1417,7 +1340,7 @@ pub const App = struct {
                 }
                 self.cover.loading = false;
                 self.cover.joinThread();
-                if (!self.search_loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
+                if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
 
                 // The result is stale if the selection moved off this id while
                 // the fetch was in flight; the controller owns that nav check.
@@ -1439,7 +1362,7 @@ pub const App = struct {
                 if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return;
                 self.cover.loading = false;
                 self.cover.joinThread();
-                if (!self.search_loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
+                if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
                 // Record the failed url *before* clear() frees it.
                 self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
                 self.cover.clear(self.gpa);
@@ -1471,7 +1394,7 @@ pub const App = struct {
                 self.spinner_frame = (self.spinner_frame + 1) % 10;
                 if (self.debounce_deadline_ms > 0 and now >= self.debounce_deadline_ms) {
                     self.debounce_deadline_ms = 0;
-                    self.clearResults();
+                    self.search.clearResults(self.gpa);
                     self.fireSearch(loop, io, provider, 1);
                 }
                 // The cursor settled: fetch the cover for the show it landed on
@@ -1525,7 +1448,7 @@ pub const App = struct {
     }
 
     fn fireSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, page: u32) void {
-        const q = self.querySlice();
+        const q = self.search.querySlice();
         if (q.len == 0) return;
         // Join any previous search thread before spawning a new one. This bounds
         // concurrent threads to 1 and prevents `loop`/`gpa` use-after-free on quit.
@@ -1536,13 +1459,13 @@ pub const App = struct {
             self.search_thread = null;
         }
         const q_copy = self.gpa.dupe(u8, q) catch return;
-        self.search_loading = true;
+        self.search.loading = true;
         self.async_start_ms = self.now_ms;
         self.search_thread = std.Thread.spawn(.{}, searchTask, .{
             loop, self.gpa, io, provider, q_copy, page, self.translation,
         }) catch {
             self.gpa.free(q_copy);
-            self.search_loading = false;
+            self.search.loading = false;
             return;
         };
     }
@@ -1628,7 +1551,7 @@ pub const App = struct {
     /// to focus into, so Enter/Space must reach the grid via the zoom (otherwise
     /// they only flip active_pane to a pane that isn't drawn — the regression).
     fn openBrowseZoom(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        if (self.results.items.len == 0) return;
+        if (self.search.results.items.len == 0) return;
         self.detail_origin = .browse;
         self.active_view = .detail;
         self.active_pane = .detail;
@@ -1715,72 +1638,59 @@ pub const App = struct {
         self.async_start_ms = self.now_ms;
     }
 
+    /// Drive a key into the search prompt and project the controller's verdict
+    /// (ROD-219, the SettingsState keystone). History view filters the in-memory
+    /// watchlist — nav state, so it stays here in `onHistoryFilterKey`. Browse
+    /// drives `SearchController.onKey`, which owns the query + results; App then
+    /// applies the verdict onto nav mode, the debounce timer, and the fire
+    /// transport — the three things the controller deliberately never touches.
     fn onSearchKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        // History view: local in-memory filter — no network calls.
-        if (self.active_view == .history) {
-            if (key.matches(vaxis.Key.escape, .{})) {
-                self.history_filter_len = 0;
+        // History view: local in-memory filter — no network, no search controller.
+        if (self.active_view == .history) return self.onHistoryFilterKey(key);
+
+        const debounce_pending = self.debounce_deadline_ms > 0;
+        switch (self.search.onKey(self.gpa, key, debounce_pending)) {
+            .ignored => {},
+            .edited => self.debounce_deadline_ms = nowMs(io) + 300,
+            .cleared => |c| {
+                self.debounce_deadline_ms = 0;
+                if (c.exit) self.input_mode = .normal;
+            },
+            .submit => |sub| {
+                if (sub.fire) {
+                    self.debounce_deadline_ms = 0;
+                    self.fireSearch(loop, io, provider, 1);
+                }
+                self.input_mode = .normal;
+            },
+        }
+    }
+
+    /// History view's in-memory watchlist filter (no network). Owns the
+    /// `history_filter` buffer + the cursor/viewport reset that keeps the
+    /// selection valid as the filtered set shrinks. Stays on App: this is
+    /// history/nav state, never search — the search half moved to
+    /// `SearchController.onKey` when ROD-219 split the fused handler.
+    fn onHistoryFilterKey(self: *App, key: vaxis.Key) void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.history_filter_len = 0;
+            self.list_cursor = 0;
+            self.list_top = 0;
+            self.input_mode = .normal;
+        } else if (key.matches(vaxis.Key.enter, .{})) {
+            self.input_mode = .normal;
+        } else if (key.matches(vaxis.Key.backspace, .{})) {
+            if (self.history_filter_len > 0) {
+                self.history_filter_len -= 1;
                 self.list_cursor = 0;
                 self.list_top = 0;
-                self.input_mode = .normal;
-            } else if (key.matches(vaxis.Key.enter, .{})) {
-                self.input_mode = .normal;
-            } else if (key.matches(vaxis.Key.backspace, .{})) {
-                if (self.history_filter_len > 0) {
-                    self.history_filter_len -= 1;
-                    self.list_cursor = 0;
-                    self.list_top = 0;
-                }
-            } else if (key.text) |text| {
-                if (text.len > 0 and self.history_filter_len + text.len <= 127) {
-                    @memcpy(self.history_filter[self.history_filter_len..][0..text.len], text);
-                    self.history_filter_len += text.len;
-                    self.list_cursor = 0;
-                    self.list_top = 0;
-                }
             }
-            return;
-        }
-
-        // Esc: clear query + any pending debounce, return to normal mode.
-        if (key.matches(vaxis.Key.escape, .{})) {
-            self.search_len = 0;
-            self.clearResults();
-            self.search_loading = false;
-            self.debounce_deadline_ms = 0;
-            self.input_mode = .normal;
-            return;
-        }
-        // Enter: bypass debounce — fire immediately if pending, then lock results.
-        if (key.matches(vaxis.Key.enter, .{})) {
-            if (self.debounce_deadline_ms > 0 and self.search_len > 0) {
-                self.debounce_deadline_ms = 0;
-                self.clearResults();
-                self.fireSearch(loop, io, provider, 1);
-            }
-            self.input_mode = .normal;
-            return;
-        }
-        // Backspace: pop last char, schedule re-search via debounce.
-        if (key.matches(vaxis.Key.backspace, .{})) {
-            if (self.search_len > 0) {
-                self.search_len -= 1;
-                if (self.search_len == 0) {
-                    self.clearResults();
-                    self.search_loading = false;
-                    self.debounce_deadline_ms = 0;
-                } else {
-                    self.debounce_deadline_ms = nowMs(io) + 300;
-                }
-            }
-            return;
-        }
-        // Printable: append and arm debounce — don't fire immediately.
-        if (key.text) |text| {
-            if (text.len > 0 and self.search_len + text.len <= 127) {
-                @memcpy(self.search_query[self.search_len..][0..text.len], text);
-                self.search_len += text.len;
-                self.debounce_deadline_ms = nowMs(io) + 300;
+        } else if (key.text) |text| {
+            if (text.len > 0 and self.history_filter_len + text.len <= 127) {
+                @memcpy(self.history_filter[self.history_filter_len..][0..text.len], text);
+                self.history_filter_len += text.len;
+                self.list_cursor = 0;
+                self.list_top = 0;
             }
         }
     }
@@ -1940,7 +1850,7 @@ pub const App = struct {
         if (self.input_mode == .normal and (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}))) {
             switch (self.active_view) {
                 .browse => {
-                    if (self.active_pane == .list and self.results.items.len > 0) {
+                    if (self.active_pane == .list and self.search.results.items.len > 0) {
                         if (self.term_cols >= pane_split_min) {
                             // Two-pane: reveal/focus the detail pane + lazy-load the
                             // episode grid (ROD-202). The fetch lands through its own
@@ -2192,7 +2102,7 @@ pub const App = struct {
         // List navigation (history + browse list pane).
         const nav_len: usize = switch (self.active_view) {
             .history => self.filteredHistoryLen(),
-            .browse => self.results.items.len,
+            .browse => self.search.results.items.len,
             .detail, .settings => return,
         };
         if (nav_len == 0) return;
@@ -2221,11 +2131,11 @@ pub const App = struct {
         if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and
             self.active_view == .browse and
             self.list_cursor == nav_len - 1 and
-            self.search_page > 0 and
+            self.search.page > 0 and
             nav_len % source_mod.search_page_size == 0 and
-            !self.search_loading)
+            !self.search.loading)
         {
-            self.fireSearch(loop, io, provider, self.search_page + 1);
+            self.fireSearch(loop, io, provider, self.search.page + 1);
         }
     }
 

@@ -206,6 +206,19 @@ pub const AnimeRecord = struct {
             .genres = a.genres,
         };
     }
+
+    /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
+    /// missing or out-of-range year collapses the whole date to null (a date with
+    /// no year isn't a date); month/day independently degrade to "not provided".
+    pub fn startDate(rec: AnimeRecord) ?domain.Date {
+        const y = rec.start_year orelse return null;
+        const year = std.math.cast(u32, y) orelse return null;
+        return .{
+            .year = year,
+            .month = if (rec.start_month) |m| std.math.cast(u32, m) else null,
+            .day = if (rec.start_day) |d| std.math.cast(u32, d) else null,
+        };
+    }
 };
 
 pub const Resume = struct {
