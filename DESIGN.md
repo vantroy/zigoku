@@ -6,9 +6,10 @@
 > buildable thing. When there are gaps, this doc fills them with a deliberate call and
 > labels it as such. Do not leave states unimplemented because "the design didn't say."
 >
-> **M3 data rendering is governed by §9.** AllAnime is the sole live source; AniList
-> enrichment (covers, scores, status chips, genres, synopsis) arrives in M4/M5. §9
-> specifies exactly what every surface renders when those fields are null.
+> **Data rendering is governed by §9.** AllAnime supplies most fields at search time
+> (titles, cover, score, season, episode counts); AniList enrichment backfills the
+> AniList-only fields (status chips, genres, synopsis) and any gaps. §9 specifies what
+> every surface renders, and the degrade fallback when a field is still null.
 
 ---
 
@@ -1380,76 +1381,87 @@ revisited without archaeology.
 
 ---
 
-## 9. M3 Data Reality — AllAnime-first, degrade-by-design
+## 9. Data Reality — AllAnime-first, degrade-by-design
 
 This section supersedes any AniList-sourced assumptions in §§1–8. It does not
 replace those sections — it governs how the Terminal Ghost chrome specified there
-renders when the fields those sections assume are null. In M3 they almost always
-are.
+renders when a field those sections assume is still null, either because AniList
+enrichment hasn't completed yet or because a show has no AniList record.
 
-**The model.** AllAnime search fills exactly three fields of `domain.Anime`:
-`id`, `name`, `eps_sub` / `eps_dub`. Everything else — `thumb`, `banner`,
-`mal_id`, `anilist_id`, `year`, `status`, `description`, `genres`, `score`,
-`studios`, `kind` — is `null` until enrichment lands (M4: cover art + metadata;
-M5: AniSkip / MAL). The `Store` (`AnimeRecord`) persists what the search gave us
-and carries nullable enrichment columns (`cover_url`, `mal_id`, `anilist_id`,
-`total_episodes`) that are blank until a future enrichment write fills them in.
+**The model.** AllAnime search fills most of `domain.Anime` at search time (see
+`edgeToAnime`): `id`, `name`, `english_name`, `native_name`, `thumb`, `anilist_id`,
+`kind`, `score` (rescaled 0–10 → 0–100), `eps_sub` / `eps_dub`, `year`, `season`.
+The AniList-only fields — `status`, `description`, `genres`, `studios`, `mal_id`,
+`banner` — plus any of the above that AllAnime left null are backfilled by
+**enrichment**: a background task fired after each search (`workers.zig`) that merges
+AniList metadata *fill-if-null* (AniSkip / MAL ride along). The `Store`
+(`AnimeRecord`) persists what it has and carries nullable columns (`cover_url`,
+`mal_id`, `anilist_id`, `total_episodes`) that stay blank until enrichment writes them.
 
-**The strategy.** Build the full Terminal Ghost chrome now. Let the null fields
-render in explicit, consistent degrade states. The UI should look intentional, not
-broken. A user on M3 should read the screen and understand it — not see a crash
-or a wall of missing values. The degrade states become invisible the moment M4
-writes the enriched data; no code changes required at those call sites.
+**The strategy.** The full Terminal Ghost chrome renders from whatever is present;
+AniList-only fields still null (no enrichment hit yet, or a show AniList doesn't
+have) render in explicit, consistent degrade states. The UI looks intentional, not
+broken — a screen with partial data reads clearly rather than crashing or showing a
+wall of blanks. The degrade states vanish *per-anime* the moment enrichment writes
+the data; no code changes required at those call sites.
 
 ---
 
 ### 9.1 Data Availability Matrix
 
-What is available per surface in M3 vs what is enrichment. "Available" means the
-field can be non-null in M3. "Enrichment" means it is always null in M3 and the
-degrade rendering applies. All degrade tokens reference §1.2 aliases.
+What each surface renders, and from where. AllAnime supplies some fields at search
+time; **AniList enrichment** — a background task that runs after every search
+(`workers.zig`) — backfills the rest. A field renders when it has a value and falls
+back to the degrade rendering below **when that particular anime has no value** (no
+AniList hit, or enrichment hasn't completed yet). The degrade rules are still live —
+as per-anime fallbacks, not a global empty state. Degrade tokens reference §1.2
+aliases.
 
-| Surface | Available in M3 | Enrichment (M4/M5) | M3 degrade rendering |
+| Surface · Field | Source | Rendered when present | Fallback when missing |
 |---|---|---|---|
-| **List row — title** | `domain.Anime.name` (always present) | `english_name` (optional alt) | Render `name` directly. No fallback needed. |
-| **List row — score** | nothing | AniList score (M4) | Render `[--/100]` in `color.fg3` ([d]). Score column is always 10 chars wide — the placeholder preserves that reservation. |
-| **List row — status glyph** | `store.AnimeRecord.list_status` (watching/planning/etc) | airing status (M4) | Use §2.4 watchlist glyph from DB `list_status`. The `◉` airing glyph is suppressed — `status` is null. |
-| **Detail pane — title** | `domain.Anime.name` | `english_name` | Render `name` in `color.fg` + bold. No subtitle line. |
-| **Detail pane — kanji status chip** | nothing | AniList `status` (M4) | Omit entirely. Do not render an empty chip or a placeholder span. The line simply reads: title only. |
-| **Detail pane — season chip** | nothing | AniList `season`/`year` (M4) | Omit entirely. Same rule as above — never render an empty chip. |
-| **Detail pane — score** | nothing | AniList score (M4) | Render `[--/100]` in [d] where the score line appears in the detail header. Omit the `✦` prefix and genre list entirely when score is null (no separators `·` for fields that do not exist). |
-| **Detail pane — cover art block** | nothing | cover URL (M4) | Render the §3.3 cell block filled with `color.surface` ([bg.surface]). Centered in the block: `no art yet` in [d] + italic. No spinner — this is a persistent absent state, not a loading state. The block still occupies its reserved cell dimensions; layout does not collapse. |
-| **Detail pane — episode count line** | `eps_sub` / `eps_dub` from AllAnime search (may be 0 if no episodes listed yet) | `total_episodes` from AniList (M4) | Render `N eps` from `eps_sub` or `eps_dub` per active translation. If both are 0, render `? eps` in [d]. Omit `kind` and `studios` segments — no separators for absent fields. |
-| **Detail pane — synopsis** | nothing | AniList description (M4) | Render a single line: `no synopsis yet` in [m] + italic. Word-wrap does not apply to a one-liner. |
-| **Detail pane — genres** | nothing | AniList genres (M4) | Omit entirely. Do not render the genres row or its `·` separator. |
-| **History view — progress bar** | `store.AnimeRecord.progress` (episode count), `total_episodes` (may be null) | — | If `total_episodes` is null, render `[████░░░░…]  N / ? eps` — the bar draws filled cells proportional to `progress` / `eps_sub` if `eps_sub` > 0, else fills to one-third width as a non-zero signal. Fraction text: `N / ?` in [m]. |
-| **History view — season chip** | nothing | AniList season (M4) | Omit. The history row title + progress bar + status glyph is sufficient. |
-| **History view — score badge** | nothing | AniList score (M4) | Omit. The `[NN]` score badge shown in §5.4 is not rendered in M3 — the space is reclaimed by the title. |
-| **Episode grid** | episode labels from AllAnime `episodes()` call (live fetch) | — | Episode grid renders normally from live data. The `total_episodes` field is not used for grid construction — AllAnime provides the actual list. |
+| **Browse · score** | AllAnime / AniList `score` | *(planned — ROD-226)* | not rendered yet — the score is already on the record (AllAnime fills it at search time); only the render is missing. Browse meta shows `N sub` / `N dub` |
+| **Detail · title + alt titles** | AllAnime `name` / `english_name` / `native_name`; AniList fills missing alts | romaji bold, then english + native (italic) alt lines when present and distinct (`drawAltTitles`) | romaji only — no empty alt lines |
+| **Detail · status chip** | AniList `status` (enrichment-only) | kanji status chip (`statusChipFor`) | omitted — no empty chip or placeholder span |
+| **Detail · season chip** | AllAnime `season` / `year`; AniList fills if null | `冬 2026`-style chip when both season and year are known | omitted — never an empty chip |
+| **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
+| **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
+| **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
+| **Detail · episode count** | AllAnime `eps_sub` / `eps_dub`; AniList `total_episodes` | `N eps` for the active translation | `? eps` in `[d]` when both sources are absent; `kind` / `studios` segments omitted |
+| **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
+| **History · row meta** | DB `progress`, `total_episodes`, `list_status` | `ep N/M · status` (`render.formatMeta`) | `ep N · status` when `total_episodes` is null — see the N7 note below |
+| **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
+| **History · season chip** | — | not rendered | the history row is title + progress bar + meta; no chip |
+| **History · score badge** | — | not rendered | the `[NN]` badge from §5.4 is omitted; the space is reclaimed by the title |
+| **Episode grid** | AllAnime `episodes()` live fetch | the episode-label grid | loading spinner during fetch; absent-state when no results — `total_episodes` is unused, AllAnime provides the actual list |
 
-**Implementation note on the score placeholder.** `[--/100]` is always rendered
-in [d] in M3 — it does not participate in the score tier rules of §2.2. Those
-rules apply only to real integer scores. A null score is not a score of 0.
+The Browse / search list rows render the romaji `name`; applying a user title-language
+preference there (English / Native) is tracked in ROD-205. The `score` row above is the
+only Browse field still pending (ROD-226). There is **no status glyph** on Browse /
+search rows: History rows come from the local store, so their watch-state is already
+loaded (hence History's status chips), but Browse results come from AllAnime and carry
+no watch-state — a glyph there would need a per-row local-DB (or cache) lookup the
+search path doesn't otherwise do. Terminal Ghost keeps the search path fast (see the
+§9.5 no-glyph decision).
 
-**Implementation note on the cover block.** The "no art yet" persistent state is
-distinct from the §4.8 loading spinner. The spinner appears while an in-flight
-fetch is pending. The "no art yet" state appears when there is no fetch to run —
-`cover_url` is null and no enrichment has been written. The two must not be
-conflated in code. In M3, the cover block goes directly to "no art yet" state on
-render without attempting any network call.
+**Score fallback.** `[--/100]` is the fallback when `score` is null; it does not
+participate in the §2.2 score-tier rules (those apply to real integer scores only).
+A null score is not a score of 0.
 
-**Implementation note on the History row meta (N7, ROD-138).** The History list's
-right-meta column renders `ep N/M · status` (e.g. `ep 6/13 · planning`) via
-`render.formatMeta`. When `total_episodes` is null it degrades to `ep N · status`
-(progress only, no denominator). This is the canonical meta format for the column;
-it is not superseded by enrichment — M4 score/season chips have not rewritten it,
-they remain omitted per the rows above.
+**Cover fallback.** The `no art yet` state (rendered when `thumb` is null — neither
+AllAnime nor AniList supplied a URL) is distinct from the §4.8 loading spinner (an
+in-flight fetch). The two must not be conflated in code: the spinner means "fetching",
+`no art yet` means "nothing to fetch".
+
+**History row meta (N7, ROD-138).** The History list's right-meta column renders
+`ep N/M · status` (e.g. `ep 6/13 · planning`) via `render.formatMeta`. When
+`total_episodes` is null it degrades to `ep N · status` (progress only, no
+denominator). This is the canonical meta format for the column.
 
 ---
 
 ### 9.2 History as Landing View
 
-In M3, the app opens to the History/Watchlist view. This is Rod's settled
+The app opens to the History/Watchlist view. This is Rod's settled
 decision: History is home. Even when future Browse lists (trending, top-of-week)
 exist, the user lands in History first. Browse is reached by keybind `H` from
 History.
@@ -1589,21 +1601,24 @@ and returns the UI to normal state.
 
 ### 9.4 Re-labeling the AniList-catalog Surfaces
 
-The following surfaces in §§3–7 contain AniList-specific copy or types that no
-longer match the architecture. These are the correct M3 readings.
+The following surfaces in §§3–7 carry AniList-catalog copy or types that predate the
+live architecture (AllAnime search + AniList background enrichment). These are the
+corrected readings.
 
 #### §3.5 — `:sync` command
 
-`:sync` was specified as "force AniList catalog sync." In M3 there is no AniList
-catalog — search is live against AllAnime on every `/` query. `:sync` has no
-meaning in M3 and must not be wired to any action. Its correct M3 disposition:
+`:sync` was specified as "force AniList catalog sync." There is no pre-fetched
+AniList catalog — search is live against AllAnime on every `/` query, and AniList
+enrichment runs **automatically** as a background task after each search, so the
+automatic path needs no manual sync. Its disposition:
 
-- Remove `:sync` from the M3 command table in §6.3.
-- The `:sync` slot is reserved for M4+ enrichment refresh (forcing a re-fetch of
-  AniList metadata for items already in the local DB). Until M4 ships, unknown
-  command handling applies: flash [h] for 800ms, return to idle.
-- The `[~]` / `BTN_SYNC` glyph is similarly reserved for M4+ use. Do not render
-  it in M3 for any active-sync indicator.
+- Command mode itself is unshipped (tracked by ROD-136); there is no `:sync` to wire
+  today. It is not in the §6.3 command table.
+- When command mode lands, the `:sync` slot is reserved for a **manual enrichment
+  refresh** — re-fetching AniList metadata for items already in the local DB (the
+  automatic post-search enrichment covers the common case).
+- The `[~]` / `BTN_SYNC` glyph is correspondingly reserved for a manual-refresh
+  indicator; it is not rendered for the automatic background enrichment.
 
 #### §5.5 Settings — Catalog section (M3 disposition superseded — see §5.5)
 
@@ -1627,8 +1642,9 @@ no hint) and skipped by `j`/`k` navigation. `enrichment sync` now reads `automat
 #### §5.6 Loading / Now Resolving — startup copy
 
 The startup loading state references "syncing AniList catalog" — that is wrong.
-In M3, startup does two things: opens the local SQLite DB and loads history. It
-does not contact AniList. The corrected copy:
+On startup the app does two things: opens the local SQLite DB and loads history.
+It does not contact AniList — enrichment fires only after a search returns
+results, never on startup. The corrected copy:
 
 ```
   ZIGOKU  ░  Watchlist  冬 2024                                                   ·
@@ -1653,20 +1669,21 @@ open is measurably slow (e.g., migration in progress on a large existing DB).
 to `taking a moment…` — identical to the §5.6 slow rule, just with corrected
 copy.
 
-There is no "syncing AniList catalog" state in M3. Any AllAnime search is
-triggered by the user explicitly via `/`, never automatically on startup.
+There is no "syncing AniList catalog" startup state. AllAnime search is triggered
+by the user via `/`, and AniList enrichment runs after results arrive — never
+automatically on startup.
 
 #### §7.6 State Machine — `results` field type
 
 The §7.6 state machine specifies `results: []AniListEntry`. The correct type is
 `[]domain.Anime` — the source-agnostic domain type filled by whatever
-`SourceProvider` is active (AllAnime in M3). Similarly `selected: ?AniListEntry`
+`SourceProvider` is active (AllAnime today). Similarly `selected: ?AniListEntry`
 becomes `selected: ?domain.Anime`.
 
 The corrected state machine diff:
 
 ```zig
-// §7.6 corrected for M3
+// §7.6 corrected (source-agnostic; enrichment live)
 AppState {
     mode:          enum { browse, history, settings, detail }
     input_mode:    enum { normal, search, command }
@@ -1676,17 +1693,17 @@ AppState {
     search_query:  []u8
     results:       []domain.Anime      // was []AniListEntry
     selected:      ?domain.Anime       // was ?AniListEntry
-    cover_image:   ?vaxis.Image        // null in M3 — no cover URL to fetch
+    cover_image:   ?vaxis.Image        // fetched once `thumb` is non-null (AllAnime/AniList)
     loading:       bool
-    sync_active:   bool                // reserved for M4+ enrichment sync; false in M3
+    sync_active:   bool                // a manual-refresh flag (auto enrichment is background)
     source_error:  bool                // NEW: persistent unreachable state (§9.3b)
     toast_queue:   []Toast
 }
 ```
 
-`sync_active` remains in the struct so M4 can wire it without a state machine
-change. It is always `false` in M3. `source_error` is new — it drives the §9.3b
-unreachable rendering.
+`sync_active` stays in the struct for a future manual-refresh path (the automatic
+post-search enrichment needs no flag); it is currently always `false`.
+`source_error` drives the §9.3b unreachable rendering.
 
 ---
 
@@ -1694,10 +1711,11 @@ unreachable rendering.
 
 | Decision | Rationale | Revisit trigger |
 |---|---|---|
-| Cover block renders "no art yet" (persistent absent) not a spinner | A spinner implies a fetch is in flight. In M3 there is no cover URL to fetch. Showing a spinner would be a lie. The absent state must be visually distinct from loading. | When M4 writes `cover_url` to the DB, the cover block switches to the §4.8 loading spinner immediately on next render. No code change needed at the cover block — just the URL going non-null. |
-| Score placeholder `[--/100]` in [d] rather than omitting the score field | Preserving the 10-char score reservation in the list row keeps column alignment stable across M3→M4 transition. A missing field would cause the title truncation point to shift when scores arrive. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
-| Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | When M4 fills `status`, chips reappear automatically. No intermediate state needed. |
-| History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source in M3. History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
+| Cover block renders "no art yet" (persistent absent) not a spinner | A spinner implies a fetch is in flight. When there is no cover URL to fetch, a spinner would be a lie. The absent state must be visually distinct from loading. | With covers live, the block uses the §4.8 spinner then the image when a URL is known, and falls back to "no art yet" only when `thumb` stays null. No code change needed at the cover block — it keys off the URL. |
+| Score placeholder `[--/100]` in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
+| Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | Now that enrichment fills `status`, chips appear automatically; the omission is the per-anime fallback for shows with no AniList hit. |
+| No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand — that is why History ships status chips (§5.4). Browse results come from AllAnime over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time — results joined against the store in one pass, or membership held in an in-memory cache — the glyph becomes nearly free; revisit then. |
+| History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land). History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
