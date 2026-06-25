@@ -6,6 +6,23 @@ on:
   pull_request:
 
 jobs:
+  # Formatting gate (ROD-223). A pure lint — no libsqlite3, no build — so it runs
+  # fast and parallel to the build/test jobs. `zig fmt` skips .zig-cache/zig-out,
+  # so `.` checks exactly the source tree. Pins the same Zig as the other jobs;
+  # fmt output is version-sensitive, so a drifting toolchain here would be noise.
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Check formatting
+        run: zig fmt --check .
+
   test:
     runs-on: ubuntu-latest
     steps:
