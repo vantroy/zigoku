@@ -19,6 +19,7 @@ const AnimeRecord = store_mod.AnimeRecord;
 const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const App = app_mod.App;
+const SearchController = app_mod.SearchController;
 const Toast = app_mod.Toast;
 const CoverState = app_mod.CoverState;
 const CoverDecision = app_mod.CoverState.Decision;
@@ -517,14 +518,14 @@ test "Browse P adds the highlighted result to the watchlist as planning (ROD-189
     app.store = &st;
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
     });
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
         app.episodes.freeResults(app.gpa);
     }
 
@@ -878,8 +879,8 @@ test "q typed into a Browse search appends instead of quitting (ROD-210)" {
     try testTick(&app, .{ .key_press = .{ .codepoint = 'q', .text = "q" } });
     try testing.expect(!app.should_quit);
     try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
-    try testing.expectEqual(@as(usize, 1), app.search_len);
-    try testing.expectEqual(@as(u8, 'q'), app.search_query[0]);
+    try testing.expectEqual(@as(usize, 1), app.search.len);
+    try testing.expectEqual(@as(u8, 'q'), app.search.query[0]);
 }
 
 test "q typed into a History filter appends instead of quitting (ROD-210)" {
@@ -929,15 +930,15 @@ test "l in browse list pane switches to detail pane" {
     app.active_pane = .list;
     app.term_cols = 80; // two-pane width: l focuses the detail pane (ROD-194)
     // l requires a selected result.
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
     });
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
     app.episodes.freeResults(app.gpa);
 }
 
@@ -949,21 +950,21 @@ test "Browse load-more fires on Down arrow at the last result, not just j (ROD-1
     // A full page so nav_len % search_page_size == 0 and the cursor can sit at the
     // last row — the exact state that shows the ╌ more ╌ footer.
     const page = source_mod.search_page_size;
-    try app.results.ensureTotalCapacity(std.testing.allocator, page);
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, page);
     for (0..page) |i| {
-        app.results.appendAssumeCapacity(.{
+        app.search.results.appendAssumeCapacity(.{
             .id = try std.fmt.allocPrint(std.testing.allocator, "id{d}", .{i}),
             .name = try std.fmt.allocPrint(std.testing.allocator, "n{d}", .{i}),
         });
     }
     app.list_cursor = page - 1;
-    app.search_page = 1;
+    app.search.page = 1;
     const q = "kimi"; // fireSearch bails on an empty query
-    @memcpy(app.search_query[0..q.len], q);
-    app.search_len = q.len;
+    @memcpy(app.search.query[0..q.len], q);
+    app.search.len = q.len;
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
         app.episodes.freeResults(app.gpa);
     }
 
@@ -971,7 +972,7 @@ test "Browse load-more fires on Down arrow at the last result, not just j (ROD-1
     // triggering page+1 (only 'j' did). fireSearch flips search_loading before it
     // spawns, so that flag proves the next page was requested.
     try testTick(&app, keyEv(vaxis.Key.down, .{}));
-    try testing.expect(app.search_loading);
+    try testing.expect(app.search.loading);
 }
 
 test "h in browse detail pane switches to list pane" {
@@ -999,16 +1000,16 @@ fn singleColumnBrowse(app: *App) !void {
     app.active_view = .browse;
     app.active_pane = .list;
     app.term_cols = 50; // < pane_split_min: single column, no pane
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
     });
 }
 
 fn teardownBrowse(app: *App) void {
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
     app.episodes.freeResults(app.gpa);
 }
 
@@ -1053,14 +1054,14 @@ test "left/right arrows mirror h/l for browse pane switching (ROD-156 #1)" {
     app.active_view = .browse;
     app.active_pane = .list;
     app.term_cols = 80; // two-pane width: right/l focus the detail pane (ROD-194)
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
     });
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
         app.episodes.freeResults(app.gpa);
     }
 
@@ -1101,16 +1102,16 @@ test "browse scrolling fires zero episode fetches; detail entry lazy-loads them 
     app.active_view = .browse;
     app.active_pane = .list;
     app.term_cols = 80; // wide split browse, list focused — the old hover-prefetch trigger
-    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 3);
     inline for (.{ "a", "b", "c" }) |id| {
-        app.results.appendAssumeCapacity(.{
+        app.search.results.appendAssumeCapacity(.{
             .id = try std.testing.allocator.dupe(u8, id),
             .name = try std.testing.allocator.dupe(u8, id),
         });
     }
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
         app.episodes.freeResults(app.gpa);
     }
 
@@ -1137,16 +1138,16 @@ test "browse scrolling debounces the cover fetch; discrete nav syncs at once (RO
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 3);
     inline for (.{ "a", "b", "c" }) |id| {
-        app.results.appendAssumeCapacity(.{
+        app.search.results.appendAssumeCapacity(.{
             .id = try std.testing.allocator.dupe(u8, id),
             .name = try std.testing.allocator.dupe(u8, id),
         });
     }
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
         app.episodes.freeResults(app.gpa);
     }
 
@@ -1213,8 +1214,8 @@ test "browse list pane detail render info uses selected anime" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
         .eps_sub = 12,
@@ -1227,8 +1228,8 @@ test "browse list pane detail render info uses selected anime" {
     try testing.expectEqualStrings("12 eps", info.meta);
     try testing.expect(info.has_meta);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "detailSyncTarget tracks the list cursor in split browse, defers elsewhere (ROD-156)" {
@@ -1236,18 +1237,18 @@ test "detailSyncTarget tracks the list cursor in split browse, defers elsewhere 
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 2);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 2);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "x"),
         .name = try std.testing.allocator.dupe(u8, "X"),
     });
-    app.results.appendAssumeCapacity(.{
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "y"),
         .name = try std.testing.allocator.dupe(u8, "Y"),
     });
     defer {
-        for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-        app.results.deinit(std.testing.allocator);
+        for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+        app.search.results.deinit(std.testing.allocator);
     }
 
     // Narrow terminal: no split pane, so the cover target defers to
@@ -1686,30 +1687,61 @@ test "search mode: Esc clears query and returns to normal" {
     var app: App = .{};
     app.active_view = .browse;
     app.input_mode = .search;
-    app.search_len = 5;
-    @memcpy(app.search_query[0..5], "hello");
+    app.search.len = 5;
+    @memcpy(app.search.query[0..5], "hello");
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(.normal, app.input_mode);
-    try testing.expectEqual(@as(usize, 0), app.search_len);
+    try testing.expectEqual(@as(usize, 0), app.search.len);
 }
 
 test "search mode: Enter locks results and returns to normal" {
     var app: App = .{};
     app.active_view = .browse;
     app.input_mode = .search;
-    app.search_len = 5;
-    @memcpy(app.search_query[0..5], "hello");
+    app.search.len = 5;
+    @memcpy(app.search.query[0..5], "hello");
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
     try testing.expectEqual(.normal, app.input_mode);
-    try testing.expectEqual(@as(usize, 5), app.search_len); // query preserved
+    try testing.expectEqual(@as(usize, 5), app.search.len); // query preserved
+}
+
+test "search mode: Backspace to empty clears results and cancels the debounce" {
+    // ROD-219 split regression guard: emptying the query via backspace must drop
+    // the results, clear the in-flight flag, and cancel an armed debounce — but
+    // stay in search mode (the `.cleared{exit:false}` verdict, vs Esc's exit).
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.input_mode = .search;
+    app.search.len = 1;
+    app.search.query[0] = 'h';
+    app.search.loading = true;
+    app.debounce_deadline_ms = 999_999; // an armed (pending) debounce
+
+    // A prior result is present; emptying the query must free + drop it (a missed
+    // free trips the testing allocator).
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "id"),
+        .name = try std.testing.allocator.dupe(u8, "Owned"),
+    });
+    defer app.search.results.deinit(std.testing.allocator);
+
+    try testTick(&app, keyEv(vaxis.Key.backspace, .{}));
+
+    try testing.expectEqual(@as(usize, 0), app.search.len);
+    try testing.expectEqual(@as(usize, 0), app.search.results.items.len);
+    try testing.expectEqual(@as(i64, 0), app.debounce_deadline_ms);
+    try testing.expect(!app.search.loading);
+    try testing.expectEqual(.search, app.input_mode); // backspace does not exit search mode
 }
 
 test "search_done page 1 populates results" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
-    app.search_len = 7;
-    @memcpy(app.search_query[0..7], "frieren");
+    app.search.len = 7;
+    @memcpy(app.search.query[0..7], "frieren");
 
     const query_copy = try std.testing.allocator.dupe(u8, "frieren");
     const results_backing = try std.testing.allocator.alloc(Anime, 1);
@@ -1720,13 +1752,13 @@ test "search_done page 1 populates results" {
     };
 
     try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 1 } });
-    try testing.expectEqual(@as(usize, 1), app.results.items.len);
-    try testing.expectEqualStrings("Frieren", app.results.items[0].name);
-    try testing.expectEqual(@as(u32, 1), app.search_page);
-    try testing.expect(!app.search_loading);
+    try testing.expectEqual(@as(usize, 1), app.search.results.items.len);
+    try testing.expectEqualStrings("Frieren", app.search.results.items[0].name);
+    try testing.expectEqual(@as(u32, 1), app.search.page);
+    try testing.expect(!app.search.loading);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "search_done stale result is discarded" {
@@ -1734,8 +1766,8 @@ test "search_done stale result is discarded" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     // Current query is "frieren"; incoming result is for "bebop" — stale.
-    app.search_len = 7;
-    @memcpy(app.search_query[0..7], "frieren");
+    app.search.len = 7;
+    @memcpy(app.search.query[0..7], "frieren");
 
     const query_copy = try std.testing.allocator.dupe(u8, "bebop");
     const results_backing = try std.testing.allocator.alloc(Anime, 1);
@@ -1747,23 +1779,23 @@ test "search_done stale result is discarded" {
 
     try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 1 } });
     // All stale data freed by tick — results untouched.
-    try testing.expectEqual(@as(usize, 0), app.results.items.len);
-    try testing.expectEqual(@as(u32, 0), app.search_page);
+    try testing.expectEqual(@as(usize, 0), app.search.results.items.len);
+    try testing.expectEqual(@as(u32, 0), app.search.page);
 
-    app.results.deinit(std.testing.allocator); // capacity is 0; safe no-op
+    app.search.results.deinit(std.testing.allocator); // capacity is 0; safe no-op
 }
 
 test "search_done page 2 appends to existing results" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
-    app.search_len = 4;
-    @memcpy(app.search_query[0..4], "test");
-    app.search_page = 1;
+    app.search.len = 4;
+    @memcpy(app.search.query[0..4], "test");
+    app.search.page = 1;
 
     // Seed a page-1 result directly.
-    try app.results.ensureTotalCapacity(std.testing.allocator, 2);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 2);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "id1"),
         .name = try std.testing.allocator.dupe(u8, "Show One"),
         .eps_sub = 12,
@@ -1778,24 +1810,54 @@ test "search_done page 2 appends to existing results" {
     };
 
     try testTick(&app, .{ .search_done = .{ .results = results_backing, .for_query = query_copy, .page = 2 } });
-    try testing.expectEqual(@as(usize, 2), app.results.items.len);
-    try testing.expectEqual(@as(u32, 2), app.search_page);
-    try testing.expectEqualStrings("Show One", app.results.items[0].name);
-    try testing.expectEqualStrings("Show Two", app.results.items[1].name);
+    try testing.expectEqual(@as(usize, 2), app.search.results.items.len);
+    try testing.expectEqual(@as(u32, 2), app.search.page);
+    try testing.expectEqualStrings("Show One", app.search.results.items[0].name);
+    try testing.expectEqualStrings("Show Two", app.search.results.items[1].name);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
+}
+
+test "SearchController.clearResults frees owned anime (leak-clean under testing.allocator)" {
+    // ROD-219 AC: clearResults must release every owned result. Append rows whose
+    // id/name are testing.allocator-owned — exactly as search_done takes ownership
+    // of worker-duped Anime — then let clearResults free them. No manual cleanup:
+    // a missed free trips the testing allocator's leak check and fails the test.
+    var search: SearchController = .{};
+    defer search.results.deinit(std.testing.allocator);
+
+    try search.results.ensureTotalCapacity(std.testing.allocator, 2);
+    search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "id1"),
+        .name = try std.testing.allocator.dupe(u8, "Owned One"),
+    });
+    search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "id2"),
+        .name = try std.testing.allocator.dupe(u8, "Owned Two"),
+    });
+    search.page = 3;
+    search.pending_enrich = .{ .offset = 0, .count = 2 };
+
+    search.clearResults(std.testing.allocator);
+
+    // Buffer emptied + page/enrich reset. The freed elements are gone — the
+    // testing allocator would already have flagged a leak if clearResults skipped
+    // any owned field above.
+    try testing.expectEqual(@as(usize, 0), search.results.items.len);
+    try testing.expectEqual(@as(u32, 0), search.page);
+    try testing.expect(search.pending_enrich == null);
 }
 
 test "search_enriched merges metadata into matching live result" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
-    app.search_len = 7;
-    @memcpy(app.search_query[0..7], "frieren");
+    app.search.len = 7;
+    @memcpy(app.search.query[0..7], "frieren");
 
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "id1"),
         .name = try std.testing.allocator.dupe(u8, "Frieren"),
         .eps_sub = 28,
@@ -1817,23 +1879,23 @@ test "search_enriched merges metadata into matching live result" {
     };
 
     try testTick(&app, .{ .search_enriched = .{ .results = enriched, .for_query = query_copy, .offset = 0 } });
-    try testing.expectEqual(@as(?u64, 154587), app.results.items[0].anilist_id);
-    try testing.expectEqual(@as(?u32, 91), app.results.items[0].score);
-    try testing.expectEqualStrings("Elf mage grief hour", app.results.items[0].description orelse "");
+    try testing.expectEqual(@as(?u64, 154587), app.search.results.items[0].anilist_id);
+    try testing.expectEqual(@as(?u32, 91), app.search.results.items[0].score);
+    try testing.expectEqualStrings("Elf mage grief hour", app.search.results.items[0].description orelse "");
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "browse j/k navigates results list" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
-    app.search_page = 1;
+    app.search.page = 1;
 
-    try app.results.ensureTotalCapacity(std.testing.allocator, 3);
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 3);
     for (0..3) |_| {
-        app.results.appendAssumeCapacity(.{
+        app.search.results.appendAssumeCapacity(.{
             .id = try std.testing.allocator.dupe(u8, "id"),
             .name = try std.testing.allocator.dupe(u8, "X"),
             .eps_sub = 12,
@@ -1850,8 +1912,8 @@ test "browse j/k navigates results list" {
     try testTick(&app, keyEv('k', .{}));
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "view switch resets cursor to 0" {
@@ -2133,8 +2195,8 @@ test "cover_done fresh result stores decoded cover state" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "anime1"),
         .name = try std.testing.allocator.dupe(u8, "Frieren"),
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
@@ -2156,8 +2218,8 @@ test "cover_done fresh result stores decoded cover state" {
     try testing.expect(app.cover.inflight_url == null); // keep path frees the in-flight url
 
     app.cover.clear(app.gpa);
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "cover_done stale result is discarded" {
@@ -2165,8 +2227,8 @@ test "cover_done stale result is discarded" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "anime2"),
         .name = try std.testing.allocator.dupe(u8, "Bebop"),
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/bebop.jpg"),
@@ -2183,8 +2245,8 @@ test "cover_done stale result is discarded" {
     try testing.expect(app.cover.loading);
 
     app.cover.clear(app.gpa);
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "cover_done while not in detail clears stale loading state" {
@@ -2192,8 +2254,8 @@ test "cover_done while not in detail clears stale loading state" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "anime1"),
         .name = try std.testing.allocator.dupe(u8, "Frieren"),
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
@@ -2210,8 +2272,8 @@ test "cover_done while not in detail clears stale loading state" {
     try testing.expect(app.cover.for_id == null);
     try testing.expect(app.cover.pixels == null);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "cover_error clears state so a later revisit can refetch" {
@@ -2219,8 +2281,8 @@ test "cover_error clears state so a later revisit can refetch" {
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .detail;
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "anime1"),
         .name = try std.testing.allocator.dupe(u8, "Frieren"),
         .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
@@ -2239,17 +2301,17 @@ test "cover_error clears state so a later revisit can refetch" {
 
     app.cover.clearFailure(app.gpa);
 
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "deinitOwnedState releases app-owned runtime resources" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
-    app.search_page = 2;
+    app.search.page = 2;
 
-    try app.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.results.appendAssumeCapacity(.{
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
         .id = try std.testing.allocator.dupe(u8, "anime1"),
         .name = try std.testing.allocator.dupe(u8, "Frieren"),
         .eps_sub = 28,
@@ -2269,8 +2331,8 @@ test "deinitOwnedState releases app-owned runtime resources" {
     var writer: std.Io.Writer = undefined;
     app.deinitOwnedState(&vx, &writer);
 
-    try testing.expectEqual(@as(usize, 0), app.results.items.len);
-    try testing.expectEqual(@as(u32, 0), app.search_page);
+    try testing.expectEqual(@as(usize, 0), app.search.results.items.len);
+    try testing.expectEqual(@as(u32, 0), app.search.page);
     try testing.expect(app.episodes.results == null);
     try testing.expect(app.episodes.for_id == null);
     try testing.expect(app.cover.pixels == null);
@@ -2285,8 +2347,8 @@ test "search mode: char appends and arms debounce, does not fire immediately" {
     app.input_mode = .search;
     const k = vaxis.Key{ .codepoint = 'a', .text = "a" };
     try testTick(&app, .{ .key_press = k });
-    try testing.expectEqual(@as(usize, 1), app.search_len);
-    try testing.expect(!app.search_loading);
+    try testing.expectEqual(@as(usize, 1), app.search.len);
+    try testing.expect(!app.search.loading);
     try testing.expect(app.debounce_deadline_ms > 0);
 }
 
@@ -2297,14 +2359,14 @@ test "search mode: h and H append to query instead of triggering navigation" {
     app.input_mode = .search;
 
     try testTick(&app, .{ .key_press = .{ .codepoint = 'h', .text = "h" } });
-    try testing.expectEqual(@as(usize, 1), app.search_len);
-    try testing.expectEqualStrings("h", app.search_query[0..app.search_len]);
+    try testing.expectEqual(@as(usize, 1), app.search.len);
+    try testing.expectEqualStrings("h", app.search.query[0..app.search.len]);
     try testing.expectEqual(.browse, app.active_view);
     try testing.expectEqual(.detail, app.active_pane);
 
     try testTick(&app, .{ .key_press = .{ .codepoint = 'H', .mods = .{ .shift = true }, .text = "H" } });
-    try testing.expectEqual(@as(usize, 2), app.search_len);
-    try testing.expectEqualStrings("hH", app.search_query[0..app.search_len]);
+    try testing.expectEqual(@as(usize, 2), app.search.len);
+    try testing.expectEqualStrings("hH", app.search.query[0..app.search.len]);
     try testing.expectEqual(.browse, app.active_view);
     try testing.expectEqual(.detail, app.active_pane);
 }
@@ -2320,14 +2382,14 @@ test "tick fires debounced search when deadline has passed" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
-    app.search_len = 3;
-    @memcpy(app.search_query[0..3], "abc");
+    app.search.len = 3;
+    @memcpy(app.search.query[0..3], "abc");
     app.debounce_deadline_ms = 1; // well in the past — always expired
     try testTick(&app, .tick);
     try testing.expectEqual(@as(i64, 0), app.debounce_deadline_ms);
-    try testing.expect(app.search_loading);
-    for (app.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.results.deinit(std.testing.allocator);
+    try testing.expect(app.search.loading);
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
 }
 
 test "task_error pushes a persistent error toast" {

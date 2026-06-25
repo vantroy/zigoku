@@ -19,7 +19,7 @@ const centerKeyHint = render.centerKeyHint;
 // and writes only `scratch` — the compiler proves it mutates no app state (ROD-155).
 pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
     const w = pane_w;
-    if (self.search_len == 0) {
+    if (self.search.len == 0) {
         // First-run absent state (§9.5): name the view, then teach its two
         // actions. Browse is search-first and never auto-fills, so "no feed yet"
         // read as broken/waiting — this says what to do instead (ROD-211).
@@ -29,17 +29,17 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         centerKeyHint(win, mid + 2, w, "P", self.s(self.palette.focus, .{ .bold = true }), "  save a result to your watchlist", self.s(self.palette.fg3, .{}));
         return;
     }
-    const search_pending = self.search_loading or self.debounce_deadline_ms > 0;
-    if (search_pending and self.results.items.len == 0) {
+    const search_pending = self.search.loading or self.debounce_deadline_ms > 0;
+    if (search_pending and self.search.results.items.len == 0) {
         const spin_msg = std.fmt.bufPrint(&scratch.msg, "{s} searching\u{2026}", .{self.spinnerChar()}) catch "⠋ searching\u{2026}";
         centerText(win, pane_h / 2, w, spin_msg, self.s(self.palette.focus, .{}));
         return;
     }
-    if (!search_pending and self.results.items.len == 0) {
+    if (!search_pending and self.search.results.items.len == 0) {
         // Centered to match the §9.5 absent state (ROD-211), not stranded
         // top-left. The bottom-bar search prompt stays visible (chrome.zig), so
         // the user keeps their query and the next-step hint sits under it.
-        const q = self.querySlice();
+        const q = self.search.querySlice();
         const mid = pane_h / 2;
         const msg = std.fmt.bufPrint(&scratch.msg, "no results for \"{s}\"", .{q}) catch "no results";
         centerText(win, mid -| 1, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
@@ -55,8 +55,8 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
     var row: u16 = 0;
     var slot: usize = 0;
     var i: usize = self.list_top;
-    while (i < self.results.items.len and row < pane_h) : (i += 1) {
-        const a = self.results.items[i];
+    while (i < self.search.results.items.len and row < pane_h) : (i += 1) {
+        const a = self.search.results.items[i];
         const selected = i == self.list_cursor;
 
         // ROD-194: the selection affordance (band + cyan-bold ▸/title) is earned only
@@ -99,12 +99,12 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
 
     // Load-more footer.
     if (row < pane_h and
-        self.search_page > 0 and
-        self.results.items.len % source_mod.search_page_size == 0 and
-        self.results.items.len > 0)
+        self.search.page > 0 and
+        self.search.results.items.len % source_mod.search_page_size == 0 and
+        self.search.results.items.len > 0)
     {
-        const footer = if (self.search_loading) "⠋ loading…" else "╌ more ╌";
-        const footer_color = if (self.search_loading) self.palette.focus else self.palette.fg3;
+        const footer = if (self.search.loading) "⠋ loading…" else "╌ more ╌";
+        const footer_color = if (self.search.loading) self.palette.focus else self.palette.fg3;
         centerText(win, row, w, footer, self.s(footer_color, .{}));
     }
 }
