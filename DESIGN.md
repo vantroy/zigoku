@@ -104,24 +104,26 @@ kanji chips, synopsis ellipsis marker, loading animation frames.
 The §1.1 hex table is **Terminal Ghost**, the default and reference theme — every
 mock, state, and decision in this doc is authored against it. But the tokens are not
 hardcoded into render code. `src/tui/colors.zig` defines a `Palette` struct (one field
-per §1.2 semantic alias) and ships three concrete instances:
+per §1.2 semantic alias) and ships four concrete instances:
 
 | Theme | Identifier | Character |
 |---|---|---|
 | Terminal Ghost | `terminal_ghost` | Default. The §1.1 palette verbatim. Green-on-void phosphor with cyan focus + magenta signature. |
 | Phosphor | `phosphor` | Pure monochrome phosphor — `focus` and `fg` share the green hue, so bold (not color) carries focus distinction; `hot` is a complementary orange-red. |
 | Nord | `nord` | Nord polar-night + snow-storm + aurora mapping. `hot` uses aurora orange (nord12) rather than nord15 purple for more urgency. **Focus distinction is hue-based, not luminance-based:** `focus` (nord8 frost) reads *dimmer* than `fg` (nord4 snow), so the focused row leans on hue shift + bold rather than out-glowing its neighbours — a deliberate trade to stay faithful to Nord's own palette relationships, not the §1.1 luminance-lift rule. |
+| TokyoNight | `tokyonight` | TokyoNight "night" base with a storm-bg surface tier (`bg_surface` is TN storm `#24283b`). `hot` is TN red `#f7768e`, `warn` TN yellow `#e0af68`. **Focus is a deliberate luminance lift off canonical TN:** TN's own cyan (`#7dcfff`, L≈0.56) reads *dimmer* than `fg` (`#c0caf5`, L≈0.60) — fine for an editor cursor on one glyph, wrong for a full focused row that must out-read its neighbours, and unlike Nord there's no hue rescue (both sit in the blue-lavender family). So `focus` is lifted to a brighter same-hue cyan (`#b0e8ff`, L≈0.75) to honour the §1.1 focus-clears-`fg` rule. `fg2` (`#9aa5ce`) is tuned between TN `fg_dark` and `dark5` for even `fg→fg2→fg3` spacing (`fg2`-vs-`fg3` = 2.55:1). |
 
 The active palette is chosen by the `palette` config key (`config.zig`, default
 `"terminal_ghost"`). `App` holds a `*const Palette`; render functions reference its
 fields instead of the module-level constants, so a theme switch takes effect without
 touching component code.
 
-**Dark-only still holds.** All three themes are dark. "No light theme, ever" (§0) is a
+**Dark-only still holds.** All four themes are dark. "No light theme, ever" (§0) is a
 constraint on every palette, not just the default — a theme is a re-hue of the same
 dark system, never a light/dark toggle. **Theme-invariant rules:** one-magenta-pointer
 and bold-is-promotion (§1.3) hold across every palette. The focus-clears-`fg`-luminance
-rule (§1.1) is *not* universal — Terminal Ghost and Phosphor honour it, Nord trades it
+rule (§1.1) is *not* universal — Terminal Ghost, Phosphor, and TokyoNight honour it
+(TokyoNight via a deliberate lift off canonical TN cyan — see its row), Nord trades it
 for a hue-shift focus per the note above. A new theme must keep the two invariants;
 how it makes `focus` legible against `fg` (luminance lift or hue shift) is its own call.
 
@@ -1123,7 +1125,7 @@ Notes:
 - **resume offset** (ROD-84) cycles `0·3·5·10·15·30` seconds, displayed as `Ns`
   (e.g. `5s`), default `5s`.
 - **skip mode** (ROD-83) cycles `none·intro·outro·both`, default `both`.
-- **palette** (ROD-87) cycles `terminal_ghost·phosphor·nord`, default
+- **palette** (ROD-87) cycles `terminal_ghost·phosphor·nord·tokyonight`, default
   `terminal_ghost`. This row took the slot the never-built `help line` toggle held.
 - **Default quality (ROD-152)** cycles `worst · 480 · 720 · 1080 · best`, default
   `best`. It is honoured at stream-resolution time via a *cap* policy over the
