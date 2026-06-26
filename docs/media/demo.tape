@@ -12,8 +12,8 @@ Output "docs/media/demo.gif"
 
 Set Shell "bash"
 Set FontSize 16
-Set Width 1200
-Set Height 760
+Set Width 1264          # 120 cols x 40 rows at FontSize 16 / Padding 16
+Set Height 886
 Set Padding 16
 Set TypingSpeed 60ms
 
@@ -21,13 +21,18 @@ Set TypingSpeed 60ms
 Hide
 Type "./docs/media/capture-launch.sh"
 Enter
-Sleep 3s
 Show
+
+
 
 # The real store boots into the Watchlist. Flip to Browse first (H toggles
 # Browse<->History) — without this, `/` filters the watchlist instead of
 # searching the catalogue.
-Sleep 1200ms
+Sleep 2s
+Type "j"
+Sleep 3s
+Type "k"
+Sleep 5s
 Type "H"
 Sleep 900ms
 
