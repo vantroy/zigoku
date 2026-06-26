@@ -697,7 +697,9 @@ state.now` escalation.
 |---|---|---|---|---|
 | `play_done` / `play_error` | completed watch (final position ≥ `NATURAL_END_RATIO`), not finale | success | `episode N done` | no |
 | `play_done` / `play_error` | completed watch, finale | success | `all caught up` | no |
-| `play_error` | no observed position — mpv died / resolve non-HTTP failure | error | `playback failed` | no |
+| `play_error` | mpv not on PATH / not installed (`MpvNotFound`) | error | `mpv not found — install mpv` | no |
+| `play_error` | mpv launched but exited non-zero (`MpvFailed`) | error | `mpv exited with error` | no |
+| `play_error` | no observed position — non-HTTP, non-mpv failure | error | `playback failed` | no |
 | `play_error` | resolve failed — network-down (timeout / refused) | error | `network unreachable` | no |
 | `play_error` | resolve failed — blocked (403 / 451) | error | `{source} blocked us` | no |
 | `play_error` | resolve failed — server-down (5xx) | error | `{source} is down` | no |
@@ -733,14 +735,15 @@ short name keeps these within the 36-column budget, and a long-named future
 provider is truncated by `pushToast` (ROD-166). `network unreachable` carries no
 `{source}` — it names the user's own connectivity, not the source.
 
-The four cause classes (`network-down`, `blocked`, `server-down`, `generic-http`)
-share copy between `play_error` (resolve path) and `episodes_error` — cause
-determines the string, context is inferrable from the user's last action
-(ROD-173). `play_error` retains `playback failed` for the non-HTTP path (mpv died
-/ resolve non-network failure) which ROD-173 does not differentiate; the
-mpv-spawn classes earn their own copy in ROD-230. The runtime source of truth for
-**these eight `play_error` / `episodes_error` class rows** is
-`App.failureClassCopy`; those rows and that switch move together.
+The four source cause classes (`network-down`, `blocked`, `server-down`,
+`generic-http`) share copy between `play_error` (resolve path) and
+`episodes_error` — cause determines the string, context is inferrable from the
+user's last action (ROD-173). `play_error` adds two **player-spawn** classes
+(ROD-230): `MpvNotFound` and `MpvFailed` get their own copy, the install-directive
+one earning the actionability the generic line couldn't. `playback failed` now
+means only a residual non-HTTP, non-mpv failure. The runtime source of truth for
+**all the `play_error` / `episodes_error` class rows** is `App.failureClassCopy`;
+those rows and that switch move together.
 
 The `Search source unreachable` row is the §9.3b *target* copy, not yet wired:
 `searchTask` currently surfaces the raw `@errorName` through `task_error` (a
