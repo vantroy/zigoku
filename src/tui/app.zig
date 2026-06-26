@@ -193,14 +193,14 @@ pub fn run(
     // On quit, abandon an in-flight history query before joining so teardown
     // never blocks on the SELECT: sqlite3_interrupt makes the worker's
     // sqlite3_step bail, the join returns at once, and the discarded result is
-    // never read. The remaining cancellation gap — the scroll-fired episode
-    // prefetch joins synchronously on the main loop — is tracked in ROD-179.
+    // never read. (The episode-prefetch half of ROD-179 is handled separately: a
+    // superseded fetch is detached, not joined — see `episode_drain`.)
     //
-    // Declared before the search/enrich/episode-thread joins below, so by LIFO
-    // it runs *after* them: every other worker is already joined when interrupt
-    // fires, so the interrupt can only hit loadHistory's statement — never a
-    // statement another worker started (interrupt also affects statements that
-    // begin before it returns).
+    // Declared before the search/enrich joins and the episode drain below, so by
+    // LIFO it runs *after* them: every other worker is already reaped when
+    // interrupt fires, so the interrupt can only hit loadHistory's statement —
+    // never a statement another worker started (interrupt also affects statements
+    // that begin before it returns).
     defer if (hist_thread) |t| {
         if (store) |st| st.interrupt();
         t.join();
@@ -221,7 +221,7 @@ pub fn run(
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
-    defer if (app.episode_thread) |t| t.join();
+    defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
     defer app.cover.joinThread();
@@ -478,13 +478,14 @@ pub const App = struct {
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
 
-    /// Handle for the most recent episode-fetch thread. Joined in fireEpisodes
-    /// before a new spawn. Transport stays on App (the shell joins it on
-    /// teardown); the episode record/cache lives in `episodes` (ROD-180).
-    episode_thread: ?std.Thread = null,
+    /// Drain barrier for episode-fetch workers (ROD-179). A superseded prefetch
+    /// is detached, not joined, so the main loop never blocks on a stale fetch;
+    /// this accounts for the in-flight set so teardown can wait them all out
+    /// before loop/gpa/io die. The episode record/cache lives in `episodes`.
+    episode_drain: workers.ThreadDrain = .{},
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
-    /// two-tier episode cache. Transport (episode_thread/async_start_ms) stays on
+    /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
     /// App; the subsystem owns only the record + cache. Embedded by value so
     /// `App{}` stays trivially constructible. See `EpisodeState`.
     episodes: EpisodeState = .{},
@@ -1447,7 +1448,12 @@ pub const App = struct {
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
             },
-            .episodes_error => |cause| {
+            .episodes_error => |ev| {
+                defer self.gpa.free(ev.for_id);
+                // Stale: a superseded fetch's failure must not clear the live load
+                // nor toast for a show the user already left (ROD-179 — mirrors the
+                // episodes_done keep-check above).
+                if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) return;
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // §4.10: an empty grid with no explanation is indistinguishable
@@ -1456,7 +1462,7 @@ pub const App = struct {
                 // the network/blocked/server class when we know it; data-shape
                 // failures fall back to the generic line.
                 var buf: [128]u8 = undefined;
-                const copy = failureClassCopy(cause, provider.displayName(), &buf) orelse "couldn't load episodes";
+                const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "couldn't load episodes";
                 self.pushToast(.@"error", copy, false);
             },
             .cover_done => |ev| {
@@ -1604,11 +1610,11 @@ pub const App = struct {
     }
 
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
-        if (self.episode_thread) |t| {
-            t.join();
-            self.episode_thread = null;
-        }
-
+        // ROD-179: do NOT join a prior in-flight episode fetch here — that would
+        // block the main loop on a slow network when a settled-then-resumed scroll
+        // supersedes it (ROD-156). The old worker is already detached + accounted
+        // in `episode_drain`; its stale result/failure is keep-checked away on
+        // arrival (see the episodes_done / episodes_error handlers).
         self.episodes.freeResults(self.gpa);
         self.episodes.cursor = 0;
 
@@ -1648,13 +1654,18 @@ pub const App = struct {
         self.episodes.for_id = id_for_app;
         self.episodes.for_source = src_for_app;
 
-        self.episode_thread = std.Thread.spawn(.{}, episodesTask, .{
-            loop, self.gpa, io, provider, id_for_task, self.translation,
+        // Account before the spawn so teardown's drain can never observe a gap;
+        // detach so a later supersede never has to join this one (ROD-179).
+        self.episode_drain.begin();
+        const t = std.Thread.spawn(.{}, episodesTask, .{
+            loop, self.gpa, io, provider, id_for_task, self.translation, &self.episode_drain,
         }) catch {
+            self.episode_drain.finish(); // no worker will run — rebalance the count
             self.gpa.free(id_for_task);
             self.episodes.loading = false;
             return;
         };
+        t.detach();
     }
 
     fn fireEpisodes(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -1663,11 +1674,11 @@ pub const App = struct {
     }
 
     /// Fire a Browse episode fetch for the selected show, unless a fetch for that
-    /// same show is already in flight — re-firing would just join and respawn the
-    /// same fetch. (Pre-ROD-202 the in-flight fetch came from the hover prefetch;
-    /// now it can only be a prior detail-entry the user backed out of and re-entered
-    /// before it finished.) Shared by the two-pane focus path and the single-column
-    /// zoom path so the guard lives in one place.
+    /// same show is already in flight — re-firing would just abandon the in-flight
+    /// fetch and respawn an identical one. (Pre-ROD-202 the in-flight fetch came
+    /// from the hover prefetch; now it can only be a prior detail-entry the user
+    /// backed out of and re-entered before it finished.) Shared by the two-pane
+    /// focus path and the single-column zoom path so the guard lives in one place.
     fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         const sel = self.selectedAnime() orelse return;
         const in_flight = self.episodes.loading and

@@ -77,6 +77,46 @@ fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
 }
 
+/// A provider whose `episodes` fetch parks until the test releases it — a
+/// deterministic stand-in for a slow in-flight network fetch (ROD-179). Per
+/// instance state rides on the vtable's `*anyopaque` self.
+const GateProvider = struct {
+    release: std.atomic.Value(bool) = .init(false),
+
+    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+        const self: *GateProvider = @ptrCast(@alignCast(ptr));
+        // yield() keeps the park from starving the test thread on a single core.
+        while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        const eps = try arena.alloc(domain.EpisodeNumber, 1);
+        eps[0] = .{ .raw = "1" };
+        return eps;
+    }
+    fn nameFn(_: *anyopaque) []const u8 {
+        return "allanime";
+    }
+    fn displayNameFn(_: *anyopaque) []const u8 {
+        return "TestSrc";
+    }
+    fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+        return &.{};
+    }
+    fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
+        return .{ .url = "" };
+    }
+
+    const vtable: SourceProvider.VTable = .{
+        .name = nameFn,
+        .displayName = displayNameFn,
+        .search = searchFn,
+        .episodes = episodesFn,
+        .resolve = resolveFn,
+    };
+
+    fn provider(self: *GateProvider) SourceProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
 fn initTestLoop() Loop {
     const io = std.testing.io;
     return .{
@@ -97,10 +137,7 @@ fn testTick(app: *App, event: Event) !void {
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
-    if (app.episode_thread) |t| {
-        t.join();
-        app.episode_thread = null;
-    }
+    app.episode_drain.drain(); // episode workers detach now (ROD-179); wait them out
     if (app.search_thread) |t| {
         t.join();
         app.search_thread = null;
@@ -140,6 +177,7 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             alloc.free(d.for_id);
         },
         .cover_error => |id| alloc.free(id),
+        .episodes_error => |e| alloc.free(e.for_id),
         // task_error and most other events carry no owned heap payloads.
         else => {},
     }
@@ -1717,7 +1755,7 @@ test "browse detail cache-hit seeds watched-dim from store progress (ROD-163)" {
     try testTick(&app, keyEv(vaxis.Key.enter, .{})); // browse → detail, synchronous cache hit
 
     try testing.expectEqual(.browse, app.detail_origin);
-    try testing.expect(app.episode_thread == null); // cache hit, not a fetch
+    try testing.expect(app.episode_drain.inflight.load(.acquire) == 0); // cache hit, not a fetch
     // The browse-origin dim seeded from the store: progress 3 → 1..3 dim, cursor 3.
     try testing.expectEqual(@as(u32, 3), app.episodes.progress);
     try testing.expectEqual(@as(usize, 3), app.episodes.cursor);
@@ -2162,7 +2200,7 @@ test "episode cache: warm LRU hit opens detail synchronously, no fetch (ROD-130)
     try testing.expectEqual(.history, app.active_view);
     try testing.expectEqual(.detail, app.active_pane);
     try testing.expect(!app.episodes.loading);
-    try testing.expect(app.episode_thread == null);
+    try testing.expect(app.episode_drain.inflight.load(.acquire) == 0);
     try testing.expectEqual(@as(usize, 3), app.episodes.results.?.len);
     try testing.expectEqualStrings("2", app.episodes.results.?[1].raw);
 
@@ -2963,10 +3001,17 @@ test "episodes_error with a data-shape cause uses the generic fallback copy" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.episodes.loading = true;
+    // The error must be for the current detail show or the keep-check drops it
+    // (ROD-179) — set a matching for_id so the toast actually fires.
+    app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
+    defer app.episodes.freeResults(app.gpa);
 
     // A non-network failure (the show had no episode data) carries no actionable
     // class — it falls back to the generic line, not a misleading network toast.
-    try testTick(&app, .{ .episodes_error = error.NoEpisodeData });
+    try testTick(&app, .{ .episodes_error = .{
+        .cause = error.NoEpisodeData,
+        .for_id = try testing.allocator.dupe(u8, "show1"),
+    } });
 
     try testing.expect(!app.episodes.loading);
     const t = &app.toast_queue[0].?;
@@ -2986,8 +3031,13 @@ test "episodes_error names the failure class for network/blocked/server (ROD-173
         var app: App = .{};
         app.gpa = testing.allocator;
         app.episodes.loading = true;
+        app.episodes.for_id = try testing.allocator.dupe(u8, "show1");
+        defer app.episodes.freeResults(app.gpa);
 
-        try testTick(&app, .{ .episodes_error = c.cause });
+        try testTick(&app, .{ .episodes_error = .{
+            .cause = c.cause,
+            .for_id = try testing.allocator.dupe(u8, "show1"),
+        } });
 
         const t = &app.toast_queue[0].?;
         try testing.expectEqual(Toast.Kind.@"error", t.kind);
@@ -3679,4 +3729,53 @@ test "halfBlockFit: degenerate inputs clamp to the grid" {
     const fit = halfBlockFit(0, 0, 20, 30, 8, 16);
     try testing.expectEqual(@as(u32, 20), fit.w);
     try testing.expectEqual(@as(u32, 30), fit.h);
+}
+
+test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
+    var gate: GateProvider = .{};
+    const provider = gate.provider();
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = sampleHistory(); // [a (Frieren), b (K-On!), c (Bebop)]
+    app.setHistory(&recs);
+    app.term_cols = 120; // zoom tier: Enter on a history row fires the async fetch
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    // Fire show "a" (cursor 0). No cache entry ⇒ async path ⇒ worker A spawns and
+    // parks on the gate, standing in for a slow in-flight network fetch.
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try testing.expectEqual(@as(usize, 1), app.episode_drain.inflight.load(.acquire));
+    try testing.expect(app.episodes.loading);
+    try testing.expectEqualStrings("a", app.episodes.for_id.?);
+
+    // Supersede: back to the list, select "b", fire again — while A is still parked.
+    // The pre-ROD-179 code joined the prior worker right here; with A wedged on the
+    // gate that join would deadlock forever. This tick *returning at all* is the
+    // proof the join is gone — the stale fetch is abandoned, not awaited.
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 1;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try testing.expectEqual(@as(usize, 2), app.episode_drain.inflight.load(.acquire));
+    try testing.expectEqualStrings("b", app.episodes.for_id.?);
+
+    // Release and reap. drain() returns only once BOTH detached workers (stale A +
+    // current B) have finished — the teardown barrier waits them all out.
+    gate.release.store(true, .release);
+    app.episode_drain.drain();
+    try testing.expectEqual(@as(usize, 0), app.episode_drain.inflight.load(.acquire));
+
+    // We drove tick directly, so both workers' episodes_done events sit unread on
+    // the queue — drain + free them (A's is the stale one a live handler would
+    // keep-check away; here we just reclaim both). Join any cover worker the detail
+    // entry may have spawned so nothing outlives the loop frame.
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
 }

@@ -19,6 +19,56 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Loop = event_mod.Loop;
 
+/// Fire-and-forget worker accounting (ROD-179). Lets the main loop spawn a
+/// background worker without synchronously joining a prior one: the superseded
+/// worker is *detached* and runs to completion on its own (its stale result is
+/// keep-checked and dropped on arrival), while a teardown barrier still
+/// guarantees every outstanding worker has finished before the shared state it
+/// borrows — the event loop, the gpa, the io — is torn down.
+///
+/// Contract:
+///   - `begin()` on the spawning thread, immediately *before* each spawn, so the
+///     count is already raised when the new thread may start. On a spawn
+///     failure, pair it with `finish()` to rebalance.
+///   - the worker calls `finish()` as its last action (via `defer`), after its
+///     final `postEvent` returns — so once `drain()` unblocks, no worker can
+///     still touch the loop/gpa/io.
+///   - `drain()` once, on teardown: blocks until every begun worker finished.
+///
+/// Just an atomic counter: this std's `Thread` is `spawn/join/detach/yield`
+/// only — the blocking sync primitives (Mutex/Condition/Futex) moved to
+/// `std.Io`, and these are raw OS threads, not io tasks. `begin`/`finish` are
+/// lock-free fetch-add/sub. `drain()` spins, but `yield()` hands the core to a
+/// worker so it can finish, it runs once on teardown only (never the hot path),
+/// and it's bounded by the in-flight fetch's wall-clock deadline (ROD-153).
+///
+/// Intentionally does NOT cap the worker count: the episode-prefetch debounce
+/// (ROD-156) keeps superseding fires rare and each fetch is deadline-bounded
+/// (ROD-153), so the outstanding set stays small in practice. A hard cap would
+/// be backpressure policy, not a safety requirement.
+pub const ThreadDrain = struct {
+    inflight: std.atomic.Value(usize) = .init(0),
+
+    /// Account for a worker about to be spawned. Call on the spawning thread,
+    /// before the spawn, so `drain()` can never observe a gap.
+    pub fn begin(self: *ThreadDrain) void {
+        _ = self.inflight.fetchAdd(1, .acq_rel);
+    }
+
+    /// Account for a finished worker. Call as the worker's last action (defer).
+    /// The release here publishes the worker's prior effects (its final
+    /// `postEvent`) to whoever observes the count hit zero in `drain()`.
+    pub fn finish(self: *ThreadDrain) void {
+        const prev = self.inflight.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+    }
+
+    /// Block until every begun worker has finished. Teardown only.
+    pub fn drain(self: *ThreadDrain) void {
+        while (self.inflight.load(.acquire) != 0) std.Thread.yield() catch {};
+    }
+};
+
 const DecodedCoverCacheOps = struct {
     pub fn freeValue(alloc: Allocator, value: cover_mod.Pixels) void {
         alloc.free(value.rgba);
@@ -292,23 +342,34 @@ pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 }
 
 /// Background task: fetch episode list and post to UI.
-/// `id` ownership: transferred to episodes_done.for_id on success; freed here on error.
-pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation) void {
+/// `id` ownership: transferred to the posted event (`episodes_done.for_id` on
+/// success, `episodes_error.for_id` on failure) so the UI thread can keep-check
+/// it; freed here only if the event can't be posted. `drain.finish()` runs last
+/// (after the final postEvent), so once the barrier drains this worker can no
+/// longer touch loop/gpa (ROD-179).
+pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation, drain: *ThreadDrain) void {
+    defer drain.finish();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     const raw = provider.episodes(arena.allocator(), io, id, translation) catch |e| {
         log.debug("episodes fetch failed: {s}", .{@errorName(e)});
-        gpa.free(id);
-        loop.postEvent(.{ .episodes_error = e }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        // Hand `id` to the event so the UI can keep-check a superseded failure
+        // (ROD-179); the handler frees it. Free here only if the post fails.
+        loop.postEvent(.{ .episodes_error = .{ .cause = e, .for_id = id } }) catch |pe| {
+            log.debug("postEvent failed: {s}", .{@errorName(pe)});
+            gpa.free(id);
+        };
         return;
     };
 
     var owned: std.ArrayListUnmanaged(domain.EpisodeNumber) = .empty;
     owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
         log.debug("episodes alloc failed: {s}", .{@errorName(e)});
-        gpa.free(id);
-        loop.postEvent(.{ .episodes_error = e }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .episodes_error = .{ .cause = e, .for_id = id } }) catch |pe| {
+            log.debug("postEvent failed: {s}", .{@errorName(pe)});
+            gpa.free(id);
+        };
         return;
     };
     for (raw) |ep| {
@@ -752,4 +813,45 @@ test "persistFinalProgress is a no-op without an observed update" {
 
     persistFinalProgress(&store, "allanime", "show1", "7", .sub, null);
     try std.testing.expect((try store.getResume("allanime", "show1", .sub, "7")) == null);
+}
+
+test "ThreadDrain.drain blocks until every begun worker has finished (ROD-179)" {
+    var drain: ThreadDrain = .{};
+    // Gate the workers so they're provably still in flight when we assert the
+    // accounting and then call drain() — a no-op barrier would let the count
+    // race ahead and the test would catch it.
+    var release: std.atomic.Value(bool) = .init(false);
+    var completed: std.atomic.Value(usize) = .init(0);
+
+    const Worker = struct {
+        fn run(d: *ThreadDrain, gate: *std.atomic.Value(bool), c: *std.atomic.Value(usize)) void {
+            defer d.finish();
+            while (!gate.load(.acquire)) std.Thread.yield() catch {};
+            _ = c.fetchAdd(1, .acq_rel);
+        }
+    };
+
+    var spawned: usize = 0;
+    for (0..8) |_| {
+        drain.begin();
+        const t = std.Thread.spawn(.{}, Worker.run, .{ &drain, &release, &completed }) catch {
+            drain.finish(); // spawn failed — rebalance, mirroring the real call site
+            continue;
+        };
+        t.detach(); // never joined; drain() is the only synchronization
+        spawned += 1;
+    }
+
+    // begin() ran on this thread before each spawn, so the count is exactly the
+    // spawn total and nothing has finished yet — the workers are parked on the gate.
+    try std.testing.expectEqual(spawned, drain.inflight.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), completed.load(.acquire));
+
+    release.store(true, .release);
+    drain.drain();
+
+    // drain() returned ⇒ every worker passed finish() ⇒ every fetchAdd (which
+    // precedes the deferred finish) is visible via finish's release / drain's acquire.
+    try std.testing.expectEqual(spawned, completed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), drain.inflight.load(.acquire));
 }
