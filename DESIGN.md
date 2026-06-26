@@ -699,16 +699,16 @@ state.now` escalation.
 | `play_done` / `play_error` | completed watch, finale | success | `all caught up` | no |
 | `play_error` | no observed position — mpv died / resolve non-HTTP failure | error | `playback failed` | no |
 | `play_error` | resolve failed — network-down (timeout / refused) | error | `network unreachable` | no |
-| `play_error` | resolve failed — blocked (403 / 451) | error | `AllAnime blocked us` | no |
-| `play_error` | resolve failed — server-down (5xx) | error | `AllAnime is down` | no |
-| `play_error` | resolve failed — other non-200 | error | `AllAnime returned an error` | no |
+| `play_error` | resolve failed — blocked (403 / 451) | error | `{source} blocked us` | no |
+| `play_error` | resolve failed — server-down (5xx) | error | `{source} is down` | no |
+| `play_error` | resolve failed — other non-200 | error | `{source} returned an error` | no |
 | `episodes_error` | network-down (timeout / refused) | error | `network unreachable` | no |
-| `episodes_error` | blocked (403 / 451) | error | `AllAnime blocked us` | no |
-| `episodes_error` | server-down (5xx) | error | `AllAnime is down` | no |
-| `episodes_error` | other non-200 | error | `AllAnime returned an error` | no |
+| `episodes_error` | blocked (403 / 451) | error | `{source} blocked us` | no |
+| `episodes_error` | server-down (5xx) | error | `{source} is down` | no |
+| `episodes_error` | other non-200 | error | `{source} returned an error` | no |
 | `episodes_error` | data-shape failure (no episode data / OOM) | error | `couldn't load episodes` | no |
 | `task_error` | background task failed | error | (payload) | yes |
-| Search source unreachable | non-200 / network fail | error | `can't reach AllAnime` | yes |
+| Search source unreachable | non-200 / network fail | error | `can't reach {source}` | yes |
 | Settings saved | write succeeded | success | `settings saved` | no |
 | Settings — no config dir | dir missing, skipped | warn | `no config dir — not saved` | no |
 | Settings save failed | write error | error | `settings save failed` | no |
@@ -724,6 +724,14 @@ with a `…` (ROD-166). **Persistence** is reserved for *ongoing* conditions sti
 true while the
 toast is visible (source unreachable). Point-in-time failures (play, episodes)
 are transient — the condition is already over and the user can retry.
+
+`{source}` above is the active source's display name from the one seam,
+`SourceProvider.displayName()` (today `AllAnime`) — no copy above the provider
+vtable hardcodes the site name, since the source is swappable. It's distinct from
+`name()`, the stable persistence key. The name is formatted in at runtime; a
+short name keeps these within the 36-column budget, and a long-named future
+provider is truncated by `pushToast` (ROD-166). `network unreachable` carries no
+`{source}` — it names the user's own connectivity, not the source.
 
 The four cause classes (`network-down`, `blocked`, `server-down`, `generic-http`)
 share copy between `play_error` (resolve path) and `episodes_error` — cause

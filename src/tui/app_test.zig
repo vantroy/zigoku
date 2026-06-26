@@ -58,8 +58,16 @@ fn dummyNameFn(_: *anyopaque) []const u8 {
     return "allanime";
 }
 
+/// A display name distinct from the persistence key, so the toast-copy tests
+/// prove the source name is read from the provider seam (provider.displayName())
+/// rather than hardcoded anywhere upstream.
+fn dummyDisplayNameFn(_: *anyopaque) []const u8 {
+    return "TestSrc";
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
+    .displayName = dummyDisplayNameFn,
     .search = dummySearchFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
@@ -2970,9 +2978,9 @@ test "episodes_error names the failure class for network/blocked/server (ROD-173
     const Case = struct { cause: anyerror, copy: []const u8 };
     const cases = [_]Case{
         .{ .cause = error.NetworkDown, .copy = "network unreachable" },
-        .{ .cause = error.Forbidden, .copy = "AllAnime blocked us" },
-        .{ .cause = error.ServerError, .copy = "AllAnime is down" },
-        .{ .cause = error.HttpNotOk, .copy = "AllAnime returned an error" },
+        .{ .cause = error.Forbidden, .copy = "TestSrc blocked us" },
+        .{ .cause = error.ServerError, .copy = "TestSrc is down" },
+        .{ .cause = error.HttpNotOk, .copy = "TestSrc returned an error" },
     };
     for (cases) |c| {
         var app: App = .{};
@@ -2991,9 +2999,9 @@ test "play_error names the resolve failure class for network/blocked/server (ROD
     const Case = struct { cause: anyerror, copy: []const u8 };
     const cases = [_]Case{
         .{ .cause = error.NetworkDown, .copy = "network unreachable" },
-        .{ .cause = error.Forbidden, .copy = "AllAnime blocked us" },
-        .{ .cause = error.ServerError, .copy = "AllAnime is down" },
-        .{ .cause = error.HttpNotOk, .copy = "AllAnime returned an error" },
+        .{ .cause = error.Forbidden, .copy = "TestSrc blocked us" },
+        .{ .cause = error.ServerError, .copy = "TestSrc is down" },
+        .{ .cause = error.HttpNotOk, .copy = "TestSrc returned an error" },
         // The mpv-spawn classes carry no §4.7 class yet — generic fallback until
         // ROD-230 gives them dedicated copy.
         .{ .cause = error.MpvNotFound, .copy = "playback failed" },

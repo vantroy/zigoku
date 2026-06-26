@@ -56,6 +56,10 @@ pub const AllAnime = struct {
     /// resume, and cache rows on `(source_name, show_id)` — see store.zig.
     pub const source_name = "allanime";
 
+    /// Human-facing name for user-visible copy. Separate from `source_name`:
+    /// that one is the DB key (must never change); this one is for display.
+    pub const display_name = "AllAnime";
+
     pub fn init() AllAnime {
         return .{};
     }
@@ -68,6 +72,7 @@ pub const AllAnime = struct {
 
     const vtable: source.SourceProvider.VTable = .{
         .name = nameErased,
+        .displayName = displayNameErased,
         .search = searchErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
@@ -77,6 +82,10 @@ pub const AllAnime = struct {
     fn nameErased(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return source_name;
+    }
+    fn displayNameErased(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return display_name;
     }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
