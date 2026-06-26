@@ -697,8 +697,16 @@ state.now` escalation.
 |---|---|---|---|---|
 | `play_done` / `play_error` | completed watch (final position ≥ `NATURAL_END_RATIO`), not finale | success | `episode N done` | no |
 | `play_done` / `play_error` | completed watch, finale | success | `all caught up` | no |
-| `play_error` | no observed position (resolve failed / mpv died) | error | `playback failed` | no |
-| `episodes_error` | always | error | `couldn't load episodes` | no |
+| `play_error` | no observed position — mpv died / resolve non-HTTP failure | error | `playback failed` | no |
+| `play_error` | resolve failed — network-down (timeout / refused) | error | `network unreachable` | no |
+| `play_error` | resolve failed — blocked (403 / 451) | error | `AllAnime blocked us` | no |
+| `play_error` | resolve failed — server-down (5xx) | error | `AllAnime is down` | no |
+| `play_error` | resolve failed — other non-200 | error | `AllAnime returned an error` | no |
+| `episodes_error` | network-down (timeout / refused) | error | `network unreachable` | no |
+| `episodes_error` | blocked (403 / 451) | error | `AllAnime blocked us` | no |
+| `episodes_error` | server-down (5xx) | error | `AllAnime is down` | no |
+| `episodes_error` | other non-200 | error | `AllAnime returned an error` | no |
+| `episodes_error` | data-shape failure (no episode data / OOM) | error | `couldn't load episodes` | no |
 | `task_error` | background task failed | error | (payload) | yes |
 | Search source unreachable | non-200 / network fail | error | `can't reach AllAnime` | yes |
 | Settings saved | write succeeded | success | `settings saved` | no |
@@ -716,6 +724,15 @@ with a `…` (ROD-166). **Persistence** is reserved for *ongoing* conditions sti
 true while the
 toast is visible (source unreachable). Point-in-time failures (play, episodes)
 are transient — the condition is already over and the user can retry.
+
+The four cause classes (`network-down`, `blocked`, `server-down`, `generic-http`)
+share copy between `play_error` (resolve path) and `episodes_error` — cause
+determines the string, context is inferrable from the user's last action
+(ROD-173). `play_error` retains `playback failed` for the non-HTTP path (mpv died
+/ resolve non-network failure) which ROD-173 does not differentiate; the
+mpv-spawn classes earn their own copy in ROD-230. The runtime source of truth for
+these four strings is `App.failureClassCopy`; this table and that switch move
+together.
 
 A watch counts as *watched* — bumps the progress high-water mark, dims the cell,
 advances the cursor — only when the final position reaches `NATURAL_END_RATIO`
