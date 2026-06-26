@@ -2782,7 +2782,7 @@ test "play_error mid-episode is a real play but not watched, and surfaces failur
     try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
-    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
+    try testing.expectEqualStrings("mpv exited with error", t.text[0..t.text_len]);
 
     app.episodes.freeResults(app.gpa);
 }
@@ -2954,7 +2954,7 @@ test "play_error with no observed position does not advance the cursor" {
     // it surfaces an error toast so the dead playback isn't a mystery.
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
-    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
+    try testing.expectEqualStrings("mpv exited with error", t.text[0..t.text_len]);
 
     app.episodes.freeResults(app.gpa);
 }
@@ -2995,17 +2995,20 @@ test "episodes_error names the failure class for network/blocked/server (ROD-173
     }
 }
 
-test "play_error names the resolve failure class for network/blocked/server (ROD-173)" {
+test "play_error names the failure class: source (173) + player-spawn (230)" {
     const Case = struct { cause: anyerror, copy: []const u8 };
     const cases = [_]Case{
+        // Source classes (ROD-173).
         .{ .cause = error.NetworkDown, .copy = "network unreachable" },
         .{ .cause = error.Forbidden, .copy = "TestSrc blocked us" },
         .{ .cause = error.ServerError, .copy = "TestSrc is down" },
         .{ .cause = error.HttpNotOk, .copy = "TestSrc returned an error" },
-        // The mpv-spawn classes carry no §4.7 class yet — generic fallback until
-        // ROD-230 gives them dedicated copy.
-        .{ .cause = error.MpvNotFound, .copy = "playback failed" },
-        .{ .cause = error.MpvFailed, .copy = "playback failed" },
+        // Player-spawn classes (ROD-230): mpv missing vs crashed, distinct copy.
+        .{ .cause = error.MpvNotFound, .copy = "mpv not found — install mpv" },
+        .{ .cause = error.MpvFailed, .copy = "mpv exited with error" },
+        // An unclassified cause (resolve produced no playable stream) keeps the
+        // generic fallback — the residual after the two families above.
+        .{ .cause = error.NoDirectStream, .copy = "playback failed" },
     };
     for (cases) |c| {
         var app: App = .{};
@@ -3064,7 +3067,7 @@ test "play_error on a different show still surfaces the failure toast" {
     try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
-    try testing.expectEqualStrings("playback failed", t.text[0..t.text_len]);
+    try testing.expectEqualStrings("mpv exited with error", t.text[0..t.text_len]);
 
     app.episodes.freeResults(app.gpa);
 }
