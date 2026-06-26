@@ -1110,19 +1110,21 @@ pub const App = struct {
         return u.reachedCompletion(store_mod.NATURAL_END_RATIO);
     }
 
-    /// The §4.7 toast line for a differentiated AllAnime failure class (ROD-173),
-    /// or null when `cause` isn't one of them — the caller supplies its own
-    /// context-generic fallback ("couldn't load episodes" / "playback failed").
-    /// These four strings are the runtime source of truth paired with DESIGN.md
-    /// §4.10; both must move together. Each is verified ≤36 display columns (the
-    /// §4.7 copy budget). Data-shape errors (NoEpisodeData, NoDirectStream…) and
-    /// the mpv-spawn classes deliberately fall through to the generic fallback.
-    fn failureClassCopy(cause: anyerror) ?[]const u8 {
+    /// The §4.7 toast line for a differentiated source failure class (ROD-173),
+    /// formatted into `buf`, or null when `cause` isn't one of them — the caller
+    /// supplies its own context-generic fallback ("couldn't load episodes" /
+    /// "playback failed"). These four phrasings are the runtime source of truth
+    /// paired with DESIGN.md §4.10; both must move together. `source_name` comes
+    /// from `provider.displayName()` — the one seam, never hardcode the site name
+    /// — so a short name keeps the copy within the §4.7 36-col budget and a long
+    /// one is truncated by pushToast (ROD-166). Data-shape errors (NoEpisodeData,
+    /// NoDirectStream…) and the mpv-spawn classes fall through to the generic line.
+    fn failureClassCopy(cause: anyerror, source_name: []const u8, buf: []u8) ?[]const u8 {
         return switch (cause) {
             error.NetworkDown => "network unreachable",
-            error.Forbidden => "AllAnime blocked us",
-            error.ServerError => "AllAnime is down",
-            error.HttpNotOk => "AllAnime returned an error",
+            error.Forbidden => std.fmt.bufPrint(buf, "{s} blocked us", .{source_name}) catch null,
+            error.ServerError => std.fmt.bufPrint(buf, "{s} is down", .{source_name}) catch null,
+            error.HttpNotOk => std.fmt.bufPrint(buf, "{s} returned an error", .{source_name}) catch null,
             else => null,
         };
     }
@@ -1432,7 +1434,9 @@ pub const App = struct {
                 // failure so the blank pane isn't a silent dead end. ROD-173 names
                 // the network/blocked/server class when we know it; data-shape
                 // failures fall back to the generic line.
-                self.pushToast(.@"error", failureClassCopy(cause) orelse "couldn't load episodes", false);
+                var buf: [128]u8 = undefined;
+                const copy = failureClassCopy(cause, provider.displayName(), &buf) orelse "couldn't load episodes";
+                self.pushToast(.@"error", copy, false);
             },
             .cover_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -1490,7 +1494,11 @@ pub const App = struct {
                 // the success path in finishPlayback instead. ROD-173 names the
                 // resolve-side network/blocked/server class when we know it; the
                 // mpv-spawn classes fall back to the generic line (ROD-230 refines).
-                if (!completed) self.pushToast(.@"error", failureClassCopy(ev.cause) orelse "playback failed", false);
+                if (!completed) {
+                    var buf: [128]u8 = undefined;
+                    const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "playback failed";
+                    self.pushToast(.@"error", copy, false);
+                }
             },
             .tick => {
                 const now = nowMs(io);

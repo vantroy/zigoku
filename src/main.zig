@@ -132,8 +132,14 @@ pub fn main(init: std.process.Init) !void {
     };
     defer if (store_opt) |*st| st.close();
 
-    run(arena, io, out, in, cli, cfg, if (store_opt) |*st| st else null) catch |err| {
-        try reportError(out, err);
+    // One provider for the whole CLI run, so both run() and the error reporter
+    // read the source name from the same vtable seam. `allanime` must outlive
+    // both calls — this frame does.
+    var allanime = zigoku.AllAnime.init();
+    const provider = allanime.provider();
+
+    run(arena, io, out, in, cli, cfg, provider, if (store_opt) |*st| st else null) catch |err| {
+        try reportError(out, err, provider.displayName());
         try out.flush();
         std.process.exit(1);
     };
@@ -165,18 +171,16 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
 
 /// The whole vertical slice, top to bottom. `store` is optional — every
 /// persistence touch is best-effort so a DB hiccup never blocks playback.
-fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, cfg: zigoku.Config, store: ?*zigoku.Store) !void {
+fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, cfg: zigoku.Config, provider: zigoku.SourceProvider, store: ?*zigoku.Store) !void {
     try zigoku.writeBanner(out);
     if (!std.mem.eql(u8, cli.quality, "best")) {
         try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
     }
 
-    var allanime = zigoku.AllAnime.init();
-    const provider = allanime.provider();
     const SOURCE = provider.name();
 
     // 1. Search.
-    try out.print("\n→ searching AllAnime for \"{s}\" ({s})…\n", .{ cli.query, cli.translation.str() });
+    try out.print("\n→ searching {s} for \"{s}\" ({s})…\n", .{ provider.displayName(), cli.query, cli.translation.str() });
     try out.flush();
 
     const results = try provider.search(arena, io, cli.query, .{ .translation = cli.translation, .limit = 20 });
@@ -419,22 +423,25 @@ fn usage(out: *Io.Writer) !void {
     );
 }
 
-/// Turn an error into a human line instead of a Zig stack trace.
-fn reportError(out: *Io.Writer, err: anyerror) !void {
+/// Turn an error into a human line instead of a Zig stack trace. `source_name`
+/// is the active source's display name from the seam (provider.displayName());
+/// never hardcode the site name — the source is swappable behind the vtable.
+fn reportError(out: *Io.Writer, err: anyerror, source_name: []const u8) !void {
+    var buf: [256]u8 = undefined;
     const msg: []const u8 = switch (err) {
         error.MpvNotFound => "mpv isn't on your PATH. Install mpv and try again.",
         error.MpvFailed => "mpv exited badly (closed early, or couldn't play the stream).",
         error.NoDirectStream => "found the episode, but it only offers providers we can't resolve yet (the direct fast4speed link wasn't there). That's the ROD-92 follow-up — try another show/episode for now.",
-        error.NoSearchData => "AllAnime returned nothing for that search.",
-        error.ShowNotFound, error.NoEpisodeData => "AllAnime had no episode data for that show.",
-        error.NotEncrypted => "AllAnime returned an unexpected (unencrypted) video payload — the protocol may have shifted.",
-        // ROD-173: the distinct AllAnime POST failure classes. No 36-col budget
-        // here (CLI stdout, not a toast), so these can be more instructional than
-        // their §4.7 toast counterparts.
-        error.NetworkDown => "can't reach AllAnime — check your network connection, then try again.",
-        error.Forbidden => "AllAnime is blocking the request (HTTP 403/451). A VPN may get you through.",
-        error.ServerError => "AllAnime's servers are down (HTTP 5xx). Nothing to do but wait and retry.",
-        error.HttpNotOk => "AllAnime rejected the request (unexpected HTTP error). The site may be down, or the recipe drifted.",
+        error.NoSearchData => std.fmt.bufPrint(&buf, "{s} returned nothing for that search.", .{source_name}) catch @errorName(err),
+        error.ShowNotFound, error.NoEpisodeData => std.fmt.bufPrint(&buf, "{s} had no episode data for that show.", .{source_name}) catch @errorName(err),
+        error.NotEncrypted => std.fmt.bufPrint(&buf, "{s} returned an unexpected (unencrypted) video payload — the protocol may have shifted.", .{source_name}) catch @errorName(err),
+        // ROD-173: the distinct POST failure classes. No 36-col budget here (CLI
+        // stdout, not a toast), so these can be more instructional than their
+        // §4.7 toast counterparts.
+        error.NetworkDown => std.fmt.bufPrint(&buf, "can't reach {s} — check your network connection, then try again.", .{source_name}) catch @errorName(err),
+        error.Forbidden => std.fmt.bufPrint(&buf, "{s} is blocking the request (HTTP 403/451). A VPN may get you through.", .{source_name}) catch @errorName(err),
+        error.ServerError => std.fmt.bufPrint(&buf, "{s}'s servers are down (HTTP 5xx). Nothing to do but wait and retry.", .{source_name}) catch @errorName(err),
+        error.HttpNotOk => std.fmt.bufPrint(&buf, "{s} rejected the request (unexpected HTTP error). The site may be down, or the recipe drifted.", .{source_name}) catch @errorName(err),
         else => @errorName(err),
     };
     try out.print("\n✗ {s}\n", .{msg});
