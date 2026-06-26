@@ -395,13 +395,25 @@ pub const AllAnime = struct {
         };
     }
 
-    /// Map a transport-layer failure from `client.fetch` to `NetworkDown` when it
-    /// is a genuine connectivity problem on our side (timeout, refused, reset,
-    /// host/network unreachable, TLS handshake) — DNS failures surface as these
-    /// same connect errors in this std.Io model. Anything else (OOM, protocol,
-    /// misconfig) propagates unchanged so we never mislabel it as a dead network.
+    /// Map a transport-layer failure from `client.fetch` to `NetworkDown` when
+    /// "check your connection" is the right advice. Two distinct families in
+    /// std.Io's `FetchError` qualify (they are NOT aliases of each other):
+    ///   * IP-level connect failures — refused / reset / host+network
+    ///     unreachable / timeout.
+    ///   * DNS `HostName.LookupError` — NXDOMAIN, SERVFAIL, malformed records,
+    ///     no address returned, unreadable resolv.conf. The ticket calls for DNS
+    ///     to land here, and these are their own error values, so they must be
+    ///     listed explicitly — an earlier draft wrongly assumed they aliased the
+    ///     connect errors (Elara H1).
+    /// `TlsInitializationFailed` is included: against our Cloudflare-fronted
+    /// upstream it is overwhelmingly a reset/intercepted handshake (a network
+    /// condition), though it also absorbs the rare server-side cert-validation
+    /// failure — an accepted imprecision over standing up a dedicated TLS class.
+    /// Everything else (OOM, protocol, local socket misconfig) propagates
+    /// unchanged so we never mislabel it as a dead network.
     fn mapTransportError(e: anyerror, referer: []const u8) anyerror {
         switch (e) {
+            // IP-level connect failures.
             error.ConnectionRefused,
             error.ConnectionResetByPeer,
             error.HostUnreachable,
@@ -409,6 +421,15 @@ pub const AllAnime = struct {
             error.NetworkDown,
             error.Timeout,
             error.TlsInitializationFailed,
+            // DNS resolution failures (HostName.LookupError).
+            error.UnknownHostName,
+            error.NameServerFailure,
+            error.NoAddressReturned,
+            error.ResolvConfParseFailed,
+            error.DetectingNetworkConfigurationFailed,
+            error.InvalidDnsARecord,
+            error.InvalidDnsAAAARecord,
+            error.InvalidDnsCnameRecord,
             => {
                 log.debug("allanime POST {s}: transport {s} -> NetworkDown", .{ referer, @errorName(e) });
                 return error.NetworkDown;
@@ -1444,6 +1465,9 @@ test "statusToError: blocked / server-down / other split distinctly (ROD-173)" {
     try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.bad_gateway));
     try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.service_unavailable));
     try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.gateway_timeout));
+    // An unnamed 5xx (Status is non-exhaustive) must still classify by range, not
+    // by tag — so a code we don't have a name for still reads as ServerError.
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(@enumFromInt(599)));
     // Any other non-200 stays the undifferentiated HttpNotOk (recipe drift, 429…).
     try std.testing.expectEqual(error.HttpNotOk, AllAnime.statusToError(.not_found));
     try std.testing.expectEqual(error.HttpNotOk, AllAnime.statusToError(.bad_request));
@@ -1459,6 +1483,13 @@ test "mapTransportError: connectivity failures become NetworkDown, rest pass thr
     try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkDown, "t"));
     try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.Timeout, "t"));
     try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.TlsInitializationFailed, "t"));
+    // DNS resolution failures (HostName.LookupError) are their own error values,
+    // not aliases of the connect errors — they must land on NetworkDown too so
+    // "name didn't resolve" reads as a connectivity problem, per the ticket.
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.UnknownHostName, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NameServerFailure, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NoAddressReturned, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ResolvConfParseFailed, "t"));
     // Anything that isn't a transport failure must not be mislabelled as a dead
     // network — it propagates unchanged.
     try std.testing.expectEqual(error.OutOfMemory, AllAnime.mapTransportError(error.OutOfMemory, "t"));
