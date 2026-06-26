@@ -87,11 +87,8 @@ Without it, you get a browser. A very nice browser, but still.
 
 ### AUR (Arch Linux) — coming soon
 
-```sh
-paru -S zigoku
-```
-
-AUR new-account registrations are currently closed — the package can't be published until that changes.
+Will be `paru -S zigoku` once published. AUR new-account registrations are
+currently closed, so the package can't be created until that changes.
 
 ### macOS: Homebrew
 

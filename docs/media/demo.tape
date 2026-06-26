@@ -3,10 +3,11 @@
 # Regenerate:  zig build && vhs docs/media/demo.tape   (→ docs/media/demo.gif)
 # Requires:    vhs, ttyd, ffmpeg on PATH.
 #
-# Drives the real binary through docs/media/capture-launch.sh, which isolates the
-# store (never the real watchlist) and stubs mpv (the play beat needs no display).
-# Content is LIVE (AllAnime + AniList) so the exact show/cover varies per run — by
-# design (ROD-148). Covers render as halfblock here; vhs has no Kitty graphics.
+# Drives the real binary through docs/media/capture-launch.sh, which uses the REAL
+# store (watchlist-read-only: stubbed mpv + read-only tape commands — NEVER add
+# P/play/status keys) and provides the colour-fix env. Content is LIVE (AllAnime +
+# AniList) so the exact show/cover varies per run — by design (ROD-148). Covers
+# render as halfblock here; vhs has no Kitty graphics.
 
 Output "docs/media/demo.gif"
 

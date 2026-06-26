@@ -50,17 +50,6 @@ key hands off to a stubbed mpv that exits instantly, so the app jumps back to th
 Watchlist — a dead end. A terminal gif can't show mpv's video window anyway, so
 "→ play" lives in the caption + the status-bar affordance. Deliberate, not missing.
 
-## README text reconciliation (for Aya)
-
-Drift found while driving the live app — the prose should be corrected:
-
-- **Palettes: README says "Three", there are now FOUR** — `terminal_ghost`,
-  `phosphor`, `nord`, **`tokyonight`** (`src/tui/settings_state.zig:88`).
-- **AUR**: not in the repo (only `packaging/homebrew/`). Per ROD-148, stub it as
-  "coming soon"; document the live three (Homebrew + prebuilt binary + source).
-- **Boot view**: a fresh/empty store opens to **Browse** (the catalogue); a populated
-  store opens to **History**. Minor, but worth not mis-stating.
-
 ## Tuning notes (verified)
 
 - Geometry: `Set Width 1264` / `Set Height 886` at `FontSize 16` / `Padding 16` =
