@@ -1117,8 +1117,11 @@ pub const App = struct {
     /// generic; the source-named ones interpolate `provider.displayName()`, the
     /// one seam, never hardcode the site name) and the player-spawn classes
     /// (ROD-230 — mpv missing vs crashed; about the local mpv binary, not the
-    /// source, so static with no name to interpolate). These phrasings are the
-    /// runtime source of truth paired with DESIGN.md §4.10; both move together. A
+    /// source, so static with no name to interpolate). The player-spawn arms only
+    /// fire on the play path; `episodes_error` shares this mapper but can never
+    /// produce an mpv cause (it never spawns mpv) — a third caller must not assume
+    /// these arms apply. These phrasings are the runtime source of truth paired
+    /// with DESIGN.md §4.10; both move together. A
     /// short source name keeps the copy within the §4.7 36-col budget and a long
     /// one is truncated by pushToast (ROD-166); an extreme name that overflows
     /// `buf` falls through to the generic line via `catch null`. Data-shape errors
