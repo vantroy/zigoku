@@ -58,8 +58,16 @@ fn dummyNameFn(_: *anyopaque) []const u8 {
     return "allanime";
 }
 
+/// A display name distinct from the persistence key, so the toast-copy tests
+/// prove the source name is read from the provider seam (provider.displayName())
+/// rather than hardcoded anywhere upstream.
+fn dummyDisplayNameFn(_: *anyopaque) []const u8 {
+    return "TestSrc";
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
+    .displayName = dummyDisplayNameFn,
     .search = dummySearchFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
@@ -2691,7 +2699,7 @@ test "play_error with a completed position persists final and records the play" 
 
     // mpv died near the end (>= NATURAL_END_RATIO): completed is derived true,
     // so the play is recorded AND the progress high-water mark advances.
-    try testTick(&app, .{ .play_error = .{ .time_pos = 1300, .duration = 1440 } });
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
 
     const saved = (try store.getResume("allanime", "show1", .sub, "3")).?;
     try testing.expectApproxEqAbs(@as(f64, 1300), saved.position_secs, 0.001);
@@ -2759,7 +2767,7 @@ test "play_error mid-episode is a real play but not watched, and surfaces failur
     // mpv crashed ~8% in: meaningful (resume + play recorded) but far below the
     // completion bar — not watched-through, cursor holds, and the crash surfaces
     // as a failure toast (not silent, not a false success).
-    try testTick(&app, .{ .play_error = .{ .time_pos = 120, .duration = 1440 } });
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 120, .duration = 1440 }, .cause = error.MpvFailed } });
 
     const saved = (try store.getResume("allanime", "show1", .sub, "8")).?;
     try testing.expectApproxEqAbs(@as(f64, 120), saved.position_secs, 0.001); // resume saved
@@ -2797,7 +2805,7 @@ test "play_error with no observed position skips recordPlay and preserves checkp
     app.session.last_checkpoint_pos = 90;
 
     // mpv died at position 0: non-meaningful, so record_play is derived false.
-    try testTick(&app, .{ .play_error = .{ .time_pos = 0, .duration = 1440 } });
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 0, .duration = 1440 }, .cause = error.MpvFailed } });
 
     const saved = (try store.getResume("allanime", "show1", .sub, "3")).?;
     try testing.expectApproxEqAbs(@as(f64, 90), saved.position_secs, 0.001); // checkpoint preserved
@@ -2865,7 +2873,7 @@ test "play_error with a completed position still advances the detail cursor" {
 
     // mpv died near the end (>= NATURAL_END_RATIO) → completed: the watch counts
     // and the detail pane reacts just like a clean completed exit.
-    try testTick(&app, .{ .play_error = .{ .time_pos = 1300, .duration = 1440 } });
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
 
     try testing.expectEqual(@as(usize, 3), app.episodes.cursor); // advanced to episode 4
     try testing.expectEqual(@as(u32, 3), app.episodes.progress);
@@ -2938,7 +2946,7 @@ test "play_error with no observed position does not advance the cursor" {
     app.session.episode_index = 3;
 
     // mpv died at position 0: record_play is derived false — nothing counted.
-    try testTick(&app, .{ .play_error = .{ .time_pos = 0, .duration = 1440 } });
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 0, .duration = 1440 }, .cause = error.MpvFailed } });
 
     try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
     try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed
@@ -2951,17 +2959,67 @@ test "play_error with no observed position does not advance the cursor" {
     app.episodes.freeResults(app.gpa);
 }
 
-test "episodes_error surfaces an error toast" {
+test "episodes_error with a data-shape cause uses the generic fallback copy" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.episodes.loading = true;
 
-    try testTick(&app, .episodes_error);
+    // A non-network failure (the show had no episode data) carries no actionable
+    // class — it falls back to the generic line, not a misleading network toast.
+    try testTick(&app, .{ .episodes_error = error.NoEpisodeData });
 
     try testing.expect(!app.episodes.loading);
     const t = &app.toast_queue[0].?;
     try testing.expectEqual(Toast.Kind.@"error", t.kind);
     try testing.expectEqualStrings("couldn't load episodes", t.text[0..t.text_len]);
+}
+
+test "episodes_error names the failure class for network/blocked/server (ROD-173)" {
+    const Case = struct { cause: anyerror, copy: []const u8 };
+    const cases = [_]Case{
+        .{ .cause = error.NetworkDown, .copy = "network unreachable" },
+        .{ .cause = error.Forbidden, .copy = "TestSrc blocked us" },
+        .{ .cause = error.ServerError, .copy = "TestSrc is down" },
+        .{ .cause = error.HttpNotOk, .copy = "TestSrc returned an error" },
+    };
+    for (cases) |c| {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        app.episodes.loading = true;
+
+        try testTick(&app, .{ .episodes_error = c.cause });
+
+        const t = &app.toast_queue[0].?;
+        try testing.expectEqual(Toast.Kind.@"error", t.kind);
+        try testing.expectEqualStrings(c.copy, t.text[0..t.text_len]);
+    }
+}
+
+test "play_error names the resolve failure class for network/blocked/server (ROD-173)" {
+    const Case = struct { cause: anyerror, copy: []const u8 };
+    const cases = [_]Case{
+        .{ .cause = error.NetworkDown, .copy = "network unreachable" },
+        .{ .cause = error.Forbidden, .copy = "TestSrc blocked us" },
+        .{ .cause = error.ServerError, .copy = "TestSrc is down" },
+        .{ .cause = error.HttpNotOk, .copy = "TestSrc returned an error" },
+        // The mpv-spawn classes carry no §4.7 class yet — generic fallback until
+        // ROD-230 gives them dedicated copy.
+        .{ .cause = error.MpvNotFound, .copy = "playback failed" },
+        .{ .cause = error.MpvFailed, .copy = "playback failed" },
+    };
+    for (cases) |c| {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        app.playing = true;
+
+        // No observed position → a genuine non-completed failure that surfaces a
+        // toast (the resolve path never produces a final position).
+        try testTick(&app, .{ .play_error = .{ .final = null, .cause = c.cause } });
+
+        const t = &app.toast_queue[0].?;
+        try testing.expectEqual(Toast.Kind.@"error", t.kind);
+        try testing.expectEqualStrings(c.copy, t.text[0..t.text_len]);
+    }
 }
 
 test "playback for a different show than the detail pane does not advance it" {
@@ -3000,7 +3058,7 @@ test "play_error on a different show still surfaces the failure toast" {
     // No observed position → not counted: no advance/dim (and same_show is
     // false anyway), but the failure is still surfaced regardless of which show
     // the pane is on — the user deserves to know mpv died.
-    try testTick(&app, .{ .play_error = null });
+    try testTick(&app, .{ .play_error = .{ .final = null, .cause = error.MpvFailed } });
 
     try testing.expectEqual(@as(usize, 2), app.episodes.cursor); // unmoved
     try testing.expectEqual(@as(u32, 0), app.episodes.progress); // nothing dimmed

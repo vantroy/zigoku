@@ -1110,6 +1110,27 @@ pub const App = struct {
         return u.reachedCompletion(store_mod.NATURAL_END_RATIO);
     }
 
+    /// The §4.7 toast line for a differentiated source failure class (ROD-173),
+    /// formatted into `buf`, or null when `cause` isn't one of them — the caller
+    /// supplies its own context-generic fallback ("couldn't load episodes" /
+    /// "playback failed"). These four phrasings are the runtime source of truth
+    /// paired with DESIGN.md §4.10; both must move together. `source_name` comes
+    /// from `provider.displayName()` — the one seam, never hardcode the site name
+    /// — so a short name keeps the copy within the §4.7 36-col budget and a long
+    /// one is truncated by pushToast (ROD-166); an extreme name that overflows
+    /// `buf` falls through to the generic line via the `catch null` guard. Same
+    /// fallback for data-shape errors (NoEpisodeData, NoDirectStream…) and the
+    /// mpv-spawn classes.
+    fn failureClassCopy(cause: anyerror, source_name: []const u8, buf: []u8) ?[]const u8 {
+        return switch (cause) {
+            error.NetworkDown => "network unreachable",
+            error.Forbidden => std.fmt.bufPrint(buf, "{s} blocked us", .{source_name}) catch null,
+            error.ServerError => std.fmt.bufPrint(buf, "{s} is down", .{source_name}) catch null,
+            error.HttpNotOk => std.fmt.bufPrint(buf, "{s} returned an error", .{source_name}) catch null,
+            else => null,
+        };
+    }
+
     fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, completed: bool) void {
         // Capture the session facts ROD-131 needs *before* finish() clears them:
         // the played episode (1-based) and whether the detail pane still shows
@@ -1407,13 +1428,17 @@ pub const App = struct {
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
             },
-            .episodes_error => {
+            .episodes_error => |cause| {
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
-                // failure so the blank pane isn't a silent dead end.
-                self.pushToast(.@"error", "couldn't load episodes", false);
+                // failure so the blank pane isn't a silent dead end. ROD-173 names
+                // the network/blocked/server class when we know it; data-shape
+                // failures fall back to the generic line.
+                var buf: [128]u8 = undefined;
+                const copy = failureClassCopy(cause, provider.displayName(), &buf) orelse "couldn't load episodes";
+                self.pushToast(.@"error", copy, false);
             },
             .cover_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -1462,14 +1487,20 @@ pub const App = struct {
                 // cleared the completion bar.
                 self.finishPlayback(final_update, watchCompleted(final_update));
             },
-            .play_error => |final_update| {
-                const completed = watchCompleted(final_update);
-                self.finishPlayback(final_update, completed);
+            .play_error => |ev| {
+                const completed = watchCompleted(ev.final);
+                self.finishPlayback(ev.final, completed);
                 // §4.10: a play that errored without reaching the watched bar is a
                 // genuine failure (resolve failed, or mpv died mid-episode) —
                 // surface it. A completed watch that errored at the very end took
-                // the success path in finishPlayback instead.
-                if (!completed) self.pushToast(.@"error", "playback failed", false);
+                // the success path in finishPlayback instead. ROD-173 names the
+                // resolve-side network/blocked/server class when we know it; the
+                // mpv-spawn classes fall back to the generic line (ROD-230 refines).
+                if (!completed) {
+                    var buf: [128]u8 = undefined;
+                    const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "playback failed";
+                    self.pushToast(.@"error", copy, false);
+                }
             },
             .tick => {
                 const now = nowMs(io);
