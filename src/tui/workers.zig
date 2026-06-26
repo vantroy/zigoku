@@ -300,7 +300,7 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     const raw = provider.episodes(arena.allocator(), io, id, translation) catch |e| {
         log.debug("episodes fetch failed: {s}", .{@errorName(e)});
         gpa.free(id);
-        loop.postEvent(.episodes_error) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .episodes_error = e }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
@@ -308,7 +308,7 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
         log.debug("episodes alloc failed: {s}", .{@errorName(e)});
         gpa.free(id);
-        loop.postEvent(.episodes_error) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .episodes_error = e }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     for (raw) |ep| {
@@ -398,7 +398,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
     const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
         log.debug("resolve failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .play_error = null }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .play_error = .{ .final = null, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
@@ -412,7 +412,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
         .func = postPositionUpdate,
     }, skip) catch |e| {
         log.debug("mpv playback failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .play_error = progress.snapshot() }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .play_error = .{ .final = progress.snapshot(), .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 

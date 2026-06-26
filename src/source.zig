@@ -39,6 +39,12 @@ pub const SourceProvider = struct {
     pub const VTable = struct {
         /// Stable source identity used by persistence keys, e.g. "allanime".
         name: *const fn (ptr: *anyopaque) []const u8,
+        /// Human-facing source name for user-visible copy (toasts, CLI, banners),
+        /// e.g. "AllAnime". Distinct from `name`: that one is the stable
+        /// persistence key DB rows depend on; this one is free to read however it
+        /// looks best to a user. THE seam for the site name above the vtable — no
+        /// copy upstream of here hardcodes it, since the source is swappable.
+        displayName: *const fn (ptr: *anyopaque) []const u8,
         /// Search the catalog; return shows ranked best-match-first.
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
         /// List a show's episode numbers in the given track, numerically sorted.
@@ -51,6 +57,9 @@ pub const SourceProvider = struct {
 
     pub fn name(self: SourceProvider) []const u8 {
         return self.vtable.name(self.ptr);
+    }
+    pub fn displayName(self: SourceProvider) []const u8 {
+        return self.vtable.displayName(self.ptr);
     }
     pub fn search(self: SourceProvider, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime {
         return self.vtable.search(self.ptr, arena, io, query, opts);

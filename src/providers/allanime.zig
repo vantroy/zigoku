@@ -56,6 +56,10 @@ pub const AllAnime = struct {
     /// resume, and cache rows on `(source_name, show_id)` — see store.zig.
     pub const source_name = "allanime";
 
+    /// Human-facing name for user-visible copy. Separate from `source_name`:
+    /// that one is the DB key (must never change); this one is for display.
+    pub const display_name = "AllAnime";
+
     pub fn init() AllAnime {
         return .{};
     }
@@ -68,6 +72,7 @@ pub const AllAnime = struct {
 
     const vtable: source.SourceProvider.VTable = .{
         .name = nameErased,
+        .displayName = displayNameErased,
         .search = searchErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
@@ -77,6 +82,10 @@ pub const AllAnime = struct {
     fn nameErased(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return source_name;
+    }
+    fn displayNameErased(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return display_name;
     }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
@@ -350,12 +359,18 @@ pub const AllAnime = struct {
     // ── internals ────────────────────────────────────────────────────────────────
 
     /// One POST to the AllAnime GraphQL endpoint. Returns the response body
-    /// (lives in `arena`). Errors `HttpNotOk` on any non-200 — the caller maps it.
+    /// (lives in `arena`). Failures are split into distinct, actionable classes
+    /// (ROD-173) so the caller can tell the user whether to retry, wait, or reach
+    /// for a VPN, instead of collapsing everything into one signal:
+    ///   * `NetworkDown` — timeout / refused / unreachable on our side.
+    ///   * `Forbidden`   — 403/451: AllAnime is actively blocking us.
+    ///   * `ServerError` — 5xx: the source itself is down.
+    ///   * `HttpNotOk`   — any other non-200 (unexpected — the recipe may have drifted).
     fn post(arena: Allocator, io: Io, body: []const u8, referer: []const u8) ![]u8 {
         var client: std.http.Client = .{ .allocator = arena, .io = io };
         defer client.deinit();
         var aw: std.Io.Writer.Allocating = .init(arena);
-        const res = try client.fetch(.{
+        const res = client.fetch(.{
             .location = .{ .url = API },
             .method = .POST,
             .payload = body,
@@ -365,14 +380,71 @@ pub const AllAnime = struct {
                 .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "Referer", .value = referer },
             },
-        });
+        }) catch |e| return mapTransportError(e, referer);
         if (res.status != .ok) {
-            // The caller collapses this to HttpNotOk; keep the real status for a
-            // --debug session, where "AllAnime rejected the request" isn't enough.
+            // Keep the real status for a --debug session, where the mapped class
+            // ("AllAnime rejected the request") isn't enough; the caller only ever
+            // sees the class, not the code.
             log.debug("allanime POST {s}: HTTP {d}", .{ referer, @intFromEnum(res.status) });
-            return error.HttpNotOk;
+            return statusToError(res.status);
         }
         return aw.writer.buffered();
+    }
+
+    /// Classify a non-200 status (ROD-173). 403/451 mean we're being blocked; any
+    /// 5xx means the source itself is down; everything else stays the
+    /// undifferentiated `HttpNotOk` (an unexpected response — likely recipe drift).
+    fn statusToError(status: std.http.Status) error{ Forbidden, ServerError, HttpNotOk } {
+        return switch (status) {
+            .forbidden, .unavailable_for_legal_reasons => error.Forbidden,
+            else => switch (status.class()) {
+                .server_error => error.ServerError,
+                else => error.HttpNotOk,
+            },
+        };
+    }
+
+    /// Map a transport-layer failure from `client.fetch` to `NetworkDown` when
+    /// "check your connection" is the right advice. Two distinct families in
+    /// std.Io's `FetchError` qualify (they are NOT aliases of each other):
+    ///   * IP-level connect failures — refused / reset / host+network
+    ///     unreachable / timeout.
+    ///   * DNS `HostName.LookupError` — NXDOMAIN, SERVFAIL, malformed records,
+    ///     no address returned, unreadable resolv.conf. The ticket calls for DNS
+    ///     to land here, and these are their own error values, so they must be
+    ///     listed explicitly — an earlier draft wrongly assumed they aliased the
+    ///     connect errors (Elara H1).
+    /// `TlsInitializationFailed` is included: against our Cloudflare-fronted
+    /// upstream it is overwhelmingly a reset/intercepted handshake (a network
+    /// condition), though it also absorbs the rare server-side cert-validation
+    /// failure — an accepted imprecision over standing up a dedicated TLS class.
+    /// Everything else (OOM, protocol, local socket misconfig) propagates
+    /// unchanged so we never mislabel it as a dead network.
+    fn mapTransportError(e: anyerror, referer: []const u8) anyerror {
+        switch (e) {
+            // IP-level connect failures.
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.NetworkDown,
+            error.Timeout,
+            error.TlsInitializationFailed,
+            // DNS resolution failures (HostName.LookupError).
+            error.UnknownHostName,
+            error.NameServerFailure,
+            error.NoAddressReturned,
+            error.ResolvConfParseFailed,
+            error.DetectingNetworkConfigurationFailed,
+            error.InvalidDnsARecord,
+            error.InvalidDnsAAAARecord,
+            error.InvalidDnsCnameRecord,
+            => {
+                log.debug("allanime POST {s}: transport {s} -> NetworkDown", .{ referer, @errorName(e) });
+                return error.NetworkDown;
+            },
+            else => return e,
+        }
     }
 
     /// Hard cap on a long-tail response body. clock JSON and m3u8 manifests are
@@ -1390,4 +1462,45 @@ test "joinUrl: absolute, rooted, and relative refs" {
     try std.testing.expectEqualStrings("https://cdn.other/v.ts", try AllAnime.joinUrl(a, base, "https://cdn.other/v.ts"));
     try std.testing.expectEqualStrings("https://h.example/a/b.ts", try AllAnime.joinUrl(a, base, "/a/b.ts"));
     try std.testing.expectEqualStrings("https://h.example/x/y/720/seg.ts", try AllAnime.joinUrl(a, base, "720/seg.ts"));
+}
+
+test "statusToError: blocked / server-down / other split distinctly (ROD-173)" {
+    // 403 and 451 are "they're blocking us" — collapse to Forbidden.
+    try std.testing.expectEqual(error.Forbidden, AllAnime.statusToError(.forbidden));
+    try std.testing.expectEqual(error.Forbidden, AllAnime.statusToError(.unavailable_for_legal_reasons));
+    // Every 5xx is "the source is down" — ServerError, by class not by value, so
+    // an unnamed 5xx still lands here.
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.internal_server_error));
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.bad_gateway));
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.service_unavailable));
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(.gateway_timeout));
+    // An unnamed 5xx (Status is non-exhaustive) must still classify by range, not
+    // by tag — so a code we don't have a name for still reads as ServerError.
+    try std.testing.expectEqual(error.ServerError, AllAnime.statusToError(@enumFromInt(599)));
+    // Any other non-200 stays the undifferentiated HttpNotOk (recipe drift, 429…).
+    try std.testing.expectEqual(error.HttpNotOk, AllAnime.statusToError(.not_found));
+    try std.testing.expectEqual(error.HttpNotOk, AllAnime.statusToError(.bad_request));
+    try std.testing.expectEqual(error.HttpNotOk, AllAnime.statusToError(.too_many_requests));
+}
+
+test "mapTransportError: connectivity failures become NetworkDown, rest pass through (ROD-173)" {
+    // Genuine connectivity problems on our side → NetworkDown.
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionRefused, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionResetByPeer, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.HostUnreachable, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkUnreachable, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkDown, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.Timeout, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.TlsInitializationFailed, "t"));
+    // DNS resolution failures (HostName.LookupError) are their own error values,
+    // not aliases of the connect errors — they must land on NetworkDown too so
+    // "name didn't resolve" reads as a connectivity problem, per the ticket.
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.UnknownHostName, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NameServerFailure, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NoAddressReturned, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ResolvConfParseFailed, "t"));
+    // Anything that isn't a transport failure must not be mislabelled as a dead
+    // network — it propagates unchanged.
+    try std.testing.expectEqual(error.OutOfMemory, AllAnime.mapTransportError(error.OutOfMemory, "t"));
+    try std.testing.expectEqual(error.WriteFailed, AllAnime.mapTransportError(error.WriteFailed, "t"));
 }
