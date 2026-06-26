@@ -1817,7 +1817,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 
 This section is the implementable specification for view switching, the per-view
 focus model, F1/F2/F3 keybinds, bottom-bar help strings, and the Esc chain.
-Everything here is a concrete buildable decision. Haru should need zero additional
+Everything here is a concrete buildable decision. An implementer should need zero additional
 design calls to implement `active_view`, `active_pane`, and the keybind dispatch
 table below.
 

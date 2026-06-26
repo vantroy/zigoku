@@ -3,7 +3,7 @@ const vaxis = @import("vaxis");
 
 const Allocator = std.mem.Allocator;
 
-// ── decode-path history (ROD-110, Elara #3) ──────────────────────────────────
+// ── decode-path history (ROD-110) ────────────────────────────────────────────
 // The original cover pipeline decoded with `zigimg` and had to *gate the real
 // decode/render path out of Debug builds*, because Zig 0.16 blew up codegenning
 // the exe when that path was live in Debug. ReleaseSafe carried the real path.

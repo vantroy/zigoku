@@ -7,7 +7,7 @@
 //! explicitly-passed `*Config` — this struct never reaches back into App or
 //! navigation state.
 //!
-//! Keystone (per Theta): the subsystem owns its own state transitions but never
+//! Keystone: the subsystem owns its own state transitions but never
 //! the *projections* of those transitions onto App-live state. `onKey` returns a
 //! `KeyResult` verdict; the controller (App.onSettingsKey) maps `.config_changed`
 //! to a palette/translation re-sync, so the settings struct stays free of `App`,

@@ -38,7 +38,7 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
 
     // ROD-186: the season/year chip rides two spaces after the view label, in
     // text.muted (fg2) so it reads as metadata beside the cyan identity chip and
-    // never competes with the cyan `·` dot at the right edge (Mira header ruling).
+    // never competes with the cyan `·` dot at the right edge (per the header layout).
     // Content (App.topBarSeasonChip): the selected show's season+year, falling back
     // to the current cour; "" in Settings and for unenriched shows in the zoom.
     const season = self.topBarSeasonChip();

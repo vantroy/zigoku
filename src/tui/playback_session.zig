@@ -7,7 +7,7 @@
 //! over a caller-supplied `Store`. It is driven through explicit dependencies
 //! (`gpa`/`store`); it never reaches back into App.
 //!
-//! Where the boundary sits (per Theta): this struct owns the *session record*, not the
+//! Where the boundary sits: this struct owns the *session record*, not the
 //! *transport*. `playing`, `play_thread`, `current_position`, and
 //! `current_duration` stay on App — those are app-shell concerns (the loading
 //! flag, the thread handle the shell joins, the live position the UI renders),

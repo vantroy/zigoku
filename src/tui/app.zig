@@ -261,7 +261,7 @@ pub fn run(
         // ROD-191: reap a finished reload. Its terminal event (success OR failure)
         // bumped history_reload_settled, so the latch always clears — even when
         // loadHistory errors (a transient SQLITE_BUSY must not wedge every future
-        // refresh; Elara C1). Flip hist_live to the just-filled arena ONLY on
+        // refresh). Flip hist_live to the just-filled arena ONLY on
         // success: on failure setHistory never ran, so the live slice still points
         // into the old arena and flipping would dangle it on the next reload.
         if (reload_inflight and app.history_reload_settled != reload_settled_at_spawn) {
@@ -417,8 +417,8 @@ pub const App = struct {
     history_dirty: bool = false,
     /// Bumped when a reload reaches a terminal state — success (.history_reloaded)
     /// OR failure (.history_reload_failed). run() watches it to reap the worker and
-    /// clear `reload_inflight`, so a failed reload can never latch the reloader off
-    /// (Elara C1). A wrapping counter — only frame-to-frame equality matters.
+    /// clear `reload_inflight`, so a failed reload can never latch the reloader off.
+    /// A wrapping counter — only frame-to-frame equality matters.
     history_reload_settled: u32 = 0,
     /// Whether the last settled reload succeeded — gates the double-buffer flip in
     /// run(): flip the live arena only when setHistory actually swapped the slice.
@@ -781,7 +781,7 @@ pub const App = struct {
     /// from the system clock. The detail zoom is the exception — it is committed to
     /// one show, so it shows only that show's season with no cour fallback (an
     /// unenriched show shows no chip, never a misleading season). Settings has no
-    /// show context (Mira header ruling) and shows no chip.
+    /// show context (per the header layout) and shows no chip.
     pub fn topBarSeasonChip(self: *App) []const u8 {
         switch (self.active_view) {
             .settings => return "",
@@ -1014,7 +1014,7 @@ pub const App = struct {
     /// arms only for these: jump keys (g/G), filter input, and view/pane switches
     /// all move the cursor too, but they're *discrete settle points*, so the cover
     /// should sync at once rather than wait out the scroll debounce (ROD-202 review:
-    /// the cursor-delta proxy alone misfired on all three — Elara M1 / Nyra E1,E2).
+    /// the cursor-delta proxy alone misfired on all three).
     fn isListScrollKey(key: vaxis.Key) bool {
         return key.matches('j', .{}) or key.matches('k', .{}) or
             key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.up, .{});
@@ -1098,7 +1098,7 @@ pub const App = struct {
     /// `source` is optional for the browse path only: history-origin never needs it
     /// (the in-memory record carries its own), and a null source can't key a store
     /// read, so we return null explicitly rather than query with an empty string —
-    /// a silent masked miss (Elara M1).
+    /// a silent masked miss.
     fn detailSeedRecord(self: *App, arena: Allocator, source: ?[]const u8, source_id: []const u8) ?AnimeRecord {
         if (self.historyDetailRecord()) |rec| return rec;
         const st = self.store orelse return null;
@@ -1437,7 +1437,7 @@ pub const App = struct {
                 // are resolved from nav state here and handed to the subsystem
                 // (ROD-180).
                 //
-                // NOTE (Elara H2): currentDetailSourceName reads live UI state. If
+                // NOTE: currentDetailSourceName reads live UI state. If
                 // the user returned to the History list before this async result
                 // arrived, it falls back to provider.name(), which can mis-key a
                 // non-default-source history show. Harmless today (a mis-keyed entry
@@ -1806,7 +1806,7 @@ pub const App = struct {
 
         // View switching — F-keys (discoverable, §10.2) and H/S (vim-native, §6.1).
         // F2 = "go to History" — no-op if already there (spec §10.2 F2 from History).
-        // H = toggle Browse ↔ History (distinct from F2, per Elara H1/M2 fixes).
+        // H = toggle Browse ↔ History (distinct from F2).
         if (key.matches(vaxis.Key.f2, .{})) {
             if (self.active_view != .history) {
                 if (self.active_view == .settings) self.leaveSettings(io);

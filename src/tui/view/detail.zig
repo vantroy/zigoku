@@ -57,7 +57,7 @@ fn ensureCoverImage(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) bool {
     return true;
 }
 
-/// Non-Kitty fallback (§7.5, ROD-110 / Mira #5). With decoded pixels we draw
+/// Non-Kitty fallback (§7.5, ROD-110). With decoded pixels we draw
 /// a half-block mosaic that preserves the poster's structure; without them
 /// (decode failed but a dominant colour survived, or the kitty upload faulted)
 /// we degrade to the flat dominant-colour fill that always worked.
@@ -199,7 +199,7 @@ fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Wi
     if (max_h == 0) return 0;
     const cover_h: u16 = coverSlotHeight(win, cover_w, max_h);
     if (cover_h == 0) return 0;
-    // ROD-137 (Mira): below min_cover_rows the poster is a smear that reads as a
+    // ROD-137: below min_cover_rows the poster is a smear that reads as a
     // glitch — drop it so the header anchors identity instead. Only in the capped
     // (single-column) path; unconstrained callers keep their cover at any height.
     // This is an intentional cliff: at a no-geometry terminal the cover first
@@ -224,7 +224,7 @@ fn drawCover(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Wi
         } else if (showing_spinner) {
             const spin = std.fmt.bufPrint(&self.scratch.detail_msg, "{s}", .{self.spinnerChar()}) catch "⠋";
             // §3.6 slow-path: shift cyan → hot once the wait crosses the
-            // long-wait threshold (Mira #4), mirroring the bottom-bar spinner.
+            // long-wait threshold, mirroring the bottom-bar spinner.
             const spin_color = if (self.isSlowPath()) self.palette.hot else self.palette.focus;
             centerText(cover_win, cover_h / 2, cover_w, spin, self.s(spin_color, .{}));
         } else if (has_pixels) {
@@ -314,11 +314,11 @@ const min_grid_rows: u16 = 2;
 const max_header_rows: u16 = 7;
 
 /// Minimum synopsis rows reserved below the cover so a shrunk-cover pane still
-/// reads as a detail view, not a grid with a one-line stub (Mira ROD-137).
+/// reads as a detail view, not a grid with a one-line stub (ROD-137).
 const min_synopsis_rows: u16 = 2;
 
 /// Below this, the 20-col poster degrades to a smear that reads as a render glitch
-/// rather than cover art — the capped (single-column) path drops it (Mira ROD-137).
+/// rather than cover art — the capped (single-column) path drops it (ROD-137).
 const min_cover_rows: u16 = 6;
 
 /// The blank row `drawCover` appends after the poster (folded into its return).
@@ -418,7 +418,7 @@ fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16
     // Chips sit flush at col 0, aligning with the title/alt-title stack above —
     // §4.4's "leading space" is for the chip rendered *inline after the title*;
     // here it lives on its own row, so a leading indent would only misalign it
-    // (Mira review).
+    // (design review).
     //
     // CRITICAL: the season text must live in App-owned storage, not a stack
     // local. vaxis cells hold a *slice* into the segment text (not a copy), and
@@ -473,7 +473,7 @@ fn drawScore(self: *App, win: vaxis.Window, w: u16, anime: ?Anime, start_row: u1
     // Render the score, then genres, as chained `win.print`s, advancing by the
     // print's *returned* cursor column. Tracking columns by slice length drifts:
     // the "✦" star (3 bytes, 1 col) and the " · " separator's "·" (2 bytes, 1 col)
-    // each overcount, opening phantom gaps before the genres (ROD-141 / Mira
+    // each overcount, opening phantom gaps before the genres (ROD-141
     // review). Letting vaxis report the real display column closes them.
     // wrap: .none on every print — these target the multi-row pane window, so a
     // segment reaching the pane edge must stop, not fold onto the next row (which
@@ -526,7 +526,7 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
     // Hairline. The row advance sits inside the height guard (the original inline
     // code advanced unconditionally) — only divergent at pane h≤2, which
     // layout()'s h<4 guard already rules out, so this is a tidy-up, not a
-    // behavior change. Elara ROD-113 N2.
+    // behavior change. ROD-113 N2.
     if (row < h) {
         drawHairline(self, win, w, row);
         row += 1;
@@ -624,7 +624,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     // Gate on terminal width, not the pane width `w`: the pane is `term_w - 2`,
     // so a `w`-based gate would lag the History list preview's ≥100 boundary by
     // 2 cols (you'd get a preview but a single-column detail at 100–101 cols).
-    // Elara/Astra ROD-113 review.
+    // ROD-113 review.
     if (two_col and isTwoColumn(term_w)) {
         // Floor of 20 keeps the 20-col cover block fitting the left column even
         // when the gate drops (ROD-170's persistent-pane threshold). Dead at the
@@ -782,7 +782,7 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // inverting the hierarchy. A launching cell owns the slot outright.
             const is_resume = !launching and
                 (if (self.episodes.resume_idx) |ri| ep_idx == ri else false);
-            // ROD-192 review (Mira NIT-2): the `▸` needs a free column inside the
+            // ROD-192 review: the `▸` needs a free column inside the
             // 5-wide `[..]` shell, which only exists for ≤2-char labels. For a
             // 3-digit or non-numeric resume label (`123`, `SP1`) the glyph would
             // clip to a bracket-less `[▸12`, which reads as broken. Drop the glyph

@@ -1461,7 +1461,7 @@ test "setListStatus: force-complete snaps progress to the known finale" {
     try testing.expectEqual(@as(i64, 3), b.progress); // unchanged, no total to snap to
 
     // total_episodes = 0 (AllAnime quirk) is NOT a real finale: force-complete
-    // must NOT reset progress to zero (Elara H1 regression — the `t > 0` guard).
+    // must NOT reset progress to zero (regression — the `t > 0` guard).
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "c", .title = "C", .total_episodes = 0 }, 1002, arena);
     try s.recordPlay(T_SOURCE, "c", 5, 2001, true); // progress 5, total 0
     try s.setListStatus(T_SOURCE, "c", .completed);

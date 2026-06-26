@@ -185,7 +185,7 @@ pub fn prepare(
 /// past whichever segment the current `time-pos` falls inside. `-1` disables a
 /// segment; `mode` gates intro vs outro.
 ///
-/// UX (design: Mira): announce the skip *before* cutting so the jump reads as
+/// UX (design): announce the skip *before* cutting so the jump reads as
 /// intentional, not a glitch. `skip_section` shows a calm OSD line, then seeks a
 /// beat later. The `skipped` flags debounce the high-frequency time-pos observer
 /// so the deferred seek fires exactly once per segment; `file-loaded` resets them
