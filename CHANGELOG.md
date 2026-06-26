@@ -14,6 +14,24 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-27
+
+### Added
+
+- **Truecolor via `COLORTERM`**: zigoku now honours `COLORTERM=truecolor` (or `24bit`) to enable 24-bit colour in terminals that advertise it but do not answer the capability query — common in some tmux and SSH setups. Without it, the palette fell back to 256-colour approximation.
+
+- **Failure-specific error toasts for playback and episode loads**: failures now surface a specific reason instead of a generic fallback. DNS and connectivity losses, blocked requests (403), and server errors each produce a distinct toast — enough to tell whether to check your connection, try a VPN, or wait out a source outage.
+
+- **Distinct `mpv not found` and `mpv crashed` messages**: a missing mpv binary shows `mpv not found — install mpv`; a crash or non-zero exit shows `mpv exited with error`. Both are distinct from source and network failures.
+
+### Fixed
+
+- **Scrolling no longer stalls against slow connections**: navigating the watchlist while an episode prefetch was in flight on a slow endpoint could briefly block input until the fetch completed. Superseded prefetches now run to completion in the background — the main loop never waits on them.
+
+- **English and native titles in Watchlist detail**: the Watchlist and History detail pane now shows the English and native-script titles below the romaji title, matching the Browse detail view. The data was already in the store; only the render path was missing.
+
+- **SQLite bind errors are now caught and surfaced**: a failed parameter bind previously ran the statement with a `NULL` substitution, which could produce data corruption on a column-index mismatch. The error now propagates instead of being discarded.
+
 ## [0.1.2] - 2026-06-26
 
 ### Added
@@ -88,7 +106,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/vantroy/zigoku/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vantroy/zigoku/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vantroy/zigoku/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/vantroy/zigoku/releases/tag/v0.1.0
