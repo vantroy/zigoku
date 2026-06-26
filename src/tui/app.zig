@@ -128,6 +128,16 @@ pub fn run(
     // Learn terminal caps (kitty graphics/keyboard) before the first paint.
     try vx.queryTerminal(writer, .fromMilliseconds(500));
 
+    // Honour COLORTERM=truecolor/24bit. vaxis only flips caps.rgb on a terminal
+    // XTGETTCAP reply (Loop.zig `cap_rgb`); a terminal that does 24-bit color but
+    // doesn't answer that query — notably vhs's headless recorder, but also some
+    // tmux/ssh setups — otherwise downsamples our truecolor palette to 256-color.
+    // COLORTERM is the standard signal; vaxis's own check is commented out upstream.
+    if (environ_map.get("COLORTERM")) |ct| {
+        if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit"))
+            vx.caps.rgb = true;
+    }
+
     // Drain events that accumulated during queryTerminal before the first paint.
     // The tty reader thread may have posted an initial .winsize event (Loop.zig
     // ttyRun lines 164–167) and/or CPR-derived key_press events: vaxis's
