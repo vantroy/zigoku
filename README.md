@@ -14,63 +14,81 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 > double as study notes — see [Why this exists](#why-this-exists) for the
 > story and how it's built.
 
+## Contents
+
+- [Screenshots / Demo](#screenshots--demo)
+- [What it does today](#what-it-does-today)
+- [Install](#install)
+- [Development](#development)
+- [Stack](#stack)
+- [Why this exists](#why-this-exists)
+- [Acknowledgements](#acknowledgements)
+- [Milestones](#milestones)
+
+## Screenshots / Demo
+
+![Demo — Watchlist, Browse, search, enriched detail, episode grid](docs/media/demo.gif)
+
+*Hero: Watchlist → Browse → search → enriched detail → episode grid, play-ready.
+The `enter` affordance is lit on the episode row — playback hands off to `mpv` from there.
+Covers render as halfblock cells here; the Kitty-graphics shots below show true cover art.*
+
+---
+
+![Detail pane with Kitty-graphics cover art, kanji chips, synopsis, and episode grid](docs/media/detail-cover.png)
+
+*Detail pane with real cover art rendered via the Kitty graphics protocol (kitty / ghostty / WezTerm),
+kanji metadata chips, reflowed synopsis, and the episode grid with resume `▸` / watched `●` markers.*
+
+![Watchlist — grouped status headers and progress bars](docs/media/history.png)
+
+*Real watchlist: grouped status headers (`Watching`, `Planning`, …) and per-show progress bars.*
+
+![Settings tab — palette row focused](docs/media/settings.png)
+
+*Settings tab with the palette row focused — four built-in themes: `terminal_ghost`, `phosphor`, `nord`, `tokyonight`.*
+
+![Themes tour — palette cycle through all four themes](docs/media/stills.gif)
+
+*Themes tour: palette cycle through `terminal_ghost` → `phosphor` → `nord` → `tokyonight`.*
+
+---
+
 ## What it does today
 
-- **Full TUI** (libvaxis): a unified two-pane shell — search with infinite-scroll
-  results, a detail pane (kanji metadata chips, reflowed synopsis, and an episode
-  grid with resume `▸` / watched `●` markers), and a grouped watchlist. Selection
-  and active-pane focus hierarchy, toasts, spinner, status bar.
-- **Watchlist & watch-state**: every show carries a status — planning / watching /
-  paused / dropped / completed — with grouped history headers and fuzzy filtering.
-  Add straight from browse with `P`, move state with `p`/`x`/`c`/`w`/`P`, recompute
-  progress from per-episode history with `r`, and undo the last change with `u`.
-  Progress and the watchlist refresh in-session right after playback.
-- **Cover art** rendered with Kitty graphics where supported, halfblock cells
-  everywhere else — fetched and decoded asynchronously, behind LRU caches.
+- **Full TUI** (libvaxis): two-pane shell — infinite-scroll search, detail pane
+  (kanji metadata chips, reflowed synopsis, episode grid with resume `▸` / watched
+  `●` markers), grouped watchlist, toasts, spinner, status bar.
+- **Watchlist & watch-state**: planning / watching / paused / dropped / completed
+  statuses, grouped headers, fuzzy filtering. Add from browse with `P`; move state
+  with `p`/`x`/`c`/`w`/`P`; recompute progress with `r`; undo with `u`. Watchlist
+  refreshes in-session after playback.
+- **Cover art** via Kitty graphics where supported, halfblock cells elsewhere —
+  fetched asynchronously, behind LRU caches.
 - **Search → resolve → play**: AllAnime catalog search, episode listing, stream
   resolution, playback in `mpv`.
-- **History & resume** in SQLite (raw C interop): watch history, exact resume
-  positions (live position over mpv's IPC socket, checkpointed during playback
-  and persisted on quit), and a
+- **History & resume** (SQLite, raw C interop): watch history, exact resume
+  positions via mpv's IPC socket (checkpointed during playback, persisted on quit),
   status-aware episode-list cache.
-- **AniList enrichment**: AllAnime results are mapped to AniList entries for
-  richer metadata (season, genres, native title, format) and cover art — surfaced
-  as kanji chips and persisted to the store.
+- **AniList enrichment**: AllAnime results mapped to AniList for richer metadata
+  (season, genres, native title, format) and cover art — surfaced as kanji chips,
+  persisted to the store.
 - **Config & settings**: live-editable settings tab (mpv path, quality, language,
   AniSkip mode, cover art, themes). Persisted to `~/.config/zigoku/config.zon`.
-  Three built-in color palettes: `terminal_ghost` (default green-on-void),
-  `phosphor` (monochrome phosphor green), and `nord`.
-- **Scriptable CLI** alongside the TUI: `zigoku <query>` runs the original
-  prompt-driven search → pick → play flow, headless-friendly.
+  Four palettes: `terminal_ghost` (default), `phosphor`, `nord`, `tokyonight`.
+- **Scriptable CLI**: `zigoku <query>` runs the original search → pick → play flow,
+  headless-friendly.
 
 ## Install
 
-Zigoku is distributed as source, as a prebuilt Linux binary, or via Homebrew on
-macOS (all below). To install from source, clone it and run the installer:
+**One hard runtime dependency across all install methods: `mpv`.**
+The binary shells out to whatever `mpv` is on your `PATH` to play video.
+Without it, you get a browser. A very nice browser, but still.
 
-```sh
-git clone https://github.com/vantroy/zigoku.git
-cd zigoku
-./scripts/install.sh            # builds ReleaseSafe → ~/.local/bin/zigoku
-```
+### AUR (Arch Linux) — coming soon
 
-The installer builds in `ReleaseSafe` and drops the binary in your prefix's
-`bin/`. Override the prefix with `--prefix DIR` (or `PREFIX=DIR`), and remove
-the binary later with `./scripts/install.sh --uninstall`. If `~/.local/bin`
-isn't on your `PATH`, the installer tells you how to add it.
-
-**Requirements:** Zig **0.16.0+** and system `sqlite3` (with dev headers) to
-build; `mpv` on `PATH` at runtime. Cover art looks best in a terminal with the
-Kitty graphics protocol (kitty, ghostty, WezTerm).
-
-Once installed:
-
-```sh
-zigoku                        # no args → the TUI
-zigoku frieren                # CLI flow: search → pick → play
-zigoku "cowboy bebop" --dub
-zigoku <query> --debug        # diagnostics to stderr (CLI) or the log file (TUI)
-```
+Will be `paru -S zigoku` once published. AUR new-account registrations are
+currently closed, so the package can't be created until that changes.
 
 ### macOS: Homebrew
 
@@ -83,14 +101,10 @@ implicitly — no separate `brew tap` needed. You get a prebuilt, SQLite-bundled
 binary for your arch (Apple Silicon or Intel), and Homebrew pulls `mpv` as a
 dependency. Upgrades ride `brew upgrade`.
 
-### Or: grab a prebuilt binary
+### Prebuilt binary (Linux)
 
 Fully static, no shared-lib deps — not even glibc. SQLite is compiled in.
 Runs on any Linux of that architecture; no Zig toolchain required.
-
-**One hard runtime dependency that is not bundled and never will be: `mpv`.**
-The binary shells out to whatever `mpv` is on your `PATH` to play video.
-Without it, you get a browser. A very nice browser, but still.
 
 1. Download the tarball for your arch from the [latest release](https://github.com/vantroy/zigoku/releases/latest):
 
@@ -113,13 +127,7 @@ Without it, you get a browser. A very nice browser, but still.
    # no chmod needed — tar preserves the executable bit
    ```
 
-4. Make sure `mpv` is installed and on your `PATH`:
-
-   ```sh
-   command -v mpv
-   ```
-
-5. Run it:
+4. Run it:
 
    ```sh
    zigoku
@@ -128,7 +136,33 @@ Without it, you get a browser. A very nice browser, but still.
 Cover art looks best in a terminal with the Kitty graphics protocol (kitty,
 ghostty, WezTerm); everywhere else you get halfblock cells. Functional either way.
 
-## Build from source
+### From source
+
+```sh
+git clone https://github.com/vantroy/zigoku.git
+cd zigoku
+./scripts/install.sh            # builds ReleaseSafe → ~/.local/bin/zigoku
+```
+
+The installer builds in `ReleaseSafe` and drops the binary in your prefix's
+`bin/`. Override the prefix with `--prefix DIR` (or `PREFIX=DIR`), and remove
+the binary later with `./scripts/install.sh --uninstall`. If `~/.local/bin`
+isn't on your `PATH`, the installer tells you how to add it.
+
+**Requirements:** Zig **0.16.0+** and system `sqlite3` (with dev headers) to build.
+
+---
+
+Once installed:
+
+```sh
+zigoku                        # no args → the TUI
+zigoku frieren                # CLI flow: search → pick → play
+zigoku "cowboy bebop" --dub
+zigoku <query> --debug        # diagnostics to stderr (CLI) or the log file (TUI)
+```
+
+## Development
 
 To work on Zigoku without installing, drive it through `zig build`:
 
@@ -140,6 +174,19 @@ zig build test                # run the unit tests
 ./scripts/e2e.sh              # end-to-end harness (stubs mpv; offline-safe)
 ```
 
+The spikes in [`src/spikes/`](src/spikes/) are self-contained throwaway programs that de-risked the hard unknowns before the real architecture existed — HTTP + JSON, SQLite via C interop, threads + a channel, the AllAnime stream resolver, mpv playback, and a TUI smoke test. Each has its own runnable build step:
+
+```sh
+zig build spike-http          # AniList HTTP search
+zig build spike-sqlite        # SQLite C-interop
+zig build spike-concurrency   # thread pool + channel
+zig build spike-stream        # AllAnime stream resolver
+zig build spike-mpv           # full pipeline → play in mpv
+zig build spike-tui           # libvaxis boot smoke test
+```
+
+**[SPIKES.md](SPIKES.md)** is the annotated tour — useful if you want to understand the decisions before diving into the real modules.
+
 ## Stack
 
 - **TUI:** libvaxis (Kitty graphics + halfblock fallback)
@@ -147,25 +194,6 @@ zig build test                # run the unit tests
 - **Concurrency:** thread pool + channels
 - **Source:** AllAnime, behind a swappable `SourceProvider` interface
 - **Catalog:** AniList for metadata & cover art
-
-## Roadmap
-
-Condensed from the [Linear project](https://linear.app/vantroy/project/zigoku-地獄-2dff2e5d180c);
-issue IDs in commit messages map back to it.
-
-| Milestone | Scope | Status |
-|-----------|-------|--------|
-| **M0** | Foundation & spikes (HTTP, SQLite, concurrency, resolver, mpv) | ✅ done |
-| **M1** | Vertical slice: CLI search → pick → play | ✅ done |
-| **M2** | Persistence: SQLite history, resume, episode cache | ✅ done |
-| **M3** | TUI shell: libvaxis, tabs, search/detail/history views | ✅ done |
-| **M4** | Cover art: Kitty graphics, async pipeline, LRU caches, AniList bridge | ✅ done |
-| **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip ✅, broader stream coverage ✅ | ✅ done |
-| **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
-| **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
-| **M8** | Nice-to-haves: quality selector ✅, wide-terminal history layout ✅, detail/episode caching ✅, post-playback state sync ✅ | ✅ done |
-| **M9** | Polish — *the watchlist Odyssey*: watch-state machine + grouped history ✅, add-to-watchlist from browse ✅, progress recompute + single-level undo ✅, episode resume/watched chips ✅, richer detail metadata as kanji chips ✅, History↔Browse two-pane unification ✅, selection & active-pane focus hierarchy ✅, in-session refresh after playback ✅, four god-file carvings + tick/draw split ✅, DESIGN.md reconciliation ✅ | ✅ done |
-| **M10** | Release: tag-driven builds + GitHub Releases, AUR & Homebrew, macOS CI, README badges & media | 📋 planned |
 
 ## Why this exists
 
@@ -201,6 +229,24 @@ find online.
 - **[anipy-cli](https://github.com/sdaqo/anipy-cli)** by [sdaqo](https://github.com/sdaqo) (GPL-3.0) — showed us the way on AllAnime streaming when every other source had gone dark. The working recipe (POST instead of GET, Apollo persisted-query hashes, and the AES-256-GCM `tobeparsed` scheme) was learned by studying its `allanime_provider.py`. Zigoku reimplements the wire protocol in Zig from observed behavior — no code is copied — but the trail was theirs. Thank you. 🙏
 - **[ani-nexus-tui](https://github.com/OsamuDazai666/ani-nexus-tui)** (CC BY-NC-SA 4.0) — studied for feature/UX inspiration.
 - Catalog metadata & cover art from **[AniList](https://anilist.co/)**.
+
+## Milestones
+
+A record of the journey — `ROD-NN` issue IDs in commit messages map to each milestone below.
+
+| Milestone | Scope | Status |
+|-----------|-------|--------|
+| **M0** | Foundation & spikes (HTTP, SQLite, concurrency, resolver, mpv) | ✅ done |
+| **M1** | Vertical slice: CLI search → pick → play | ✅ done |
+| **M2** | Persistence: SQLite history, resume, episode cache | ✅ done |
+| **M3** | TUI shell: libvaxis, tabs, search/detail/history views | ✅ done |
+| **M4** | Cover art: Kitty graphics, async pipeline, LRU caches, AniList bridge | ✅ done |
+| **M5** | Playback polish: mpv IPC position ✅, checkpoints & exact resume ✅, AniSkip ✅, broader stream coverage ✅ | ✅ done |
+| **M6** | Config & settings: config file ✅, settings tab ✅, themes ✅ | ✅ done |
+| **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
+| **M8** | Nice-to-haves: quality selector ✅, wide-terminal history layout ✅, detail/episode caching ✅, post-playback state sync ✅ | ✅ done |
+| **M9** | Polish — *the watchlist Odyssey*: watch-state machine + grouped history ✅, add-to-watchlist from browse ✅, progress recompute + single-level undo ✅, episode resume/watched chips ✅, richer detail metadata as kanji chips ✅, History↔Browse two-pane unification ✅, selection & active-pane focus hierarchy ✅, in-session refresh after playback ✅, four god-file carvings + tick/draw split ✅, DESIGN.md reconciliation ✅ | ✅ done |
+| **M10** | Release: tag-driven builds + GitHub Releases ✅, Homebrew ✅, macOS CI ✅, README badges & media ✅ — AUR pending (see [Install](#install)) | ✅ mostly done |
 
 ## License
 
