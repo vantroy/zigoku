@@ -36,7 +36,7 @@ const paths = @import("paths.zig");
 // pre-resolved path. `defaultDbPath` reaches those through `paths.Error` and
 // carries them via its inferred error set — keeping them out of `Store.Error`
 // stops a reader from writing handlers for errors `Store` can't produce.
-pub const Error = error{ Open, Exec, Prepare, Step, OutOfMemory, SchemaTooNew };
+pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaTooNew };
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
@@ -353,39 +353,39 @@ pub const Store = struct {
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
 
-        bindText(stmt, 1, a.source);
-        bindText(stmt, 2, a.source_id);
-        bindText(stmt, 3, a.title);
-        bindOptText(stmt, 4, a.title_english);
-        bindOptI64(stmt, 5, a.mal_id);
-        bindOptI64(stmt, 6, a.anilist_id);
-        bindOptText(stmt, 7, a.cover_url);
-        bindOptI64(stmt, 8, a.year);
-        bindOptText(stmt, 9, a.status);
-        bindOptText(stmt, 10, a.description);
-        bindOptI64(stmt, 11, a.score);
-        bindOptI64(stmt, 12, a.total_episodes);
-        bindText(stmt, 13, a.list_status.str());
-        bindOptF64(stmt, 14, a.user_rating);
-        bindOptText(stmt, 15, a.notes);
-        _ = c.sqlite3_bind_int64(stmt, 16, a.play_count);
-        _ = c.sqlite3_bind_int64(stmt, 17, a.progress);
-        _ = c.sqlite3_bind_int64(stmt, 18, if (a.added_at != 0) a.added_at else now);
-        bindOptI64(stmt, 19, a.last_watched_at);
-        _ = c.sqlite3_bind_int64(stmt, 20, if (a.history_visible) 1 else 0);
-        bindOptText(stmt, 21, a.season);
-        bindOptText(stmt, 22, a.native_name);
-        bindOptText(stmt, 23, a.kind);
-        bindOptI64(stmt, 24, a.start_year);
-        bindOptI64(stmt, 25, a.start_month);
-        bindOptI64(stmt, 26, a.start_day);
+        try bindText(stmt, 1, a.source);
+        try bindText(stmt, 2, a.source_id);
+        try bindText(stmt, 3, a.title);
+        try bindOptText(stmt, 4, a.title_english);
+        try bindOptI64(stmt, 5, a.mal_id);
+        try bindOptI64(stmt, 6, a.anilist_id);
+        try bindOptText(stmt, 7, a.cover_url);
+        try bindOptI64(stmt, 8, a.year);
+        try bindOptText(stmt, 9, a.status);
+        try bindOptText(stmt, 10, a.description);
+        try bindOptI64(stmt, 11, a.score);
+        try bindOptI64(stmt, 12, a.total_episodes);
+        try bindText(stmt, 13, a.list_status.str());
+        try bindOptF64(stmt, 14, a.user_rating);
+        try bindOptText(stmt, 15, a.notes);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 16, a.play_count));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 17, a.progress));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 18, if (a.added_at != 0) a.added_at else now));
+        try bindOptI64(stmt, 19, a.last_watched_at);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 20, if (a.history_visible) 1 else 0));
+        try bindOptText(stmt, 21, a.season);
+        try bindOptText(stmt, 22, a.native_name);
+        try bindOptText(stmt, 23, a.kind);
+        try bindOptI64(stmt, 24, a.start_year);
+        try bindOptI64(stmt, 25, a.start_month);
+        try bindOptI64(stmt, 26, a.start_day);
         // Empty list → bind NULL so the COALESCE preserves any genres already
         // persisted by an earlier enrichment (same "re-search never wipes" rule
         // the scalar fields lean on).
         if (a.genres.len == 0) {
-            _ = c.sqlite3_bind_null(stmt, 27);
+            try checkBind(stmt, c.sqlite3_bind_null(stmt, 27));
         } else {
-            bindText(stmt, 27, try joinGenres(scratch, a.genres));
+            try bindText(stmt, 27, try joinGenres(scratch, a.genres));
         }
 
         try self.stepDone(stmt);
@@ -453,8 +453,8 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         return .{
             .source = try dupeText(arena, stmt, 0) orelse "",
@@ -493,8 +493,8 @@ pub const Store = struct {
     fn statusRow(self: *Store, source: []const u8, source_id: []const u8) Error!?StatusRow {
         const stmt = try self.prepare("SELECT list_status, progress, total_episodes FROM anime WHERE source = ? AND source_id = ?");
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
         return .{
             .status = colStatus(stmt, 0),
@@ -529,11 +529,11 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        _ = c.sqlite3_bind_int64(stmt, 1, now);
-        _ = c.sqlite3_bind_int64(stmt, 2, new_progress);
-        bindText(stmt, 3, new_status.str());
-        bindText(stmt, 4, source);
-        bindText(stmt, 5, source_id);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 1, now));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, new_progress));
+        try bindText(stmt, 3, new_status.str());
+        try bindText(stmt, 4, source);
+        try bindText(stmt, 5, source_id);
         try self.stepDone(stmt);
     }
 
@@ -565,10 +565,10 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, status.str());
-        _ = c.sqlite3_bind_int64(stmt, 2, new_progress);
-        bindText(stmt, 3, source);
-        bindText(stmt, 4, source_id);
+        try bindText(stmt, 1, status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, new_progress));
+        try bindText(stmt, 3, source);
+        try bindText(stmt, 4, source_id);
         try self.stepDone(stmt);
     }
 
@@ -587,10 +587,10 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, status.str());
-        _ = c.sqlite3_bind_int64(stmt, 2, progress);
-        bindText(stmt, 3, source);
-        bindText(stmt, 4, source_id);
+        try bindText(stmt, 1, status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, progress));
+        try bindText(stmt, 3, source);
+        try bindText(stmt, 4, source_id);
         try self.stepDone(stmt);
     }
 
@@ -631,9 +631,9 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql_sel);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
-        bindText(stmt, 3, tt.str());
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try bindText(stmt, 3, tt.str());
 
         // 2. Collect rows into a scratch-allocated list; dupe labels into scratch.
         const Row = struct { ep: domain.EpisodeNumber, watched: bool };
@@ -669,9 +669,9 @@ pub const Store = struct {
         const sql_upd = "UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?";
         const upd = try self.prepare(sql_upd);
         defer _ = c.sqlite3_finalize(upd);
-        _ = c.sqlite3_bind_int64(upd, 1, high_water);
-        bindText(upd, 2, source);
-        bindText(upd, 3, source_id);
+        try checkBind(upd, c.sqlite3_bind_int64(upd, 1, high_water));
+        try bindText(upd, 2, source);
+        try bindText(upd, 3, source_id);
         try self.stepDone(upd);
 
         return high_water;
@@ -704,14 +704,14 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
-        bindText(stmt, 3, tt.str());
-        bindText(stmt, 4, episode);
-        _ = c.sqlite3_bind_double(stmt, 5, position_secs);
-        _ = c.sqlite3_bind_double(stmt, 6, duration_secs);
-        _ = c.sqlite3_bind_int64(stmt, 7, watched);
-        _ = c.sqlite3_bind_int64(stmt, 8, now);
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try bindText(stmt, 3, tt.str());
+        try bindText(stmt, 4, episode);
+        try checkBind(stmt, c.sqlite3_bind_double(stmt, 5, position_secs));
+        try checkBind(stmt, c.sqlite3_bind_double(stmt, 6, duration_secs));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 7, watched));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 8, now));
         try self.stepDone(stmt);
     }
 
@@ -729,10 +729,10 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
-        bindText(stmt, 3, tt.str());
-        bindText(stmt, 4, episode);
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try bindText(stmt, 3, tt.str());
+        try bindText(stmt, 4, episode);
         switch (c.sqlite3_step(stmt)) {
             c.SQLITE_ROW => return .{
                 .position_secs = c.sqlite3_column_double(stmt, 0),
@@ -784,12 +784,12 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
-        bindText(stmt, 3, tt.str());
-        bindText(stmt, 4, blob.items);
-        _ = c.sqlite3_bind_int64(stmt, 5, now);
-        _ = c.sqlite3_bind_int64(stmt, 6, now + cacheTtl(airing_status));
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try bindText(stmt, 3, tt.str());
+        try bindText(stmt, 4, blob.items);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 5, now));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 6, now + cacheTtl(airing_status)));
         try self.stepDone(stmt);
     }
 
@@ -809,9 +809,9 @@ pub const Store = struct {
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
-        bindText(stmt, 1, source);
-        bindText(stmt, 2, source_id);
-        bindText(stmt, 3, tt.str());
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try bindText(stmt, 3, tt.str());
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
 
         const expires_at = c.sqlite3_column_int64(stmt, 1);
@@ -918,19 +918,44 @@ pub fn defaultDbPath(arena: Allocator) ![:0]const u8 {
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
-fn bindText(stmt: Stmt, idx: c_int, s: []const u8) void {
+// Map a `sqlite3_bind_*` return code to the module error set. Side-effect-free
+// (no logging) so the failure path is unit-testable without tripping the test
+// runner's logged-error guard; `checkBind` wraps it with the diagnostic log.
+fn bindCode(code: c_int) Error!void {
+    if (code != c.SQLITE_OK) return error.Bind;
+}
+
+// Check a `sqlite3_bind_*` return code, mirroring `prepare`/`stepDone`: a non-OK
+// code is logged and surfaced as `error.Bind` rather than discarded. A swallowed
+// failure would let the statement execute with a NULL where a value was expected —
+// silent data corruption. Reachable via SQLITE_RANGE (a column index drifting past
+// a schema change) and SQLITE_NOMEM/SQLITE_TOOBIG on pathological inputs.
+//
+// The bind helpers hold only a `Stmt`, not the `*Store`, so we recover the owning
+// connection with `sqlite3_db_handle(stmt)` to read its error message.
+fn checkBind(stmt: Stmt, code: c_int) Error!void {
+    bindCode(code) catch |e| {
+        std.log.err("store: bind failed: {s}", .{c.sqlite3_errmsg(c.sqlite3_db_handle(stmt))});
+        return e;
+    };
+}
+
+fn bindText(stmt: Stmt, idx: c_int, s: []const u8) Error!void {
     // SQLITE_STATIC: caller guarantees `s` outlives the step (always true here —
     // bind args live in the calling method's frame across its single step).
-    _ = c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), SQLITE_STATIC);
+    return checkBind(stmt, c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), SQLITE_STATIC));
 }
-fn bindOptText(stmt: Stmt, idx: c_int, s: ?[]const u8) void {
-    if (s) |x| bindText(stmt, idx, x) else _ = c.sqlite3_bind_null(stmt, idx);
+fn bindOptText(stmt: Stmt, idx: c_int, s: ?[]const u8) Error!void {
+    if (s) |x| return bindText(stmt, idx, x);
+    return checkBind(stmt, c.sqlite3_bind_null(stmt, idx));
 }
-fn bindOptI64(stmt: Stmt, idx: c_int, v: ?i64) void {
-    if (v) |x| _ = c.sqlite3_bind_int64(stmt, idx, x) else _ = c.sqlite3_bind_null(stmt, idx);
+fn bindOptI64(stmt: Stmt, idx: c_int, v: ?i64) Error!void {
+    if (v) |x| return checkBind(stmt, c.sqlite3_bind_int64(stmt, idx, x));
+    return checkBind(stmt, c.sqlite3_bind_null(stmt, idx));
 }
-fn bindOptF64(stmt: Stmt, idx: c_int, v: ?f64) void {
-    if (v) |x| _ = c.sqlite3_bind_double(stmt, idx, x) else _ = c.sqlite3_bind_null(stmt, idx);
+fn bindOptF64(stmt: Stmt, idx: c_int, v: ?f64) Error!void {
+    if (v) |x| return checkBind(stmt, c.sqlite3_bind_double(stmt, idx, x));
+    return checkBind(stmt, c.sqlite3_bind_null(stmt, idx));
 }
 
 fn dupeText(arena: Allocator, stmt: Stmt, idx: c_int) Error!?[]const u8 {
@@ -993,6 +1018,30 @@ test "open + migrate sets user_version" {
     var s = try Store.openMemory();
     defer s.close();
     try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
+}
+
+test "bind error surfaces instead of writing a silent NULL" {
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A single-parameter statement: valid bind indices are 1..1, so binding column
+    // 2 is out of range and SQLite returns SQLITE_RANGE. Pre-ROD-217 that code was
+    // discarded and the statement would have executed with a NULL where a value was
+    // expected. We drive the real failing bind, then map its actual return code
+    // through the side-effect-free `bindCode` (checkBind's core) to assert it
+    // surfaces as error.Bind — without emitting the diagnostic .err log the test
+    // runner counts as a failure.
+    const stmt = try s.prepare("SELECT ?1");
+    defer _ = c.sqlite3_finalize(stmt);
+
+    const range_code = c.sqlite3_bind_text(stmt, 2, "x", 1, SQLITE_STATIC);
+    try testing.expect(range_code != c.SQLITE_OK);
+    try testing.expectError(error.Bind, bindCode(range_code));
+
+    // The happy-path bind on the valid index maps to success.
+    const ok_code = c.sqlite3_bind_text(stmt, 1, "ok", 2, SQLITE_STATIC);
+    try testing.expectEqual(c.SQLITE_OK, ok_code);
+    try bindCode(ok_code);
 }
 
 test "upsertAnime + loadHistory round-trips" {
