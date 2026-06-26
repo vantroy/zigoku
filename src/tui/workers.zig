@@ -46,6 +46,12 @@ const Loop = event_mod.Loop;
 /// (ROD-156) keeps superseding fires rare and each fetch is deadline-bounded
 /// (ROD-153), so the outstanding set stays small in practice. A hard cap would
 /// be backpressure policy, not a safety requirement.
+///
+/// `drain()` assumes the event queue keeps draining: a worker's final
+/// `postEvent` blocks if the bounded queue is full, and during teardown the main
+/// loop has stopped popping — so a saturated queue could wedge the drain. This is
+/// a pre-existing, low-probability teardown hazard shared by every worker join in
+/// run(); hardening it (pump the queue while draining) is a separate follow-up.
 pub const ThreadDrain = struct {
     inflight: std.atomic.Value(usize) = .init(0),
 
@@ -376,10 +382,16 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
         const raw_owned = gpa.dupe(u8, ep.raw) catch continue;
         owned.appendAssumeCapacity(.{ .raw = raw_owned });
     }
-    const exact = owned.toOwnedSlice(gpa) catch {
+    const exact = owned.toOwnedSlice(gpa) catch |e| {
         for (owned.items) |ep| gpa.free(ep.raw);
         owned.deinit(gpa);
-        gpa.free(id);
+        // Mirror the error paths above: post so the UI clears `loading` instead of
+        // stranding the spinner forever; hand `id` to the event and free it here
+        // only if the post fails (ROD-179 review).
+        loop.postEvent(.{ .episodes_error = .{ .cause = e, .for_id = id } }) catch |pe| {
+            log.debug("postEvent failed: {s}", .{@errorName(pe)});
+            gpa.free(id);
+        };
         return;
     };
 
