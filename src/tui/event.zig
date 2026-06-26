@@ -53,10 +53,17 @@ pub const Event = union(enum) {
         episodes: []domain.EpisodeNumber,
         for_id: []const u8,
     },
-    /// Episode fetch failed; payload is the failure cause so the toast can name
-    /// the class (network / blocked / server / generic — ROD-173). `anyerror` is
-    /// a POD error code, safe to ship across the worker→UI boundary.
-    episodes_error: anyerror,
+    /// Episode fetch failed. `cause` names the failure class for the toast
+    /// (network / blocked / server / generic — ROD-173); `anyerror` is a POD
+    /// error code, safe to ship across the worker→UI boundary. `for_id` is a
+    /// gpa-duped copy of the show id (transferred from the worker) so the handler
+    /// can keep-check a superseded failure and drop it — concurrent episode
+    /// fetches became possible once supersede stopped joining (ROD-179). The
+    /// handler frees `for_id`.
+    episodes_error: struct {
+        cause: anyerror,
+        for_id: []const u8,
+    },
     /// Cover image bytes were fetched + decoded. `rgba` and `for_id` are
     /// GPA-owned; App takes ownership on the fresh path.
     cover_done: struct {
