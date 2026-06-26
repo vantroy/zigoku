@@ -10,3 +10,6 @@ zig-pkg/
 # agent compiled `nyra_test` (suffix) past the `test_*` (prefix) rule once.
 /test_*
 /*_test
+
+# local agent config (skills, worktrees) — personal dev setup, not part of the project
+/.claude/
