@@ -1637,22 +1637,31 @@ pub const App = struct {
             return;
         }
 
-        self.episodes.loading = true;
-        self.async_start_ms = self.now_ms;
-
         // Two GPA-duped copies: one for episodes.for_id, one for the task (→ event).
-        const id_for_app = self.gpa.dupe(u8, source_id) catch return;
+        // `loading` is set only once the spawn is committed below — an OOM in this
+        // dupe chain returns with loading cleared, so a fire that never starts a
+        // worker can't strand the spinner (ROD-179 review). freeResults above
+        // already nulled for_id, so "not loading" is the coherent state on bail.
+        const id_for_app = self.gpa.dupe(u8, source_id) catch {
+            self.episodes.loading = false;
+            return;
+        };
         const src_for_app = self.gpa.dupe(u8, source) catch {
             self.gpa.free(id_for_app);
+            self.episodes.loading = false;
             return;
         };
         const id_for_task = self.gpa.dupe(u8, source_id) catch {
             self.gpa.free(id_for_app);
             self.gpa.free(src_for_app);
+            self.episodes.loading = false;
             return;
         };
         self.episodes.for_id = id_for_app;
         self.episodes.for_source = src_for_app;
+
+        self.episodes.loading = true;
+        self.async_start_ms = self.now_ms;
 
         // Account before the spawn so teardown's drain can never observe a gap;
         // detach so a later supersede never has to join this one (ROD-179).
