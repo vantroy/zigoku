@@ -126,7 +126,7 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
             put(win, row, score_at, score_str, self.scoreStyle(a.score, row_bg));
 
             // Episode count, right-aligned within its field so it clusters against
-            // the score instead of leaving a loose gap before it (Mira, ROD-226).
+            // the score instead of leaving a loose gap before it (ROD-226).
             // Only rendered when the pane seats it (the `show_eps` floor).
             if (show_eps and slot < scratch.meta.len) {
                 const tt = self.translation;

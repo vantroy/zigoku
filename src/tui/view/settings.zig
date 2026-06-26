@@ -1,4 +1,4 @@
-//! Zigoku — Settings view render pass (ROD-86, Mira's §5.5 contract).
+//! Zigoku — Settings view render pass (ROD-86, §5.5 contract).
 //! Extracted from app.zig along the tick/draw seam (ROD-144). The settings
 //! *state* (cursor, edit buffer, cycle/toggle handlers) lives in `SettingsState`
 //! (settings_state.zig, ROD-161); this module is the pure render of that state.
@@ -22,7 +22,7 @@ const fillRow = render.fillRow;
 const settings_hairline_cols = 256;
 const settings_hairline = "─" ** settings_hairline_cols;
 
-// ── Settings render (ROD-86, Mira's §5.5 contract) ──────────────────────
+// ── Settings render (ROD-86, §5.5 contract) ─────────────────────────────
 //
 // Columns (relative to the body window): marker 0–1, label @4, value @36,
 // hint right-anchored at w-2-len. Focus matches the Browse list (bg_surface

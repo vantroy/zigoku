@@ -413,7 +413,7 @@ pub const AllAnime = struct {
     ///     no address returned, unreadable resolv.conf. The ticket calls for DNS
     ///     to land here, and these are their own error values, so they must be
     ///     listed explicitly — an earlier draft wrongly assumed they aliased the
-    ///     connect errors (Elara H1).
+    ///     connect errors.
     /// `TlsInitializationFailed` is included: against our Cloudflare-fronted
     /// upstream it is overwhelmingly a reset/intercepted handshake (a network
     /// condition), though it also absorbs the rare server-side cert-validation
@@ -559,7 +559,7 @@ pub const AllAnime = struct {
     /// We validate the *decoded* host (`getHost`/`toRaw`) — the same bytes
     /// std.http resolves against. Reading the raw component would let
     /// `127%2e0%2e0%2e1` slip by as a "hostname" while the client decodes it to
-    /// loopback (a guard/client host disagreement — Elara's percent-encode bypass).
+    /// loopback (a guard/client host disagreement — the percent-encode bypass).
     ///
     /// KNOWN RESIDUAL: a public DNS *name* whose record points at a private IP
     /// (DNS rebinding) is still NOT caught — std's Io net API exposes no
@@ -1174,7 +1174,7 @@ test "videoInner escapes show id and episode label" {
     );
 }
 
-// M1 review (Elara/Astra): a canned AES-256-GCM fixture cements the exact
+// M1 review: a canned AES-256-GCM fixture cements the exact
 // `tobeparsed` blob layout — 1-byte prefix, 12-byte nonce, ciphertext, 16-byte
 // tag, key = sha256("Xot36i3lK3:v1") — and guards against the server scheme
 // drifting silently. Generated offline with Python's `cryptography`.
@@ -1376,13 +1376,13 @@ test "guardFetchUrl: blocks SSRF vectors, allows public http(s)" {
     try AllAnime.guardFetchUrl("http://8.8.8.8/x"); // public IP literal allowed
 }
 
-test "guardFetchUrl: percent-encoded host bypass blocked (Elara C1)" {
+test "guardFetchUrl: percent-encoded host bypass blocked" {
     // Guard must validate the DECODED host, since std.http resolves the decoded form.
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://127%2e0%2e0%2e1/x"));
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://%6c%6fcalhost:8080/x"));
 }
 
-test "guardFetchUrl: alternate IP encodings blocked (Nyra defense-in-depth)" {
+test "guardFetchUrl: alternate IP encodings blocked (defense-in-depth)" {
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://2130706433/x")); // decimal 127.0.0.1
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://2852039166/latest")); // decimal 169.254.169.254
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://0x7f000001/x")); // hex
@@ -1440,7 +1440,7 @@ test "withDeadline: propagates a winning operation's error untouched (ROD-153)" 
     );
 }
 
-test "isPrivateV4: multicast and broadcast blocked (Elara M1)" {
+test "isPrivateV4: multicast and broadcast blocked" {
     try std.testing.expect(AllAnime.isPrivateV4(.{ 224, 0, 0, 1 })); // multicast
     try std.testing.expect(AllAnime.isPrivateV4(.{ 255, 255, 255, 255 })); // broadcast
     try std.testing.expect(!AllAnime.isPrivateV4(.{ 93, 184, 216, 34 })); // public, allowed

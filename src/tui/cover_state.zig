@@ -38,7 +38,7 @@ pub const CoverState = struct {
 
     /// What `sync` should do for the current selection. Extracted from the
     /// side effects so the fetch/suppress/retry policy is unit-testable without
-    /// spawning threads or relying on `builtin.is_test` (ROD-110, Elara #2).
+    /// spawning threads or relying on `builtin.is_test` (ROD-110).
     pub const Action = enum {
         /// Nothing to do — no target, or target already matches in-flight/loaded.
         none,
@@ -111,7 +111,7 @@ pub const CoverState = struct {
     /// `ppc`/`pph` (pixels per column/row). Pass `ppc == 0` or `pph == 0` when the
     /// terminal won't report pixel metrics, which falls back to assuming square
     /// half-pixels (the pre-fix behavior — correct on 2:1 cells, off elsewhere).
-    /// Extracted as a pure helper so the aspect math is unit-testable (Mira S2).
+    /// Extracted as a pure helper so the aspect math is unit-testable.
     pub fn halfBlockFit(img_w: u32, img_h: u32, grid_w: u32, grid_h: u32, ppc: u32, pph: u32) HalfBlockFit {
         var fit_w = grid_w;
         var fit_h = grid_h;
@@ -216,7 +216,7 @@ pub const CoverState = struct {
 
     /// Take ownership of freshly decoded pixels for the current selection and
     /// derive the non-Kitty fallback colour. Owns the staging the controller
-    /// used to do inline (ROD-160 review, Elara): supersede any failure record,
+    /// used to do inline (ROD-160 review): supersede any failure record,
     /// drop the spent in-flight url, retire the old Kitty image, and free the
     /// previous pixel buffer before adopting `rgba` (caller transfers ownership).
     pub fn acceptPixels(self: *CoverState, gpa: Allocator, rgba: []u8, w: u32, h: u32) void {

@@ -281,7 +281,7 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 /// dedicated terminal events so run()'s double-buffer reaper always settles —
 /// .history_reloaded on success, .history_reload_failed on error. The generic
 /// .task_error path would never bump the reload's settle signal, latching the
-/// reloader off after one transient failure (Elara C1).
+/// reloader off after one transient failure.
 pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     const recs = store.loadHistory(arena) catch |err| {
         log.debug("history reload failed: {s}", .{@errorName(err)});

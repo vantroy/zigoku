@@ -63,7 +63,7 @@ pub const ListStatus = enum {
     }
 
     /// History grouping order (ROD-139 §3 / §5.4); lower sorts higher in the list.
-    /// Deliberately `planning` before `paused` — Rod's call, overriding Mira's
+    /// Deliberately `planning` before `paused` — Rod's call, overriding the
     /// active-intent ordering (which put paused first). Not an accident. This is
     /// the single source of the order; `group_order` is its materialised inverse.
     pub fn groupRank(self: ListStatus) u8 {
@@ -410,7 +410,7 @@ test "ListStatus.afterPlay drives the auto-transition table (ROD-139 §1)" {
 }
 
 test "ListStatus.groupRank orders watching → planning → paused → completed → dropped" {
-    // Rod's ordering (planning before paused), overriding Mira's active-intent spec.
+    // Rod's ordering (planning before paused), overriding the active-intent spec.
     try std.testing.expect(ListStatus.watching.groupRank() < ListStatus.planning.groupRank());
     try std.testing.expect(ListStatus.planning.groupRank() < ListStatus.paused.groupRank());
     try std.testing.expect(ListStatus.paused.groupRank() < ListStatus.completed.groupRank());

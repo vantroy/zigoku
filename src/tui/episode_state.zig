@@ -139,7 +139,7 @@ pub const EpisodeState = struct {
     /// no thread, no loading spinner. `id` and `view` are both GPA-owned;
     /// ownership transfers to `for_id` / `results`. Infallible by contract — the
     /// caller pre-allocates both, so a hit can never leave `results` set with a
-    /// null `for_id` (which would silently block playback — Elara C1). Mirrors the
+    /// null `for_id` (which would silently block playback). Mirrors the
     /// state the controller's `episodes_done` handler leaves behind so the two
     /// write sites stay consistent; `history_rec` (resolved by the controller from
     /// nav state) seeds the history cursor exactly as that handler does.
@@ -187,7 +187,7 @@ pub const EpisodeState = struct {
         if (self.lru.get(key)) |entry| {
             if (now < entry.expires_at) {
                 // for_id first (small): on OOM bail before touching results, so a
-                // hit never half-installs (Elara C1).
+                // hit never half-installs.
                 const id = gpa.dupe(u8, source_id) catch return false;
                 const src = gpa.dupe(u8, source) catch {
                     gpa.free(id);
@@ -203,13 +203,13 @@ pub const EpisodeState = struct {
             }
             // Stale: drop it so a repeatedly-visited stale entry can't squat in
             // the MRU slot (get() just promoted it) and evict fresher entries
-            // during the refetch window (Elara H1). The refetch re-populates it.
+            // during the refetch window. The refetch re-populates it.
             self.lru.remove(gpa, key);
         }
 
         // 2) DB cache — getCachedEpisodes returns null for stale/missing rows. An
         // empty list is never stored (cacheEpisodes guards eps.len==0), so a
-        // zero-length result here is treated as a miss (Elara M2).
+        // zero-length result here is treated as a miss.
         const st = store orelse return false;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();

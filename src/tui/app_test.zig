@@ -1172,7 +1172,7 @@ test "browse scrolling debounces the cover fetch; discrete nav syncs at once (RO
 
     // A jump key (g/G) moves the cursor but is a deliberate settle point, NOT a
     // scroll — it must sync the cover at once, not arm the debounce (review fix:
-    // Elara M1 / Nyra E1; only j/k/↓/↑ in normal mode arm). Arm a settle, then
+    // only j/k/↓/↑ in normal mode arm). Arm a settle, then
     // jump to top: the jump cancels it.
     app.cover_sync_deadline_ms = 999;
     try testTick(&app, keyEv('g', .{}));
@@ -3319,13 +3319,13 @@ test "settings: cycling an out-of-preset value snaps to a valid preset" {
     try testing.expectEqual(@as(u32, 3), app.config.resume_offset_sec);
 }
 
-// ── Save-to-disk round-trip (originally Astra's verification harness) ────────
+// ── Save-to-disk round-trip (verification harness) ───────────────────────────
 // These exercise the disk-write path the state-machine tests above can't reach
 // (they only cover the null-path branch). Kept as permanent coverage.
 
 const config_mod = @import("../config.zig");
 
-test "astra: settings save round-trip — q writes file, load reads back mutations" {
+test "settings save round-trip — q writes file, load reads back mutations" {
     const alloc = testing.allocator;
 
     // Create a temp dir and derive an absolute config path inside it.
@@ -3422,7 +3422,7 @@ test "F1/F2/H from a dirty Settings tab persist on the way out (ROD-210 H1)" {
     }
 }
 
-test "astra: Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)" {
+test "Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)" {
     const alloc = testing.allocator;
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -3458,7 +3458,7 @@ test "astra: Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)
     try testing.expect(!loaded.cover_art);
 }
 
-test "astra: entering settings resets cursor, editing state, and input_mode" {
+test "entering settings resets cursor, editing state, and input_mode" {
     var app: App = .{};
     app.gpa = testing.allocator;
     // Dirty state from a prior visit.
@@ -3475,7 +3475,7 @@ test "astra: entering settings resets cursor, editing state, and input_mode" {
     try testing.expectEqual(.normal, app.input_mode);
 }
 
-test "astra: Esc from settings is a no-op and never saves (ROD-210)" {
+test "Esc from settings is a no-op and never saves (ROD-210)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
@@ -3490,7 +3490,7 @@ test "astra: Esc from settings is a no-op and never saves (ROD-210)" {
     try testing.expect(app.toast_queue[0] == null);
 }
 
-test "astra: edit mode swallows F-keys — cannot switch views mid-edit" {
+test "edit mode swallows F-keys — cannot switch views mid-edit" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
@@ -3525,7 +3525,7 @@ test "settings: Ctrl-C hard-quits even while editing a text field" {
     try testing.expect(app.should_quit);
 }
 
-// ── cover fetch/suppress/retry decision (ROD-110, Elara #2) ──────────────────
+// ── cover fetch/suppress/retry decision (ROD-110) ────────────────────────────
 // `CoverState.Decision.eval` is the pure core of `CoverState.sync`: it decides
 // whether to fetch, suppress (cooldown), leave an in-flight/loaded cover alone,
 // clear stale state, or do nothing — with no threads or `builtin.is_test` guards.
@@ -3640,7 +3640,7 @@ test "cover decision: live pixels win over a stale same-id failure record" {
     try testing.expectEqual(.up_to_date, d.eval());
 }
 
-// ── half-block letterbox fit (ROD-110, Mira S2) ──────────────────────────────
+// ── half-block letterbox fit (ROD-110) ───────────────────────────────────────
 // `halfBlockFit` letterboxes an image into a cols × rows*2 half-pixel grid,
 // aspect-correct using the terminal's pixels-per-cell metrics.
 

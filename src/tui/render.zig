@@ -274,7 +274,7 @@ test "truncateToWidth: byte-dense but column-narrow input falls off the fast pat
     // 3 CJK glyphs = 6 display cols / 9 bytes, into an 8-byte buf with a generous
     // column budget. It fits the columns but NOT the bytes — the fast path's
     // `text.len <= buf.len` guard rejects it so it cuts on a cluster boundary
-    // with "…" instead of shearing a 3-byte glyph mid-sequence (Elara M1 / Nyra).
+    // with "…" instead of shearing a 3-byte glyph mid-sequence.
     var buf: [8]u8 = undefined;
     const out = truncateToWidth(&buf, "東京都", 10);
     try testing.expect(std.unicode.utf8ValidateSlice(out)); // never mid-cluster
