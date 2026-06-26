@@ -1117,8 +1117,10 @@ pub const App = struct {
     /// paired with DESIGN.md §4.10; both must move together. `source_name` comes
     /// from `provider.displayName()` — the one seam, never hardcode the site name
     /// — so a short name keeps the copy within the §4.7 36-col budget and a long
-    /// one is truncated by pushToast (ROD-166). Data-shape errors (NoEpisodeData,
-    /// NoDirectStream…) and the mpv-spawn classes fall through to the generic line.
+    /// one is truncated by pushToast (ROD-166); an extreme name that overflows
+    /// `buf` falls through to the generic line via the `catch null` guard. Same
+    /// fallback for data-shape errors (NoEpisodeData, NoDirectStream…) and the
+    /// mpv-spawn classes.
     fn failureClassCopy(cause: anyerror, source_name: []const u8, buf: []u8) ?[]const u8 {
         return switch (cause) {
             error.NetworkDown => "network unreachable",
