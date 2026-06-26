@@ -739,8 +739,14 @@ determines the string, context is inferrable from the user's last action
 (ROD-173). `play_error` retains `playback failed` for the non-HTTP path (mpv died
 / resolve non-network failure) which ROD-173 does not differentiate; the
 mpv-spawn classes earn their own copy in ROD-230. The runtime source of truth for
-these four strings is `App.failureClassCopy`; this table and that switch move
-together.
+**these eight `play_error` / `episodes_error` class rows** is
+`App.failureClassCopy`; those rows and that switch move together.
+
+The `Search source unreachable` row is the §9.3b *target* copy, not yet wired:
+`searchTask` currently surfaces the raw `@errorName` through `task_error` (a
+persistent toast), so a search failure shows e.g. `NetworkDown`, not `can't reach
+{source}`. Routing it through `displayName()` like the other two paths is a
+follow-up, deliberately out of ROD-173's scope.
 
 A watch counts as *watched* — bumps the progress high-water mark, dims the cell,
 advances the cursor — only when the final position reaches `NATURAL_END_RATIO`
