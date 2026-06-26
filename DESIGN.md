@@ -973,7 +973,7 @@ full-screen zoom (any width). `Enter`/`Space` "drill toward the grid":
 | `w` | Layout |
 |---|---|
 | `w < 60` | Single-column list (§5.4). Clamp `active_pane = .list`. No pane to focus, so `Enter`/`Space` open the **zoom** directly (the only detail surface here). |
-| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + chips + score + synopsis). No *in-pane* grid. Pane toggle `h`/`l` works; `Enter`/`Space` from the focused pane promote to the **zoom** to reach the grid. |
+| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + alt titles + score + chips + synopsis). No *in-pane* grid. Pane toggle `h`/`l` works; `Enter`/`Space` from the focused pane promote to the **zoom** to reach the grid. |
 | `w ≥ 100` | Two panes. Detail = full `drawDetailPane` with the interactive grid in-pane. `Enter` plays the focused episode; `Space` promotes to the zoom. |
 
 Episodes fetch on focus at any two-pane width (`w ≥ 60`), so the zoom always has
@@ -1010,6 +1010,22 @@ record is focused.
 
   ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit                          [list focused; help matches Browse §10.5]
 ```
+
+**History preview — detail stack (authoritative).** The ASCII mocks in this
+section are schematic and predate ROD-231; `drawHistoryPreview` renders the detail
+pane top-to-bottom as:
+
+1. cover (or "no art yet")
+2. **title** — romaji name, bold
+3. **english title** — `text.fg2`; omitted when it equals the romaji name *(ROD-231)*
+4. **native title** — `text.fg2` italic (foreign-language rule §1.3); omitted when absent *(ROD-231)*
+5. **score · genres** — `[--/100]` until enriched, then §2.2 tiers
+6. hairline
+7. **status + season/year chips** — or the `list_status` label when no chip resolves
+8. **synopsis** — word-wrapped
+
+Rows 3–4 mirror the Browse header's title stack (`drawAltTitles`, §1.3) so the two
+surfaces stay consistent.
 
 ---
 
