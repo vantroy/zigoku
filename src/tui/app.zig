@@ -1110,23 +1110,29 @@ pub const App = struct {
         return u.reachedCompletion(store_mod.NATURAL_END_RATIO);
     }
 
-    /// The §4.7 toast line for a differentiated source failure class (ROD-173),
-    /// formatted into `buf`, or null when `cause` isn't one of them — the caller
-    /// supplies its own context-generic fallback ("couldn't load episodes" /
-    /// "playback failed"). These four phrasings are the runtime source of truth
-    /// paired with DESIGN.md §4.10; both must move together. `source_name` comes
-    /// from `provider.displayName()` — the one seam, never hardcode the site name
-    /// — so a short name keeps the copy within the §4.7 36-col budget and a long
+    /// The §4.7 toast line for a play/episode failure cause, formatted into `buf`,
+    /// or null when `cause` isn't one we differentiate — the caller supplies its
+    /// own generic fallback ("couldn't load episodes" / "playback failed"). Two
+    /// families: the source classes (ROD-173 — network / blocked / server /
+    /// generic; the source-named ones interpolate `provider.displayName()`, the
+    /// one seam, never hardcode the site name) and the player-spawn classes
+    /// (ROD-230 — mpv missing vs crashed; about the local mpv binary, not the
+    /// source, so static with no name to interpolate). These phrasings are the
+    /// runtime source of truth paired with DESIGN.md §4.10; both move together. A
+    /// short source name keeps the copy within the §4.7 36-col budget and a long
     /// one is truncated by pushToast (ROD-166); an extreme name that overflows
-    /// `buf` falls through to the generic line via the `catch null` guard. Same
-    /// fallback for data-shape errors (NoEpisodeData, NoDirectStream…) and the
-    /// mpv-spawn classes.
+    /// `buf` falls through to the generic line via `catch null`. Data-shape errors
+    /// (NoEpisodeData, NoDirectStream…) also fall through.
     fn failureClassCopy(cause: anyerror, source_name: []const u8, buf: []u8) ?[]const u8 {
         return switch (cause) {
+            // Source classes (ROD-173).
             error.NetworkDown => "network unreachable",
             error.Forbidden => std.fmt.bufPrint(buf, "{s} blocked us", .{source_name}) catch null,
             error.ServerError => std.fmt.bufPrint(buf, "{s} is down", .{source_name}) catch null,
             error.HttpNotOk => std.fmt.bufPrint(buf, "{s} returned an error", .{source_name}) catch null,
+            // Player-spawn classes (ROD-230).
+            error.MpvNotFound => "mpv not found — install mpv",
+            error.MpvFailed => "mpv exited with error",
             else => null,
         };
     }
