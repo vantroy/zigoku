@@ -9,8 +9,8 @@
 //! back into App or navigation state.
 //!
 //! Where the boundary sits (mirroring PlaybackSession's): this struct owns the episode
-//! *record + cache*, not the *transport*. `episode_thread` (the handle run()
-//! joins on teardown) and `async_start_ms` (the shared slow-path timer, not
+//! *record + cache*, not the *transport*. `episode_drain` (the barrier run()
+//! drains on teardown) and `async_start_ms` (the shared slow-path timer, not
 //! episode-scoped) stay on App. The controller (`tick`'s episode-event handlers +
 //! `fireEpisodes`/`fireEpisodesForId`) resolves the source name, status, and any
 //! history record from navigation state and passes those primitives in here; it
@@ -29,7 +29,7 @@ const Store = store_mod.Store;
 
 /// The detail pane's episode subsystem (ROD-180). Holds the fetched episode
 /// list, the show it belongs to, the grid cursor + watched high-water mark, and
-/// the two-tier episode cache (ROD-130). Transport (`episode_thread`,
+/// the two-tier episode cache (ROD-130). Transport (`episode_drain`,
 /// `async_start_ms`) lives on App, not here.
 pub const EpisodeState = struct {
     /// Current episode list for the detail pane. GPA-owned (each .raw owned);
