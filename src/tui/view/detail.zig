@@ -691,6 +691,13 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
         row += 1;
     }
 
+    // Alternate titles (english + native) — parity with the Browse detail header
+    // (drawHeader → drawAltTitles); the History/Watchlist preview omitted them, so
+    // it showed only the romaji name (ROD-231). drawAltTitles self-guards (english
+    // only when it differs from the romaji name, native only when present), so rows
+    // with no alternates render exactly as before — no blank line introduced.
+    if (row < h) row = drawAltTitles(self, win, w, h, anime, row);
+
     if (row < h) row = drawScore(self, win, w, anime, row);
 
     if (row < h) {
@@ -989,4 +996,64 @@ test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane
     // The synopsis lands at exactly its reserved minimum under the worst-case header.
     const after_header = (coverHeightCap(h) + cover_spacer_rows) + max_header_rows;
     try t.expectEqual(min_synopsis_rows, synopsisCap(h - after_header));
+}
+
+// ── ROD-231: Watchlist/History detail title-parity ───────────────────────────
+
+test "ROD-231: drawAltTitles renders english (when differing) + native rows" {
+    const t = std.testing;
+    var app: App = .{}; // default palette (terminal_ghost) is enough for self.s()
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 8, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 60,
+        .height = 8,
+        .screen = &screen,
+    };
+
+    // English differs from the romaji name + native present → both rows render.
+    const both: Anime = .{
+        .id = "ks",
+        .name = "Kimetsu no Yaiba",
+        .english_name = "Demon Slayer: Kimetsu no Yaiba",
+        .native_name = "鬼滅の刃",
+    };
+    try t.expectEqual(@as(u16, 2), drawAltTitles(&app, win, 60, 8, both, 0));
+    try t.expectEqualStrings("D", win.readCell(0, 0).?.char.grapheme); // english on row 0
+    try t.expectEqualStrings("鬼", win.readCell(0, 1).?.char.grapheme); // native on row 1
+
+    // English identical to the romaji name → skipped; only the native row renders.
+    const eng_dupe: Anime = .{
+        .id = "fr",
+        .name = "Frieren",
+        .english_name = "Frieren",
+        .native_name = "葬送のフリーレン",
+    };
+    try t.expectEqual(@as(u16, 4), drawAltTitles(&app, win, 60, 8, eng_dupe, 3));
+    try t.expectEqualStrings("葬", win.readCell(0, 3).?.char.grapheme);
+
+    // No alternates → no rows emitted (sparse rows/movies unchanged, no blank line).
+    const none: Anime = .{ .id = "y", .name = "Solo" };
+    try t.expectEqual(@as(u16, 5), drawAltTitles(&app, win, 60, 8, none, 5));
+}
+
+test "ROD-231: animeFromHistoryRecord carries english + native title to the renderer" {
+    const t = std.testing;
+    // The History/Watchlist preview builds its Anime from a store row; the fix
+    // relies on these two fields surviving that mapping (loadHistory selects them).
+    const rec: AnimeRecord = .{
+        .source = "allanime",
+        .source_id = "ks",
+        .title = "Kimetsu no Yaiba",
+        .title_english = "Demon Slayer: Kimetsu no Yaiba",
+        .native_name = "鬼滅の刃",
+    };
+    const a = App.animeFromHistoryRecord(rec);
+    try t.expectEqualStrings("Demon Slayer: Kimetsu no Yaiba", a.english_name.?);
+    try t.expectEqualStrings("鬼滅の刃", a.native_name.?);
 }
