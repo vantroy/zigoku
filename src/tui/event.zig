@@ -53,8 +53,10 @@ pub const Event = union(enum) {
         episodes: []domain.EpisodeNumber,
         for_id: []const u8,
     },
-    /// Episode fetch failed.
-    episodes_error,
+    /// Episode fetch failed; payload is the failure cause so the toast can name
+    /// the class (network / blocked / server / generic — ROD-173). `anyerror` is
+    /// a POD error code, safe to ship across the worker→UI boundary.
+    episodes_error: anyerror,
     /// Cover image bytes were fetched + decoded. `rgba` and `for_id` are
     /// GPA-owned; App takes ownership on the fresh path.
     cover_done: struct {
@@ -72,8 +74,13 @@ pub const Event = union(enum) {
     },
     /// mpv exited cleanly; payload carries the final observed authoritative position, if any.
     play_done: ?PositionUpdate,
-    /// resolve failed or mpv exited badly; payload carries the final observed position, if any.
-    play_error: ?PositionUpdate,
+    /// resolve failed or mpv exited badly. `final` carries the last observed
+    /// position (if any) so a watch that errored at the very end still counts;
+    /// `cause` is the failure reason, so a non-completed failure names its class
+    /// (network / blocked / server — ROD-173). `cause` covers the resolve path;
+    /// the mpv-spawn classes (MpvNotFound/MpvFailed) ride the same slot and are
+    /// refined into their own copy by ROD-230.
+    play_error: struct { final: ?PositionUpdate, cause: anyerror },
     /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
     tick,
 };

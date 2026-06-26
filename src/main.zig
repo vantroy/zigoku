@@ -428,7 +428,13 @@ fn reportError(out: *Io.Writer, err: anyerror) !void {
         error.NoSearchData => "AllAnime returned nothing for that search.",
         error.ShowNotFound, error.NoEpisodeData => "AllAnime had no episode data for that show.",
         error.NotEncrypted => "AllAnime returned an unexpected (unencrypted) video payload — the protocol may have shifted.",
-        error.HttpNotOk => "AllAnime rejected the request (HTTP error). The site may be down, or the recipe drifted.",
+        // ROD-173: the distinct AllAnime POST failure classes. No 36-col budget
+        // here (CLI stdout, not a toast), so these can be more instructional than
+        // their §4.7 toast counterparts.
+        error.NetworkDown => "can't reach AllAnime — check your network connection, then try again.",
+        error.Forbidden => "AllAnime is blocking the request (HTTP 403/451). A VPN may get you through.",
+        error.ServerError => "AllAnime's servers are down (HTTP 5xx). Nothing to do but wait and retry.",
+        error.HttpNotOk => "AllAnime rejected the request (unexpected HTTP error). The site may be down, or the recipe drifted.",
         else => @errorName(err),
     };
     try out.print("\n✗ {s}\n", .{msg});
