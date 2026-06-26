@@ -691,11 +691,8 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
         row += 1;
     }
 
-    // Alternate titles (english + native) — parity with the Browse detail header
-    // (drawHeader → drawAltTitles); the History/Watchlist preview omitted them, so
-    // it showed only the romaji name (ROD-231). drawAltTitles self-guards (english
-    // only when it differs from the romaji name, native only when present), so rows
-    // with no alternates render exactly as before — no blank line introduced.
+    // Alternate titles (english + native) — parity with Browse's drawHeader.
+    // drawAltTitles self-guards; rows with no alternates are unchanged (ROD-231).
     if (row < h) row = drawAltTitles(self, win, w, h, anime, row);
 
     if (row < h) row = drawScore(self, win, w, anime, row);
@@ -707,7 +704,7 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 
     // Kanji chips (ROD-141): status chip then season/year chip. The history
     // row itself shows progress + list_status, so the airing-status kanji is
-    // the complementary fact here (matches §5.4a preview mock).
+    // the complementary fact here (§5.4a "History preview — detail stack").
     // Fallback: if no chip resolves (status null/unknown), show list_status in
     // text.muted as a last resort so the pane is never entirely silent.
     if (row < h) {
