@@ -30,7 +30,13 @@ pub const Event = union(enum) {
     /// from task_error so a transient reload failure neither wipes the watchlist nor
     /// raises the persistent load_error banner — it just clears the reload latch.
     history_reload_failed,
-    /// A background task failed; payload is a human-readable reason.
+    /// The initial background history load failed; payload is a human-readable
+    /// reason for the load_error banner. Distinct from task_error (ROD-234) so a
+    /// Browse search/enrich failure can never falsely mark History "unavailable" —
+    /// only a real history-load failure raises that banner.
+    history_load_failed: []const u8,
+    /// A background BROWSE task (search/enrich) failed; payload is a human-readable
+    /// reason. Surfaces as a toast only — never touches History state (ROD-234).
     task_error: []const u8,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
     /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
