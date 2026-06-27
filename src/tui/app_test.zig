@@ -3318,6 +3318,28 @@ test "settings: palette cycle re-points the live app palette" {
     try testing.expectEqual(&colors.terminal_ghost, app.palette);
 }
 
+test "settings: landing cycle steps through the live startup-view presets and wraps" {
+    // Only the live views (history, browse) are cyclable; "last_watched" is
+    // accepted by landingEnum but deliberately absent from the cycle until
+    // ROD-229 makes it real (so the row never offers a silent no-op).
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = app_mod.settings_row_count - 1; // landing view (last row)
+    try testing.expectEqualStrings("history", app.config.landing);
+
+    try testTick(&app, keyEv('l', .{})); // history -> browse
+    try testing.expectEqualStrings("browse", app.config.landing);
+
+    try testTick(&app, keyEv('l', .{})); // browse -> history (forward wrap)
+    try testing.expectEqualStrings("history", app.config.landing);
+
+    try testTick(&app, keyEv('h', .{})); // history -> browse (reverse wrap)
+    try testing.expectEqualStrings("browse", app.config.landing);
+
+    try testing.expect(app.settings.dirty);
+}
+
 test "settings: space toggles a bool field" {
     var app: App = .{};
     app.gpa = testing.allocator;

@@ -46,6 +46,7 @@ pub const SettingId = enum {
     cover_art,
     kanji_chips,
     palette,
+    landing,
 };
 
 pub const SettingKind = enum { text, cycle, toggle };
@@ -66,6 +67,7 @@ pub const settings_rows = [_]SettingRow{
     .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .landing, .label = "landing view", .kind = .cycle, .hint = "hjkl to cycle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not
@@ -73,10 +75,10 @@ pub const settings_rows = [_]SettingRow{
 pub const settings_row_count = settings_rows.len;
 
 comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..8 = Interface. Pin the
+    // `drawSettings` splits this table 0..5 = Player, 5..end = Interface. Pin the
     // boundary so inserting/removing a row can't silently misattribute it to the
     // wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 8);
+    std.debug.assert(settings_rows.len == 9);
     std.debug.assert(settings_rows[4].id == .skip_mode);
     std.debug.assert(settings_rows[5].id == .cover_art);
 }
@@ -86,6 +88,11 @@ const translation_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
 const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord", "tokyonight" };
+// Only the live landing views are cyclable. "last_watched" is intentionally
+// absent: `Config.landingEnum` still accepts it from a hand-edited or
+// future-build config (folding to History), but the cycle never offers a value
+// that silently no-ops — ROD-229 adds it here when resume-landing is real.
+const landing_presets = [_][]const u8{ "history", "browse" };
 
 /// Step through a preset list to the value after (`dir > 0`) or before the
 /// current one, wrapping. An unrecognized current value starts from index 0.
@@ -124,6 +131,7 @@ fn cycle(config: *Config, id: SettingId, dir: i8) void {
         .skip_mode => config.skip_mode = cyclePreset(&skip_presets, config.skip_mode, dir),
         .resume_offset => config.resume_offset_sec = cyclePresetU32(&resume_presets, config.resume_offset_sec, dir),
         .palette => config.palette = cyclePreset(&palette_presets, config.palette, dir),
+        .landing => config.landing = cyclePreset(&landing_presets, config.landing, dir),
         else => {},
     }
 }
@@ -304,6 +312,7 @@ pub const SettingsState = struct {
             .cover_art => if (config.cover_art) "on" else "off",
             .kanji_chips => if (config.kanji_chips) "on" else "off",
             .palette => config.palette,
+            .landing => config.landing,
         };
     }
 };
