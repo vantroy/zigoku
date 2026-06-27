@@ -1833,13 +1833,15 @@ pub const App = struct {
         // show. (`resumeTargetIndex` picks the record; `ordinalOf` places it.)
         const ordinal = history.ordinalOf(self, rec.source, rec.source_id) orelse return;
         self.list_cursor = ordinal;
-        // Open the SAME surface a manual drill-in (`onDrillKey`) would at this
-        // width, so resume-landing and navigation never diverge: the two-pane
-        // detail at `>= pane_split_min` (in-pane grid at `>= zoom_min`, zoom-drill
-        // below), the full-screen zoom otherwise. The spawn-failure call site runs
-        // before the first layout(), so term_cols is 0 there → the zoom branch,
-        // which is the correct single-surface fallback at any width anyway.
-        if (self.term_cols >= pane_split_min) {
+        // Open whichever surface actually SHOWS the episode grid at this width —
+        // the grid parked on the resume episode is the whole point. Only `>=
+        // zoom_min` renders the in-pane grid in the two-pane detail (below that
+        // the focused pane is a no-grid preview — see drawContent's history arm),
+        // so anything narrower goes straight to the full-screen zoom, the grid
+        // surface at any width. The spawn-failure call site runs before the first
+        // layout(), so term_cols is 0 there → the zoom branch, the correct
+        // single-surface fallback.
+        if (self.term_cols >= zoom_min) {
             self.active_pane = .detail;
             self.fireEpisodesForId(loop, io, provider, rec.source_id);
         } else {
