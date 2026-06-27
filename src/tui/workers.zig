@@ -327,7 +327,9 @@ pub fn enrichTask(
 pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     const recs = store.loadHistory(arena) catch |err| {
         log.debug("loadHistory failed: {s}", .{@errorName(err)});
-        loop.postEvent(.{ .task_error = @errorName(err) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        // ROD-234: post a dedicated history-load failure (not the generic task_error)
+        // so only a real history-load error raises the "history unavailable" banner.
+        loop.postEvent(.{ .history_load_failed = @errorName(err) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
