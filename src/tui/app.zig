@@ -1833,11 +1833,22 @@ pub const App = struct {
         // show. (`resumeTargetIndex` picks the record; `ordinalOf` places it.)
         const ordinal = history.ordinalOf(self, rec.source, rec.source_id) orelse return;
         self.list_cursor = ordinal;
-        self.openHistoryZoom(loop, io, provider, rec);
+        // Open the SAME surface a manual drill-in (`onDrillKey`) would at this
+        // width, so resume-landing and navigation never diverge: the two-pane
+        // detail at `>= pane_split_min` (in-pane grid at `>= zoom_min`, zoom-drill
+        // below), the full-screen zoom otherwise. The spawn-failure call site runs
+        // before the first layout(), so term_cols is 0 there → the zoom branch,
+        // which is the correct single-surface fallback at any width anyway.
+        if (self.term_cols >= pane_split_min) {
+            self.active_pane = .detail;
+            self.fireEpisodesForId(loop, io, provider, rec.source_id);
+        } else {
+            self.openHistoryZoom(loop, io, provider, rec);
+        }
         // Arm the demote-on-failure only when the open actually started an async
         // fetch — a synchronous cache hit already has the grid, so there is nothing
-        // to fall back from. (`openHistoryZoom` → `fireEpisodesForId` clears the
-        // flag at entry, so this assignment is the authoritative arm.)
+        // to fall back from. (`fireEpisodesForId` clears the flag at entry, so this
+        // assignment is the authoritative arm.)
         self.resume_landing_pending = self.episodes.loading;
     }
 

@@ -3135,26 +3135,32 @@ test "ROD-229: a user-driven episode fetch failure stays in detail (no demote)" 
     try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
 }
 
-test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on one show" {
-    // A completed show watched most recently sorts into a LOWER group than an
-    // older "watching" show. self.history is last_watched DESC (Frieren index 0),
-    // but the grouped cursor space renders watching first — so Frieren's ordinal
-    // is 1, not 0. Seeding the cursor with the raw history index would put One
-    // Piece's meta beside Frieren's grid (the bug this guards).
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    app.config.landing = "last_watched";
-    var recs = [_]AnimeRecord{
+// Frieren completed+newest (self.history index 0); One Piece watching+older. The
+// grouped cursor space renders watching first, so Frieren's ordinal is 1, not 0 —
+// seeding the cursor with the raw history index would put One Piece's meta beside
+// Frieren's grid (the bug this guards). Shared by the two-pane and zoom cases.
+fn twoShowResumeHistory() [2]AnimeRecord {
+    return .{
         .{ .source = "allanime", .source_id = "fr", .title = "Frieren", .list_status = .completed, .total_episodes = 12, .progress = 12, .last_watched_at = 2000 },
         .{ .source = "allanime", .source_id = "op", .title = "One Piece", .list_status = .watching, .total_episodes = 1100, .progress = 50, .last_watched_at = 1000 },
     };
+}
+
+test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on one show" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.config.landing = "last_watched";
+    app.term_cols = 120; // wide: the two-pane detail surface (matches manual drill-in)
+    var recs = twoShowResumeHistory();
 
     // The initial history load is the real resume trigger.
     try testTick(&app, .{ .history_loaded = &recs });
 
-    // Opened the most-recently-watched show's detail...
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
-    // ...with the cursor on Frieren's GROUPED ordinal (1), not its history index (0).
+    // Wide terminal → two-pane History with the detail pane focused (NOT the
+    // full-screen zoom), exactly like pressing l/Enter on the row manually.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+    // Cursor on Frieren's GROUPED ordinal (1), not its history index (0).
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
     // The invariant the bug broke: the highlighted record (detail meta, via
     // recordAtCursor) and the fetched grid (episodes.for_id) are the same show.
@@ -3163,6 +3169,85 @@ test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on
 
     app.cover.joinThread();
     app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-229: resume landing opens the full-screen zoom on a narrow terminal" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.config.landing = "last_watched";
+    app.term_cols = 40; // below pane_split_min: the zoom is the only grid surface
+    var recs = twoShowResumeHistory();
+
+    try testTick(&app, .{ .history_loaded = &recs });
+
+    // Narrow → the standalone zoom, with the same grouped-ordinal target.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    try testing.expectEqualStrings("fr", app.episodes.for_id.?);
+
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-229: resume landing fires only on the first history load, not a reload" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.config.landing = "last_watched";
+    app.term_cols = 120;
+    var recs = twoShowResumeHistory();
+
+    try testTick(&app, .{ .history_loaded = &recs });
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane); // opened
+
+    // Back out to the list, then deliver a second history load (stands in for a
+    // mid-session reload). The one-shot guard must make it a complete no-op.
+    app.active_view = .history;
+    app.active_pane = .list;
+    try testTick(&app, .{ .history_loaded = &recs });
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane); // not re-opened
+
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-229: never-played history under last_watched stays on the History view" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.config.landing = "last_watched";
+    app.term_cols = 120;
+    // Every row has a null last_watched_at → nothing to resume.
+    var recs = sampleHistory();
+
+    try testTick(&app, .{ .history_loaded = &recs });
+
+    // No auto-open: the ROD-228 startup map already left us on History.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+    try testing.expect(!app.resume_landing_pending);
+}
+
+test "ROD-229: a successful resume grid load clears the demote arm" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    // Stand in the post-auto-open state: detail open, fetch in flight, armed.
+    app.active_view = .detail;
+    app.active_pane = .detail;
+    app.detail_origin = .history;
+    app.resume_landing_pending = true;
+    app.episodes.loading = true;
+    app.episodes.for_id = try testing.allocator.dupe(u8, "fr");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.lru.deinit(app.gpa); // episodes_done caches into the LRU
+
+    const eps = try testing.allocator.alloc(domain.EpisodeNumber, 2);
+    eps[0] = .{ .raw = try testing.allocator.dupe(u8, "1") };
+    eps[1] = .{ .raw = try testing.allocator.dupe(u8, "2") };
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = try testing.allocator.dupe(u8, "fr") } });
+
+    // The grid arrived: stay in detail, disarm the demote.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    try testing.expect(!app.resume_landing_pending);
 }
 
 test "episodes_error names the failure class for network/blocked/server (ROD-173)" {
