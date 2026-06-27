@@ -1129,15 +1129,16 @@ Live-editable. Full width. No cover art.
     cover art                     [████ on ████]                     space to toggle
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
+    landing view                  history                              hjkl to cycle
 
   ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
 > **Reconciled with shipped code (ROD-138).** This surface drifted from the M4-era
 > spec across M5/M6. The mock above is what `view/settings.zig` renders as of M6:
-> three sections (Player · Catalog · Interface), eight interactive rows plus two
+> three sections (Player · Catalog · Interface), nine interactive rows plus two
 > read-only Catalog rows. Added since the original spec: `resume offset` (ROD-84),
-> `skip mode` (ROD-83), `palette` (ROD-87). Renamed: `subtitle language` →
+> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228). Renamed: `subtitle language` →
 > `translation` (ROD-138 — it always controlled the sub/dub track, never a language).
 > Removed: `audio language` (superseded by the `translation` selector — the sub/dub
 > model has no per-language audio tracks), `preferred title` (deferred to ROD-205),
@@ -1554,10 +1555,20 @@ cycle row — ROD-228); History stays the default and the fallback for any
 unrecognized value. History is home because it is the only view backed by real
 data on launch: AllAnime is search-first (no proven popular-feed endpoint), so a
 Browse landing shows its idle search prompt (§9.5) until the v0.2 Discovery Feeds
-land. The cycle offers **History** and **Browse**; the `last_watched` value is
-reserved for the resume-landing child ticket (ROD-229) — `landingEnum` accepts it
-from a config file and folds it to History, but it is not offered in the cycle
-until that behavior is real. Browse is also reachable by keybind `H` from History.
+land. The cycle offers all three live landings — **History**, **Browse**, and
+**last watched** (ROD-229): the last opens the most-recently-watched show's detail
+pane parked on its resume episode, and falls back to History whenever there is
+nothing to resume (empty history, every row never played, or a failed episode
+fetch — see below). Browse is also reachable by keybind `H` from History.
+
+**Resume landing (`last_watched`).** Resolved once, on the *initial* history load
+only — never on a mid-session reload after playback. The most-recently-watched
+show is the first row with a non-null `last_watched_at` (`loadHistory` sorts those
+first). The existing episode-grid seed positions the cursor on the resume episode
+(▸ marker when an unwatched episode exists); a caught-up show opens with the cursor
+parked and no marker. If the grid fetch fails (offline / source error) the
+auto-open demotes to the History view with a toast rather than stranding a blank
+detail pane. Empty or never-played history simply lands on History.
 
 **Normal state (DB has rows).** Reuse the §5.4 layout verbatim. The top bar
 reads `ZIGOKU  ░  Watchlist  冬 2024` — same as §5.4 (the season chip mirrors the
@@ -1810,7 +1821,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Score placeholder `[--/100]` (detail) / `[--]` (list) in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
 | Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | Now that enrichment fills `status`, chips appear automatically; the omission is the per-anime fallback for shows with no AniList hit. |
 | No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand — that is why History ships status chips (§5.4). Browse results come from AllAnime over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time — results joined against the store in one pass, or membership held in an in-memory cache — the glyph becomes nearly free; revisit then. |
-| History is the **default** landing view; the landing is configurable (ROD-228) | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land), so History is the honest default and the fallback for any unrecognized value. The setting cashes in the earlier "add a settings toggle" plan: a Browse landing shows its idle search prompt (§9.5) until feeds land, and `last_watched` folds to History until ROD-229. | When the v0.2 Discovery Feeds land, a Browse landing auto-populates and becomes a first-class choice rather than just the search prompt. |
+| History is the **default** landing view; the landing is configurable (ROD-228) | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land), so History is the honest default and the fallback for any unrecognized value. The setting cashes in the earlier "add a settings toggle" plan: a Browse landing shows its idle search prompt (§9.5) until feeds land, and `last_watched` opens the most-recently-watched show on its resume episode (ROD-229), falling back to History when there is nothing to resume. | When the v0.2 Discovery Feeds land, a Browse landing auto-populates and becomes a first-class choice rather than just the search prompt. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
