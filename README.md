@@ -40,6 +40,11 @@ Covers render as halfblock cells here; the Kitty-graphics shots below show true 
 *Detail pane with real cover art rendered via the Kitty graphics protocol (kitty / ghostty / WezTerm),
 kanji metadata chips, reflowed synopsis, and the episode grid with resume `▸` / watched `●` markers.*
 
+![Browse — live search results with the focused show's cover art rendered inline](docs/media/browse-covers.png)
+
+*Browse: a live search (`dragon ball`) with results on the left and the focused show's cover art
+rendered inline via Kitty graphics on the right — kanji chips and synopsis alongside.*
+
 ![Watchlist — grouped status headers and progress bars](docs/media/history.png)
 
 *Real watchlist: grouped status headers (`Watching`, `Planning`, …) and per-show progress bars.*
