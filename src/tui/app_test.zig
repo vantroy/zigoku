@@ -3989,6 +3989,25 @@ test "halfBlockFit: degenerate inputs clamp to the grid" {
     try testing.expectEqual(@as(u32, 30), fit.h);
 }
 
+test "ROD-236: drainTtyResponses empties pending bytes and leaves the fd non-blocking" {
+    var fds: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.SkipZigTest;
+    // fds are intentionally not closed — a 2-fd leak in one short test is
+    // harmless, and raw-fd close moved behind Io in Zig 0.16.
+
+    // Stand in for a buffered Kitty graphics ack the reader thread never read.
+    const msg = "\x1b_Gi=1;OK\x1b\\";
+    _ = std.c.write(fds[1], msg, msg.len);
+
+    app_mod.drainTtyResponses(fds[0]);
+
+    // Drained: the queue is empty. The drain left the read end non-blocking, so a
+    // further read reports WouldBlock instead of hanging (write end still open) —
+    // this also proves the drain can never wedge the quit path on an empty fd.
+    var buf: [32]u8 = undefined;
+    try testing.expectError(error.WouldBlock, std.posix.read(fds[0], &buf));
+}
+
 test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     var gate: GateProvider = .{};
     const provider = gate.provider();
