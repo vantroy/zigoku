@@ -2594,6 +2594,35 @@ test "task_error pushes a persistent error toast" {
     try testing.expectEqualStrings("network down", t.text[0..t.text_len]);
 }
 
+test "task_error (Browse failure) never marks History unavailable (ROD-234)" {
+    var app: App = .{};
+    // A Browse search/enrich error must surface only as a toast — it must not raise
+    // the History "unavailable" banner nor stop the history spinner, or a transient
+    // network blip would falsely brick the History landing view for the session.
+    try testTick(&app, .{ .task_error = "ServerError" });
+    try testing.expectEqual(@as(?[]const u8, null), app.load_error);
+    try testing.expect(app.history_loading); // still loading; not bricked
+}
+
+test "history_load_failed raises the banner and stops the spinner (ROD-234)" {
+    var app: App = .{};
+    try testTick(&app, .{ .history_load_failed = "DiskCorrupt" });
+    try testing.expect(app.load_error != null);
+    try testing.expectEqualStrings("DiskCorrupt", app.load_error.?);
+    try testing.expect(!app.history_loading);
+}
+
+test "a successful history load clears a latched load_error (ROD-234)" {
+    var app: App = .{};
+    // Simulate a prior history-load failure, then a recovery load.
+    try testTick(&app, .{ .history_load_failed = "DiskCorrupt" });
+    try testing.expect(app.load_error != null);
+    var recs = sampleHistory();
+    try testTick(&app, .{ .history_loaded = &recs });
+    try testing.expectEqual(@as(?[]const u8, null), app.load_error);
+    try testing.expect(!app.history_loading);
+}
+
 test "task_error truncates an over-long payload to the §4.7 copy budget with … (ROD-166)" {
     var app: App = .{};
     // A 50-char @errorName-style payload, well past the 36-col copy budget.
