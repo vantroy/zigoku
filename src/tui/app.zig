@@ -370,8 +370,12 @@ pub fn run(
     // tty reader thread's blind spot (it reads input), so this can't race it.
     vx.deinit(null, writer);
     // Must run before tty.deinit (which closes /dev/tty off macOS) while the fd
-    // is still open. Racing the reader thread is safe: it swallows read errors
-    // (Loop.ttyRun `catch {}`), so a WouldBlock there ends it cleanly.
+    // is still open. The ack gets consumed one of two ways, both leak-free: the
+    // reader thread is parked in a blocking read() that flipping O_NONBLOCK can't
+    // interrupt, so it often wins the arriving ack (the drain then just spins out
+    // its rounds and finds nothing); otherwise the drain's own poll/read takes
+    // it. Either way the reader thread stays safe — Loop.ttyRun swallows read
+    // errors (`catch {}`), so a WouldBlock on its NEXT read just ends it cleanly.
     if (transmitted_cover) drainTtyResponses(tty.fd.handle);
     // Restore cooked-mode termios (and close /dev/tty off macOS). The reader
     // thread is parked in read(); tcsetattr is safe concurrently, and the close
@@ -389,7 +393,9 @@ pub fn run(
 /// it (and any stragglers); we stop once a round goes quiet after seeing data, or
 /// after `max_rounds`. Bounded (≤ `max_rounds * poll_ms` ≈ 120ms, and only when a
 /// cover was shown) — nothing like the multi-second worker waits ROD-232 removed.
-/// Best-effort throughout; setting the fd non-blocking is safe (see call site).
+/// Best-effort throughout. The fd is left non-blocking on return (we `_exit` next,
+/// so it is never restored); racing the reader thread on it is safe — see the
+/// call site.
 pub fn drainTtyResponses(fd: std.posix.fd_t) void {
     // fcntl moved behind Io in Zig 0.16; with libc linked, std.c.fcntl is the
     // escape (matches the std.c.unlink/c.time pattern already in store.zig).

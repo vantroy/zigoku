@@ -3992,8 +3992,8 @@ test "halfBlockFit: degenerate inputs clamp to the grid" {
 test "ROD-236: drainTtyResponses empties pending bytes and leaves the fd non-blocking" {
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.SkipZigTest;
-    // fds are intentionally not closed — a 2-fd leak in one short test is
-    // harmless, and raw-fd close moved behind Io in Zig 0.16.
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
 
     // Stand in for a buffered Kitty graphics ack the reader thread never read.
     const msg = "\x1b_Gi=1;OK\x1b\\";
