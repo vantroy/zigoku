@@ -1129,15 +1129,16 @@ Live-editable. Full width. No cover art.
     cover art                     [████ on ████]                     space to toggle
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
+    landing view                  history                              hjkl to cycle
 
   ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
 ```
 
 > **Reconciled with shipped code (ROD-138).** This surface drifted from the M4-era
 > spec across M5/M6. The mock above is what `view/settings.zig` renders as of M6:
-> three sections (Player · Catalog · Interface), eight interactive rows plus two
+> three sections (Player · Catalog · Interface), nine interactive rows plus two
 > read-only Catalog rows. Added since the original spec: `resume offset` (ROD-84),
-> `skip mode` (ROD-83), `palette` (ROD-87). Renamed: `subtitle language` →
+> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228). Renamed: `subtitle language` →
 > `translation` (ROD-138 — it always controlled the sub/dub track, never a language).
 > Removed: `audio language` (superseded by the `translation` selector — the sub/dub
 > model has no per-language audio tracks), `preferred title` (deferred to ROD-205),
