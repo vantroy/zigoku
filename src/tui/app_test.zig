@@ -2623,6 +2623,20 @@ test "a successful history load clears a latched load_error (ROD-234)" {
     try testing.expect(!app.history_loading);
 }
 
+test "a successful history RELOAD also clears a latched load_error (ROD-234)" {
+    // Guard the reload path explicitly: both .history_loaded and .history_reloaded
+    // route through setHistory(), so a post-playback reload that succeeds must clear
+    // a prior latched banner too. Pins the invariant against a future refactor that
+    // decouples .history_reloaded from setHistory.
+    var app: App = .{};
+    try testTick(&app, .{ .history_load_failed = "DiskCorrupt" });
+    try testing.expect(app.load_error != null);
+    var recs = sampleHistory();
+    try testTick(&app, .{ .history_reloaded = &recs });
+    try testing.expectEqual(@as(?[]const u8, null), app.load_error);
+    try testing.expect(!app.history_loading);
+}
+
 test "task_error truncates an over-long payload to the §4.7 copy budget with … (ROD-166)" {
     var app: App = .{};
     // A 50-char @errorName-style payload, well past the 36-col copy budget.
