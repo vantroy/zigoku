@@ -3171,16 +3171,20 @@ test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on
     app.episodes.freeResults(app.gpa);
 }
 
-test "ROD-229: resume landing opens the full-screen zoom on a narrow terminal" {
+test "ROD-229: resume landing opens the zoom below zoom_min so the grid is visible" {
+    // The 60–99 band is the trap: the two-pane detail renders here, but its
+    // in-pane episode grid does NOT (that needs >= zoom_min) — it's a no-grid
+    // preview. A resume landing must show the grid, so below zoom_min it opens the
+    // full-screen zoom instead of focusing a gridless pane (the regression guard).
     var app: App = .{};
     app.gpa = testing.allocator;
     app.config.landing = "last_watched";
-    app.term_cols = 40; // below pane_split_min: the zoom is the only grid surface
+    app.term_cols = 80; // two-pane width, but below zoom_min → no in-pane grid
     var recs = twoShowResumeHistory();
 
     try testTick(&app, .{ .history_loaded = &recs });
 
-    // Narrow → the standalone zoom, with the same grouped-ordinal target.
+    // The standalone zoom (the grid surface at any width), same grouped target.
     try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
     try testing.expectEqualStrings("fr", app.episodes.for_id.?);
