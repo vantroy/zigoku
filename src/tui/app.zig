@@ -217,6 +217,9 @@ pub fn run(
             // Couldn't spawn — fall back to a synchronous load so the user still
             // sees their history.
             app.setHistory(st.loadHistory(hist_arenas[0].allocator()) catch &.{});
+            // ROD-229: same resume-landing resolution as the async .history_loaded
+            // path, so a spawn-failure boot still honors landing == last_watched.
+            app.maybeResumeLanding(&loop, io, provider);
             break :blk null;
         };
     } else {
@@ -476,6 +479,17 @@ pub const App = struct {
     /// Whether the last settled reload succeeded — gates the double-buffer flip in
     /// run(): flip the live arena only when setHistory actually swapped the slice.
     history_reload_ok: bool = false,
+
+    /// ROD-229: resume-landing one-shot. Set the first time history finishes its
+    /// INITIAL load, so a `landing = "last_watched"` auto-open fires exactly once
+    /// at boot and never on a post-playback reload (reloads post .history_reloaded,
+    /// not .history_loaded, so this guard is belt-and-suspenders).
+    resume_landing_done: bool = false,
+    /// ROD-229: true while an auto-opened resume grid fetch is in flight. If that
+    /// fetch fails (offline / source error) we demote back to History rather than
+    /// strand the user on a blank detail pane. Cleared by any superseding fetch,
+    /// by grid-load success, or by the demote itself.
+    resume_landing_pending: bool = false,
 
     history_filter: [128]u8 = undefined,
     history_filter_len: usize = 0,
@@ -1344,7 +1358,12 @@ pub const App = struct {
                     self.active_pane = .list;
             },
             .focus_in, .focus_out => {},
-            .history_loaded => |recs| self.setHistory(recs),
+            .history_loaded => |recs| {
+                self.setHistory(recs);
+                // ROD-229: the initial load just landed — resolve the resume
+                // landing (no-op unless landing == last_watched). One-shot.
+                self.maybeResumeLanding(loop, io, provider);
+            },
             .history_reloaded => |recs| {
                 // ROD-191: a reload landed. setHistory swaps the slice; run() flips
                 // the live double-buffer arena because history_reload_ok is set.
@@ -1469,6 +1488,9 @@ pub const App = struct {
                 }
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
+                // ROD-229: the resume grid loaded — the auto-open succeeded, so
+                // there is nothing left to demote from.
+                self.resume_landing_pending = false;
                 // Free any old results (fireEpisodes clears them, but be defensive).
                 if (self.episodes.results) |old| {
                     for (old) |ep| self.gpa.free(ep.raw);
@@ -1522,6 +1544,16 @@ pub const App = struct {
                 if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) return;
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
+                // ROD-229: an auto-opened resume landing whose grid fetch failed
+                // must not strand the user on a blank detail pane — demote to the
+                // History view (cursor already parked on the target row). The toast
+                // below still explains the failure. A user-driven open is never
+                // pending here (cleared at fire time), so it stays put.
+                if (self.resume_landing_pending) {
+                    self.active_view = .history;
+                    self.active_pane = .list;
+                    self.resume_landing_pending = false;
+                }
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
                 // failure so the blank pane isn't a silent dead end. ROD-173 names
@@ -1683,6 +1715,10 @@ pub const App = struct {
         // arrival (see the episodes_done / episodes_error handlers).
         self.episodes.freeResults(self.gpa);
         self.episodes.cursor = 0;
+        // ROD-229: any new fetch supersedes a pending resume-landing, so a later
+        // failure of *this* (user-driven) fetch must not demote to History. Only
+        // the auto-open re-arms the flag, immediately after this returns.
+        self.resume_landing_pending = false;
 
         // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
         // Resolve the source/status/history-record from nav state here and hand
@@ -1760,6 +1796,49 @@ pub const App = struct {
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, sel.id);
         if (!in_flight) self.fireEpisodes(loop, io, provider);
+    }
+
+    /// ROD-229: index of the show to resume — the most-recently-watched row, i.e.
+    /// the first with a non-null `last_watched_at`. `loadHistory` sorts those rows
+    /// first (DESC NULLS LAST), so this is normally index 0; the scan keeps it
+    /// correct even if that ORDER BY ever changes. null when nothing was ever
+    /// played (every row's `last_watched_at` is null, or history is empty). Pure —
+    /// drives `maybeResumeLanding` and is unit-tested without a tty.
+    pub fn resumeTargetIndex(self: *const App) ?usize {
+        return for (self.history, 0..) |rec, i| {
+            if (rec.last_watched_at != null) break i;
+        } else null;
+    }
+
+    /// ROD-229: on the INITIAL history load, when `landing = "last_watched"`, open
+    /// the most-recently-watched show's detail pane parked on its resume episode.
+    /// One-shot (the `resume_landing_done` guard). Falls back to the History view
+    /// when there is nothing to resume. The grid seed (`seedHistoryCursor`) plants
+    /// the resume cursor on arrival; a failed grid fetch demotes via
+    /// `resume_landing_pending` (see the `episodes_error` handler). Called after
+    /// the initial `setHistory`, so a no-resume case simply leaves us on History
+    /// (where the ROD-228 startup map already put `.last_watched`).
+    fn maybeResumeLanding(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        if (self.resume_landing_done) return;
+        self.resume_landing_done = true;
+        if (self.config.landingEnum() != .last_watched) return;
+
+        const idx = self.resumeTargetIndex() orelse return;
+        const rec = self.history[idx];
+        // `list_cursor` is a grouped/filtered ENTRY ORDINAL, not a self.history
+        // index — the History list is grouped by status (§5.4), so the two spaces
+        // diverge whenever the most-recent show isn't in the first group. Map the
+        // record to its cursor ordinal so the seeded highlight, the detail meta
+        // (resolved via recordAtCursor) and the episode grid all land on the same
+        // show. (`resumeTargetIndex` picks the record; `ordinalOf` places it.)
+        const ordinal = history.ordinalOf(self, rec.source, rec.source_id) orelse return;
+        self.list_cursor = ordinal;
+        self.openHistoryZoom(loop, io, provider, rec);
+        // Arm the demote-on-failure only when the open actually started an async
+        // fetch — a synchronous cache hit already has the grid, so there is nothing
+        // to fall back from. (`openHistoryZoom` → `fireEpisodesForId` clears the
+        // flag at entry, so this assignment is the authoritative arm.)
+        self.resume_landing_pending = self.episodes.loading;
     }
 
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its
