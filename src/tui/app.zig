@@ -311,6 +311,52 @@ pub fn run(
         app.layout(win.height, win.width);
         try app.draw(&vx, writer);
     }
+
+    // ROD-232: fast-exit on the quit path. Falling out of the loop only happens
+    // on a user quit (q / Ctrl-C set should_quit; nothing else does), and a user
+    // quit has nothing to wait for. The durable writes already landed: Settings
+    // saves synchronously before should_quit (leaveSettings → config save in
+    // onKey), and playback progress is checkpointed on the main thread as
+    // .position_update events arrive — so abandoning the play worker loses at
+    // most the last few seconds of resume position, not the row (mpv, a detached
+    // child, keeps running; the old play_thread join would have blocked quit on
+    // it). The other in-flight workers (enrich/episode/cover/search) are network
+    // reads; the DB is autocommit and the one on-disk writer (the cover cache) is
+    // crash-safe via atomic rename. So instead of the graceful drain below —
+    // which can sit 5+s on each worker's withDeadline wall clock (ROD-153) and
+    // can deadlock when the bounded event queue fills (a worker's final postEvent
+    // blocks in push() while the main loop has stopped popping; ROD-179 widened
+    // it to N workers) — restore the terminal and terminate, abandoning the
+    // workers for the OS to reap: no wait, no full-queue hang.
+    //
+    // Terminate, don't return: the abandoned workers postEvent into the loop's
+    // queue, so the queue must die *with* the process — we can't loop.stop() it
+    // out from under them first or we get a use-after-free. And it must be _exit,
+    // not std.process.exit: libc is linked (build.zig), so the latter routes
+    // through C exit(), which runs atexit handlers and flushes stdio on *this*
+    // thread while the workers are still live — the exact teardown-wedge hazard
+    // we're killing. _exit issues the exit syscall directly: no handlers, no
+    // locks, no stdio. The terminal is already restored and flushed below before
+    // we call it, and every defer (the ThreadDrain barrier + the search/enrich/
+    // cover/play joins) is skipped — those stay for the error-unwind path and
+    // tests, which can't _exit.
+    if (vx.caps.kitty_graphics) {
+        // Drop lingering cover images explicitly — leaving the alt-screen does
+        // not reliably clear Kitty graphics on every terminal. A pure terminal
+        // write: it touches none of the cover caches a cover worker may still be
+        // reading, so nothing is freed here.
+        writer.writeAll(vaxis.ctlseqs.kitty_graphics_clear) catch {};
+    }
+    // resetState only (alloc = null): show cursor, sgr/kitty-keyboard reset,
+    // leave alt-screen, flush — no frees, since _exit reclaims it all and
+    // skipping the frees keeps us off vx.screen entirely. The output side is the
+    // tty reader thread's blind spot (it reads input), so this can't race it.
+    vx.deinit(null, writer);
+    // Restore cooked-mode termios (and close /dev/tty off macOS). The reader
+    // thread is parked in read(); tcsetattr is safe concurrently, and the close
+    // can't fault before _exit reaps the thread on its heels.
+    tty.deinit();
+    std.c._exit(0);
 }
 
 pub const Toast = struct {
