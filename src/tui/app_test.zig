@@ -3062,6 +3062,109 @@ test "episodes_error with a data-shape cause uses the generic fallback copy" {
     try testing.expectEqualStrings("couldn't load episodes", t.text[0..t.text_len]);
 }
 
+test "ROD-229: resumeTargetIndex finds the most-recently-watched row, else null" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    // Empty history → nothing to resume.
+    var empty: [0]AnimeRecord = .{};
+    app.setHistory(&empty);
+    try testing.expectEqual(@as(?usize, null), app.resumeTargetIndex());
+
+    // Every row never played (last_watched_at all null) → nothing to resume.
+    var never = sampleHistory();
+    app.setHistory(&never);
+    try testing.expectEqual(@as(?usize, null), app.resumeTargetIndex());
+
+    // Most-recently-watched sits at the top (loadHistory's DESC-NULLS-LAST order).
+    var top = sampleHistory();
+    top[0].last_watched_at = 1000;
+    app.setHistory(&top);
+    try testing.expectEqual(@as(?usize, 0), app.resumeTargetIndex());
+
+    // Defensive: the scan still finds a non-null that isn't at index 0.
+    var mid = sampleHistory();
+    mid[1].last_watched_at = 500;
+    app.setHistory(&mid);
+    try testing.expectEqual(@as(?usize, 1), app.resumeTargetIndex());
+}
+
+test "ROD-229: a failed resume grid fetch demotes the auto-open to History" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    // Stand in the post-auto-open state: detail open, fetch in flight, armed.
+    app.active_view = .detail;
+    app.active_pane = .detail;
+    app.detail_origin = .history;
+    app.list_cursor = 0;
+    app.resume_landing_pending = true;
+    app.episodes.loading = true;
+    app.episodes.for_id = try testing.allocator.dupe(u8, "a");
+    defer app.episodes.freeResults(app.gpa);
+
+    // The grid fetch fails (offline) — the auto-open must not strand a blank pane.
+    try testTick(&app, .{ .episodes_error = .{
+        .cause = error.NetworkDown,
+        .for_id = try testing.allocator.dupe(u8, "a"),
+    } });
+
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .list), app.active_pane);
+    try testing.expect(!app.resume_landing_pending);
+    // The failure is still surfaced — a demote, not a silent swallow.
+    try testing.expect(app.toast_queue[0] != null);
+}
+
+test "ROD-229: a user-driven episode fetch failure stays in detail (no demote)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .detail;
+    app.active_pane = .detail;
+    app.detail_origin = .history;
+    app.resume_landing_pending = false; // a deliberate open, not a resume landing
+    app.episodes.loading = true;
+    app.episodes.for_id = try testing.allocator.dupe(u8, "a");
+    defer app.episodes.freeResults(app.gpa);
+
+    try testTick(&app, .{ .episodes_error = .{
+        .cause = error.NetworkDown,
+        .for_id = try testing.allocator.dupe(u8, "a"),
+    } });
+
+    // Stays put: the user opened this; the toast explains the error in place.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+}
+
+test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on one show" {
+    // A completed show watched most recently sorts into a LOWER group than an
+    // older "watching" show. self.history is last_watched DESC (Frieren index 0),
+    // but the grouped cursor space renders watching first — so Frieren's ordinal
+    // is 1, not 0. Seeding the cursor with the raw history index would put One
+    // Piece's meta beside Frieren's grid (the bug this guards).
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.config.landing = "last_watched";
+    var recs = [_]AnimeRecord{
+        .{ .source = "allanime", .source_id = "fr", .title = "Frieren", .list_status = .completed, .total_episodes = 12, .progress = 12, .last_watched_at = 2000 },
+        .{ .source = "allanime", .source_id = "op", .title = "One Piece", .list_status = .watching, .total_episodes = 1100, .progress = 50, .last_watched_at = 1000 },
+    };
+
+    // The initial history load is the real resume trigger.
+    try testTick(&app, .{ .history_loaded = &recs });
+
+    // Opened the most-recently-watched show's detail...
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    // ...with the cursor on Frieren's GROUPED ordinal (1), not its history index (0).
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    // The invariant the bug broke: the highlighted record (detail meta, via
+    // recordAtCursor) and the fetched grid (episodes.for_id) are the same show.
+    try testing.expectEqualStrings("fr", app.selectedHistoryRecord().?.source_id);
+    try testing.expectEqualStrings("fr", app.episodes.for_id.?);
+
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
 test "episodes_error names the failure class for network/blocked/server (ROD-173)" {
     const Case = struct { cause: anyerror, copy: []const u8 };
     const cases = [_]Case{
@@ -3318,10 +3421,8 @@ test "settings: palette cycle re-points the live app palette" {
     try testing.expectEqual(&colors.terminal_ghost, app.palette);
 }
 
-test "settings: landing cycle steps through the live startup-view presets and wraps" {
-    // Only the live views (history, browse) are cyclable; "last_watched" is
-    // accepted by landingEnum but deliberately absent from the cycle until
-    // ROD-229 makes it real (so the row never offers a silent no-op).
+test "settings: landing cycle steps through all three startup-view presets and wraps" {
+    // ROD-229 made resume-landing real, so "last_watched" is back in the cycle.
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
@@ -3331,11 +3432,14 @@ test "settings: landing cycle steps through the live startup-view presets and wr
     try testTick(&app, keyEv('l', .{})); // history -> browse
     try testing.expectEqualStrings("browse", app.config.landing);
 
-    try testTick(&app, keyEv('l', .{})); // browse -> history (forward wrap)
+    try testTick(&app, keyEv('l', .{})); // browse -> last_watched
+    try testing.expectEqualStrings("last_watched", app.config.landing);
+
+    try testTick(&app, keyEv('l', .{})); // last_watched -> history (forward wrap)
     try testing.expectEqualStrings("history", app.config.landing);
 
-    try testTick(&app, keyEv('h', .{})); // history -> browse (reverse wrap)
-    try testing.expectEqualStrings("browse", app.config.landing);
+    try testTick(&app, keyEv('h', .{})); // history -> last_watched (reverse wrap)
+    try testing.expectEqualStrings("last_watched", app.config.landing);
 
     try testing.expect(app.settings.dirty);
 }

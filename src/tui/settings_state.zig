@@ -88,11 +88,10 @@ const translation_presets = [_][]const u8{ "sub", "dub" };
 const skip_presets = [_][]const u8{ "none", "intro", "outro", "both" };
 const resume_presets = [_]u32{ 0, 3, 5, 10, 15, 30 };
 const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord", "tokyonight" };
-// Only the live landing views are cyclable. "last_watched" is intentionally
-// absent: `Config.landingEnum` still accepts it from a hand-edited or
-// future-build config (folding to History), but the cycle never offers a value
-// that silently no-ops — ROD-229 adds it here when resume-landing is real.
-const landing_presets = [_][]const u8{ "history", "browse" };
+// All three landing views are live now: ROD-229 implemented resume-landing, so
+// "last_watched" rejoins the cycle (it was held back in ROD-228 only because it
+// would have silently folded to History).
+const landing_presets = [_][]const u8{ "history", "browse", "last_watched" };
 
 /// Step through a preset list to the value after (`dir > 0`) or before the
 /// current one, wrapping. An unrecognized current value starts from index 0.

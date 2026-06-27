@@ -161,6 +161,31 @@ pub fn indexById(self: *const App, source: []const u8, source_id: []const u8) ?u
     return null;
 }
 
+/// ROD-229: the cursor *ordinal* (the `list_cursor` space) of the entry with this
+/// key, in §5.4 grouped/filtered order — or null when the entry is filtered out or
+/// absent. The inverse of `recordAtCursor`: seeding `list_cursor` with this lands
+/// the highlight on exactly this record. Distinct from `indexById`, which returns
+/// the raw `self.history` index — that index is NOT the cursor space (the list is
+/// grouped by status), so seeding the cursor with it points at the wrong row.
+pub fn ordinalOf(self: *const App, source: []const u8, source_id: []const u8) ?usize {
+    const Ctx = struct {
+        want_source: []const u8,
+        want_id: []const u8,
+        found: ?usize = null,
+        fn onBlank(_: *@This(), _: u16) void {}
+        fn onHeader(_: *@This(), _: u16, _: ListStatus, _: usize) void {}
+        fn onHairline(_: *@This(), _: u16) void {}
+        fn onEntry(c: *@This(), _: u16, rec: AnimeRecord, _: usize, ordinal: usize, _: bool) void {
+            if (c.found != null) return; // keep the first match
+            if (std.mem.eql(u8, rec.source, c.want_source) and std.mem.eql(u8, rec.source_id, c.want_id))
+                c.found = ordinal;
+        }
+    };
+    var ctx = Ctx{ .want_source = source, .want_id = source_id };
+    _ = walk(self, &ctx);
+    return ctx.found;
+}
+
 // ── Paint ────────────────────────────────────────────────────────────────────
 
 const DrawCtx = struct {
