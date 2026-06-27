@@ -174,7 +174,7 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
 fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: Cli, cfg: zigoku.Config, provider: zigoku.SourceProvider, store: ?*zigoku.Store) !void {
     try zigoku.writeBanner(out);
     if (!std.mem.eql(u8, cli.quality, "best")) {
-        try out.print("\n  (note: --quality is parsed but not wired yet — fast4speed is 1080p direct; quality select is ROD-92)\n", .{});
+        try out.print("\n  (note: --quality isn't wired up yet — playback uses the highest direct stream available.)\n", .{});
     }
 
     const SOURCE = provider.name();
@@ -412,7 +412,7 @@ fn usage(out: *Io.Writer) !void {
     try zigoku.writeBanner(out);
     try out.writeAll(
         \\
-        \\  usage: zigoku <query> [--dub] [--quality best|1080|720|480|worst] [--debug]
+        \\  usage: zigoku <query> [--dub] [--debug]
         \\
         \\    zigoku frieren
         \\    zigoku "cowboy bebop" --dub
@@ -431,7 +431,7 @@ fn reportError(out: *Io.Writer, err: anyerror, source_name: []const u8) !void {
     const msg: []const u8 = switch (err) {
         error.MpvNotFound => "mpv isn't on your PATH. Install mpv and try again.",
         error.MpvFailed => "mpv exited badly (closed early, or couldn't play the stream).",
-        error.NoDirectStream => "found the episode, but it only offers providers we can't resolve yet (the direct fast4speed link wasn't there). That's the ROD-92 follow-up — try another show/episode for now.",
+        error.NoDirectStream => "found the episode, but it only offers stream providers we can't resolve yet — try another show or episode for now.",
         error.NoSearchData => std.fmt.bufPrint(&buf, "{s} returned nothing for that search.", .{source_name}) catch @errorName(err),
         error.ShowNotFound, error.NoEpisodeData => std.fmt.bufPrint(&buf, "{s} had no episode data for that show.", .{source_name}) catch @errorName(err),
         error.NotEncrypted => std.fmt.bufPrint(&buf, "{s} returned an unexpected (unencrypted) video payload — the protocol may have shifted.", .{source_name}) catch @errorName(err),
