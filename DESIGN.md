@@ -1546,7 +1546,7 @@ spec just isn't settled — and would return in the title's row when added.
 
 ---
 
-### 9.2 History as Landing View
+### 9.2 History as the Default Landing View
 
 The app opens to the History/Watchlist view **by default**. The landing view is a
 config setting (`landing` in `config.zon`, surfaced as the Settings "landing view"
@@ -1554,9 +1554,10 @@ cycle row — ROD-228); History stays the default and the fallback for any
 unrecognized value. History is home because it is the only view backed by real
 data on launch: AllAnime is search-first (no proven popular-feed endpoint), so a
 Browse landing shows its idle search prompt (§9.5) until the v0.2 Discovery Feeds
-land. The `last_watched` value is reserved for the resume-landing child ticket
-(ROD-229) and folds to History until then. Browse is also reachable by keybind `H`
-from History.
+land. The cycle offers **History** and **Browse**; the `last_watched` value is
+reserved for the resume-landing child ticket (ROD-229) — `landingEnum` accepts it
+from a config file and folds it to History, but it is not offered in the cycle
+until that behavior is real. Browse is also reachable by keybind `H` from History.
 
 **Normal state (DB has rows).** Reuse the §5.4 layout verbatim. The top bar
 reads `ZIGOKU  ░  Watchlist  冬 2024` — same as §5.4 (the season chip mirrors the
@@ -1866,9 +1867,10 @@ opens on its idle search prompt (§9.5). It also becomes live when the user pres
 | `H` | Toggle: if in History → switch to Browse; if elsewhere → switch to History | Any view |
 | `S` | Switch to Settings | Any view (except already in Settings → no-op) |
 
-`H` is a toggle because it is the only way to reach Browse in M3 (Browse has no
-dedicated single-key bind of its own — `F1` covers that path, see below). From
-Browse, pressing `H` returns to History. This matches §6.1's current `H` entry.
+`H` is a toggle because Browse has no dedicated single-key jump of its own —
+`F1` reaches it (see below), and `landing = "browse"` (§9.2) can open the app
+straight into Browse. From Browse, pressing `H` returns to History. This matches
+§6.1's current `H` entry.
 
 `S` from Settings is a no-op. There is no "toggle Settings" semantic. `q` quits
 the app (persisting a dirty tab first); `F1`/`F2`/`F3`/`H` switch away (also
