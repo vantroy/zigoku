@@ -311,6 +311,44 @@ pub fn run(
         app.layout(win.height, win.width);
         try app.draw(&vx, writer);
     }
+
+    // ROD-232: fast-exit on the quit path. Falling out of the loop only happens
+    // on a user quit (q / Ctrl-C set should_quit; nothing else does), and a user
+    // quit has nothing durable to wait for: Settings — the only durable write on
+    // quit — already saved synchronously before should_quit (leaveSettings →
+    // config save in onKey). The in-flight workers (enrich/episode/cover/search/
+    // play) are pure network reads holding nothing durable; the DB is autocommit.
+    // So instead of running the graceful drain below — which can sit 5+s on each
+    // worker's withDeadline wall clock (ROD-153) and can deadlock when the
+    // bounded event queue is full (a worker's final postEvent blocks in push()
+    // while the main loop has stopped popping; ROD-179 widened it to N workers) —
+    // restore the terminal and process.exit, abandoning the workers. The OS reaps
+    // the threads instantly: no wait, no full-queue hang.
+    //
+    // It must be process.exit, not a graceful return: the abandoned workers
+    // postEvent into the loop's queue, so the queue has to die *with* the process
+    // — we can't loop.stop() it out from under them first or we get a
+    // use-after-free. process.exit kills them before anything they touch is freed,
+    // and skips every defer below. Those defers (the ThreadDrain barrier + the
+    // search/enrich/cover/play joins) stay for the error-unwind path and tests,
+    // where we can't process.exit.
+    if (vx.caps.kitty_graphics) {
+        // Drop lingering cover images explicitly — leaving the alt-screen does
+        // not reliably clear Kitty graphics on every terminal. A pure terminal
+        // write: it touches none of the cover caches a cover worker may still be
+        // reading, so nothing is freed here.
+        writer.writeAll(vaxis.ctlseqs.kitty_graphics_clear) catch {};
+    }
+    // resetState only (alloc = null): show cursor, sgr/kitty-keyboard reset,
+    // leave alt-screen, flush — no frees, since process.exit reclaims it all and
+    // skipping the frees keeps us off vx.screen entirely. The output side is the
+    // tty reader thread's blind spot (it reads input), so this can't race it.
+    vx.deinit(null, writer);
+    // Restore cooked-mode termios (and close /dev/tty off macOS). The reader
+    // thread is parked in read(); tcsetattr is safe concurrently, and the close
+    // can't fault before process.exit reaps the thread on its heels.
+    tty.deinit();
+    std.process.exit(0);
 }
 
 pub const Toast = struct {
