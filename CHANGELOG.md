@@ -14,6 +14,18 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-28
+
+### Added
+
+- **Configurable startup view**: zigoku now opens on whichever view is set via `landing` in `config.zon` — `"history"` or `"browse"` — with a matching "landing view" cycle row in the Settings tab. Previously the app always started on History; History remains the default when the setting is absent or unrecognised.
+
+- **Resume landing**: `landing = "last_watched"` in `config.zon` (selectable in the Settings landing cycle) opens the most-recently-watched show's detail pane at startup, with the episode cursor parked on the next episode to continue. Previously the app always landed on a list view; empty history and fetch failures fall back gracefully to History.
+
+### Fixed
+
+- **Kitty graphics acknowledgements no longer bleed onto the shell prompt after quitting**: the terminal replies to each cover-art transmission with an `_Gi=N;OK` response; these arrive asynchronously and were left unread when the app exited, landing in the tty buffer for the shell to echo as garbage on the next prompt. The quit path now drains any pending acks before exiting — bounded to avoid delay, and skipped entirely when no cover art was transmitted during the session.
+
 ## [0.1.4] - 2026-06-27
 
 ### Fixed
@@ -114,7 +126,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/vantroy/zigoku/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/vantroy/zigoku/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vantroy/zigoku/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vantroy/zigoku/compare/v0.1.1...v0.1.2
