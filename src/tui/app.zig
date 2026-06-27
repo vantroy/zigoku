@@ -1260,6 +1260,9 @@ pub const App = struct {
     pub fn setHistory(self: *App, recs: []AnimeRecord) void {
         self.history = recs;
         self.history_loading = false;
+        // ROD-234: a successful (re)load clears any prior history-load banner, so a
+        // transient failure can never latch History as "unavailable" for the session.
+        self.load_error = null;
         // Clamp against filtered len so an active filter can't leave the cursor
         // pointing past the visible range when history reloads.
         const cap = self.filteredHistoryLen();
@@ -1302,9 +1305,17 @@ pub const App = struct {
                 self.history_reload_settled +%= 1;
                 self.pushToast(.warn, "watchlist refresh failed", false);
             },
-            .task_error => |msg| {
+            .history_load_failed => |msg| {
+                // ROD-234: the initial history load failed for real — raise the
+                // banner and stop the spinner. Scoped to history so a Browse error
+                // (task_error) can no longer falsely mark History "unavailable".
                 self.load_error = msg;
                 self.history_loading = false;
+            },
+            .task_error => |msg| {
+                // ROD-234: a Browse search/enrich failure. Surfaces as a persistent
+                // toast only — it must NOT touch History state (no load_error, no
+                // history_loading), or it falsely bricks the History landing view.
                 self.search.loading = false;
                 self.debounce_deadline_ms = 0;
                 self.cover_sync_deadline_ms = 0;
