@@ -14,6 +14,14 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-06-27
+
+### Fixed
+
+- **Quitting no longer freezes the screen after a busy Browse session**: exiting while background cover and metadata fetches were in flight waited for each worker to time out — up to five seconds of a frozen alt-screen if Browse had fired a storm of requests. Settings save synchronously and the store is autocommit, so nothing durable needs draining; quit now restores the terminal and exits at once, leaving any in-flight network work to the OS.
+
+- **Browse errors no longer disable the History view**: a search or metadata-fetch failure in Browse wrongly raised History's "unavailable" banner — and because nothing cleared it, History stayed unreachable until the app restarted. Browse and network errors are now scoped to Browse and surface as a toast; History gets its own error path, and a successful load clears any prior failure so a transient blip self-heals rather than latching for the session.
+
 ## [0.1.3] - 2026-06-27
 
 ### Added
@@ -106,7 +114,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/vantroy/zigoku/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vantroy/zigoku/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/vantroy/zigoku/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/vantroy/zigoku/compare/v0.1.0...v0.1.1
