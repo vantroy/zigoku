@@ -350,6 +350,13 @@ pub fn run(
     // we call it, and every defer (the ThreadDrain barrier + the search/enrich/
     // cover/play joins) is skipped — those stay for the error-unwind path and
     // tests, which can't _exit.
+    // ROD-236: a cover image was transmitted this session, so the terminal has
+    // been acking each per-frame Kitty placement with `_Gi=N;OK`. The final
+    // frame's ack is still round-tripping back when we exit; drain it (and any
+    // stragglers) so it doesn't echo onto the shell prompt. `next_img_id` starts
+    // at 1 and only `transmitImage` bumps it, so `> 1` means a cover was sent —
+    // gate on it so a cover-less quit pays nothing. Captured before `vx.deinit`.
+    const transmitted_cover = vx.next_img_id > 1;
     if (vx.caps.kitty_graphics) {
         // Drop lingering cover images explicitly — leaving the alt-screen does
         // not reliably clear Kitty graphics on every terminal. A pure terminal
@@ -362,11 +369,57 @@ pub fn run(
     // skipping the frees keeps us off vx.screen entirely. The output side is the
     // tty reader thread's blind spot (it reads input), so this can't race it.
     vx.deinit(null, writer);
+    // Must run before tty.deinit (which closes /dev/tty off macOS) while the fd
+    // is still open. The ack gets consumed one of two ways, both leak-free: the
+    // reader thread is parked in a blocking read() that flipping O_NONBLOCK can't
+    // interrupt, so it often wins the arriving ack (the drain then just spins out
+    // its rounds and finds nothing); otherwise the drain's own poll/read takes
+    // it. Either way the reader thread stays safe — Loop.ttyRun swallows read
+    // errors (`catch {}`), so a WouldBlock on its NEXT read just ends it cleanly.
+    if (transmitted_cover) drainTtyResponses(tty.fd.handle);
     // Restore cooked-mode termios (and close /dev/tty off macOS). The reader
     // thread is parked in read(); tcsetattr is safe concurrently, and the close
     // can't fault before _exit reaps the thread on its heels.
     tty.deinit();
     std.c._exit(0);
+}
+
+/// ROD-236: drain in-flight terminal responses (Kitty graphics `_Gi=N;OK` acks)
+/// from the tty input queue before the ROD-232 fast `_exit`. vaxis re-emits the
+/// cover placement every render frame and the terminal acks each one; the reader
+/// thread eats them during the session, but the FINAL frame's ack is still
+/// round-tripping back when we exit, so a plain non-blocking drain races and
+/// loses it. Each round polls a short window so the ack can land, then discards
+/// it (and any stragglers); we stop once a round goes quiet after seeing data, or
+/// after `max_rounds`. Bounded (≤ `max_rounds * poll_ms` ≈ 120ms, and only when a
+/// cover was shown) — nothing like the multi-second worker waits ROD-232 removed.
+/// Best-effort throughout. The fd is left non-blocking on return (we `_exit` next,
+/// so it is never restored); racing the reader thread on it is safe — see the
+/// call site.
+pub fn drainTtyResponses(fd: std.posix.fd_t) void {
+    // fcntl moved behind Io in Zig 0.16; with libc linked, std.c.fcntl is the
+    // escape (matches the std.c.unlink/c.time pattern already in store.zig).
+    const cur = std.c.fcntl(fd, std.c.F.GETFL);
+    if (cur == -1) return;
+    const nonblock: c_int = @bitCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    if (std.c.fcntl(fd, std.c.F.SETFL, cur | nonblock) == -1) return;
+
+    const poll_ms: c_int = 30;
+    const max_rounds: u8 = 4;
+    var buf: [4096]u8 = undefined;
+    var seen = false;
+    var rounds: u8 = 0;
+    while (rounds < max_rounds) : (rounds += 1) {
+        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        _ = std.c.poll(&pfd, 1, poll_ms); // wait up to poll_ms for the ack to land
+        var got = false;
+        inner: while (true) {
+            const n = std.posix.read(fd, &buf) catch break :inner; // WouldBlock/empty
+            if (n == 0) break :inner; // EOF
+            got = true;
+        }
+        if (got) seen = true else if (seen) break; // drained, then quiet → done
+    }
 }
 
 pub const Toast = struct {
