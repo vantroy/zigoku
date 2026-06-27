@@ -1548,10 +1548,15 @@ spec just isn't settled — and would return in the title's row when added.
 
 ### 9.2 History as Landing View
 
-The app opens to the History/Watchlist view. This is Rod's settled
-decision: History is home. Even when future Browse lists (trending, top-of-week)
-exist, the user lands in History first. Browse is reached by keybind `H` from
-History.
+The app opens to the History/Watchlist view **by default**. The landing view is a
+config setting (`landing` in `config.zon`, surfaced as the Settings "landing view"
+cycle row — ROD-228); History stays the default and the fallback for any
+unrecognized value. History is home because it is the only view backed by real
+data on launch: AllAnime is search-first (no proven popular-feed endpoint), so a
+Browse landing shows its idle search prompt (§9.5) until the v0.2 Discovery Feeds
+land. The `last_watched` value is reserved for the resume-landing child ticket
+(ROD-229) and folds to History until then. Browse is also reachable by keybind `H`
+from History.
 
 **Normal state (DB has rows).** Reuse the §5.4 layout verbatim. The top bar
 reads `ZIGOKU  ░  Watchlist  冬 2024` — same as §5.4 (the season chip mirrors the
@@ -1804,7 +1809,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Score placeholder `[--/100]` (detail) / `[--]` (list) in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
 | Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | Now that enrichment fills `status`, chips appear automatically; the omission is the per-anime fallback for shows with no AniList hit. |
 | No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand — that is why History ships status chips (§5.4). Browse results come from AllAnime over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time — results joined against the store in one pass, or membership held in an in-memory cache — the glyph becomes nearly free; revisit then. |
-| History is the landing view even on first run | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land). History landing is the honest choice and aligns with Rod's decision. | If a Browse feed endpoint is confirmed in a future spike, add it as an optional secondary landing behind a settings toggle. |
+| History is the **default** landing view; the landing is configurable (ROD-228) | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land), so History is the honest default and the fallback for any unrecognized value. The setting cashes in the earlier "add a settings toggle" plan: a Browse landing shows its idle search prompt (§9.5) until feeds land, and `last_watched` folds to History until ROD-229. | When the v0.2 Discovery Feeds land, a Browse landing auto-populates and becomes a first-class choice rather than just the search prompt. |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
@@ -1831,8 +1836,8 @@ keybinds.
 
 | View | Identifier | Default | Layout |
 |---|---|---|---|
-| Browse | `active_view = .browse` | No (M3 landing is History) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
-| History | `active_view = .history` | Yes (M3 landing, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
+| Browse | `active_view = .browse` | Optional (config `landing = "browse"`, §9.2) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
+| History | `active_view = .history` | Default (config `landing = "history"`, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
 | Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
@@ -1845,8 +1850,10 @@ reached with `Space` from a focused detail pane in **either** Browse or History 
 do the same). `q` no longer backs out — it quits the app (ROD-210). See §10.4 for the full Esc chain,
 and §10.7 for the decision log.
 
-Browse is not available as a landing view in M3 — there is no feed to populate it.
-It becomes live when the user presses `F1` or `H` from History. This is unchanged from §9.2.
+Browse can be selected as the landing view (`landing = "browse"`, §9.2), but until
+the v0.2 Discovery Feeds land there is no feed to populate it — a Browse landing
+opens on its idle search prompt (§9.5). It also becomes live when the user presses
+`F1` or `H` from History.
 
 ---
 
@@ -2171,7 +2178,8 @@ ROD-170 as noted):
 
 ```zig
 /// Which top-level view is currently displayed.
-/// Defaults to .history — the M3 landing (§9.2).
+/// Struct default is .history; run() seeds it from config.landingEnum() at
+/// startup (ROD-228, §9.2), History remaining the default/fallback.
 /// ROD-170: .detail is now reached from Browse or History (both arms live).
 active_view: enum { browse, history, detail, settings } = .history,
 

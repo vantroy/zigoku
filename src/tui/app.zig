@@ -169,6 +169,13 @@ pub fn run(
     // The configured sub/dub default seeds the search translation; the user can
     // still toggle it live in-session (ROD-85).
     app.translation = config.translationEnum();
+    // Seed the startup view from config (ROD-228). `.last_watched` folds to
+    // History until ROD-229 wires the resume-landing; Browse with no results
+    // lands on its idle search prompt (view/browse.zig), never a blank pane.
+    app.active_view = switch (config.landingEnum()) {
+        .browse => .browse,
+        .history, .last_watched => .history,
+    };
     defer app.deinitOwnedState(&vx, writer);
 
     // History memory lives in a double-buffered pair of arenas owned here and
@@ -482,8 +489,10 @@ pub const App = struct {
     /// see RenderScratch for the vaxis by-reference lifetime contract.
     scratch: RenderScratch = .{},
 
-    /// Which top-level view is currently displayed.
-    /// Defaults to .history — the M3 landing (§9.2).
+    /// Which top-level view is currently displayed. The struct default is
+    /// `.history`, but `run()` overwrites it at startup from the configured
+    /// landing view (`config.landingEnum()`, ROD-228) before the first frame —
+    /// History remains the default when unset/unrecognized (§9.2).
     active_view: enum { browse, history, detail, settings } = .history,
     /// Which top-level view opened the standalone detail screen.
     detail_origin: enum { browse, history } = .browse,

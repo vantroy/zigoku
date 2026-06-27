@@ -37,12 +37,24 @@ pub const Config = struct {
     cover_art: bool = true,
     kanji_chips: bool = true,
     palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord" | "tokyonight"
+    landing: []const u8 = "history", // "history" | "browse" | "last_watched" (ROD-228)
 
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
     pub fn translationEnum(self: Config) domain.Translation {
         if (std.mem.eql(u8, self.translation, "dub")) return .dub;
         return .sub;
+    }
+
+    /// Map `landing` onto the startup-view choice, defaulting to `.history` for
+    /// anything unrecognized — same degrade-at-callsite contract as
+    /// `translationEnum`. `.last_watched` is a valid string today but the app
+    /// folds it back to History until ROD-229 implements resume-landing; the
+    /// value is reserved now so an early config never trips an older binary.
+    pub fn landingEnum(self: Config) enum { browse, history, last_watched } {
+        if (std.mem.eql(u8, self.landing, "browse")) return .browse;
+        if (std.mem.eql(u8, self.landing, "last_watched")) return .last_watched;
+        return .history;
     }
 };
 
@@ -111,6 +123,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqual(want.cover_art, got.cover_art);
     try testing.expectEqual(want.kanji_chips, got.kanji_chips);
     try testing.expectEqualStrings(want.palette, got.palette);
+    try testing.expectEqualStrings(want.landing, got.landing);
 }
 
 test "empty struct literal yields all defaults" {
@@ -159,6 +172,7 @@ test "serialized config round-trips back through parse" {
         .cover_art = false,
         .kanji_chips = false,
         .palette = "nord",
+        .landing = "browse",
     };
 
     var aw = std.Io.Writer.Allocating.init(a);
@@ -172,4 +186,12 @@ test "translationEnum maps dub, defaults everything else to sub" {
     try testing.expectEqual(.dub, (Config{ .translation = "dub" }).translationEnum());
     try testing.expectEqual(.sub, (Config{ .translation = "sub" }).translationEnum());
     try testing.expectEqual(.sub, (Config{ .translation = "garbage" }).translationEnum());
+}
+
+test "landingEnum maps browse and last_watched, defaults everything else to history" {
+    try testing.expectEqual(.browse, (Config{ .landing = "browse" }).landingEnum());
+    try testing.expectEqual(.last_watched, (Config{ .landing = "last_watched" }).landingEnum());
+    try testing.expectEqual(.history, (Config{ .landing = "history" }).landingEnum());
+    try testing.expectEqual(.history, (Config{ .landing = "garbage" }).landingEnum());
+    try testing.expectEqual(.history, (Config{}).landingEnum()); // default
 }
