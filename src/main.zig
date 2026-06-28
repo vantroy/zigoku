@@ -92,6 +92,14 @@ pub fn main(init: std.process.Init) !void {
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const out = &stdout_fw.interface;
 
+    // ROD-221: `--version`/`-V` is an explicit fast-path — print the version line
+    // and exit 0 before any config/store/network work, independent of the
+    // UnknownFlag → usage() fallthrough the distribution checks used to rely on.
+    if (try handleVersionFlag(args, out)) {
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
@@ -408,15 +416,74 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
     return false;
 }
 
+/// True if a version flag (`--version` or `-V`) appears anywhere in `args`.
+/// Position-independent so `zigoku frieren --version` still reports the version
+/// rather than searching.
+fn hasVersionFlag(args: []const [:0]const u8) bool {
+    return hasFlag(args, "--version") or hasFlag(args, "-V");
+}
+
+/// ROD-221: the `--version`/`-V` fast-path, factored out of `main` so the
+/// flag-dispatch *and* the line emission can be unit-tested without standing up
+/// `main`'s full IO. Returns true when a version flag was present (and the
+/// version line was written) — the caller flushes and exits 0 before any
+/// config/store/network work.
+fn handleVersionFlag(args: []const [:0]const u8, out: *Io.Writer) !bool {
+    if (!hasVersionFlag(args)) return false;
+    try zigoku.writeVersion(out);
+    return true;
+}
+
+test "hasVersionFlag detects --version and -V anywhere, ignores others" {
+    const v1 = [_][:0]const u8{ "zigoku", "--version" };
+    const v2 = [_][:0]const u8{ "zigoku", "frieren", "-V" };
+    const none = [_][:0]const u8{ "zigoku", "frieren", "--dub" };
+    const bare = [_][:0]const u8{"zigoku"};
+    try std.testing.expect(hasVersionFlag(&v1));
+    try std.testing.expect(hasVersionFlag(&v2));
+    try std.testing.expect(!hasVersionFlag(&none));
+    try std.testing.expect(!hasVersionFlag(&bare));
+}
+
+test "handleVersionFlag emits the version line and signals exit only on a version flag" {
+    // Flag present (even behind a positional query) → writes the clean version
+    // line carrying build.zig.zon's version (mirrored in root.zig), not the
+    // usage/banner text, and returns true so `main` exits 0 before any
+    // config/store/network work. The exit-0 half is `main`'s `return` on true.
+    {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        const args = [_][:0]const u8{ "zigoku", "frieren", "--version" };
+        const handled = try handleVersionFlag(&args, &aw.writer);
+        try std.testing.expect(handled);
+        const printed = aw.writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, printed, zigoku.version) != null);
+        try std.testing.expect(std.mem.indexOf(u8, printed, "usage:") == null);
+    }
+    // No version flag → writes nothing and returns false so `main` continues to
+    // the normal parse/search/TUI path.
+    {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        const args = [_][:0]const u8{ "zigoku", "frieren" };
+        const handled = try handleVersionFlag(&args, &aw.writer);
+        try std.testing.expect(!handled);
+        try std.testing.expectEqual(@as(usize, 0), aw.writer.buffered().len);
+    }
+}
+
 fn usage(out: *Io.Writer) !void {
     try zigoku.writeBanner(out);
     try out.writeAll(
         \\
         \\  usage: zigoku <query> [--dub] [--debug]
+        \\         zigoku --version
         \\
         \\    zigoku frieren
         \\    zigoku "cowboy bebop" --dub
+        \\    zigoku --version
         \\
+        \\  --version (or -V) prints the version and exits.
         \\  --debug (or ZIGOKU_DEBUG=1) writes diagnostics: stderr in CLI mode,
         \\  ~/.local/share/zigoku/zigoku.log in the TUI.
         \\
