@@ -62,6 +62,22 @@ pub fn writeBanner(w: *std.Io.Writer) !void {
     try w.print("    v{s}\n", .{version});
 }
 
+/// Write a clean, single-line version string for `--version` (ROD-221). Kept
+/// separate from the banner so the version contract the distribution checks
+/// (Homebrew formula test, release smoke step) lean on is its own line, not a
+/// side effect of the usage/banner fallthrough.
+pub fn writeVersion(w: *std.Io.Writer) !void {
+    try w.print("zigoku v{s}\n", .{version});
+}
+
+test "writeVersion prints a clean line carrying the version" {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try writeVersion(&aw.writer);
+    const out = aw.writer.buffered();
+    try std.testing.expectEqualStrings("zigoku v" ++ version ++ "\n", out);
+}
+
 test "version matches build.zig.zon" {
     // Pin the literal so a bump here without the matching `.version` edit in
     // build.zig.zon (or vice versa) trips CI — the "keep in sync" comment above

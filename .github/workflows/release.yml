@@ -121,9 +121,17 @@ jobs:
           echo "sqlite is bundled: no external libsqlite3 dependency"
 
       # Only the native-arch targets can execute on their runner (see `smoke`).
+      # ROD-221: assert the explicit `--version` line carries the in-repo version,
+      # not just exit 0 — the handler is intended behaviour now, not a fallthrough.
       - name: Smoke-run on native targets
         if: matrix.smoke
-        run: ./out/bin/zigoku --version
+        run: |
+          out="$(./out/bin/zigoku --version)"
+          echo "$out"
+          case "$out" in
+            "zigoku v${{ needs.guard.outputs.version }}"*) echo "version line OK" ;;
+            *) echo "::error::--version did not print 'zigoku v${{ needs.guard.outputs.version }}'"; exit 1 ;;
+          esac
 
       - name: Package tarball
         run: |

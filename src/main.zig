@@ -92,6 +92,15 @@ pub fn main(init: std.process.Init) !void {
     var stdout_fw: Io.File.Writer = .init(.stdout(), io, &stdout_buf);
     const out = &stdout_fw.interface;
 
+    // ROD-221: `--version`/`-V` is an explicit fast-path — print the version line
+    // and exit 0 before any config/store/network work, independent of the
+    // UnknownFlag → usage() fallthrough the distribution checks used to rely on.
+    if (hasVersionFlag(args)) {
+        try zigoku.writeVersion(out);
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
@@ -408,15 +417,46 @@ fn hasFlag(args: []const [:0]const u8, flag: []const u8) bool {
     return false;
 }
 
+/// True if a version flag (`--version` or `-V`) appears anywhere in `args`.
+/// Position-independent so `zigoku frieren --version` still reports the version
+/// rather than searching.
+fn hasVersionFlag(args: []const [:0]const u8) bool {
+    return hasFlag(args, "--version") or hasFlag(args, "-V");
+}
+
+test "hasVersionFlag detects --version and -V anywhere, ignores others" {
+    const v1 = [_][:0]const u8{ "zigoku", "--version" };
+    const v2 = [_][:0]const u8{ "zigoku", "frieren", "-V" };
+    const none = [_][:0]const u8{ "zigoku", "frieren", "--dub" };
+    try std.testing.expect(hasVersionFlag(&v1));
+    try std.testing.expect(hasVersionFlag(&v2));
+    try std.testing.expect(!hasVersionFlag(&none));
+}
+
+test "version flag emits the version contract, not the usage banner" {
+    // Pins the ROD-221 contract: the line `--version` prints carries the version
+    // from build.zig.zon (mirrored in root.zig) and is the clean version line,
+    // not the usage/banner text. The exit-0 half is the `return` in main right
+    // after this writes — covered by the release smoke step + brew formula test.
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    try zigoku.writeVersion(&aw.writer);
+    const printed = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, printed, zigoku.version) != null);
+    try std.testing.expect(std.mem.indexOf(u8, printed, "usage:") == null);
+}
+
 fn usage(out: *Io.Writer) !void {
     try zigoku.writeBanner(out);
     try out.writeAll(
         \\
-        \\  usage: zigoku <query> [--dub] [--debug]
+        \\  usage: zigoku <query> [--dub] [--debug] [--version]
         \\
         \\    zigoku frieren
         \\    zigoku "cowboy bebop" --dub
+        \\    zigoku --version
         \\
+        \\  --version (or -V) prints the version and exits.
         \\  --debug (or ZIGOKU_DEBUG=1) writes diagnostics: stderr in CLI mode,
         \\  ~/.local/share/zigoku/zigoku.log in the TUI.
         \\
