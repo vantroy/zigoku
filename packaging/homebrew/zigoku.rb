@@ -38,8 +38,9 @@ class Zigoku < Formula
   end
 
   test do
-    # `--version` prints the banner with the version string and exits 0
-    # (same invocation the release workflow smoke-tests).
-    assert_match version.to_s, shell_output("#{bin}/zigoku --version")
+    # `--version` prints a dedicated `zigoku vX.Y.Z` line and exits 0 (ROD-221 —
+    # an explicit handler, not the old usage/banner fallthrough). Same invocation
+    # the release workflow smoke-tests.
+    assert_match "zigoku v#{version}", shell_output("#{bin}/zigoku --version")
   end
 end
