@@ -95,8 +95,7 @@ pub fn main(init: std.process.Init) !void {
     // ROD-221: `--version`/`-V` is an explicit fast-path — print the version line
     // and exit 0 before any config/store/network work, independent of the
     // UnknownFlag → usage() fallthrough the distribution checks used to rely on.
-    if (hasVersionFlag(args)) {
-        try zigoku.writeVersion(out);
+    if (try handleVersionFlag(args, out)) {
         try out.flush();
         return;
     }
@@ -424,33 +423,61 @@ fn hasVersionFlag(args: []const [:0]const u8) bool {
     return hasFlag(args, "--version") or hasFlag(args, "-V");
 }
 
+/// ROD-221: the `--version`/`-V` fast-path, factored out of `main` so the
+/// flag-dispatch *and* the line emission can be unit-tested without standing up
+/// `main`'s full IO. Returns true when a version flag was present (and the
+/// version line was written) — the caller flushes and exits 0 before any
+/// config/store/network work.
+fn handleVersionFlag(args: []const [:0]const u8, out: *Io.Writer) !bool {
+    if (!hasVersionFlag(args)) return false;
+    try zigoku.writeVersion(out);
+    return true;
+}
+
 test "hasVersionFlag detects --version and -V anywhere, ignores others" {
     const v1 = [_][:0]const u8{ "zigoku", "--version" };
     const v2 = [_][:0]const u8{ "zigoku", "frieren", "-V" };
     const none = [_][:0]const u8{ "zigoku", "frieren", "--dub" };
+    const bare = [_][:0]const u8{"zigoku"};
     try std.testing.expect(hasVersionFlag(&v1));
     try std.testing.expect(hasVersionFlag(&v2));
     try std.testing.expect(!hasVersionFlag(&none));
+    try std.testing.expect(!hasVersionFlag(&bare));
 }
 
-test "version flag emits the version contract, not the usage banner" {
-    // Pins the ROD-221 contract: the line `--version` prints carries the version
-    // from build.zig.zon (mirrored in root.zig) and is the clean version line,
-    // not the usage/banner text. The exit-0 half is the `return` in main right
-    // after this writes — covered by the release smoke step + brew formula test.
-    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer aw.deinit();
-    try zigoku.writeVersion(&aw.writer);
-    const printed = aw.writer.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, printed, zigoku.version) != null);
-    try std.testing.expect(std.mem.indexOf(u8, printed, "usage:") == null);
+test "handleVersionFlag emits the version line and signals exit only on a version flag" {
+    // Flag present (even behind a positional query) → writes the clean version
+    // line carrying build.zig.zon's version (mirrored in root.zig), not the
+    // usage/banner text, and returns true so `main` exits 0 before any
+    // config/store/network work. The exit-0 half is `main`'s `return` on true.
+    {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        const args = [_][:0]const u8{ "zigoku", "frieren", "--version" };
+        const handled = try handleVersionFlag(&args, &aw.writer);
+        try std.testing.expect(handled);
+        const printed = aw.writer.buffered();
+        try std.testing.expect(std.mem.indexOf(u8, printed, zigoku.version) != null);
+        try std.testing.expect(std.mem.indexOf(u8, printed, "usage:") == null);
+    }
+    // No version flag → writes nothing and returns false so `main` continues to
+    // the normal parse/search/TUI path.
+    {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        const args = [_][:0]const u8{ "zigoku", "frieren" };
+        const handled = try handleVersionFlag(&args, &aw.writer);
+        try std.testing.expect(!handled);
+        try std.testing.expectEqual(@as(usize, 0), aw.writer.buffered().len);
+    }
 }
 
 fn usage(out: *Io.Writer) !void {
     try zigoku.writeBanner(out);
     try out.writeAll(
         \\
-        \\  usage: zigoku <query> [--dub] [--debug] [--version]
+        \\  usage: zigoku <query> [--dub] [--debug]
+        \\         zigoku --version
         \\
         \\    zigoku frieren
         \\    zigoku "cowboy bebop" --dub
