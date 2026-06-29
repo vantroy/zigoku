@@ -506,6 +506,34 @@ test "F1 from browse is a no-op and preserves active_pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
+test "F4 and D from browse open Discover (ROD-239)" {
+    inline for (.{ keyEv(vaxis.Key.f4, .{}), keyEv('D', .{}) }) |k| {
+        var app: App = .{};
+        app.active_view = .browse;
+        try testTick(&app, k);
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+    }
+}
+
+test "F1 leaves Discover for Browse; F4 in Discover is a no-op (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    try testTick(&app, keyEv(vaxis.Key.f4, .{})); // already in Discover → no-op
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
+test "D in search mode does not switch to Discover (normal-mode guard, ROD-239)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    try testTick(&app, keyEv('D', .{ .shift = true }));
+    // The D→Discover binding is normal-mode only; in search it must fall through
+    // to the query buffer, leaving the view untouched.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
 test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

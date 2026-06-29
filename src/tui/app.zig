@@ -35,6 +35,7 @@ const history = @import("view/history.zig");
 const browse = @import("view/browse.zig");
 const detail = @import("view/detail.zig");
 const settings = @import("view/settings.zig");
+const discover_view = @import("view/discover.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
@@ -99,6 +100,7 @@ pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 /// carve. Re-exported here so existing `app_mod.SearchController` references keep
 /// resolving.
 pub const SearchController = @import("search_state.zig").SearchController;
+pub const DiscoverState = @import("discover_state.zig").DiscoverState;
 
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
@@ -568,9 +570,9 @@ pub const App = struct {
     /// `.history`, but `run()` overwrites it at startup from the configured
     /// landing view (`config.landingEnum()`, ROD-228) before the first frame —
     /// History remains the default when unset/unrecognized (§9.2).
-    active_view: enum { browse, history, detail, settings } = .history,
+    active_view: enum { browse, history, detail, settings, discover } = .history,
     /// Which top-level view opened the standalone detail screen.
-    detail_origin: enum { browse, history } = .browse,
+    detail_origin: enum { browse, history, discover } = .browse,
 
     /// Which pane has keyboard focus within the current view.
     /// Meaningful in both Browse and History (two-pane at `w >= pane_split_min`,
@@ -590,6 +592,12 @@ pub const App = struct {
     /// clear/hydrate/persist helpers. Embedded by value so `App{}` stays trivially
     /// constructible. See `SearchController`.
     search: SearchController = .{},
+
+    /// Discover/Popular feed controller (ROD-239): the active window, the grid
+    /// cursor/scroll, and the per-window result cache. Transport (the feed worker
+    /// thread, the slow-path timer) stays on App, like SearchController. Embedded
+    /// by value so `App{}` stays trivially constructible. See `DiscoverState`.
+    discover: DiscoverState = .{},
 
     /// GPA reference for freeing search results. Set in run() before the event loop.
     /// Intentionally not zero-initialised — only valid after run() sets it.
@@ -800,6 +808,7 @@ pub const App = struct {
     /// still reference.
     pub fn deinitOwnedState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
         self.search.deinit(self.gpa);
+        self.discover.deinit(self.gpa);
         self.episodes.freeResults(self.gpa);
         self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
@@ -916,6 +925,10 @@ pub const App = struct {
     pub fn topBarSeasonChip(self: *App) []const u8 {
         switch (self.active_view) {
             .settings => return "",
+            // Discover renders no per-row season chip in the grid scaffold (the
+            // selected-card season chip is a later refinement); a discover-origin
+            // zoom likewise shows none until that selection is wired.
+            .discover => return "",
             .detail => switch (self.detail_origin) {
                 .browse => {
                     const a = self.selectedAnime() orelse return "";
@@ -925,6 +938,7 @@ pub const App = struct {
                     const r = self.selectedHistoryRecord() orelse return "";
                     return self.seasonChipText(historySeason(r), historyYear(r));
                 },
+                .discover => return "",
             },
             .browse => {
                 if (self.selectedAnime()) |a| {
@@ -1085,6 +1099,9 @@ pub const App = struct {
             .detail => switch (self.detail_origin) {
                 .browse => self.selectedAnime(),
                 .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
+                // The discover→zoom selection is wired in a later chunk; until then
+                // there is no discover-origin detail show.
+                .discover => null,
             },
             // ROD-170: the focused record is the "actively-focused detail show"
             // only when the detail pane is focused — list focus must not let the
@@ -1094,6 +1111,9 @@ pub const App = struct {
             else
                 null,
             .settings => null,
+            // Discover is single-pane: no in-view detail show (Enter opens the
+            // standalone zoom, handled under .detail above).
+            .discover => null,
         };
     }
 
@@ -1114,11 +1134,13 @@ pub const App = struct {
             .detail => switch (self.detail_origin) {
                 .browse => self.selectedAnime(),
                 .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
+                .discover => null, // discover→zoom selection wired in a later chunk
             },
             // ROD-170: the preview pane always shows the focused record, whichever
             // pane has focus — the cover/metadata track the list cursor like Browse.
             .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
             .settings => null,
+            .discover => null, // single-pane; no in-view detail preview
         };
     }
 
@@ -2090,6 +2112,22 @@ pub const App = struct {
             }
             return;
         }
+        // F4 / D = "go to Discover" (ROD-239) — both unbound before this, no
+        // conflicts. F4 is global like the other F-keys; D carries the normal-mode
+        // guard (a literal "d" in a search/filter must append, not switch). Match
+        // shift+'D' and bare 'D' for the cross-terminal reason as the G/H nav.
+        if (key.matches(vaxis.Key.f4, .{}) or
+            (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
+        {
+            if (self.active_view != .discover) {
+                if (self.active_view == .settings) self.leaveSettings(io);
+                self.active_view = .discover;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+            return;
+        }
 
         // Search mode intercepts every remaining key (including Esc) before the
         // normal-mode chain — onKey owns the normal-vs-search split, onSearchKey
@@ -2110,6 +2148,14 @@ pub const App = struct {
     /// at this call site, and pure noise inside per-intent functions). Delegates to
     /// the handlers below; the only inline arm is '/' search-mode entry.
     fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Discover owns its full normal-mode key set (grid nav, window toggle,
+        // Enter→zoom, P, /) — route there before the Browse/History drill+list
+        // chain so a discover keypress can never leak into another view's handler.
+        if (self.active_view == .discover) {
+            self.onDiscoverKey(key, loop, io, provider);
+            return;
+        }
+
         // Spatial pane/zoom navigation (ROD-170 focus model). These keys —
         // l/→/Enter, h/←/Esc, Space — are mutually exclusive by keycode, so the
         // order among the three handlers is immaterial.
@@ -2130,6 +2176,19 @@ pub const App = struct {
         if (self.active_view == .history and self.onHistoryMutationKey(key)) return; // p/x/c/w/P/r/u
         if (self.onBrowseAddKey(key, provider)) return; // P — add result to watchlist
         self.onListCursorKey(key, loop, io, provider); // j/k/g/G — list cursor + load-more
+    }
+
+    /// Normal-mode keys while Discover is active (ROD-239). This chunk is the
+    /// navigable shell: entry/exit ride the global F-key chain in onKey, so here we
+    /// only need to swallow the in-view keys (grid nav, window toggle, Enter→zoom,
+    /// P, /) — they are wired in the data + layout chunks. Consuming them keeps a
+    /// keypress from leaking into the Browse/History handlers behind this intercept.
+    fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        _ = self;
+        _ = key;
+        _ = loop;
+        _ = io;
+        _ = provider;
     }
 
     /// Drill forward (ROD-170 focus model): l/→/Enter reveal+focus the detail pane
@@ -2202,6 +2261,9 @@ pub const App = struct {
                 if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, provider);
             },
             .settings => {},
+            // Discover routes its own drill (Enter→zoom) through onDiscoverKey,
+            // intercepted before this chain in onNormalListKey; never reached here.
+            .discover => {},
         }
         return true;
     }
@@ -2226,6 +2288,7 @@ pub const App = struct {
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
+                    .discover => .discover, // zoom opened from Discover returns to it
                 };
                 self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
             } else if ((self.active_view == .browse or self.active_view == .history) and
@@ -2249,6 +2312,7 @@ pub const App = struct {
                 self.active_view = switch (self.detail_origin) {
                     .browse => .browse,
                     .history => .history,
+                    .discover => .discover, // zoom opened from Discover returns to it
                 };
                 self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
             }
@@ -2272,6 +2336,7 @@ pub const App = struct {
             self.active_view = switch (self.detail_origin) {
                 .browse => .browse,
                 .history => .history,
+                .discover => .discover, // zoom opened from Discover returns to it
             };
             self.active_pane = if (self.term_cols >= pane_split_min) .detail else .list;
         } else if ((self.active_view == .browse or self.active_view == .history) and
@@ -2369,7 +2434,9 @@ pub const App = struct {
         const nav_len: usize = switch (self.active_view) {
             .history => self.filteredHistoryLen(),
             .browse => self.search.results.items.len,
-            .detail, .settings => return,
+            // Discover's grid cursor is driven by its own handler (onDiscoverKey),
+            // not this list-cursor path; never reached, but the switch is exhaustive.
+            .detail, .settings, .discover => return,
         };
         if (nav_len == 0) return;
 
@@ -2696,6 +2763,10 @@ pub const App = struct {
             },
 
             .settings => settings.drawSettings(self, win, top, visible, w),
+
+            // Discover is full-canvas single-pane (ROD-239): the feed grid owns the
+            // whole content area, no pane split.
+            .discover => discover_view.draw(self, win, top, visible, w),
         }
     }
 
@@ -2740,6 +2811,9 @@ pub const App = struct {
             },
             .browse => self.scrollIntoView(visible),
             .detail, .settings => {},
+            // Discover's grid viewport is settled in its own pass once the grid
+            // lands (later chunk); nothing to scroll while it's empty.
+            .discover => {},
         }
     }
 
