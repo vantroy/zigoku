@@ -2136,8 +2136,9 @@ pub const App = struct {
         // it spawns and frees it (`defer gpa.free(urls)`); a cache-hit batch resolves
         // in microseconds, so iterating `batch` here would race that free → a
         // use-after-free on the hot path (ROD-243 review). Done before the spawn so
-        // the in-test path exercises it too; a (rare) spawn failure leaves the slots
-        // marked, which self-heals when the card scrolls off and re-enters as idle.
+        // the in-test path exercises it too; the spawn-failure catch below resets
+        // these slots — a stranded `.loading` slot is eviction-protected AND skipped
+        // by the planner, so it would never recover on its own.
         for (chosen[0..m]) |ci| self.discover_covers.markLoading(self.gpa, urls[ci]);
 
         // No real worker under test — the spawn is the only threaded line; the
@@ -2153,6 +2154,14 @@ pub const App = struct {
             loop, self.gpa, io, batch, &self.cover_caches, &self.discover_cover_active,
         }) catch {
             self.discover_cover_active.store(false, .release);
+            // No worker will resolve these — reset the slots we just marked so the
+            // next pump retries (a stranded `.loading` slot never recovers, ROD-243
+            // re-review). Reset by URL value; markLoading retained no borrow.
+            for (chosen[0..m]) |ci| {
+                if (self.discover_covers.get(urls[ci])) |slot| {
+                    if (slot.status == .loading) slot.status = .idle;
+                }
+            }
             for (batch) |u| self.gpa.free(u);
             self.gpa.free(batch);
             return;
