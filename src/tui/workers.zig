@@ -672,6 +672,16 @@ fn readCoverDisk(gpa: Allocator, io: std.Io, url: []const u8) ?[]u8 {
     return reader.interface.allocRemaining(gpa, std.Io.Limit.limited(max_cover_encoded_bytes)) catch null;
 }
 
+/// Per-write nonce for the disk-cache temp file (ROD-243). With concurrent cover
+/// workers, two threads — or a second app instance — can persist the SAME url at
+/// once; a fixed `<path>.tmp` would let them interleave writes into one temp file
+/// and then rename a torn `.jpg` into place. A unique suffix per write gives each
+/// writer its own temp sibling, so the final atomic rename always promotes a whole
+/// file. The thread id keeps it unique across processes too (Linux tids are
+/// system-wide). Worst case is a uniquely-named orphan tmp on a hard crash — best-
+/// effort cleanup already deletes it on every non-crash failure path.
+var disk_tmp_nonce: std.atomic.Value(u64) = .init(0);
+
 /// Persist raw cover `body` for `url` to disk, best-effort. A failure (read-only
 /// dir, full disk, no cache home) is logged at debug and otherwise ignored — the
 /// cover still renders from the in-memory bytes this run.
@@ -685,10 +695,12 @@ fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8)
     };
     if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
 
-    // Write to a temp sibling then atomically rename into place: a crash, full
-    // disk, or second instance racing mid-write can never leave a torn `.jpg`
-    // that a later cold start would read back as a corrupt cover (ROD-171 review).
-    const tmp_path = std.fmt.allocPrint(arena, "{s}.tmp", .{path}) catch return;
+    // Write to a per-writer temp sibling then atomically rename into place: a
+    // crash, full disk, or concurrent writer racing mid-write can never leave a
+    // torn `.jpg` that a later cold start would read back as a corrupt cover
+    // (ROD-171; per-write nonce added in ROD-243 for the concurrent cover workers).
+    const nonce = disk_tmp_nonce.fetchAdd(1, .monotonic);
+    const tmp_path = std.fmt.allocPrint(arena, "{s}.{d}.{d}.tmp", .{ path, std.Thread.getCurrentId(), nonce }) catch return;
     var file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |e| {
         log.debug("cover disk-cache create failed: {s}", .{@errorName(e)});
         return;
