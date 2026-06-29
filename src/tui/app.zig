@@ -234,6 +234,7 @@ pub fn run(
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
     defer if (app.popular_thread) |t| t.join();
+    defer if (app.discover_enrich_thread) |t| t.join();
     defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
@@ -618,6 +619,10 @@ pub const App = struct {
     /// new spawn (bounding concurrent feed threads to 1) and in run() teardown,
     /// so an in-flight fetch can't dereference a torn-down loop/gpa on quit.
     popular_thread: ?std.Thread = null,
+
+    /// Handle for the most recent Discover lazy zoom-enrich thread (ROD-239).
+    /// Bounded to 1 and joined on teardown, same contract as popular_thread.
+    discover_enrich_thread: ?std.Thread = null,
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -1604,6 +1609,32 @@ pub const App = struct {
                 log.debug("popular fetch failed: {s}", .{@errorName(ev.cause)});
                 self.pushToast(.@"error", "can't reach the feed", true);
             },
+
+            .discover_enriched => |ev| {
+                // Merge the enriched show back into its window slot by id (the
+                // cursor may have moved). Free the stale row, take ownership of the
+                // enriched one; persist it so a later hit hydrates rich.
+                const idx = @intFromEnum(ev.window);
+                const items = self.discover.slots[idx].results.items;
+                var merged_at: ?usize = null;
+                for (items, 0..) |*live, i| {
+                    if (std.mem.eql(u8, live.id, ev.result.id)) {
+                        freeOwnedAnime(self.gpa, live.*);
+                        live.* = ev.result;
+                        merged_at = i;
+                        break;
+                    }
+                }
+                if (merged_at) |i| {
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1);
+                } else {
+                    freeOwnedAnime(self.gpa, ev.result); // slot cleared/refetched — drop it
+                }
+                if (self.discover_enrich_thread) |t| {
+                    t.join();
+                    self.discover_enrich_thread = null;
+                }
+            },
             .search_enriched => |ev| {
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
@@ -1904,6 +1935,25 @@ pub const App = struct {
         const fresh = slot.page > 0 and (Store.nowSecs() - slot.fetched_at) < feed_ttl_secs;
         if (fresh) return; // cache hit — render the slot as-is, no network
         self.firePopular(loop, io, provider, self.discover.window, 1);
+    }
+
+    /// Lazily enrich one Discover show for its zoom (ROD-239): the feed has no
+    /// synopsis, so opening a card fetches its AniList metadata off-thread and
+    /// merges it back into the slot (.discover_enriched). Bounds to one thread like
+    /// the feed fetch. No-op in tests (network) and when nothing's missing.
+    fn fireDiscoverEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, anime: Anime) void {
+        if (builtin.is_test) return;
+        if (self.discover_enrich_thread) |t| {
+            t.join();
+            self.discover_enrich_thread = null;
+        }
+        const copy = dupeOwnedAnime(self.gpa, anime) catch return;
+        self.discover_enrich_thread = std.Thread.spawn(.{}, workers.discoverEnrichTask, .{
+            loop, self.gpa, io, copy, window,
+        }) catch {
+            freeOwnedAnime(self.gpa, copy);
+            return;
+        };
     }
 
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
@@ -2312,6 +2362,9 @@ pub const App = struct {
                 self.active_view = .detail;
                 self.active_pane = .detail;
                 self.fireEpisodesForId(loop, io, provider, a.id);
+                // The feed payload has no synopsis — lazily enrich this one show so
+                // the zoom fills in (only when it's actually missing, ROD-239).
+                if (a.description == null) self.fireDiscoverEnrich(loop, io, self.discover.window, a);
             }
             return;
         }
