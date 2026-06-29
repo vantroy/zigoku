@@ -227,10 +227,12 @@ pub const Anime = struct {
     /// Show kind ("TV", "Movie", "OVA"…). `type` is too close to a keyword to
     /// read well, so: `kind`.
     kind: ?[]const u8 = null,
-    /// Live view count, for the Discover/Popular feed (ROD-239). Runtime-only: it
-    /// is the show's standing in the feed at fetch time, not a durable show fact,
-    /// so it is never persisted (AnimeRecord ignores it) and stays null outside
-    /// the feed. The feed's rank is the array position; the TOP/NEW badges the site
+    /// Live view count, for the Discover/Popular feed (ROD-239). The *windowed*
+    /// count (views within the active window), falling back to lifetime total for
+    /// the All-Time window — so it always tracks the card's rank. Runtime-only:
+    /// the show's standing in the feed at fetch time, not a durable show fact, so
+    /// it is never persisted (AnimeRecord ignores it) and stays null outside the
+    /// feed. The feed's rank is the array position; the TOP/NEW badges the site
     /// shows are client-derived (not in the payload), so they live render-side.
     view_count: ?u64 = null,
 
