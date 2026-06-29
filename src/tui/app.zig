@@ -445,6 +445,10 @@ pub const Toast = struct {
     pub const max_box_cols: u16 = 40;
     pub const glyph_cols: u16 = 4; // "[!] "/"[✓] "/"[~] " all paint 4 cells.
     pub const max_copy_cols: u16 = max_box_cols - glyph_cols;
+    /// Which subsystem owns a persistent error, so each view's recovery clears
+    /// only its own (ROD-239): a feed success must not wipe a Browse search error,
+    /// or vice versa. Non-error / transient toasts ignore it.
+    pub const Topic = enum { general, feed };
     kind: Kind,
     text: [80]u8 = undefined,
     text_len: usize = 0,
@@ -452,6 +456,8 @@ pub const Toast = struct {
     ttl_ms: i32 = 4000,
     /// Persistent toasts survive TTL and are only cleared by a recovery path.
     persistent: bool = false,
+    /// Recovery scope for persistent errors — see `Topic`.
+    topic: Topic = .general,
 };
 
 /// Resolve a config palette name to its static `colors.Palette`, falling back
@@ -787,6 +793,13 @@ pub const App = struct {
     }
 
     fn pushToast(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool) void {
+        self.pushToastTopic(kind, text, persistent, .general);
+    }
+
+    /// Like `pushToast`, but tags the recovery scope (ROD-239): a persistent error
+    /// is cleared only by its own subsystem's recovery (feed success clears feed
+    /// errors; search success clears general errors), never cross-view.
+    fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
         var idx: usize = 3;
         for (self.toast_queue, 0..) |slot, i| {
             if (slot == null) {
@@ -803,7 +816,7 @@ pub const App = struct {
         // posted the instant mpv exits, but on a tiling WM focus is still
         // returning from mpv's window, eating the first ~1s. Matches the
         // Toast.ttl_ms struct default.
-        var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000 };
+        var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000, .topic = topic };
         // §4.7: cap the copy to the 36-column budget here, at the single choke
         // point, so a long dynamic payload (task_error's @errorName) gets a "…"
         // affordance instead of being silently sheared by the render clip
@@ -1522,10 +1535,11 @@ pub const App = struct {
                 }
                 self.search.loading = false;
                 self.async_start_ms = 0;
-                // Clear persistent search-error toasts on a good result.
+                // Clear persistent search-error toasts on a good result — only the
+                // general-topic ones, so a feed error survives a Browse search (ROD-239).
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |t| {
-                        if (t.persistent and t.kind == .@"error") slot.* = null;
+                        if (t.persistent and t.kind == .@"error" and t.topic == .general) slot.* = null;
                     }
                 }
                 if (ev.page == 1) {
@@ -1567,24 +1581,31 @@ pub const App = struct {
                 slot.failed = false; // a good page clears the feed's error state
                 const is_active = idx == @intFromEnum(self.discover.window);
                 if (is_active) self.async_start_ms = 0;
-                // Clear a persistent feed-error toast on first success (§9.3b).
+                // Clear the persistent feed-error toast on first success — only the
+                // feed-topic one, so a Browse search error survives (§9.3b, ROD-239).
                 for (&self.toast_queue) |*ts| {
                     if (ts.*) |t| {
-                        if (t.persistent and t.kind == .@"error") ts.* = null;
+                        if (t.persistent and t.kind == .@"error" and t.topic == .feed) ts.* = null;
                     }
                 }
                 // Page 1 is a fresh window load — free the old slot contents first.
                 if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
                 const offset = slot.results.items.len;
-                slot.fetched_at = Store.nowSecs();
-                slot.page = ev.page;
                 // Take ownership: the duped Anime (strings already gpa-owned) move
                 // into the slot's list, which may hold earlier pages for page > 1.
                 slot.results.appendSlice(self.gpa, ev.results) catch |e| {
+                    // OOM: free the page and bail WITHOUT stamping fetched_at/page —
+                    // leaving the slot page-0 so refreshDiscover refetches it, rather
+                    // than a fresh+exhausted+empty TTL-locked dead end (ROD-239 review).
                     log.debug("appending popular results failed: {s}", .{@errorName(e)});
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+                    self.gpa.free(ev.results);
+                    return;
                 };
                 self.gpa.free(ev.results);
+                // Stamp freshness + exhausted only on a successful append.
+                slot.fetched_at = Store.nowSecs();
+                slot.page = ev.page;
                 // Cache the new rows as hidden store records — "persist like search"
                 // (window-agnostic facts only; the per-window view_count never
                 // persists — there is no such store column).
@@ -1610,7 +1631,7 @@ pub const App = struct {
                 slot.failed = true;
                 if (@intFromEnum(ev.window) == @intFromEnum(self.discover.window)) self.async_start_ms = 0;
                 log.debug("popular fetch failed: {s}", .{@errorName(ev.cause)});
-                self.pushToast(.@"error", "can't reach the feed", true);
+                self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
             },
 
             .discover_enriched => |ev| {

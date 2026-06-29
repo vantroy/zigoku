@@ -152,13 +152,19 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
     if (results.len == 0) {
         const mid: u16 = grid_top + (if (visible > 2) visible - 2 else 0) / 2;
         if (slot.loading) {
-            // A retry sets loading, so the spinner takes precedence over a stale error.
-            const msg = std.fmt.bufPrint(&scratch.msg, "{s} loading popular\u{2026}", .{self.spinnerChar()}) catch "loading\u{2026}";
-            centerText(win, mid, w, msg, self.s(self.palette.focus, .{}));
+            // A retry sets loading, so the spinner takes precedence over a stale
+            // error. After ~3s the slow path escalates focus→hot + "taking a
+            // moment…", matching the bottom-bar spinner (§4.8/§5.6).
+            const slow = self.isSlowPath();
+            const label: []const u8 = if (slow) "taking a moment\u{2026}" else "loading popular\u{2026}";
+            const color = if (slow) self.palette.hot else self.palette.focus;
+            const msg = std.fmt.bufPrint(&scratch.msg, "{s} {s}", .{ self.spinnerChar(), label }) catch label;
+            centerText(win, mid, w, msg, self.s(color, .{}));
         } else if (slot.failed) {
-            // §9.3b graceful offline — the feed is unreachable, not empty.
-            centerText(win, mid -| 1, w, "[!] can't reach the feed", self.s(self.palette.hot, .{}));
-            centerText(win, mid + 1, w, "check your connection", self.s(self.palette.fg3, .{ .italic = true }));
+            // §9.3b graceful offline — the feed is unreachable, not empty. Heading
+            // is state.now+bold (§4.7); the sub-line is text.muted, an actionable hint.
+            centerText(win, mid -| 1, w, "[!] can't reach the feed", self.s(self.palette.hot, .{ .bold = true }));
+            centerText(win, mid + 1, w, "check your connection", self.s(self.palette.fg2, .{ .italic = true }));
         } else {
             centerText(win, mid, w, "no entries", self.s(self.palette.fg2, .{ .italic = true }));
         }
@@ -190,8 +196,12 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         if (slot.loading) {
             const msg = std.fmt.bufPrint(&scratch.msg, "{s} loading more\u{2026}", .{self.spinnerChar()}) catch "loading more\u{2026}";
             centerText(win, footer_y, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
-        } else if (slot.exhausted and (results.len - 1) / geo.cols < self.discover.scroll + geo.rows_visible) {
-            centerText(win, footer_y, w, "all entries loaded", self.s(self.palette.fg3, .{ .italic = true }));
+        } else if (slot.exhausted and results.len > 0 and (results.len - 1) / geo.cols < self.discover.scroll + geo.rows_visible) {
+            // `results.len > 0` is already guaranteed by the empty-state early
+            // return above; kept explicit so a future refactor can't reintroduce a
+            // usize underflow on `results.len - 1`. Plain text.dim — a status fact,
+            // not an annotation (§1.3 reserves italic for those).
+            centerText(win, footer_y, w, "all entries loaded", self.s(self.palette.fg3, .{}));
         }
     }
 }

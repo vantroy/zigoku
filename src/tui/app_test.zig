@@ -750,6 +750,31 @@ test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" 
     try testing.expectEqualStrings("A grand tale.", daily.results.items[0].description.?);
 }
 
+test "discover_enriched drops the result when the show is gone from the slot (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    // The slot was cleared/refetched between firing the enrich and its landing, so
+    // the show id no longer matches. The enriched result must be FREED, not leaked
+    // — the test allocator fails the test if the else-branch drops the free.
+    const orphan = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "gone", .name = "Gone", .description = "x" });
+    try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily } });
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "isNewRelease: current-cour match drives NEW; guards return false (ROD-239)" {
+    var app: App = .{};
+    app.now_ms = 1778889600000; // 2026-05-15 UTC → Spring 2026 cour
+    try testing.expect(app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2026 }));
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .fall, .year = 2026 })); // wrong season
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2025 })); // wrong year
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = null, .year = 2026 })); // no season
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = null })); // no year
+    app.now_ms = 0; // before the first tick — never NEW (no false flash on frame zero)
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2026 }));
+}
+
 test "Discover P adds the selected card to the watchlist (ROD-239)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

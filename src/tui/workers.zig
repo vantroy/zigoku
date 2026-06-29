@@ -272,8 +272,8 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
 /// Mirrors searchTask's ownership shape — dupes every owned string into gpa so the
 /// event payload outlives the worker's arena, and the UI thread frees `results`
 /// via the `.popular_done` arm. No query string to thread (the feed has none); a
-/// failure rides `task_error` (the .popular_done arm and task_error both clear the
-/// slot's loading flag).
+/// failure posts `.popular_error` (whose handler clears the slot's loading flag
+/// and marks it failed).
 pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -318,8 +318,6 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
     };
 }
 
-/// Background task: enrich one page of search results from AniList.
-/// `results` and `query` are GPA-owned by this task and transferred to the event on success.
 /// Fill an Anime's blank fields from AniList metadata — AllAnime is the source of
 /// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
 /// before the arena `meta` came from is torn down; a failed copy keeps the prior
@@ -347,6 +345,9 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.score == null) a.score = meta.score;
 }
 
+/// Background task: enrich one page of search results from AniList. `results` and
+/// `query` are GPA-owned by this task and transferred to the `.search_enriched`
+/// event on success (freed here on failure). Fills each row via `applyMetadata`.
 pub fn enrichTask(
     loop: *Loop,
     gpa: Allocator,

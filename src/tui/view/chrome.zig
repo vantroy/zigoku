@@ -143,7 +143,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
-            .list => "hjkl · / find anime · P save · F1/F2/F3 views · q quit",
+            .list => "hjkl · / find anime · P save · F1/F2/F3/F4 views · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
             .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
@@ -154,7 +154,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .history => if (self.history.len == 0)
             "F1 browse · q quit"
         else switch (self.active_pane) {
-            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit",
+            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3/F4 · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
             // preview band there is no grid, so enter/space drill into the zoom.
             .detail => if (w >= App.zoom_min)
@@ -164,7 +164,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
-        .discover => "hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3 views · q quit",
+        .discover => "hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
