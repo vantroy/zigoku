@@ -14,10 +14,14 @@
 const std = @import("std");
 const domain = @import("../domain.zig");
 const source = @import("../source.zig");
+const store_mod = @import("../store.zig");
 const workers = @import("workers.zig");
+const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const Anime = domain.Anime;
+const Store = store_mod.Store;
+const AnimeRecord = store_mod.AnimeRecord;
 const freeOwnedAnime = workers.freeOwnedAnime;
 
 /// One cached popularity window. Holds *that window's* fetched page(s), the
@@ -33,6 +37,11 @@ pub const Slot = struct {
     fetched_at: i64 = 0,
     /// Whether a fetch for this window is in flight.
     loading: bool = false,
+    /// Whether the last fetch for this window failed (ROD-239). Surfaces the
+    /// in-view "can't reach the feed" state only while the slot is also empty;
+    /// cleared on the next successful page. A retry sets `loading`, which the view
+    /// shows ahead of this.
+    failed: bool = false,
 };
 
 /// The Popular-feed controller (ROD-239).
@@ -85,6 +94,28 @@ pub const DiscoverState = struct {
         slot.results.clearRetainingCapacity();
         slot.page = 0;
         slot.fetched_at = 0;
+    }
+
+    /// Mirror a window slot's [offset, offset+count) rows into the store as hidden
+    /// catalogue-cache records (history_visible=false), exactly as search caches its
+    /// results — so a Discover-seen show enriches a later Browse hit and seeds the
+    /// detail episode cache. Window-agnostic facts only: `view_count` is not a store
+    /// column, so the per-window count never persists (the invariant). Best effort —
+    /// a write failure never disrupts the feed. `store`/`source_name`/`translation`
+    /// are resolved by App and passed in; this never reads App.
+    pub fn persistSlot(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, translation: domain.Translation, idx: usize, offset: usize, count: usize) void {
+        const st = store orelse return;
+        const items = self.slots[idx].results.items;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const end = @min(items.len, offset + count);
+        var i = offset;
+        while (i < end) : (i += 1) {
+            var rec = AnimeRecord.fromDomain(source_name, items[i], translation);
+            rec.history_visible = false; // a hidden cache row, like a search result
+            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
+            _ = arena.reset(.retain_capacity);
+        }
     }
 
     /// Release every window's results on teardown. Call once from App's

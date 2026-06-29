@@ -57,6 +57,14 @@ pub const Event = union(enum) {
         window: source_mod.PopularWindow,
         page: u32,
     },
+    /// A Popular-feed fetch failed (ROD-239). `window` is the slot it was for (so
+    /// the handler clears that slot's loading + marks it failed); `cause` names the
+    /// failure class. Distinct from task_error so the feed owns its own error UX
+    /// (in-view "can't reach the feed" + a feed toast) without touching Browse.
+    popular_error: struct {
+        window: source_mod.PopularWindow,
+        cause: anyerror,
+    },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.
     search_enriched: struct {

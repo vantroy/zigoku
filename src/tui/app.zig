@@ -909,6 +909,15 @@ pub const App = struct {
         return self.search.results.items[self.list_cursor];
     }
 
+    /// The Discover card under the grid cursor (ROD-239) — the show a zoom opened
+    /// from Discover (`detail_origin == .discover`) is committed to. Reads the
+    /// active window's slot, so it carries that window's `view_count`.
+    fn selectedDiscoverAnime(self: *const App) ?Anime {
+        const items = self.discover.activeSlot().results.items;
+        if (self.discover.cursor >= items.len) return null;
+        return items[self.discover.cursor];
+    }
+
     /// The focused record, in the History view's §5.4 grouped order. Delegates to
     /// the renderer's walk so the highlighted row and the focused record share one
     /// ordering definition (ROD-139).
@@ -944,7 +953,10 @@ pub const App = struct {
                     const r = self.selectedHistoryRecord() orelse return "";
                     return self.seasonChipText(historySeason(r), historyYear(r));
                 },
-                .discover => return "",
+                .discover => {
+                    const a = self.selectedDiscoverAnime() orelse return "";
+                    return self.seasonChipText(a.season, a.year);
+                },
             },
             .browse => {
                 if (self.selectedAnime()) |a| {
@@ -982,6 +994,18 @@ pub const App = struct {
         if (self.now_ms <= 0) return "";
         const c = currentCour(self.now_ms);
         return self.seasonChipText(c.season, c.year);
+    }
+
+    /// Whether `a` is a current-cour release — the basis for the Discover NEW badge
+    /// (ROD-239). True when the show's season+year match the current real-world
+    /// cour. Needs `now_ms` (≤0 before the first tick → false, so no NEW flashes on
+    /// frame zero). The TOP badge is pure rank (#1) and is decided render-side.
+    pub fn isNewRelease(self: *const App, a: Anime) bool {
+        if (self.now_ms <= 0) return false;
+        const year = a.year orelse return false;
+        const season = a.season orelse return false;
+        const c = currentCour(self.now_ms);
+        return year == c.year and season == c.season;
     }
 
     /// The broadcast cour for an epoch-ms instant, using AniList's season
@@ -1105,9 +1129,7 @@ pub const App = struct {
             .detail => switch (self.detail_origin) {
                 .browse => self.selectedAnime(),
                 .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
-                // The discover→zoom selection is wired in a later chunk; until then
-                // there is no discover-origin detail show.
-                .discover => null,
+                .discover => self.selectedDiscoverAnime(),
             },
             // ROD-170: the focused record is the "actively-focused detail show"
             // only when the detail pane is focused — list focus must not let the
@@ -1140,7 +1162,7 @@ pub const App = struct {
             .detail => switch (self.detail_origin) {
                 .browse => self.selectedAnime(),
                 .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
-                .discover => null, // discover→zoom selection wired in a later chunk
+                .discover => self.selectedDiscoverAnime(),
             },
             // ROD-170: the preview pane always shows the focused record, whichever
             // pane has focus — the cover/metadata track the list cursor like Browse.
@@ -1483,10 +1505,6 @@ pub const App = struct {
                 self.debounce_deadline_ms = 0;
                 self.cover_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
-                // A failed Popular-feed fetch (ROD-239) rides task_error too; clear
-                // any in-flight feed slot so its spinner can't hang. (Chunk 4 swaps
-                // this for a dedicated feed-error toast + retry.)
-                for (&self.discover.slots) |*slot| slot.loading = false;
                 self.pushToast(.@"error", msg, true);
             },
             .search_done => |ev| {
@@ -1541,10 +1559,18 @@ pub const App = struct {
                 const idx = @intFromEnum(ev.window);
                 const slot = &self.discover.slots[idx];
                 slot.loading = false;
+                slot.failed = false; // a good page clears the feed's error state
                 const is_active = idx == @intFromEnum(self.discover.window);
                 if (is_active) self.async_start_ms = 0;
+                // Clear a persistent feed-error toast on first success (§9.3b).
+                for (&self.toast_queue) |*ts| {
+                    if (ts.*) |t| {
+                        if (t.persistent and t.kind == .@"error") ts.* = null;
+                    }
+                }
                 // Page 1 is a fresh window load — free the old slot contents first.
                 if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
+                const offset = slot.results.items.len;
                 slot.fetched_at = Store.nowSecs();
                 slot.page = ev.page;
                 // Take ownership: the duped Anime (strings already gpa-owned) move
@@ -1554,11 +1580,29 @@ pub const App = struct {
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                 };
                 self.gpa.free(ev.results);
+                // Cache the new rows as hidden store records — "persist like search"
+                // (window-agnostic facts only; the per-window view_count never
+                // persists — there is no such store column).
+                const added = slot.results.items.len - offset;
+                self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added);
                 // Reset the grid cursor on a fresh load of the visible window.
                 if (is_active and ev.page == 1) {
                     self.discover.cursor = 0;
                     self.discover.scroll = 0;
                 }
+            },
+
+            .popular_error => |ev| {
+                // Feed fetch failed (ROD-239, §9.3b). Mark the slot failed + clear
+                // its spinner; the view shows "can't reach the feed" while the slot
+                // is empty, and [ ] / 1-4 / re-entry retry (refreshDiscover re-fires
+                // a page-0 slot). Persistent toast, cleared on the next good page.
+                const slot = &self.discover.slots[@intFromEnum(ev.window)];
+                slot.loading = false;
+                slot.failed = true;
+                if (@intFromEnum(ev.window) == @intFromEnum(self.discover.window)) self.async_start_ms = 0;
+                log.debug("popular fetch failed: {s}", .{@errorName(ev.cause)});
+                self.pushToast(.@"error", "can't reach the feed", true);
             },
             .search_enriched => |ev| {
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
@@ -2258,6 +2302,34 @@ pub const App = struct {
     /// chain in onKey; this intercept owns everything else so a keypress can't leak
     /// into the Browse/History handlers. (Enter→zoom, P→save, /→Browse land next.)
     fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // Enter → open the full-screen detail zoom for the selected card, exactly
+        // like Browse/History (origin=.discover, so the back-nav returns here).
+        // fireEpisodesForId resolves status/source/seed from currentDetailAnime,
+        // which now reads selectedDiscoverAnime under this origin.
+        if (key.matches(vaxis.Key.enter, .{})) {
+            if (self.selectedDiscoverAnime()) |a| {
+                self.detail_origin = .discover;
+                self.active_view = .detail;
+                self.active_pane = .detail;
+                self.fireEpisodesForId(loop, io, provider, a.id);
+            }
+            return;
+        }
+        // P → add the selected card to the watchlist (the Browse-add path).
+        if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
+            if (self.selectedDiscoverAnime()) |a| self.addToWatchlist(provider, a);
+            return;
+        }
+        // / → jump to Browse and open its search prompt (the discovery→search seam).
+        if (key.matches('/', .{})) {
+            self.active_view = .browse;
+            self.active_pane = .list;
+            self.list_cursor = 0;
+            self.list_top = 0;
+            self.input_mode = .search;
+            return;
+        }
+
         // Window toggle — [ ] cycle, 1-4 direct select. Drives the feed regardless
         // of the grid cursor (the segmented bar is passive).
         if (key.matches(']', .{}) or key.matches('[', .{})) {
@@ -2295,10 +2367,13 @@ pub const App = struct {
     /// Switch the active Popular window and cache-or-fetch it (ROD-239). Resets the
     /// grid cursor/scroll; a no-op if already on `window`.
     fn setDiscoverWindow(self: *App, window: source_mod.PopularWindow, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        if (self.discover.window == window) return;
-        self.discover.window = window;
-        self.discover.cursor = 0;
-        self.discover.scroll = 0;
+        if (self.discover.window != window) {
+            self.discover.window = window;
+            self.discover.cursor = 0;
+            self.discover.scroll = 0;
+        }
+        // Cache-or-fetch — also the retry path: a failed/stale slot refetches, a
+        // fresh one is a no-op, so re-selecting the current window retries it (§9.3b).
         self.refreshDiscover(loop, io, provider);
     }
 
@@ -2512,12 +2587,18 @@ pub const App = struct {
     fn onBrowseAddKey(self: *App, key: vaxis.Key, provider: SourceProvider) bool {
         if (!(self.active_view == .browse and self.active_pane == .list and
             (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))) return false;
-        const st = self.store orelse return true;
-        const anime = self.selectedAnime() orelse return true;
+        if (self.selectedAnime()) |anime| self.addToWatchlist(provider, anime);
+        return true; // P is consumed in Browse-list focus whether or not a row is selected
+    }
+
+    /// Upsert `anime` into the watchlist as a revealed planning row, and toast the
+    /// outcome. Shared by Browse's P and Discover's P (ROD-189 / ROD-239).
+    fn addToWatchlist(self: *App, provider: SourceProvider, anime: Anime) void {
+        const st = self.store orelse return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         var rec = AnimeRecord.fromDomain(provider.name(), anime, self.translation);
-        // Explicit, not via the fromDomain struct default: a browse-add is always a
+        // Explicit, not via the fromDomain struct default: an add is always a
         // reveal. If AnimeRecord.history_visible's default ever flips to false
         // (defensible for its search-cache role), this keeps P revealing rows
         // (ON CONFLICT does MAX(excluded, anime)) instead of silently hiding them.
@@ -2525,15 +2606,14 @@ pub const App = struct {
         st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| {
             log.debug("add-to-watchlist failed: {s}", .{@errorName(e)});
             self.pushToast(.@"error", "couldn't add to watchlist", false);
-            return true;
+            return;
         };
         // Unlike the p/x/c/w transitions (which mutate a row already in
-        // self.history in place), P adds a row that isn't in the in-memory
-        // list yet — flag a background reload so it surfaces in History this
-        // session, not just after a restart.
+        // self.history in place), P adds a row that isn't in the in-memory list
+        // yet — flag a background reload so it surfaces in History this session,
+        // not just after a restart.
         self.history_dirty = true;
         self.pushToast(.success, "added to watchlist", false);
-        return true;
     }
 
     /// List-cursor navigation (Browse results + History list): j/k/g/G move the

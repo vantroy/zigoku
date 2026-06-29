@@ -114,10 +114,16 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
     // Selection affordance: ▸ at the cover's bottom-left (no box, no row band).
     if (selected) put(win, y + geo.cover_h -| 1, x, "▸", self.s(self.palette.focus, .{ .bg = bg }));
 
-    // Metadata rows under the cover. (TOP/NEW badges are derived render-side in a
-    // later chunk — they are not in the feed payload; see ROD-239.)
+    // Metadata rows under the cover. TOP/NEW are DERIVED render-side (not in the
+    // payload, ROD-239): TOP on rank #1 (state.now+bold), NEW on a current-cour
+    // release (state.focus+bold). At most one shows.
     const rank_y = y + geo.cover_h;
     put(win, rank_y, x, rank, self.s(self.palette.fg, .{}));
+    if (idx == 0) {
+        put(win, rank_y, x + rank_w + 1, "TOP", self.s(self.palette.hot, .{ .bold = true }));
+    } else if (self.isNewRelease(a)) {
+        put(win, rank_y, x + rank_w + 1, "NEW", self.s(self.palette.focus, .{ .bold = true }));
+    }
 
     const title_sty = if (selected)
         self.s(self.palette.focus, .{ .bold = true })
@@ -146,8 +152,13 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
     if (results.len == 0) {
         const mid: u16 = grid_top + (if (visible > 2) visible - 2 else 0) / 2;
         if (slot.loading) {
+            // A retry sets loading, so the spinner takes precedence over a stale error.
             const msg = std.fmt.bufPrint(&scratch.msg, "{s} loading popular\u{2026}", .{self.spinnerChar()}) catch "loading\u{2026}";
             centerText(win, mid, w, msg, self.s(self.palette.focus, .{}));
+        } else if (slot.failed) {
+            // §9.3b graceful offline — the feed is unreachable, not empty.
+            centerText(win, mid -| 1, w, "[!] can't reach the feed", self.s(self.palette.hot, .{}));
+            centerText(win, mid + 1, w, "check your connection", self.s(self.palette.fg3, .{ .italic = true }));
         } else {
             centerText(win, mid, w, "no entries", self.s(self.palette.fg2, .{ .italic = true }));
         }

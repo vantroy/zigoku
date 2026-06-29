@@ -283,7 +283,7 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
         .page = page,
     }) catch |e| {
         log.debug("popular failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
@@ -292,7 +292,7 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
     var owned = std.ArrayListUnmanaged(Anime).empty;
     owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
         log.debug("popular result alloc failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     for (raw) |a| {
