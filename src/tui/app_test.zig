@@ -65,10 +65,15 @@ fn dummyDisplayNameFn(_: *anyopaque) []const u8 {
     return "TestSrc";
 }
 
+fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
+    return &.{};
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
     .search = dummySearchFn,
+    .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
 };
@@ -100,6 +105,9 @@ const GateProvider = struct {
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
+    fn popularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
+        return &.{};
+    }
     fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
         return .{ .url = "" };
     }
@@ -108,6 +116,7 @@ const GateProvider = struct {
         .name = nameFn,
         .displayName = displayNameFn,
         .search = searchFn,
+        .popular = popularFn,
         .episodes = episodesFn,
         .resolve = resolveFn,
     };
