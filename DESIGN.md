@@ -481,14 +481,16 @@ the appropriate `dateRange` value (§9.6), and resets cursor and scroll.
 
 **Card anatomy.** Each card occupies one slot, rendered top-to-bottom:
 
-1. **Cover block** (`cover_w × cover_h` cells). Kitty image when art is available
-   (ROD-243). Placeholder until then: `bg.surface` fill + rank label `#N` centered
-   in `text.dim`. The fill is the only `bg.surface`-elevated element in the grid;
-   real cover art replaces it entirely in ROD-243.
-2. **Selection marker.** `▸` at the cover's bottom-left cell in `state.focus` when
-   this card is selected. No box border, no background band. When Kitty image is
-   active the marker overlays the cover and the image background is stripped for
-   that cell — a ROD-243 dependency.
+1. **Cover block** (`cover_w × cover_h` cells). Kitty image when art is available;
+   half-block fallback for terminals without Kitty support. Placeholder while art is
+   loading or unavailable: `bg.surface` fill + rank label `#N` centered in
+   `text.dim`. The fill is the only `bg.surface`-elevated element in the grid;
+   real cover art replaces it once available.
+2. **Selection marker.** `▸` in the **left gutter at `x-1`** (one column left of the
+   card's content origin) on the **rank row** (`y + cover_h`), `state.focus`,
+   text-on-base. No box border, no background band. The marker does not touch the
+   cover cell, so cover art is never masked or composited. Combined selection cue:
+   `▸` in the gutter + title in `state.focus` + bold.
 3. **Rank + badge row.** `#N` in `text.primary`. At most one badge follows:
    - Rank #1: `TOP` in `state.now` + bold.
    - Current-cour release (exclusive with `TOP`): `NEW` in `state.focus` + bold.
@@ -506,7 +508,7 @@ the appropriate `dateRange` value (§9.6), and resets cursor and scroll.
 |---|---|---|
 | Cover placeholder fill | `bg.surface` | — |
 | Cover placeholder rank `#N` | `text.dim` | centered in cover block |
-| Selection `▸` | `state.focus` | cover bottom-left |
+| Selection `▸` | `state.focus` | rank row, left gutter (`x-1`) |
 | Rank `#N` (metadata row) | `text.primary` | — |
 | `TOP` badge | `state.now` | bold |
 | `NEW` badge | `state.focus` | bold |
@@ -1347,13 +1349,13 @@ Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
   Daily · Weekly · Monthly · All-Time                                                    [active=Daily f+bold; rest m; separator dots d]
                                                                                          [spacer row]
   [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; 20×7 cells each; bg.surface fill]
-  [         ][         ][  ▸      ][         ][         ]                               [card 3 selected: ▸ f at cover bottom-left]
+  [         ][         ][         ][         ][         ]
   [  #1     ][  #2     ][  #3     ][  #4     ][  #5     ]                               [rank d, centered in cover placeholder]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
-  #1 TOP      #2          #3 NEW      #4          #5                                     [rank fg; TOP h+bold; NEW f+bold; at most one badge per card]
+  #1 TOP      #2         ▸#3 NEW      #4          #5                                     [rank fg; TOP h+bold; NEW f+bold; ▸ f in left gutter (x-1) marks selected card; at most one badge per card]
   Frieren: B… FMA: Brothe Vinland S  Mob Psycho  Steins;Ga…                            [title fg; selected (#3) f+bold; clipped to cover_w with …]
   1.4m        659.29k     892.10k     341.2k      —                                     [view count m; absent → — in d]
                                                                                          [gap row, part of slot]
@@ -1370,8 +1372,10 @@ Notes:
 - `·` dot: always `state.focus` — single pane, no dim state.
 - Window bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
   own. Window change triggers a refetch.
-- The `▸` selection marker sits at the cover's bottom-left cell, `state.focus`.
-  No box border, no background band around the card.
+- The `▸` selection marker sits in the **left gutter at `x-1`** (one column left of
+  the card's content origin) on the **rank row** (`y + cover_h`), `state.focus`,
+  text-on-base. No box border, no background band around the card. The marker does
+  not touch the cover cell, so cover art is never masked or composited.
 - `TOP` is always rank #1 (`state.now` + bold). `NEW` is a current-cour show not
   ranked #1 (`state.focus` + bold). The two are mutually exclusive.
 - Title clips to `cover_w` (20 cols at the large tier) with `…`. Selected title is
@@ -2044,7 +2048,7 @@ falls back per §9.1 where enrichment hasn't completed:
 
 | Field | Present | Absent fallback |
 |---|---|---|
-| Cover URL | Kitty image (ROD-243) | `bg.surface` placeholder fill (§3.8) |
+| Cover URL | cover art — Kitty image, or half-block mosaic on non-Kitty terminals (§3.8) | `bg.surface` placeholder fill (§3.8) |
 | View count | formatted count in `text.muted` | `—` in `text.dim` |
 | Season/year | `NEW` badge derivation possible | `NEW` badge suppressed for that card |
 | Romaji title | shown, clipped | shown as-is (AllAnime always supplies a name) |

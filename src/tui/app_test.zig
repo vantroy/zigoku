@@ -158,6 +158,13 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.discover_enrich_thread = null;
     }
+    // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
+    // worker from ever spawning in tests), but joined defensively so a future test
+    // that drives the spawn path can't strand a thread on a torn-down loop (ROD-243).
+    if (app.discover_cover_thread) |t| {
+        t.join();
+        app.discover_cover_thread = null;
+    }
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -2744,6 +2751,40 @@ test "discover_cover_error records the per-url cooldown (leak-clean)" {
     const slot = app.discover_covers.get("https://img/grid-b.png") orelse return error.TestUnexpectedResult;
     try testing.expect(slot.status == .failed);
     try testing.expectEqual(@as(i64, 123_456), slot.failed_at_ms);
+}
+
+test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-243)" {
+    // Pins the UAF fix: the pump marks slots .loading from the borrowed thumb URLs
+    // (stable for the synchronous pump), never the batch slice it hands to the
+    // worker. The is_test gate skips the spawn, so this drives build + mark and the
+    // testing allocator proves it's leak-clean.
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .discover;
+    app.term_cols = 120;
+    app.term_rows = 40;
+    app.now_ms = 1000;
+    defer app.discover.deinit(app.gpa);
+    defer app.discover_covers.deinit(app.gpa);
+
+    const thumbs = [_][]const u8{ "https://img/g1.png", "https://img/g2.png", "https://img/g3.png" };
+    const daily = &app.discover.slots[0];
+    for (thumbs) |t| {
+        try daily.results.append(app.gpa, .{
+            .id = try app.gpa.dupe(u8, t),
+            .name = try app.gpa.dupe(u8, "Show"),
+            .thumb = try app.gpa.dupe(u8, t),
+        });
+    }
+
+    var loop = initTestLoop();
+    app.pumpDiscoverCovers(&loop, std.testing.io);
+
+    // Every visible card's slot is now in-flight, marked from the borrowed thumb.
+    for (thumbs) |t| {
+        const slot = app.discover_covers.get(t) orelse return error.TestUnexpectedResult;
+        try testing.expect(slot.status == .loading);
+    }
 }
 
 test "cover_done fresh result stores decoded cover state" {

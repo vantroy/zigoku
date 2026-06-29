@@ -21,10 +21,18 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const cover_mod = @import("../cover.zig");
 const workers = @import("workers.zig");
+const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const CoverCaches = workers.CoverCaches;
 const CoverState = @import("cover_state.zig").CoverState;
+
+/// Capacity of the deferred Kitty-image-free queue. Bounds one frame's evictions
+/// (drained every draw): the pool is `discover_cover_cap` + at most one grid, and
+/// each evicted slot contributes at most 2 ids (its image + a superseded one), so
+/// 256 clears the realistic worst case with margin. A fixed array (vs a growable
+/// list) means an eviction can never OOM and silently drop an id (ROD-243 review).
+pub const max_pending_free = 256;
 
 /// A failed cover suppresses refetch of the same url for this long, then allows one
 /// retry — shared with the single-cover policy so both back off identically
@@ -149,7 +157,8 @@ pub fn planEvictions(last_seen: []const u64, visible: []const bool, cap: usize, 
             if (containsIdx(out[0..n], i)) continue;
             if (best == null or ls < last_seen[best.?]) best = i;
         }
-        out[n] = best.?; // want ≤ non_visible guarantees a candidate exists
+        std.debug.assert(best != null); // want ≤ non_visible guarantees a candidate
+        out[n] = best.?;
     }
     return n;
 }
@@ -170,10 +179,24 @@ pub const DiscoverCovers = struct {
     slots: std.ArrayListUnmanaged(CoverSlot) = .empty,
     /// Kitty image ids awaiting release on the next render flush — populated when a
     /// slot is evicted (the slot is gone, but its image must still be freed on the
-    /// UI thread). Same-url re-decodes use the slot's own `pending_free_id`.
-    pending_free: std.ArrayListUnmanaged(u32) = .empty,
+    /// UI thread). Same-url re-decodes use the slot's own `pending_free_id`. Fixed
+    /// array + length (drained every frame), so an eviction can never OOM here.
+    pending_free: [max_pending_free]u32 = undefined,
+    pending_free_len: usize = 0,
     /// Monotonic render-frame counter; stamps `last_seen_frame` for eviction recency.
     frame: u64 = 0,
+
+    /// Queue a Kitty image id for release on the next render flush. Drops with a
+    /// debug log only if a single frame somehow evicts past `max_pending_free`
+    /// (bounded not to in practice — see the const).
+    fn queueFree(self: *DiscoverCovers, id: u32) void {
+        if (self.pending_free_len < max_pending_free) {
+            self.pending_free[self.pending_free_len] = id;
+            self.pending_free_len += 1;
+        } else {
+            log.debug("discover cover pending-free overflow; image {d} dropped", .{id});
+        }
+    }
 
     pub fn indexOf(self: *const DiscoverCovers, url: []const u8) ?usize {
         for (self.slots.items, 0..) |*s, i| {
@@ -236,8 +259,8 @@ pub const DiscoverCovers = struct {
     pub fn evict(self: *DiscoverCovers, gpa: Allocator, url: []const u8) void {
         const i = self.indexOf(url) orelse return;
         const slot = &self.slots.items[i];
-        if (slot.image) |img| self.pending_free.append(gpa, img.id) catch {};
-        if (slot.pending_free_id) |id| self.pending_free.append(gpa, id) catch {};
+        if (slot.image) |img| self.queueFree(img.id);
+        if (slot.pending_free_id) |id| self.queueFree(id);
         slot.freeOwned(gpa);
         _ = self.slots.swapRemove(i);
     }
@@ -272,8 +295,8 @@ pub const DiscoverCovers = struct {
                 slot.pending_free_id = null;
             }
         }
-        for (self.pending_free.items) |id| vx.freeImage(writer, id);
-        self.pending_free.clearRetainingCapacity();
+        for (self.pending_free[0..self.pending_free_len]) |id| vx.freeImage(writer, id);
+        self.pending_free_len = 0;
     }
 
     /// Teardown with image release: free every resident + pending Kitty image (UI
@@ -289,16 +312,15 @@ pub const DiscoverCovers = struct {
         self.deinit(gpa);
     }
 
-    /// Release the pool's owned memory: every slot's url + pixels, then the slot and
-    /// pending-free lists. Kitty images are NOT freed here — `freeAll` flushes them
-    /// first on the error-unwind path, and the quit-path global clear (`a=d,q=2`)
-    /// catches them on the normal `_exit`.
+    /// Release the pool's owned memory: every slot's url + pixels, then the slot
+    /// list (the pending-free queue is a fixed array — just reset its length). Kitty
+    /// images are NOT freed here — `freeAll` flushes them first on the error-unwind
+    /// path, and the quit-path global clear (`a=d,q=2`) catches them on `_exit`.
     pub fn deinit(self: *DiscoverCovers, gpa: Allocator) void {
         for (self.slots.items) |*s| s.freeOwned(gpa);
         self.slots.deinit(gpa);
         self.slots = .empty;
-        self.pending_free.deinit(gpa);
-        self.pending_free = .empty;
+        self.pending_free_len = 0;
     }
 };
 
@@ -398,8 +420,8 @@ test "DiscoverCovers.evict frees the slot and defers a pending image id" {
 
     dc.evict(testing.allocator, "https://img/b.png");
     try testing.expectEqual(@as(usize, 0), dc.slots.items.len);
-    try testing.expectEqual(@as(usize, 1), dc.pending_free.items.len);
-    try testing.expectEqual(@as(u32, 42), dc.pending_free.items[0]);
+    try testing.expectEqual(@as(usize, 1), dc.pending_free_len);
+    try testing.expectEqual(@as(u32, 42), dc.pending_free[0]);
     // Evicting an absent url is a no-op.
     dc.evict(testing.allocator, "https://img/missing.png");
 }
