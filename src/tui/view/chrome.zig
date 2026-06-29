@@ -30,9 +30,11 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
         .detail => switch (self.detail_origin) {
             .browse => "Browse",
             .history => "Watchlist",
+            .discover => "Popular",
         },
         .settings => "Settings",
         .browse => "Browse",
+        .discover => "Popular",
     };
     put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
 
@@ -58,7 +60,8 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     // like Browse. The zoom (.detail) and single-pane Settings stay lit.
     const dot_color = switch (self.active_view) {
         .browse, .history => if (self.active_pane == .detail) self.palette.focus else self.palette.fg3,
-        .detail, .settings => self.palette.focus,
+        // Single-pane surfaces keep the dot lit (Discover is full-canvas, ROD-239).
+        .detail, .settings, .discover => self.palette.focus,
     };
     if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
 }
@@ -161,6 +164,9 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
+        // ROD-239: navigation / window-toggle keys are wired in a later chunk;
+        // the final wording is settled with them. F-keys + q work now.
+        .discover => "hjkl navigate · enter detail · P save · [/] window · F1/F2/F3/F4 views · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
