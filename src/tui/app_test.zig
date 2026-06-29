@@ -151,6 +151,10 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.search_thread = null;
     }
+    if (app.popular_thread) |t| {
+        t.join();
+        app.popular_thread = null;
+    }
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -180,6 +184,10 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             for (d.results) |r| freeOwnedAnime(alloc, r);
             alloc.free(d.results);
             alloc.free(d.for_query);
+        },
+        .popular_done => |d| {
+            for (d.results) |r| freeOwnedAnime(alloc, r);
+            alloc.free(d.results);
         },
         .cover_done => |d| {
             alloc.free(d.rgba);
@@ -532,6 +540,99 @@ test "D in search mode does not switch to Discover (normal-mode guard, ROD-239)"
     // The D→Discover binding is normal-mode only; in search it must fall through
     // to the query buffer, leaving the view untouched.
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
+test "popular_done lands in its own window slot, not the active one (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+
+    // A one-result WEEKLY page arrives while DAILY is the active window.
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "w1", .name = "Weekly Show", .view_count = 39653 });
+    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .weekly, .page = 1 } });
+
+    // Landed in the weekly slot, stamped fresh…
+    const weekly = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.weekly)];
+    try testing.expectEqual(@as(usize, 1), weekly.results.items.len);
+    try testing.expectEqual(@as(u32, 1), weekly.page);
+    try testing.expect(weekly.fetched_at > 0);
+    try testing.expectEqual(@as(?u64, 39653), weekly.results.items[0].view_count);
+    // …and the active daily slot is untouched — no cross-window contamination.
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (ROD-239)" {
+    // Cache HIT: a slot fetched within the TTL must NOT fire a fetch. Observable:
+    // firePopular sets the slot's loading flag before spawning; testTick drains the
+    // worker's .popular_done without processing it, so a fired fetch leaves loading
+    // set. A hit never calls firePopular, so loading stays false.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        defer app.discover.deinit(testing.allocator);
+        app.active_view = .browse;
+        const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "d1", .name = "Daily Show" }));
+        daily.page = 1;
+        daily.fetched_at = store_mod.Store.nowSecs(); // fresh
+        try testTick(&app, keyEv('D', .{}));
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+        try testing.expect(!daily.loading); // cache hit — no fetch fired
+        try testing.expectEqual(@as(usize, 1), daily.results.items.len); // preserved
+    }
+    // Cache MISS: an unfetched slot (page 0) fires a page-1 fetch on entry.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        defer app.discover.deinit(testing.allocator);
+        app.active_view = .browse;
+        try testTick(&app, keyEv(vaxis.Key.f4, .{}));
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+        // Stale/empty → firePopular ran (loading set; the drained .popular_done that
+        // would clear it is freed unprocessed by the test harness).
+        try testing.expect(app.discover.activeSlot().loading);
+    }
+}
+
+test "Discover grid cursor: l advances, g/G jump to ends (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.term_cols = 120;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "Show" }));
+    }
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(@as(usize, 1), app.discover.cursor);
+    try testTick(&app, keyEv('G', .{}));
+    try testing.expectEqual(@as(usize, 4), app.discover.cursor); // last
+    try testTick(&app, keyEv('g', .{}));
+    try testing.expectEqual(@as(usize, 0), app.discover.cursor); // first
+}
+
+test "Discover window keys switch the active window and reset the cursor (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    app.discover.cursor = 3;
+    // '2' selects Weekly directly; the cursor resets and the slot (stale) fetches.
+    try testTick(&app, keyEv('2', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
+    try testing.expectEqual(@as(usize, 0), app.discover.cursor);
+    // ']' cycles forward Weekly → Monthly.
+    try testTick(&app, keyEv(']', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .monthly), app.discover.window);
+    // '[' cycles back Monthly → Weekly.
+    try testTick(&app, keyEv('[', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
 }
 
 test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {

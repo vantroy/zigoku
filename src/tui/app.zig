@@ -233,6 +233,7 @@ pub fn run(
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
+    defer if (app.popular_thread) |t| t.join();
     defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
@@ -612,6 +613,11 @@ pub const App = struct {
     /// search queues one follow-up via `search.pending_enrich` without blocking
     /// the UI.
     enrich_thread: ?std.Thread = null,
+
+    /// Handle for the most recent Popular-feed thread (ROD-239). Joined before a
+    /// new spawn (bounding concurrent feed threads to 1) and in run() teardown,
+    /// so an in-flight fetch can't dereference a torn-down loop/gpa on quit.
+    popular_thread: ?std.Thread = null,
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -1477,6 +1483,10 @@ pub const App = struct {
                 self.debounce_deadline_ms = 0;
                 self.cover_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
+                // A failed Popular-feed fetch (ROD-239) rides task_error too; clear
+                // any in-flight feed slot so its spinner can't hang. (Chunk 4 swaps
+                // this for a dedicated feed-error toast + retry.)
+                for (&self.discover.slots) |*slot| slot.loading = false;
                 self.pushToast(.@"error", msg, true);
             },
             .search_done => |ev| {
@@ -1520,6 +1530,35 @@ pub const App = struct {
                 self.search.hydrateResultsFromStore(self.gpa, self.store, source_name, offset, added);
                 self.search.persistResults(self.gpa, self.store, source_name, self.translation, offset, added, false);
                 self.fireEnrich(loop, io, offset, added);
+            },
+
+            .popular_done => |ev| {
+                // Land the page into ITS OWN window slot (by ev.window), never the
+                // active one — a window switch mid-flight must not misfile the
+                // result, and the windowed view_counts differ per slot (the
+                // DiscoverState invariant). No "stale drop": every page is valid
+                // cached data for the window it was fetched for.
+                const idx = @intFromEnum(ev.window);
+                const slot = &self.discover.slots[idx];
+                slot.loading = false;
+                const is_active = idx == @intFromEnum(self.discover.window);
+                if (is_active) self.async_start_ms = 0;
+                // Page 1 is a fresh window load — free the old slot contents first.
+                if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
+                slot.fetched_at = Store.nowSecs();
+                slot.page = ev.page;
+                // Take ownership: the duped Anime (strings already gpa-owned) move
+                // into the slot's list, which may hold earlier pages for page > 1.
+                slot.results.appendSlice(self.gpa, ev.results) catch |e| {
+                    log.debug("appending popular results failed: {s}", .{@errorName(e)});
+                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+                };
+                self.gpa.free(ev.results);
+                // Reset the grid cursor on a fresh load of the visible window.
+                if (is_active and ev.page == 1) {
+                    self.discover.cursor = 0;
+                    self.discover.scroll = 0;
+                }
             },
             .search_enriched => |ev| {
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
@@ -1788,6 +1827,39 @@ pub const App = struct {
             self.search.loading = false;
             return;
         };
+    }
+
+    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Mirrors
+    /// fireSearch's 1-thread bound: join the prior feed thread before spawning.
+    /// Sets the target slot's loading flag; the `.popular_done` arm clears it and
+    /// lands the results in that slot (by window — not necessarily the active one).
+    fn firePopular(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+        if (self.popular_thread) |t| {
+            t.join();
+            self.popular_thread = null;
+        }
+        const slot = &self.discover.slots[@intFromEnum(window)];
+        slot.loading = true;
+        self.async_start_ms = self.now_ms;
+        self.popular_thread = std.Thread.spawn(.{}, workers.popularTask, .{
+            loop, self.gpa, io, provider, window, page,
+        }) catch {
+            slot.loading = false;
+            self.async_start_ms = 0;
+            return;
+        };
+    }
+
+    /// Cache-or-fetch the active Discover window (ROD-239). Renders the cached slot
+    /// untouched when it's fresh (fetched within `feed_ttl_secs`); otherwise fires
+    /// a page-1 fetch. Called on entering Discover and on every window switch. The
+    /// per-window slot is the whole point — see the DiscoverState invariant.
+    fn refreshDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const slot = self.discover.activeSlot();
+        if (slot.loading) return; // a fetch for this window is already in flight
+        const fresh = slot.page > 0 and (Store.nowSecs() - slot.fetched_at) < feed_ttl_secs;
+        if (fresh) return; // cache hit — render the slot as-is, no network
+        self.firePopular(loop, io, provider, self.discover.window, 1);
     }
 
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
@@ -2125,6 +2197,9 @@ pub const App = struct {
                 self.active_pane = .list;
                 self.list_cursor = 0;
                 self.list_top = 0;
+                // Cache-or-fetch the active window on entry: a fresh slot renders
+                // instantly, a stale/empty one fires a page-1 fetch (ROD-239).
+                self.refreshDiscover(loop, io, provider);
             }
             return;
         }
@@ -2178,17 +2253,53 @@ pub const App = struct {
         self.onListCursorKey(key, loop, io, provider); // j/k/g/G — list cursor + load-more
     }
 
-    /// Normal-mode keys while Discover is active (ROD-239). This chunk is the
-    /// navigable shell: entry/exit ride the global F-key chain in onKey, so here we
-    /// only need to swallow the in-view keys (grid nav, window toggle, Enter→zoom,
-    /// P, /) — they are wired in the data + layout chunks. Consuming them keeps a
-    /// keypress from leaking into the Browse/History handlers behind this intercept.
+    /// Normal-mode keys while Discover is active (ROD-239): window toggle ([ ] /
+    /// 1-4) and the 2D grid cursor (hjkl + g/G). Entry/exit ride the global F-key
+    /// chain in onKey; this intercept owns everything else so a keypress can't leak
+    /// into the Browse/History handlers. (Enter→zoom, P→save, /→Browse land next.)
     fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        _ = self;
-        _ = key;
-        _ = loop;
-        _ = io;
-        _ = provider;
+        // Window toggle — [ ] cycle, 1-4 direct select. Drives the feed regardless
+        // of the grid cursor (the segmented bar is passive).
+        if (key.matches(']', .{}) or key.matches('[', .{})) {
+            const n = std.meta.fields(source_mod.PopularWindow).len;
+            const cur = @intFromEnum(self.discover.window);
+            const next = if (key.matches(']', .{})) (cur + 1) % n else (cur + n - 1) % n;
+            self.setDiscoverWindow(@enumFromInt(next), loop, io, provider);
+            return;
+        }
+        if (key.matches('1', .{})) return self.setDiscoverWindow(.daily, loop, io, provider);
+        if (key.matches('2', .{})) return self.setDiscoverWindow(.weekly, loop, io, provider);
+        if (key.matches('3', .{})) return self.setDiscoverWindow(.monthly, loop, io, provider);
+        if (key.matches('4', .{})) return self.setDiscoverWindow(.all_time, loop, io, provider);
+
+        // Grid cursor over the active window's results (flat index; the column
+        // count resolves the 2D step). Inert while the slot is empty.
+        const len = self.discover.activeSlot().results.items.len;
+        if (len == 0) return;
+        const cols: usize = discover_view.gridCols(self.term_cols);
+        if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
+            if (self.discover.cursor + 1 < len) self.discover.cursor += 1;
+        } else if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
+            if (self.discover.cursor > 0) self.discover.cursor -= 1;
+        } else if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            self.discover.cursor = if (self.discover.cursor + cols < len) self.discover.cursor + cols else len - 1;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            self.discover.cursor = if (self.discover.cursor >= cols) self.discover.cursor - cols else 0;
+        } else if (key.matches('g', .{})) {
+            self.discover.cursor = 0;
+        } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
+            self.discover.cursor = len - 1;
+        }
+    }
+
+    /// Switch the active Popular window and cache-or-fetch it (ROD-239). Resets the
+    /// grid cursor/scroll; a no-op if already on `window`.
+    fn setDiscoverWindow(self: *App, window: source_mod.PopularWindow, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        if (self.discover.window == window) return;
+        self.discover.window = window;
+        self.discover.cursor = 0;
+        self.discover.scroll = 0;
+        self.refreshDiscover(loop, io, provider);
     }
 
     /// Drill forward (ROD-170 focus model): l/→/Enter reveal+focus the detail pane
@@ -2679,6 +2790,13 @@ pub const App = struct {
     /// `pane_split_min` and this, the detail pane is the no-grid preview stack.
     pub const zoom_min: u16 = 100;
 
+    /// How long a fetched Popular-feed window stays fresh in the in-memory cache
+    /// (ROD-239). Re-opening Discover or flipping back to a window within this
+    /// window renders the cached slot with no network; past it, the slot refetches.
+    /// "hour'ish" per the design steer — a feed isn't real-time, and the windowed
+    /// counts move slowly enough that an hour is invisible to the user.
+    pub const feed_ttl_secs: i64 = 3600;
+
     /// Cursor-settle window (ms) before a cursor-tracked cover preview actually
     /// fetches (ROD-202). Shorter than the 300 ms search debounce on purpose: the
     /// cover is a preview the user watches *while* navigating, so it should feel
@@ -2766,7 +2884,7 @@ pub const App = struct {
 
             // Discover is full-canvas single-pane (ROD-239): the feed grid owns the
             // whole content area, no pane split.
-            .discover => discover_view.draw(self, win, top, visible, w),
+            .discover => discover_view.draw(self, &self.scratch, win, top, visible, w),
         }
     }
 
@@ -2811,9 +2929,21 @@ pub const App = struct {
             },
             .browse => self.scrollIntoView(visible),
             .detail, .settings => {},
-            // Discover's grid viewport is settled in its own pass once the grid
-            // lands (later chunk); nothing to scroll while it's empty.
-            .discover => {},
+            // Discover: keep the cursor's card-row inside the grid viewport. scroll
+            // is a card-row offset; geometry resolves cols + the visible row budget.
+            .discover => {
+                const geo = discover_view.geometry(w, visible);
+                if (geo.rows_visible == 0 or geo.cols == 0) {
+                    self.discover.scroll = 0;
+                } else {
+                    const cur_row = self.discover.cursor / geo.cols;
+                    if (cur_row < self.discover.scroll) {
+                        self.discover.scroll = cur_row;
+                    } else if (cur_row >= self.discover.scroll + geo.rows_visible) {
+                        self.discover.scroll = cur_row + 1 - geo.rows_visible;
+                    }
+                }
+            },
         }
     }
 
