@@ -4003,8 +4003,7 @@ test "ROD-238: drainTtyResponses sweeps buffered bytes and leaves the fd non-blo
 
     // Swept: the buffer is empty. The drain left the read end non-blocking, so a
     // further read reports WouldBlock instead of hanging (write end still open) —
-    // this also proves the drain returns at once on an empty fd (the q=2 norm)
-    // and can never wedge the quit path.
+    // proof it can never wedge the quit path on a drained fd.
     var buf: [32]u8 = undefined;
     try testing.expectError(error.WouldBlock, std.posix.read(fds[0], &buf));
 }
