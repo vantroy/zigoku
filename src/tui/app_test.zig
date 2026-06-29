@@ -155,6 +155,10 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.popular_thread = null;
     }
+    if (app.discover_enrich_thread) |t| {
+        t.join();
+        app.discover_enrich_thread = null;
+    }
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -189,6 +193,7 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             for (d.results) |r| freeOwnedAnime(alloc, r);
             alloc.free(d.results);
         },
+        .discover_enriched => |d| freeOwnedAnime(alloc, d.result),
         .cover_done => |d| {
             alloc.free(d.rgba);
             alloc.free(d.for_id);
@@ -693,6 +698,24 @@ test "popular_done persists feed rows to the store (persist like search, ROD-239
     const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "f1")).?;
     try testing.expectEqualStrings("Feed Show", rec.title);
     try testing.expectEqual(@as(?i64, null), rec.year); // no year in the feed payload row
+}
+
+test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    // A feed card as delivered: no synopsis (anyCard has no description).
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me" }));
+    try testing.expectEqual(@as(?[]const u8, null), daily.results.items[0].description);
+
+    // The lazily-enriched copy arrives (same id, now with a synopsis).
+    const enriched = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me", .description = "A grand tale." });
+    try testTick(&app, .{ .discover_enriched = .{ .result = enriched, .window = .daily } });
+
+    // Merged in place — the zoom now has its synopsis.
+    try testing.expectEqualStrings("A grand tale.", daily.results.items[0].description.?);
 }
 
 test "Discover P adds the selected card to the watchlist (ROD-239)" {

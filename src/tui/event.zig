@@ -65,6 +65,13 @@ pub const Event = union(enum) {
         window: source_mod.PopularWindow,
         cause: anyerror,
     },
+    /// One Discover card lazily enriched from AniList for its zoom (ROD-239). The
+    /// feed has no synopsis, so opening a card fetches it. `result` is gpa-owned;
+    /// App merges it into `window`'s slot (matched by id) and takes ownership.
+    discover_enriched: struct {
+        result: Anime,
+        window: source_mod.PopularWindow,
+    },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.
     search_enriched: struct {
