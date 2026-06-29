@@ -170,6 +170,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .season = a.season,
         .start_date = a.start_date,
         .score = a.score,
+        .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
 
@@ -265,6 +266,56 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
     };
     // On success: `exact` and `query` are now owned by the event.
     // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
+}
+
+/// Background task: fetch one page of the Popular feed for `window` (ROD-239).
+/// Mirrors searchTask's ownership shape — dupes every owned string into gpa so the
+/// event payload outlives the worker's arena, and the UI thread frees `results`
+/// via the `.popular_done` arm. No query string to thread (the feed has none); a
+/// failure rides `task_error` (the .popular_done arm and task_error both clear the
+/// slot's loading flag).
+pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const raw = provider.popular(arena.allocator(), io, .{
+        .window = window,
+        .page = page,
+    }) catch |e| {
+        log.debug("popular failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return;
+    };
+
+    // Dupe every owned string we thread into the UI so arena teardown cannot leave
+    // dangling references in the event payload (mirrors searchTask).
+    var owned = std.ArrayListUnmanaged(Anime).empty;
+    owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
+        log.debug("popular result alloc failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return;
+    };
+    for (raw) |a| {
+        const duped = dupeOwnedAnime(gpa, a) catch continue;
+        owned.appendAssumeCapacity(duped);
+    }
+
+    // toOwnedSlice resizes to exact fit (len == capacity) so gpa.free is valid on
+    // either path below (see searchTask for the over-allocation rationale).
+    const exact = owned.toOwnedSlice(gpa) catch {
+        for (owned.items) |r| freeOwnedAnime(gpa, r);
+        owned.deinit(gpa);
+        return;
+    };
+
+    loop.postEvent(.{ .popular_done = .{
+        .results = exact,
+        .window = window,
+        .page = page,
+    } }) catch {
+        for (exact) |r| freeOwnedAnime(gpa, r);
+        gpa.free(exact); // exact-fit: len == capacity, free is valid
+    };
 }
 
 /// Background task: enrich one page of search results from AniList.

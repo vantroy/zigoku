@@ -129,7 +129,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     // while playback resolves, and gives the bar one coherent busy story.
     const any_loading = self.search.loading or self.history_loading or
         self.episodes.loading or self.cover.loading or self.debounce_deadline_ms > 0 or
-        self.playing;
+        self.playing or self.discover.activeSlot().loading;
     if (any_loading) {
         const spin_color: vaxis.Color = if (self.isSlowPath())
             self.palette.hot

@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
+const source_mod = @import("../source.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
@@ -44,6 +45,16 @@ pub const Event = union(enum) {
     search_done: struct {
         results: []Anime,
         for_query: []const u8,
+        page: u32,
+    },
+    /// Popular-feed results from a background thread (ROD-239). `results` is
+    /// gpa-allocated (each Anime's strings owned); App takes ownership into the
+    /// feed slot for `window`. `window` is carried so a result lands in its own
+    /// per-window cache slot even if the active window changed mid-flight; `page`
+    /// is the page this set belongs to.
+    popular_done: struct {
+        results: []Anime,
+        window: source_mod.PopularWindow,
         page: u32,
     },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
