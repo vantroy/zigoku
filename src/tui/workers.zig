@@ -170,6 +170,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .season = a.season,
         .start_date = a.start_date,
         .score = a.score,
+        .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
 
@@ -267,8 +268,86 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
     // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
 }
 
-/// Background task: enrich one page of search results from AniList.
-/// `results` and `query` are GPA-owned by this task and transferred to the event on success.
+/// Background task: fetch one page of the Popular feed for `window` (ROD-239).
+/// Mirrors searchTask's ownership shape — dupes every owned string into gpa so the
+/// event payload outlives the worker's arena, and the UI thread frees `results`
+/// via the `.popular_done` arm. No query string to thread (the feed has none); a
+/// failure posts `.popular_error` (whose handler clears the slot's loading flag
+/// and marks it failed).
+pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const raw = provider.popular(arena.allocator(), io, .{
+        .window = window,
+        .page = page,
+    }) catch |e| {
+        log.debug("popular failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return;
+    };
+
+    // Dupe every owned string we thread into the UI so arena teardown cannot leave
+    // dangling references in the event payload (mirrors searchTask).
+    var owned = std.ArrayListUnmanaged(Anime).empty;
+    owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
+        log.debug("popular result alloc failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return;
+    };
+    for (raw) |a| {
+        const duped = dupeOwnedAnime(gpa, a) catch continue;
+        owned.appendAssumeCapacity(duped);
+    }
+
+    // toOwnedSlice resizes to exact fit (len == capacity) so gpa.free is valid on
+    // either path below (see searchTask for the over-allocation rationale).
+    const exact = owned.toOwnedSlice(gpa) catch {
+        for (owned.items) |r| freeOwnedAnime(gpa, r);
+        owned.deinit(gpa);
+        return;
+    };
+
+    loop.postEvent(.{ .popular_done = .{
+        .results = exact,
+        .window = window,
+        .page = page,
+    } }) catch {
+        for (exact) |r| freeOwnedAnime(gpa, r);
+        gpa.free(exact); // exact-fit: len == capacity, free is valid
+    };
+}
+
+/// Fill an Anime's blank fields from AniList metadata — AllAnime is the source of
+/// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
+/// before the arena `meta` came from is torn down; a failed copy keeps the prior
+/// (blank) value rather than aliasing the soon-dead arena. Shared by the
+/// search-page enrich and the Discover lazy zoom enrich (ROD-239).
+pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
+    if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
+    if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
+    if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
+    if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
+    if (a.kind == null) a.kind = dupeOptText(gpa, meta.kind) catch a.kind;
+    if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
+    if (a.genres.len == 0) {
+        if (dupeOwnedStrList(gpa, meta.genres) catch null) |g| a.genres = g;
+    }
+    if (a.studios.len == 0) {
+        if (dupeOwnedStrList(gpa, meta.studios) catch null) |s| a.studios = s;
+    }
+    if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
+    if (a.mal_id == null) a.mal_id = meta.mal_id;
+    if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
+    if (a.year == null) a.year = meta.year;
+    if (a.season == null) a.season = meta.season;
+    if (a.start_date == null) a.start_date = meta.start_date;
+    if (a.score == null) a.score = meta.score;
+}
+
+/// Background task: enrich one page of search results from AniList. `results` and
+/// `query` are GPA-owned by this task and transferred to the `.search_enriched`
+/// event on success (freed here on failure). Fills each row via `applyMetadata`.
 pub fn enrichTask(
     loop: *Loop,
     gpa: Allocator,
@@ -289,30 +368,7 @@ pub fn enrichTask(
 
     for (results) |*a| {
         const meta = anilist.enrich(arena.allocator(), io, a.*) catch null orelse continue;
-        // Fill only what AllAnime left blank (it's the source of truth); deep-copy
-        // each string/slice into GPA before the arena `meta` came from is torn down.
-        // A failed copy leaves the prior (blank) value rather than a dangling one.
-        if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
-        if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
-        if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
-        if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
-        if (a.kind == null) a.kind = dupeOptText(gpa, meta.kind) catch a.kind;
-        if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
-        // Optional-on-OOM (matches the dupeOptText fields): a failed copy yields
-        // null and we keep the prior slice, never aliasing the soon-dead arena.
-        if (a.genres.len == 0) {
-            if (dupeOwnedStrList(gpa, meta.genres) catch null) |g| a.genres = g;
-        }
-        if (a.studios.len == 0) {
-            if (dupeOwnedStrList(gpa, meta.studios) catch null) |s| a.studios = s;
-        }
-        if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
-        if (a.mal_id == null) a.mal_id = meta.mal_id;
-        if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
-        if (a.year == null) a.year = meta.year;
-        if (a.season == null) a.season = meta.season;
-        if (a.start_date == null) a.start_date = meta.start_date;
-        if (a.score == null) a.score = meta.score;
+        applyMetadata(gpa, a, meta);
     }
 
     loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch |pe| {
@@ -320,6 +376,24 @@ pub fn enrichTask(
         return; // `posted` stays false → the defer frees results/query
     };
     posted = true;
+}
+
+/// Lazy single-show enrich for the Discover zoom (ROD-239): the feed payload has
+/// no synopsis (anyCard has no description), so opening a card enriches just that
+/// show from AniList — far cheaper than enriching all ~30 grid cards proactively.
+/// `anime` is gpa-owned (the caller duped it); ownership transfers to the
+/// discover_enriched event on success, or is freed here on a post failure.
+/// `window` routes the merge to the right per-window slot.
+pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime, window: source_mod.PopularWindow) void {
+    var a = anime;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    // A miss (no AniList match / offline) still posts `a` unchanged — the merge is
+    // then a harmless self-replace and the zoom shows no synopsis (none exists).
+    if (anilist.enrich(arena.allocator(), io, a) catch null) |meta| applyMetadata(gpa, &a, meta);
+    loop.postEvent(.{ .discover_enriched = .{ .result = a, .window = window } }) catch {
+        freeOwnedAnime(gpa, a);
+    };
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are

@@ -5,6 +5,7 @@ const vaxis = @import("vaxis");
 const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
+const source_mod = @import("../source.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
@@ -45,6 +46,31 @@ pub const Event = union(enum) {
         results: []Anime,
         for_query: []const u8,
         page: u32,
+    },
+    /// Popular-feed results from a background thread (ROD-239). `results` is
+    /// gpa-allocated (each Anime's strings owned); App takes ownership into the
+    /// feed slot for `window`. `window` is carried so a result lands in its own
+    /// per-window cache slot even if the active window changed mid-flight; `page`
+    /// is the page this set belongs to.
+    popular_done: struct {
+        results: []Anime,
+        window: source_mod.PopularWindow,
+        page: u32,
+    },
+    /// A Popular-feed fetch failed (ROD-239). `window` is the slot it was for (so
+    /// the handler clears that slot's loading + marks it failed); `cause` names the
+    /// failure class. Distinct from task_error so the feed owns its own error UX
+    /// (in-view "can't reach the feed" + a feed toast) without touching Browse.
+    popular_error: struct {
+        window: source_mod.PopularWindow,
+        cause: anyerror,
+    },
+    /// One Discover card lazily enriched from AniList for its zoom (ROD-239). The
+    /// feed has no synopsis, so opening a card fetches it. `result` is gpa-owned;
+    /// App merges it into `window`'s slot (matched by id) and takes ownership.
+    discover_enriched: struct {
+        result: Anime,
+        window: source_mod.PopularWindow,
     },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.
