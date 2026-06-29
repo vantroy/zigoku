@@ -25,8 +25,7 @@ const CoverState = app_mod.CoverState;
 const CoverDecision = app_mod.CoverState.Decision;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
-const RawCoverCache = workers.RawCoverCache;
-const DecodedCoverCache = workers.DecodedCoverCache;
+const CoverCaches = workers.CoverCaches;
 const max_cover_raw_cache_bytes = workers.max_cover_raw_cache_bytes;
 const max_cover_decoded_cache_bytes = workers.max_cover_decoded_cache_bytes;
 const freeOwnedAnime = workers.freeOwnedAnime;
@@ -158,6 +157,13 @@ fn testTick(app: *App, event: Event) !void {
     if (app.discover_enrich_thread) |t| {
         t.join();
         app.discover_enrich_thread = null;
+    }
+    // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
+    // worker from ever spawning in tests), but joined defensively so a future test
+    // that drives the spawn path can't strand a thread on a torn-down loop (ROD-243).
+    if (app.discover_cover_thread) |t| {
+        t.join();
+        app.discover_cover_thread = null;
     }
     if (app.enrich_thread) |t| {
         t.join();
@@ -2627,13 +2633,11 @@ test "episodes_done stale result is discarded" {
 
 test "coverTask decoded-cache hit posts a cloned cover_done event" {
     var loop = initTestLoop();
-    var raw_cache: RawCoverCache = .{};
-    defer raw_cache.deinit(testing.allocator);
-    var decoded_cache: DecodedCoverCache = .{};
-    defer decoded_cache.deinit(testing.allocator);
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
 
     const decoded = try cover_mod.decodeRgba(testing.allocator, &tiny_png);
-    try testing.expect(try decoded_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", decoded, max_cover_decoded_cache_bytes));
+    try testing.expect(try caches.decoded.putOwnedBounded(testing.allocator, "https://img/anime.png", decoded, max_cover_decoded_cache_bytes));
 
     coverTask(
         &loop,
@@ -2641,8 +2645,7 @@ test "coverTask decoded-cache hit posts a cloned cover_done event" {
         testing.io,
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
-        &raw_cache,
-        &decoded_cache,
+        &caches,
     );
 
     const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
@@ -2652,18 +2655,16 @@ test "coverTask decoded-cache hit posts a cloned cover_done event" {
     try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
     try testing.expectEqual(@as(usize, 4), ev.cover_done.rgba.len);
-    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+    try testing.expect(caches.decoded.get("https://img/anime.png") != null);
 }
 
 test "coverTask raw-cache hit decodes once and warms decoded cache" {
     var loop = initTestLoop();
-    var raw_cache: RawCoverCache = .{};
-    defer raw_cache.deinit(testing.allocator);
-    var decoded_cache: DecodedCoverCache = .{};
-    defer decoded_cache.deinit(testing.allocator);
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
 
     const raw = try testing.allocator.dupe(u8, &tiny_png);
-    try testing.expect(try raw_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", raw, max_cover_raw_cache_bytes));
+    try testing.expect(try caches.raw.putOwnedBounded(testing.allocator, "https://img/anime.png", raw, max_cover_raw_cache_bytes));
 
     coverTask(
         &loop,
@@ -2671,16 +2672,119 @@ test "coverTask raw-cache hit decodes once and warms decoded cache" {
         testing.io,
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
-        &raw_cache,
-        &decoded_cache,
+        &caches,
     );
 
     const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
     defer freeTestEvent(testing.allocator, ev);
     try testing.expect(ev == .cover_done);
-    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+    try testing.expect(caches.decoded.get("https://img/anime.png") != null);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
+}
+
+test "CoverCaches survives concurrent loadCoverPixels under the lock (ROD-243)" {
+    // Proves the lock contract that makes the grid safe: N worker threads hammering
+    // the shared caches — get() (which promotes, so it mutates), decode, and
+    // putOwnedBounded with eviction (decoded cap 5 < 8 keys) — never corrupt the
+    // LRUs, leak, or double-free. The testing allocator fails the test on any of
+    // those. Every key is pre-seeded into the raw cache (cap 20, none evict), so
+    // every call is a cache hit and no thread touches the network. Without the
+    // copy-under-lock discipline, a concurrent evict-and-free would race the dupe.
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
+
+    const urls = [_][]const u8{
+        "https://img/a0.png", "https://img/a1.png", "https://img/a2.png", "https://img/a3.png",
+        "https://img/a4.png", "https://img/a5.png", "https://img/a6.png", "https://img/a7.png",
+    };
+    for (urls) |u| {
+        const raw = try testing.allocator.dupe(u8, &tiny_png);
+        try testing.expect(try caches.raw.putOwnedBounded(testing.allocator, u, raw, max_cover_raw_cache_bytes));
+    }
+
+    const Worker = struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, c: *CoverCaches, keys: []const []const u8, tid: usize) void {
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                // Overlapping, deterministic key stride → contention + eviction churn.
+                const px = workers.loadCoverPixels(gpa, io, keys[(tid * 7 + i) % keys.len], c) catch continue;
+                gpa.free(px.rgba); // independent copy — owned by us, never the cache's
+            }
+        }
+    };
+
+    var threads: [8]?std.Thread = .{null} ** 8;
+    for (&threads, 0..) |*t, tid| {
+        t.* = std.Thread.spawn(.{}, Worker.run, .{ testing.allocator, testing.io, &caches, &urls, tid }) catch null;
+    }
+    for (threads) |t| if (t) |th| th.join();
+}
+
+test "discover_cover_done adopts pixels into the grid slot (leak-clean)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    defer app.discover_covers.deinit(app.gpa);
+
+    // url + rgba are gpa-owned (as the worker posts them): the handler frees the
+    // url and hands rgba to the slot; deinit frees the slot's key + pixels. The
+    // testing allocator fails the test on any leak or double-free.
+    const url = try std.testing.allocator.dupe(u8, "https://img/grid-a.png");
+    const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0x12, 0x34, 0x56, 0xff });
+    try testTick(&app, .{ .discover_cover_done = .{ .url = url, .rgba = rgba, .width = 1, .height = 1 } });
+
+    const slot = app.discover_covers.get("https://img/grid-a.png") orelse return error.TestUnexpectedResult;
+    try testing.expect(slot.status == .ready);
+    try testing.expect(slot.pixels != null);
+    try testing.expectEqual(@as(usize, 4), slot.pixels.?.rgba.len);
+}
+
+test "discover_cover_error records the per-url cooldown (leak-clean)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.now_ms = 123_456; // only .tick updates now_ms, so this stamp holds
+    defer app.discover_covers.deinit(app.gpa);
+
+    const url = try std.testing.allocator.dupe(u8, "https://img/grid-b.png");
+    try testTick(&app, .{ .discover_cover_error = url });
+
+    const slot = app.discover_covers.get("https://img/grid-b.png") orelse return error.TestUnexpectedResult;
+    try testing.expect(slot.status == .failed);
+    try testing.expectEqual(@as(i64, 123_456), slot.failed_at_ms);
+}
+
+test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-243)" {
+    // Pins the UAF fix: the pump marks slots .loading from the borrowed thumb URLs
+    // (stable for the synchronous pump), never the batch slice it hands to the
+    // worker. The is_test gate skips the spawn, so this drives build + mark and the
+    // testing allocator proves it's leak-clean.
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .discover;
+    app.term_cols = 120;
+    app.term_rows = 40;
+    app.now_ms = 1000;
+    defer app.discover.deinit(app.gpa);
+    defer app.discover_covers.deinit(app.gpa);
+
+    const thumbs = [_][]const u8{ "https://img/g1.png", "https://img/g2.png", "https://img/g3.png" };
+    const daily = &app.discover.slots[0];
+    for (thumbs) |t| {
+        try daily.results.append(app.gpa, .{
+            .id = try app.gpa.dupe(u8, t),
+            .name = try app.gpa.dupe(u8, "Show"),
+            .thumb = try app.gpa.dupe(u8, t),
+        });
+    }
+
+    var loop = initTestLoop();
+    app.pumpDiscoverCovers(&loop, std.testing.io);
+
+    // Every visible card's slot is now in-flight, marked from the borrowed thumb.
+    for (thumbs) |t| {
+        const slot = app.discover_covers.get(t) orelse return error.TestUnexpectedResult;
+        try testing.expect(slot.status == .loading);
+    }
 }
 
 test "cover_done fresh result stores decoded cover state" {
