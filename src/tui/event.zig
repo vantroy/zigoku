@@ -106,6 +106,21 @@ pub const Event = union(enum) {
     },
     /// Cover fetch/decode failed for this show id.
     cover_error: []const u8,
+    /// One Discover-grid cover finished fetching+decoding (ROD-243). `url` and
+    /// `rgba` are gpa-owned and transferred to the handler, which adopts them into
+    /// the slot for `url`. Covers are URL-keyed and window-agnostic, so a result is
+    /// always a valid cover for `url` even if the window changed mid-flight — no
+    /// stale-drop; the handler frees `rgba` only if no slot can hold it (OOM).
+    discover_cover_done: struct {
+        url: []const u8,
+        rgba: []u8,
+        width: u32,
+        height: u32,
+    },
+    /// A Discover-grid cover fetch failed (ROD-243); payload is the gpa-owned url.
+    /// The handler records the per-url failure cooldown (so a transient miss doesn't
+    /// hammer the network) and frees the url.
+    discover_cover_error: []const u8,
     /// Live playback position from mpv IPC.
     position_update: struct {
         time_pos: f64,

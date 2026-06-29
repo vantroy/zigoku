@@ -2714,6 +2714,38 @@ test "CoverCaches survives concurrent loadCoverPixels under the lock (ROD-243)" 
     for (threads) |t| if (t) |th| th.join();
 }
 
+test "discover_cover_done adopts pixels into the grid slot (leak-clean)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    defer app.discover_covers.deinit(app.gpa);
+
+    // url + rgba are gpa-owned (as the worker posts them): the handler frees the
+    // url and hands rgba to the slot; deinit frees the slot's key + pixels. The
+    // testing allocator fails the test on any leak or double-free.
+    const url = try std.testing.allocator.dupe(u8, "https://img/grid-a.png");
+    const rgba = try std.testing.allocator.dupe(u8, &[_]u8{ 0x12, 0x34, 0x56, 0xff });
+    try testTick(&app, .{ .discover_cover_done = .{ .url = url, .rgba = rgba, .width = 1, .height = 1 } });
+
+    const slot = app.discover_covers.get("https://img/grid-a.png") orelse return error.TestUnexpectedResult;
+    try testing.expect(slot.status == .ready);
+    try testing.expect(slot.pixels != null);
+    try testing.expectEqual(@as(usize, 4), slot.pixels.?.rgba.len);
+}
+
+test "discover_cover_error records the per-url cooldown (leak-clean)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.now_ms = 123_456; // only .tick updates now_ms, so this stamp holds
+    defer app.discover_covers.deinit(app.gpa);
+
+    const url = try std.testing.allocator.dupe(u8, "https://img/grid-b.png");
+    try testTick(&app, .{ .discover_cover_error = url });
+
+    const slot = app.discover_covers.get("https://img/grid-b.png") orelse return error.TestUnexpectedResult;
+    try testing.expect(slot.status == .failed);
+    try testing.expectEqual(@as(i64, 123_456), slot.failed_at_ms);
+}
+
 test "cover_done fresh result stores decoded cover state" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
