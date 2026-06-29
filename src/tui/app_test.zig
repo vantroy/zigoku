@@ -658,6 +658,38 @@ test "Discover Enter opens the detail zoom for the selected card; Esc returns (R
     try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
 }
 
+test "Discover prefetches the next page near the end; exhausted/loading block it (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.term_cols = 120; // → 5 columns
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "S" }));
+    }
+    daily.page = 1;
+
+    // Cursor at the top is not near the end → no prefetch. (firePopular sets
+    // loading before spawning; the harness drains the dummy page-2 reply without
+    // processing it, so a fired prefetch leaves loading set as the signal.)
+    app.discover.cursor = 0;
+    try testTick(&app, keyEv('k', .{}));
+    try testing.expect(!daily.loading);
+
+    // Cursor near the end → the next page is prefetched.
+    app.discover.cursor = 28;
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expect(daily.loading);
+
+    // Exhausted blocks the prefetch even at the very end.
+    daily.loading = false;
+    daily.exhausted = true;
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expect(!daily.loading);
+}
+
 test "Discover / jumps to Browse search (ROD-239)" {
     var app: App = .{};
     app.active_view = .discover;
