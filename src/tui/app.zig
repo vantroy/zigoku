@@ -1590,6 +1590,9 @@ pub const App = struct {
                 // persists — there is no such store column).
                 const added = slot.results.items.len - offset;
                 self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added);
+                // A short page (incl. the server's ~500 ceiling) means no more —
+                // stops the load-more prefetch and flips the footer to "all loaded".
+                slot.exhausted = added < source_mod.popular_page_size;
                 // Reset the grid cursor on a fresh load of the visible window.
                 if (is_active and ev.page == 1) {
                     self.discover.cursor = 0;
@@ -2414,6 +2417,23 @@ pub const App = struct {
             self.discover.cursor = 0;
         } else if (key.matches('G', .{ .shift = true }) or key.matches('G', .{})) {
             self.discover.cursor = len - 1;
+        }
+        // Prefetch the next page once the cursor nears the grid's end (ROD-239).
+        self.maybePrefetchDiscover(loop, io, provider);
+    }
+
+    /// Fire the next Popular page when the grid cursor comes within ~2 card-rows of
+    /// the end, unless the window is exhausted, already loading, or unfetched. The
+    /// page-> 1 tick arm appends (not clears) for page > 1, so the grid grows
+    /// in place; a short page sets `exhausted` and stops this (ROD-239 load-more).
+    fn maybePrefetchDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const slot = self.discover.activeSlot();
+        if (slot.loading or slot.exhausted or slot.page == 0) return;
+        const len = slot.results.items.len;
+        if (len == 0) return;
+        const cols: usize = discover_view.gridCols(self.term_cols);
+        if (self.discover.cursor + cols * 2 >= len) {
+            self.firePopular(loop, io, provider, self.discover.window, slot.page + 1);
         }
     }
 

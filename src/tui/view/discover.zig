@@ -180,4 +180,18 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         drawCard(self, scratch, win, x, y, geo, vis, i, results[i], i == self.discover.cursor);
         vis += 1;
     }
+
+    // Load-more footer, on the row just below the last card slot (no overlap).
+    // "loading more…" while the next page is in flight (results already on screen,
+    // so it's a page-N fetch, not the initial spinner); "all entries loaded" once
+    // the feed is exhausted and the last card is actually in view (ROD-239).
+    const footer_y: u16 = grid_top + geo.rows_visible * geo.slot_h;
+    if (footer_y < top + visible) {
+        if (slot.loading) {
+            const msg = std.fmt.bufPrint(&scratch.msg, "{s} loading more\u{2026}", .{self.spinnerChar()}) catch "loading more\u{2026}";
+            centerText(win, footer_y, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
+        } else if (slot.exhausted and (results.len - 1) / geo.cols < self.discover.scroll + geo.rows_visible) {
+            centerText(win, footer_y, w, "all entries loaded", self.s(self.palette.fg3, .{ .italic = true }));
+        }
+    }
 }

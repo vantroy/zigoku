@@ -42,6 +42,10 @@ pub const Slot = struct {
     /// cleared on the next successful page. A retry sets `loading`, which the view
     /// shows ahead of this.
     failed: bool = false,
+    /// Whether the feed has no more pages — set when a page comes back short
+    /// (< popular_page_size, the server's ~500 ceiling included). Stops the
+    /// load-more prefetch and flips the footer to "all entries loaded".
+    exhausted: bool = false,
 };
 
 /// The Popular-feed controller (ROD-239).
@@ -94,6 +98,7 @@ pub const DiscoverState = struct {
         slot.results.clearRetainingCapacity();
         slot.page = 0;
         slot.fetched_at = 0;
+        slot.exhausted = false;
     }
 
     /// Mirror a window slot's [offset, offset+count) rows into the store as hidden
