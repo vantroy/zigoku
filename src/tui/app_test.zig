@@ -3989,21 +3989,22 @@ test "halfBlockFit: degenerate inputs clamp to the grid" {
     try testing.expectEqual(@as(u32, 30), fit.h);
 }
 
-test "ROD-236: drainTtyResponses empties pending bytes and leaves the fd non-blocking" {
+test "ROD-238: drainTtyResponses sweeps buffered bytes and leaves the fd non-blocking" {
     var fds: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&fds) != 0) return error.SkipZigTest;
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
 
-    // Stand in for a buffered Kitty graphics ack the reader thread never read.
+    // Stand in for a stray terminal response left in the tty queue at quit.
     const msg = "\x1b_Gi=1;OK\x1b\\";
     _ = std.c.write(fds[1], msg, msg.len);
 
     app_mod.drainTtyResponses(fds[0]);
 
-    // Drained: the queue is empty. The drain left the read end non-blocking, so a
+    // Swept: the buffer is empty. The drain left the read end non-blocking, so a
     // further read reports WouldBlock instead of hanging (write end still open) —
-    // this also proves the drain can never wedge the quit path on an empty fd.
+    // this also proves the drain returns at once on an empty fd (the q=2 norm)
+    // and can never wedge the quit path.
     var buf: [32]u8 = undefined;
     try testing.expectError(error.WouldBlock, std.posix.read(fds[0], &buf));
 }
