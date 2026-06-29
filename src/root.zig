@@ -100,5 +100,6 @@ test {
     _ = log;
     _ = tui;
     _ = @import("tui/app_test.zig");
+    _ = @import("tui/discover_covers.zig");
     _ = @import("providers/allanime.zig");
 }

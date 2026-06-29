@@ -7,6 +7,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
+const cover_render = @import("../cover_render.zig");
 const domain = @import("../../domain.zig");
 const store_mod = @import("../../store.zig");
 
@@ -69,100 +70,16 @@ fn drawFallbackCover(self: *const App, cover_win: vaxis.Window) void {
     }
 }
 
-/// Sample one half-pixel of the letterboxed cover. `(gx, gy)` is a half-pixel
-/// grid coordinate (grid is `cols` wide × `rows*2` tall); cells outside the
-/// fitted image region return `bg_base` so the letterbox matte matches the pane
-/// (ROD-164 / DESIGN.md §8 footprint fill).
-fn sampleHalfBlock(
-    self: *const App,
-    px: anytype,
-    gx: u32,
-    gy: u32,
-    off_x: u32,
-    off_y: u32,
-    fit_w: u32,
-    fit_h: u32,
-) vaxis.Color {
-    if (gx < off_x or gy < off_y) return self.palette.bg_base;
-    const fx = gx - off_x;
-    const fy = gy - off_y;
-    if (fx >= fit_w or fy >= fit_h) return self.palette.bg_base;
-    const sx = @min(px.w - 1, fx * px.w / fit_w);
-    const sy = @min(px.h - 1, fy * px.h / fit_h);
-    const idx = (@as(usize, sy) * px.w + sx) * 4;
-    return .{ .rgb = .{ px.rgba[idx], px.rgba[idx + 1], px.rgba[idx + 2] } };
-}
-
-/// Render decoded cover pixels as a half-block mosaic: each cell packs two
-/// vertically-stacked samples via `▀` (upper half = fg, lower half = bg),
-/// doubling vertical resolution over a flat fill. The image is letterboxed
-/// into the cell grid via `halfBlockFit` (aspect-correct using the terminal's
-/// reported cell pixel metrics) so posters stay poster-shaped on non-Kitty
-/// terminals regardless of cell aspect ratio.
+/// Render the single cover's decoded pixels as a half-block mosaic (ROD-243: the
+/// sampler now lives in `cover_render`, shared with the Discover grid). `bg_base`
+/// is the letterbox matte so the fit-fill matches the pane (ROD-164 §8).
 fn drawHalfBlockCover(self: *const App, cover_win: vaxis.Window) void {
     const px = self.cover.pixels orelse return;
-    const cols = cover_win.width;
-    const rows = cover_win.height;
-    if (cols == 0 or rows == 0 or px.w == 0 or px.h == 0) return;
-
-    const grid_w: u32 = cols;
-    const grid_h: u32 = @as(u32, rows) * 2;
-
-    // Terminal pixels per cell, if reported — lets halfBlockFit correct for
-    // non-2:1 cells (e.g. gnome-terminal 8x18) instead of squishing posters.
-    // 0/0 → square-half-pixel assumption inside halfBlockFit.
-    const sw = cover_win.screen.width;
-    const sh = cover_win.screen.height;
-    const ppc: u32 = if (sw != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.width_pix), sw) catch 0) else 0;
-    const pph: u32 = if (sh != 0) (std.math.divCeil(u32, @intCast(cover_win.screen.height_pix), sh) catch 0) else 0;
-
-    const fit = app_mod.CoverState.halfBlockFit(px.w, px.h, grid_w, grid_h, ppc, pph);
-
-    var ry: u16 = 0;
-    while (ry < rows) : (ry += 1) {
-        const top_y = @as(u32, ry) * 2;
-        var cx: u16 = 0;
-        while (cx < cols) : (cx += 1) {
-            const top = sampleHalfBlock(self, px, cx, top_y, fit.off_x, fit.off_y, fit.w, fit.h);
-            const bot = sampleHalfBlock(self, px, cx, top_y + 1, fit.off_x, fit.off_y, fit.w, fit.h);
-            put(cover_win, ry, cx, "▀", .{ .fg = top, .bg = bot });
-        }
-    }
+    cover_render.drawHalfBlock(cover_win, .{ .rgba = px.rgba, .w = px.w, .h = px.h }, self.palette.bg_base);
 }
 
 fn drawKittyCover(self: *const App, img: vaxis.Image, cover_win: vaxis.Window) void {
-    const cols = cover_win.screen.width;
-    const rows = cover_win.screen.height;
-    if (cols == 0 or rows == 0 or cover_win.width == 0 or cover_win.height == 0) return;
-
-    const pix_per_col = std.math.divCeil(usize, cover_win.screen.width_pix, cols) catch return;
-    const pix_per_row = std.math.divCeil(usize, cover_win.screen.height_pix, rows) catch return;
-    const slot_w = pix_per_col * cover_win.width;
-    const slot_h = pix_per_row * cover_win.height;
-    if (slot_w == 0 or slot_h == 0) return;
-
-    const img_w = @as(usize, img.width);
-    const img_h = @as(usize, img.height);
-    if (img_w == 0 or img_h == 0) return;
-
-    var draw_cols: u16 = cover_win.width;
-    var draw_rows: u16 = cover_win.height;
-
-    if (img_w * slot_h > img_h * slot_w) {
-        const fit_h_px = @max(@as(usize, 1), (img_h * slot_w) / img_w);
-        draw_rows = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.height), fit_h_px / pix_per_row)));
-    } else if (img_w * slot_h < img_h * slot_w) {
-        const fit_w_px = @max(@as(usize, 1), (img_w * slot_h) / img_h);
-        draw_cols = @intCast(@max(@as(usize, 1), @min(@as(usize, cover_win.width), fit_w_px / pix_per_col)));
-    }
-
-    const draw_win = cover_win.child(.{
-        .x_off = @intCast((cover_win.width - draw_cols) / 2),
-        .y_off = @intCast((cover_win.height - draw_rows) / 2),
-        .width = draw_cols,
-        .height = draw_rows,
-    });
-    img.draw(draw_win, .{ .scale = .fit }) catch drawFallbackCover(self, cover_win);
+    if (!cover_render.drawKittyFit(img, cover_win)) drawFallbackCover(self, cover_win);
 }
 
 fn coverSlotHeight(win: vaxis.Window, cover_w: u16, max_h: u16) u16 {

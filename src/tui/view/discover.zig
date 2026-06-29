@@ -10,6 +10,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("../app.zig");
 const render = @import("../render.zig");
+const cover_render = @import("../cover_render.zig");
 
 const App = app_mod.App;
 const RenderScratch = app_mod.RenderScratch;
@@ -98,31 +99,32 @@ fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
 /// title, and view-count metadata rows. `vis` indexes the per-frame scratch slots
 /// (the formatted rank/views must outlive vx.render — RenderScratch contract).
 fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16, y: u16, geo: Geometry, vis: usize, idx: usize, a: Anime, selected: bool) void {
-    const bg = self.palette.bg_surface;
-    // Placeholder cover (graceful no-art, ROD-239): bg.surface fill, rank centered
-    // in text.dim. Covers replace this in ROD-243.
-    fillRect(win, x, y, geo.cover_w, geo.cover_h, bg);
-
     // Rank string — reused for the in-cell placeholder and the metadata row.
     const rank: []const u8 = if (vis < scratch.score.len)
         (std.fmt.bufPrint(&scratch.score[vis], "#{d}", .{idx + 1}) catch "#")
     else
         "#";
     const rank_w: u16 = @intCast(rank.len);
-    put(win, y + geo.cover_h / 2, x + (geo.cover_w -| rank_w) / 2, rank, self.s(self.palette.fg3, .{ .bg = bg }));
 
-    // Selection affordance: ▸ at the cover's bottom-left (no box, no row band).
-    if (selected) put(win, y + geo.cover_h -| 1, x, "▸", self.s(self.palette.focus, .{ .bg = bg }));
+    // Cover cell: real art (Kitty image, or a half-block mosaic on non-Kitty
+    // terminals) once the slot has it; else the graceful rank placeholder (ROD-243).
+    drawCoverCell(self, win, x, y, geo, rank, rank_w, a);
 
     // Metadata rows under the cover. TOP/NEW are DERIVED render-side (not in the
     // payload, ROD-239): TOP on rank #1 (state.now+bold), NEW on a current-cour
     // release (state.focus+bold). At most one shows.
     const rank_y = y + geo.cover_h;
+    // Selection marker (ROD-243): on the rank row (never the cover art, so it can't
+    // mask a Kitty image), in the left gutter at x-1 so the rank, badge, and title
+    // stay column-anchored at x whether or not the card is selected. x >= 2 (the
+    // §3.7 left margin / inter-card gap) so x-1 >= 1 is always a safe empty cell.
+    if (selected) put(win, rank_y, x - 1, "▸", self.s(self.palette.focus, .{}));
     put(win, rank_y, x, rank, self.s(self.palette.fg, .{}));
+    const badge_x = x + rank_w + 1;
     if (idx == 0) {
-        put(win, rank_y, x + rank_w + 1, "TOP", self.s(self.palette.hot, .{ .bold = true }));
+        put(win, rank_y, badge_x, "TOP", self.s(self.palette.hot, .{ .bold = true }));
     } else if (self.isNewRelease(a)) {
-        put(win, rank_y, x + rank_w + 1, "NEW", self.s(self.palette.focus, .{ .bold = true }));
+        put(win, rank_y, badge_x, "NEW", self.s(self.palette.focus, .{ .bold = true }));
     }
 
     const title_sty = if (selected)
@@ -137,6 +139,33 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
     } else {
         put(win, rank_y + 2, x, "—", self.s(self.palette.fg3, .{}));
     }
+}
+
+/// Draw the card's cover cell: the slot's transmitted Kitty image (fitted), else a
+/// half-block mosaic when pixels exist without Kitty graphics, else the graceful
+/// `bg.surface` + centered `#N` placeholder for loading / no-art cards (ROD-243).
+fn drawCoverCell(self: *const App, win: vaxis.Window, x: u16, y: u16, geo: Geometry, rank: []const u8, rank_w: u16, a: Anime) void {
+    if (a.thumb) |thumb| {
+        if (self.discover_covers.getConst(thumb)) |slot| {
+            if (slot.image) |img| {
+                const cover_win = win.child(.{ .x_off = @intCast(x), .y_off = @intCast(y), .width = geo.cover_w, .height = geo.cover_h });
+                // §8 matte: bg_base so the fit-letterbox matches the canvas, not the
+                // placeholder panel.
+                cover_win.fill(.{ .style = .{ .bg = self.palette.bg_base } });
+                if (cover_render.drawKittyFit(img, cover_win)) return;
+                // placement faulted → fall through to the placeholder
+            } else if (slot.pixels) |px| {
+                const cover_win = win.child(.{ .x_off = @intCast(x), .y_off = @intCast(y), .width = geo.cover_w, .height = geo.cover_h });
+                cover_win.fill(.{ .style = .{ .bg = self.palette.bg_base } });
+                cover_render.drawHalfBlock(cover_win, .{ .rgba = px.rgba, .w = px.w, .h = px.h }, self.palette.bg_base);
+                return;
+            }
+        }
+    }
+    // Graceful placeholder (ROD-239): bg.surface fill, rank centered in text.dim.
+    const bg = self.palette.bg_surface;
+    fillRect(win, x, y, geo.cover_w, geo.cover_h, bg);
+    put(win, y + geo.cover_h / 2, x + (geo.cover_w -| rank_w) / 2, rank, self.s(self.palette.fg3, .{ .bg = bg }));
 }
 
 /// Full-canvas Discover pass. `top` is the first content row; `visible` the

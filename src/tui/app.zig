@@ -36,6 +36,7 @@ const browse = @import("view/browse.zig");
 const detail = @import("view/detail.zig");
 const settings = @import("view/settings.zig");
 const discover_view = @import("view/discover.zig");
+const discover_covers_mod = @import("discover_covers.zig");
 
 const Allocator = std.mem.Allocator;
 const AnimeRecord = store_mod.AnimeRecord;
@@ -101,6 +102,7 @@ pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 /// resolving.
 pub const SearchController = @import("search_state.zig").SearchController;
 pub const DiscoverState = @import("discover_state.zig").DiscoverState;
+pub const DiscoverCovers = @import("discover_covers.zig").DiscoverCovers;
 
 /// Run the TUI to completion. `store` is optional and best-effort, exactly like
 /// the CLI path: a DB hiccup means "no history," never a refusal to run.
@@ -239,6 +241,10 @@ pub fn run(
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
     defer app.cover.joinThread();
+    // Discover-grid cover worker: same contract (ROD-243). The quit `_exit` path
+    // skips this defer and abandons the worker (the global Kitty clear drops its
+    // images, nothing is freed); this join covers the error-unwind/test paths.
+    defer if (app.discover_cover_thread) |t| t.join();
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -323,6 +329,9 @@ pub fn run(
         // (ROD-155). run() owns geometry, so it feeds the terminal size in.
         const win = vx.window();
         app.layout(win.height, win.width);
+        // ROD-243: fetch the visible grid's covers off-thread once scroll is settled
+        // (geometry known). No-op outside Discover / when nothing's missing.
+        app.pumpDiscoverCovers(&loop, io);
         try app.draw(&vx, writer);
     }
 
@@ -630,6 +639,15 @@ pub const App = struct {
     /// Bounded to 1 and joined on teardown, same contract as popular_thread.
     discover_enrich_thread: ?std.Thread = null,
 
+    /// Serialized Discover-grid cover worker (ROD-243): one batch in flight at a
+    /// time. `pump` reaps this handle once `discover_cover_active` clears, then
+    /// respawns for the next batch of missing covers; the join is non-blocking
+    /// (the flag guarantees the worker already exited). Joined on teardown too.
+    discover_cover_thread: ?std.Thread = null,
+    /// True while a grid-cover batch runs; lets `pump` skip respawning without a
+    /// blocking join, and is cleared by the worker as its last action.
+    discover_cover_active: std.atomic.Value(bool) = .init(false),
+
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
 
@@ -647,6 +665,15 @@ pub const App = struct {
     /// Cover/image subsystem — fetch policy, decoded-pixel + Kitty-image state,
     /// and the cover worker-thread lifecycle. See `CoverState` (ROD-160).
     cover: CoverState = .{},
+    /// Shared, mutex-guarded cover caches (raw + decoded LRU). App-owned so both the
+    /// single-cover path and the Discover grid fetch against the same URL-keyed
+    /// caches under one lock (ROD-243). Freed in `deinitOwnedState` after the cover
+    /// workers join.
+    cover_caches: workers.CoverCaches = .{},
+    /// Discover-grid multi-cover pool (ROD-243): URL-keyed slots, each owning its
+    /// decoded pixels + Kitty image. Shares `cover_caches`; driven by `pump` and the
+    /// `.discover_cover_*` handlers. Freed in `deinitOwnedState` after the workers join.
+    discover_covers: DiscoverCovers = .{},
     /// Handle for the most recent play thread. Joined before a new spawn.
     play_thread: ?std.Thread = null,
     /// Whether mpv is running (play thread in-flight).
@@ -725,6 +752,10 @@ pub const App = struct {
     /// real geometry so onKey/tick can gate split-browse and wide-history
     /// behaviour without being passed the winsize event.
     term_cols: u16 = 0,
+    /// Last-seen terminal height (rows). Seeded in layout() alongside term_cols so
+    /// the Discover cover `pump` (run from run(), not layout) can resolve the grid
+    /// geometry from the last settled frame (ROD-243).
+    term_rows: u16 = 0,
     /// Last tick timestamp (ms). Updated on every .tick event; used by draw functions.
     now_ms: i64 = 0,
     /// Toast queue (oldest first). null = empty slot.
@@ -837,7 +868,8 @@ pub const App = struct {
         self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
-        self.cover.deinitCaches(self.gpa);
+        self.discover_covers.freeAll(self.gpa, vx, writer);
+        self.cover_caches.deinit(self.gpa);
         if (self.undo) |u| {
             u.free(self.gpa);
             self.undo = null;
@@ -1240,6 +1272,7 @@ pub const App = struct {
             self.gpa,
             loop,
             io,
+            &self.cover_caches,
             self.now_ms,
             if (anime) |a| a.id else null,
             if (anime) |a| a.thumb else null,
@@ -1820,6 +1853,22 @@ pub const App = struct {
                 self.cover.clear(self.gpa);
                 std.log.debug("cover fetch/decode failed for {s}", .{for_id});
             },
+            .discover_cover_done => |ev| {
+                // Covers are URL-keyed and window-agnostic, so this is always a valid
+                // cover for ev.url — adopt it into the slot (recreated if it was
+                // evicted mid-flight). acceptPixels takes ownership of ev.rgba,
+                // freeing it only if no slot can hold it (OOM). The url is borrowed
+                // (the slot dupes its own key) and freed here.
+                defer self.gpa.free(ev.url);
+                self.discover_covers.acceptPixels(self.gpa, ev.url, ev.rgba, ev.width, ev.height);
+            },
+            .discover_cover_error => |url| {
+                // Record the per-url cooldown so pump won't hammer a transient miss,
+                // then free the url. No async_start_ms / spinner: the rank placeholder
+                // is the per-card loading affordance, not a blocking wait.
+                defer self.gpa.free(url);
+                self.discover_covers.noteFailure(self.gpa, url, self.now_ms);
+            },
             .position_update => |ev| {
                 self.current_position = ev.time_pos;
                 self.current_duration = ev.duration;
@@ -1978,6 +2027,184 @@ pub const App = struct {
             freeOwnedAnime(self.gpa, copy);
             return;
         };
+    }
+
+    /// Pool cap for Discover-grid covers (ROD-243): retain roughly two large-tier
+    /// grid pages of recently-seen *off-screen* covers so scrolling back stays
+    /// instant without unbounded memory. On-screen and in-flight slots are never
+    /// evicted, so the live footprint is (visible set + this). ROD-241 makes it a
+    /// configurable knob.
+    const discover_cover_cap = 30;
+    /// Upper bound on visible+prefetch cards a single pump considers — far above any
+    /// real grid (a 200×60 terminal is ~54) — so the on-stack planner buffers are
+    /// fixed-size. Past this the tail cards keep their placeholder until `scroll`
+    /// brings them within the first `max_pump_urls`; only reachable on absurd
+    /// geometries, never in practice (ROD-243 review).
+    const max_pump_urls = 128;
+
+    /// Fetch the covers for the visible Discover cards + one prefetch row, then evict
+    /// off-screen slots back to the pool cap (ROD-243). Runs on the UI thread from
+    /// run(), right after `layout` settles `scroll`, so the grid geometry is known.
+    /// One serialized worker at a time: if a batch is in flight we skip — its results
+    /// land and the next pump picks up whatever is still missing. Covers pop in
+    /// progressively (bounded parallelism is ROD-240). No-op outside Discover and
+    /// under test (the spawn is gated like `cover.sync`).
+    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io) void {
+        if (self.active_view != .discover) return;
+        // A batch is still running — let it finish; never stack a second worker.
+        if (self.discover_cover_active.load(.acquire)) return;
+        // Batch done (flag cleared) → reap the finished handle (join returns at once).
+        if (self.discover_cover_thread) |t| {
+            t.join();
+            self.discover_cover_thread = null;
+        }
+
+        const w = self.term_cols;
+        const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
+        const geo = discover_view.geometry(w, visible);
+        if (geo.cols == 0 or geo.rows_visible == 0) return;
+
+        const items = self.discover.activeSlot().results.items;
+        if (items.len == 0) return;
+
+        // Visible card range + one prefetch row (ROD-243 scope: no full-feed sweep).
+        const start = self.discover.scroll * geo.cols;
+        const span = (@as(usize, geo.rows_visible) + 1) * @as(usize, geo.cols);
+        const end = @min(items.len, start + span);
+        if (start >= end) return;
+
+        self.discover_covers.frame +%= 1;
+        const frame = self.discover_covers.frame;
+
+        // Build the planner inputs over the visible cover URLs (skip cards with no
+        // thumb), stamping each present slot's recency for eviction. URLs are
+        // borrowed from the slot's results — valid for this synchronous pump.
+        var urls: [max_pump_urls][]const u8 = undefined;
+        var has_pixels: [max_pump_urls]bool = undefined;
+        var inflight: [max_pump_urls]bool = undefined;
+        var failed_at: [max_pump_urls]i64 = undefined;
+        var n: usize = 0;
+        var i = start;
+        while (i < end and n < max_pump_urls) : (i += 1) {
+            const thumb = items[i].thumb orelse continue;
+            if (self.discover_covers.get(thumb)) |slot| {
+                slot.last_seen_frame = frame;
+                has_pixels[n] = slot.pixels != null;
+                inflight[n] = slot.status == .loading;
+                failed_at[n] = slot.failed_at_ms;
+            } else {
+                has_pixels[n] = false;
+                inflight[n] = false;
+                failed_at[n] = 0;
+            }
+            urls[n] = thumb;
+            n += 1;
+        }
+
+        // Evict off-screen slots back to cap now that visible recency is stamped.
+        self.evictDiscoverCovers(urls[0..n]);
+
+        if (n == 0) return;
+
+        // Pure plan: which visible URLs need a fetch (missing, not in flight, not
+        // inside the failure cooldown).
+        const plan: discover_covers_mod.FetchPlan = .{
+            .has_pixels = has_pixels[0..n],
+            .inflight = inflight[0..n],
+            .failed_at = failed_at[0..n],
+            .now_ms = self.now_ms,
+        };
+        var chosen: [max_pump_urls]usize = undefined;
+        const m = plan.eval(chosen[0..n]);
+        if (m == 0) return;
+
+        // Snapshot the chosen URLs (gpa-owned) for the worker to consume + free.
+        const batch = self.gpa.alloc([]const u8, m) catch return;
+        var filled: usize = 0;
+        for (chosen[0..m]) |ci| {
+            const dup = self.gpa.dupe(u8, urls[ci]) catch {
+                for (batch[0..filled]) |u| self.gpa.free(u);
+                self.gpa.free(batch);
+                return;
+            };
+            batch[filled] = dup;
+            filled += 1;
+        }
+
+        // Mark the chosen slots in-flight from the BORROWED `urls` (stable for this
+        // synchronous pump) — NEVER from `batch`. The worker owns `batch` the instant
+        // it spawns and frees it (`defer gpa.free(urls)`); a cache-hit batch resolves
+        // in microseconds, so iterating `batch` here would race that free → a
+        // use-after-free on the hot path (ROD-243 review). Done before the spawn so
+        // the in-test path exercises it too; the spawn-failure catch below resets
+        // these slots — a stranded `.loading` slot is eviction-protected AND skipped
+        // by the planner, so it would never recover on its own.
+        for (chosen[0..m]) |ci| self.discover_covers.markLoading(self.gpa, urls[ci]);
+
+        // No real worker under test — the spawn is the only threaded line; the
+        // build + mark above is what tests exercise. Free the snapshot and return.
+        if (builtin.is_test) {
+            for (batch) |u| self.gpa.free(u);
+            self.gpa.free(batch);
+            return;
+        }
+
+        self.discover_cover_active.store(true, .release);
+        self.discover_cover_thread = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
+            loop, self.gpa, io, batch, &self.cover_caches, &self.discover_cover_active,
+        }) catch {
+            self.discover_cover_active.store(false, .release);
+            // No worker will resolve these — reset the slots we just marked so the
+            // next pump retries (a stranded `.loading` slot never recovers, ROD-243
+            // re-review). Reset by URL value; markLoading retained no borrow.
+            for (chosen[0..m]) |ci| {
+                if (self.discover_covers.get(urls[ci])) |slot| {
+                    if (slot.status == .loading) slot.status = .idle;
+                }
+            }
+            for (batch) |u| self.gpa.free(u);
+            self.gpa.free(batch);
+            return;
+        };
+    }
+
+    /// Evict the off-screen Discover cover slots overflowing the pool cap, dropping
+    /// the least-recently-visible first and never a currently-visible or in-flight
+    /// slot (ROD-243). `visible_urls` are the cards in view this frame.
+    fn evictDiscoverCovers(self: *App, visible_urls: []const []const u8) void {
+        const slots = self.discover_covers.slots.items;
+        if (slots.len <= discover_cover_cap) return;
+        const max_slots = 256;
+        // The pool is `cap` + at most one grid's fresh slots, well under 256. Assert
+        // in debug so a future tuning regression (ROD-241) is loud, but keep the
+        // release-safe clamp — the fixed buffers below are sized to `max_slots`.
+        std.debug.assert(slots.len <= max_slots);
+        if (slots.len > max_slots) return;
+
+        var last_seen: [max_slots]u64 = undefined;
+        var vis: [max_slots]bool = undefined;
+        for (slots, 0..) |*slot, i| {
+            last_seen[i] = slot.last_seen_frame;
+            // Protect on-screen and in-flight slots from eviction.
+            vis[i] = slot.status == .loading or containsUrl(visible_urls, slot.url);
+        }
+        var out: [max_slots]usize = undefined;
+        const k = discover_covers_mod.planEvictions(last_seen[0..slots.len], vis[0..slots.len], discover_cover_cap, out[0..slots.len]);
+        if (k == 0) return;
+
+        // Capture the urls to evict before mutating the pool: swapRemove moves slot
+        // structs but not their key allocations, so these slices stay valid until
+        // each is freed by its own evict().
+        var ev_urls: [max_slots][]const u8 = undefined;
+        for (out[0..k], 0..) |idx, j| ev_urls[j] = slots[idx].url;
+        for (ev_urls[0..k]) |u| self.discover_covers.evict(self.gpa, u);
+    }
+
+    fn containsUrl(urls: []const []const u8, url: []const u8) bool {
+        for (urls) |u| {
+            if (std.mem.eql(u8, u, url)) return true;
+        }
+        return false;
     }
 
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
@@ -2931,6 +3158,12 @@ pub const App = struct {
     // ── draw: pure render from state ─────────────────────────────────────────
     fn draw(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
         self.cover.flushPendingFree(vx, writer);
+        // ROD-243: the grid covers' image lifecycle needs vx+writer on the UI thread,
+        // so it runs here (the const view pass only reads slot.image and places it).
+        // Release evicted/superseded grid images, then transmit any newly-decoded
+        // covers while Discover is showing.
+        self.discover_covers.flushPendingFrees(vx, writer);
+        if (self.active_view == .discover) self.discover_covers.ensureImages(self.gpa, vx, writer);
 
         const win = vx.window();
         win.clear();
@@ -3077,6 +3310,7 @@ pub const App = struct {
         // .winsize handler alone would leave term_cols at 0 until the first manual
         // resize — and the prefetch would stay inert until then (ROD-156).
         self.term_cols = w;
+        self.term_rows = h;
         // Match draw()'s too-small guard: below this there's no viewport to settle.
         if (h < 4 or w < 16) return;
         const visible: u16 = h - 3;
