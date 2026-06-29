@@ -147,10 +147,14 @@ pub const AllAnime = struct {
     // The feed envelope is `data.queryPopular.recommendations[]`, each a
     // `{ anyCard, pageStatus }`. `anyCard` is field-for-field a search `SEdge`
     // (plus manga-only extras we ignore), so it parses straight into SEdge and
-    // reuses `edgeToAnime`. `pageStatus.views` carries the live view count — as a
-    // *string* ("660170"); `rangeViews` is the within-window count (unused). The
-    // TOP/NEW badges the site renders are NOT in the payload — they are derived
-    // client-side, so they don't appear here.
+    // reuses `edgeToAnime`. Both view counts arrive as JSON *strings*:
+    //   * `rangeViews` — views WITHIN the selected window; the feed's rank key for
+    //     daily/weekly/monthly. Null for the All-Time window.
+    //   * `views` — total lifetime views; the rank key only for All-Time.
+    // We display the windowed metric (`rangeViews ?? views`) so the number always
+    // matches the card order — total views are non-monotonic in a windowed feed
+    // (a show can have more lifetime views yet a lower weekly rank). The TOP/NEW
+    // badges the site renders are NOT in the payload — they're derived client-side.
     const PStatus = struct {
         views: ?[]const u8 = null,
         rangeViews: ?[]const u8 = null,
@@ -312,7 +316,9 @@ pub const AllAnime = struct {
         for (pop.recommendations) |rec| {
             const card = rec.anyCard orelse continue; // drop a malformed entry, keep the page
             var a = edgeToAnime(card);
-            a.view_count = parseViews(rec.pageStatus.views);
+            // Windowed count first (matches the rank); fall back to total views for
+            // the All-Time window, where rangeViews is null.
+            a.view_count = parseViews(rec.pageStatus.rangeViews) orelse parseViews(rec.pageStatus.views);
             try list.append(arena, a);
         }
         // NO re-sort: the server returns the page already in popularity rank, and
@@ -1201,40 +1207,48 @@ test "edgeToAnime: maps the widened search edge (ROD-181)" {
     try std.testing.expectEqual(@as(?domain.Season, null), f2.season); // bare _id → no season
 }
 
-test "popular: parses queryPopular feed, reuses edge mapping + view counts (ROD-239)" {
+/// Mirror `popular()`'s per-card view-count rule so the test asserts the shipped
+/// behaviour: windowed `rangeViews` first, then total `views`.
+fn fixtureViewCount(ps: AllAnime.PStatus) ?u64 {
+    return AllAnime.parseViews(ps.rangeViews) orelse AllAnime.parseViews(ps.views);
+}
+
+test "popular: parses queryPopular feed, reuses edge mapping + windowed view counts (ROD-239)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // Trimmed live capture. Rec 0: full card + pageStatus.views (string). Rec 1:
-    // a bare card with a pageStatus that omits views — exercises the null path.
+    // Trimmed live capture. Rec 0: windowed entry — both views + rangeViews, so
+    // the windowed count wins. Rec 1: All-Time-style — total views, rangeViews
+    // absent, so it falls back to views. Rec 2: a bare card with neither → null.
     // Manga-only extras (availableChapters/lastEpisodeDate) must be ignored.
     const json =
         \\{"data":{"queryPopular":{"total":500,"recommendations":[
         \\{"anyCard":{"_id":"Gcou36nB8su3KWXrr","name":"Tsue to Tsurugi no Wistoria Season 2","englishName":"Wistoria: Wand and Sword Season 2","nativeName":"杖と剣のウィストリア Season 2","thumbnail":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182300-IYkq5KrkQq1V.jpg","airedStart":{"year":2026,"month":3,"date":12},"availableEpisodes":{"sub":13,"dub":9,"raw":0},"score":8.23,"lastEpisodeDate":{"sub":{}},"availableChapters":null},"pageStatus":{"_id":"670c","views":"660170","rangeViews":"12177","showId":"Gcou36nB8su3KWXrr"}},
-        \\{"anyCard":{"_id":"x2","name":"No Views Show","availableEpisodes":{"sub":1,"dub":0}},"pageStatus":{"showId":"x2"}}
+        \\{"anyCard":{"_id":"x2","name":"All-Time Show","availableEpisodes":{"sub":24,"dub":24}},"pageStatus":{"views":"2668088","rangeViews":null,"showId":"x2"}},
+        \\{"anyCard":{"_id":"x3","name":"No Views Show","availableEpisodes":{"sub":1,"dub":0}},"pageStatus":{"showId":"x3"}}
         \\]}}}
     ;
     const parsed = try std.json.parseFromSlice(AllAnime.PResp, a, json, .{ .ignore_unknown_fields = true });
     const pop = parsed.value.data.?.queryPopular.?;
     try std.testing.expectEqual(@as(u32, 500), pop.total);
-    try std.testing.expectEqual(@as(usize, 2), pop.recommendations.len);
+    try std.testing.expectEqual(@as(usize, 3), pop.recommendations.len);
 
     // Rec 0: anyCard maps through edgeToAnime (id/title/thumb-mined anilist id /
-    // eps), and pageStatus.views parses from its string to u64.
+    // eps); the windowed rangeViews (12177) wins over total views (660170).
     var r0 = AllAnime.edgeToAnime(pop.recommendations[0].anyCard.?);
-    r0.view_count = AllAnime.parseViews(pop.recommendations[0].pageStatus.views);
+    r0.view_count = fixtureViewCount(pop.recommendations[0].pageStatus);
     try std.testing.expectEqualStrings("Gcou36nB8su3KWXrr", r0.id);
     try std.testing.expectEqualStrings("Tsue to Tsurugi no Wistoria Season 2", r0.name);
     try std.testing.expectEqual(@as(?u64, 182300), r0.anilist_id); // mined from the AniList thumb
     try std.testing.expectEqual(@as(u32, 13), r0.eps_sub);
-    try std.testing.expectEqual(@as(?u64, 660170), r0.view_count);
+    try std.testing.expectEqual(@as(?u64, 12177), r0.view_count); // windowed, not lifetime
 
-    // Rec 1: pageStatus without `views` → null (card shows "—"); bare card maps.
-    var r1 = AllAnime.edgeToAnime(pop.recommendations[1].anyCard.?);
-    r1.view_count = AllAnime.parseViews(pop.recommendations[1].pageStatus.views);
-    try std.testing.expectEqualStrings("No Views Show", r1.name);
-    try std.testing.expectEqual(@as(?u64, null), r1.view_count);
+    // Rec 1: rangeViews null (All-Time) → falls back to total views.
+    try std.testing.expectEqual(@as(?u64, 2668088), fixtureViewCount(pop.recommendations[1].pageStatus));
+
+    // Rec 2: neither count present → null (card shows "—").
+    try std.testing.expectEqual(@as(?u64, null), fixtureViewCount(pop.recommendations[2].pageStatus));
 }
 
 test "windowDateRange: maps popularity windows to AllAnime dateRange (ROD-239)" {
