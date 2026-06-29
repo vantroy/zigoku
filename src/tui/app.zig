@@ -2037,7 +2037,9 @@ pub const App = struct {
     const discover_cover_cap = 30;
     /// Upper bound on visible+prefetch cards a single pump considers — far above any
     /// real grid (a 200×60 terminal is ~54) — so the on-stack planner buffers are
-    /// fixed-size. Beyond this, extra cards just wait for the next pump.
+    /// fixed-size. Past this the tail cards keep their placeholder until `scroll`
+    /// brings them within the first `max_pump_urls`; only reachable on absurd
+    /// geometries, never in practice (ROD-243 review).
     const max_pump_urls = 128;
 
     /// Fetch the covers for the visible Discover cards + one prefetch row, then evict
@@ -2047,7 +2049,7 @@ pub const App = struct {
     /// land and the next pump picks up whatever is still missing. Covers pop in
     /// progressively (bounded parallelism is ROD-240). No-op outside Discover and
     /// under test (the spawn is gated like `cover.sync`).
-    fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io) void {
+    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io) void {
         if (self.active_view != .discover) return;
         // A batch is still running — let it finish; never stack a second worker.
         if (self.discover_cover_active.load(.acquire)) return;
@@ -2115,7 +2117,6 @@ pub const App = struct {
         var chosen: [max_pump_urls]usize = undefined;
         const m = plan.eval(chosen[0..n]);
         if (m == 0) return;
-        if (builtin.is_test) return; // decision logic is unit-tested; no thread in tests
 
         // Snapshot the chosen URLs (gpa-owned) for the worker to consume + free.
         const batch = self.gpa.alloc([]const u8, m) catch return;
@@ -2130,6 +2131,23 @@ pub const App = struct {
             filled += 1;
         }
 
+        // Mark the chosen slots in-flight from the BORROWED `urls` (stable for this
+        // synchronous pump) — NEVER from `batch`. The worker owns `batch` the instant
+        // it spawns and frees it (`defer gpa.free(urls)`); a cache-hit batch resolves
+        // in microseconds, so iterating `batch` here would race that free → a
+        // use-after-free on the hot path (ROD-243 review). Done before the spawn so
+        // the in-test path exercises it too; a (rare) spawn failure leaves the slots
+        // marked, which self-heals when the card scrolls off and re-enters as idle.
+        for (chosen[0..m]) |ci| self.discover_covers.markLoading(self.gpa, urls[ci]);
+
+        // No real worker under test — the spawn is the only threaded line; the
+        // build + mark above is what tests exercise. Free the snapshot and return.
+        if (builtin.is_test) {
+            for (batch) |u| self.gpa.free(u);
+            self.gpa.free(batch);
+            return;
+        }
+
         self.discover_cover_active.store(true, .release);
         self.discover_cover_thread = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
             loop, self.gpa, io, batch, &self.cover_caches, &self.discover_cover_active,
@@ -2139,8 +2157,6 @@ pub const App = struct {
             self.gpa.free(batch);
             return;
         };
-        // Spawn succeeded → mark these slots in-flight so the next pump won't refetch.
-        for (batch) |u| self.discover_covers.markLoading(self.gpa, u);
     }
 
     /// Evict the off-screen Discover cover slots overflowing the pool cap, dropping
@@ -2150,7 +2166,11 @@ pub const App = struct {
         const slots = self.discover_covers.slots.items;
         if (slots.len <= discover_cover_cap) return;
         const max_slots = 256;
-        if (slots.len > max_slots) return; // unreachable in practice (cap + one grid)
+        // The pool is `cap` + at most one grid's fresh slots, well under 256. Assert
+        // in debug so a future tuning regression (ROD-241) is loud, but keep the
+        // release-safe clamp — the fixed buffers below are sized to `max_slots`.
+        std.debug.assert(slots.len <= max_slots);
+        if (slots.len > max_slots) return;
 
         var last_seen: [max_slots]u64 = undefined;
         var vis: [max_slots]bool = undefined;
