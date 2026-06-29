@@ -25,8 +25,7 @@ const CoverState = app_mod.CoverState;
 const CoverDecision = app_mod.CoverState.Decision;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
-const RawCoverCache = workers.RawCoverCache;
-const DecodedCoverCache = workers.DecodedCoverCache;
+const CoverCaches = workers.CoverCaches;
 const max_cover_raw_cache_bytes = workers.max_cover_raw_cache_bytes;
 const max_cover_decoded_cache_bytes = workers.max_cover_decoded_cache_bytes;
 const freeOwnedAnime = workers.freeOwnedAnime;
@@ -2627,13 +2626,11 @@ test "episodes_done stale result is discarded" {
 
 test "coverTask decoded-cache hit posts a cloned cover_done event" {
     var loop = initTestLoop();
-    var raw_cache: RawCoverCache = .{};
-    defer raw_cache.deinit(testing.allocator);
-    var decoded_cache: DecodedCoverCache = .{};
-    defer decoded_cache.deinit(testing.allocator);
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
 
     const decoded = try cover_mod.decodeRgba(testing.allocator, &tiny_png);
-    try testing.expect(try decoded_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", decoded, max_cover_decoded_cache_bytes));
+    try testing.expect(try caches.decoded.putOwnedBounded(testing.allocator, "https://img/anime.png", decoded, max_cover_decoded_cache_bytes));
 
     coverTask(
         &loop,
@@ -2641,8 +2638,7 @@ test "coverTask decoded-cache hit posts a cloned cover_done event" {
         testing.io,
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
-        &raw_cache,
-        &decoded_cache,
+        &caches,
     );
 
     const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
@@ -2652,18 +2648,16 @@ test "coverTask decoded-cache hit posts a cloned cover_done event" {
     try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
     try testing.expectEqual(@as(usize, 4), ev.cover_done.rgba.len);
-    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+    try testing.expect(caches.decoded.get("https://img/anime.png") != null);
 }
 
 test "coverTask raw-cache hit decodes once and warms decoded cache" {
     var loop = initTestLoop();
-    var raw_cache: RawCoverCache = .{};
-    defer raw_cache.deinit(testing.allocator);
-    var decoded_cache: DecodedCoverCache = .{};
-    defer decoded_cache.deinit(testing.allocator);
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
 
     const raw = try testing.allocator.dupe(u8, &tiny_png);
-    try testing.expect(try raw_cache.putOwnedBounded(testing.allocator, "https://img/anime.png", raw, max_cover_raw_cache_bytes));
+    try testing.expect(try caches.raw.putOwnedBounded(testing.allocator, "https://img/anime.png", raw, max_cover_raw_cache_bytes));
 
     coverTask(
         &loop,
@@ -2671,16 +2665,53 @@ test "coverTask raw-cache hit decodes once and warms decoded cache" {
         testing.io,
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
-        &raw_cache,
-        &decoded_cache,
+        &caches,
     );
 
     const ev = (loop.queue.tryPop() catch null) orelse return error.TestUnexpectedResult;
     defer freeTestEvent(testing.allocator, ev);
     try testing.expect(ev == .cover_done);
-    try testing.expect(decoded_cache.get("https://img/anime.png") != null);
+    try testing.expect(caches.decoded.get("https://img/anime.png") != null);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.width);
     try testing.expectEqual(@as(u32, 1), ev.cover_done.height);
+}
+
+test "CoverCaches survives concurrent loadCoverPixels under the lock (ROD-243)" {
+    // Proves the lock contract that makes the grid safe: N worker threads hammering
+    // the shared caches — get() (which promotes, so it mutates), decode, and
+    // putOwnedBounded with eviction (decoded cap 5 < 8 keys) — never corrupt the
+    // LRUs, leak, or double-free. The testing allocator fails the test on any of
+    // those. Every key is pre-seeded into the raw cache (cap 20, none evict), so
+    // every call is a cache hit and no thread touches the network. Without the
+    // copy-under-lock discipline, a concurrent evict-and-free would race the dupe.
+    var caches: CoverCaches = .{};
+    defer caches.deinit(testing.allocator);
+
+    const urls = [_][]const u8{
+        "https://img/a0.png", "https://img/a1.png", "https://img/a2.png", "https://img/a3.png",
+        "https://img/a4.png", "https://img/a5.png", "https://img/a6.png", "https://img/a7.png",
+    };
+    for (urls) |u| {
+        const raw = try testing.allocator.dupe(u8, &tiny_png);
+        try testing.expect(try caches.raw.putOwnedBounded(testing.allocator, u, raw, max_cover_raw_cache_bytes));
+    }
+
+    const Worker = struct {
+        fn run(gpa: std.mem.Allocator, io: std.Io, c: *CoverCaches, keys: []const []const u8, tid: usize) void {
+            var i: usize = 0;
+            while (i < 64) : (i += 1) {
+                // Overlapping, deterministic key stride → contention + eviction churn.
+                const px = workers.loadCoverPixels(gpa, io, keys[(tid * 7 + i) % keys.len], c) catch continue;
+                gpa.free(px.rgba); // independent copy — owned by us, never the cache's
+            }
+        }
+    };
+
+    var threads: [8]?std.Thread = .{null} ** 8;
+    for (&threads, 0..) |*t, tid| {
+        t.* = std.Thread.spawn(.{}, Worker.run, .{ testing.allocator, testing.io, &caches, &urls, tid }) catch null;
+    }
+    for (threads) |t| if (t) |th| th.join();
 }
 
 test "cover_done fresh result stores decoded cover state" {

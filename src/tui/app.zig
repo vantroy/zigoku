@@ -647,6 +647,11 @@ pub const App = struct {
     /// Cover/image subsystem — fetch policy, decoded-pixel + Kitty-image state,
     /// and the cover worker-thread lifecycle. See `CoverState` (ROD-160).
     cover: CoverState = .{},
+    /// Shared, mutex-guarded cover caches (raw + decoded LRU). App-owned so both the
+    /// single-cover path and the Discover grid fetch against the same URL-keyed
+    /// caches under one lock (ROD-243). Freed in `deinitOwnedState` after the cover
+    /// workers join.
+    cover_caches: workers.CoverCaches = .{},
     /// Handle for the most recent play thread. Joined before a new spawn.
     play_thread: ?std.Thread = null,
     /// Whether mpv is running (play thread in-flight).
@@ -837,7 +842,7 @@ pub const App = struct {
         self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
-        self.cover.deinitCaches(self.gpa);
+        self.cover_caches.deinit(self.gpa);
         if (self.undo) |u| {
             u.free(self.gpa);
             self.undo = null;
@@ -1240,6 +1245,7 @@ pub const App = struct {
             self.gpa,
             loop,
             io,
+            &self.cover_caches,
             self.now_ms,
             if (anime) |a| a.id else null,
             if (anime) |a| a.thumb else null,
