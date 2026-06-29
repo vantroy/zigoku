@@ -164,9 +164,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
-        // ROD-239: navigation / window-toggle keys are wired in a later chunk;
-        // the final wording is settled with them. F-keys + q work now.
-        .discover => "hjkl navigate · enter detail · P save · [/] window · F1/F2/F3/F4 views · q quit",
+        .discover => "hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3 views · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else

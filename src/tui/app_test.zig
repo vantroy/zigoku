@@ -635,6 +635,88 @@ test "Discover window keys switch the active window and reset the cursor (ROD-23
     try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
 }
 
+test "Discover Enter opens the detail zoom for the selected card; Esc returns (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    defer app.episodes.freeResults(testing.allocator); // Enter fires an episode fetch
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "z1", .name = "Zoom Me" }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.detail_origin), .discover), app.detail_origin);
+    // Esc demotes the zoom back to Discover (origin maps home).
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+}
+
+test "Discover / jumps to Browse search (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    try testTick(&app, keyEv('/', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+}
+
+test "popular_error marks the window failed and clears its spinner (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    daily.loading = true;
+    try testTick(&app, .{ .popular_error = .{ .window = .daily, .cause = error.NetworkDown } });
+    try testing.expect(!daily.loading);
+    try testing.expect(daily.failed); // drives the in-view "can't reach the feed"
+}
+
+test "popular_done persists feed rows to the store (persist like search, ROD-239)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "f1", .name = "Feed Show", .view_count = 12345 });
+    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .daily, .page = 1 } });
+
+    // The window-agnostic facts landed in the store, shareable with Browse. (The
+    // hidden-cache flag is a History-query filter column; getAnime doesn't surface
+    // it, so the row's presence + correct facts is the persist proof here.)
+    const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "f1")).?;
+    try testing.expectEqualStrings("Feed Show", rec.title);
+    try testing.expectEqual(@as(?i64, null), rec.year); // no year in the feed payload row
+}
+
+test "Discover P adds the selected card to the watchlist (ROD-239)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "p1", .name = "Plan Me" }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv('P', .{ .shift = true }));
+    // The add flags a background history reload and lands a row in the store.
+    try testing.expect(app.history_dirty);
+    const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "p1")).?;
+    try testing.expectEqualStrings("Plan Me", rec.title);
+}
+
 test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
