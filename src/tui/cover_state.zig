@@ -16,8 +16,7 @@ const event_mod = @import("event.zig");
 
 const Allocator = std.mem.Allocator;
 const Loop = event_mod.Loop;
-const RawCoverCache = workers.RawCoverCache;
-const DecodedCoverCache = workers.DecodedCoverCache;
+const CoverCaches = workers.CoverCaches;
 const coverTask = workers.coverTask;
 
 /// The cover/image subsystem (ROD-160). Owns one selection's poster art: the
@@ -142,10 +141,6 @@ pub const CoverState = struct {
     // ── state ────────────────────────────────────────────────────────────────
     /// Handle for the most recent cover-fetch thread. Joined before a new spawn.
     thread: ?std.Thread = null,
-    /// Worker-thread raw-image cache (avoids refetch by URL).
-    raw_cache: RawCoverCache = .{},
-    /// Worker-thread decoded-pixel cache (avoids re-decode by URL).
-    decoded_cache: DecodedCoverCache = .{},
     /// Decoded cover pixels for the currently tracked show id.
     pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
     /// Which show id the current cover state belongs to.
@@ -254,13 +249,6 @@ pub const CoverState = struct {
         self.clearFailure(gpa);
     }
 
-    pub fn deinitCaches(self: *CoverState, gpa: Allocator) void {
-        self.decoded_cache.deinit(gpa);
-        self.decoded_cache = .{};
-        self.raw_cache.deinit(gpa);
-        self.raw_cache = .{};
-    }
-
     pub fn joinThread(self: *CoverState) void {
         if (self.thread) |t| {
             t.join();
@@ -277,6 +265,7 @@ pub const CoverState = struct {
         gpa: Allocator,
         loop: *Loop,
         io: std.Io,
+        caches: *CoverCaches,
         now: i64,
         target_id: ?[]const u8,
         target_url: ?[]const u8,
@@ -328,8 +317,7 @@ pub const CoverState = struct {
             io,
             url_copy,
             id_for_event,
-            &self.raw_cache,
-            &self.decoded_cache,
+            caches,
         }) catch {
             gpa.free(url_copy);
             gpa.free(id_for_event);

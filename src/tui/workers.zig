@@ -89,6 +89,35 @@ pub const DecodedCoverCache = lru_mod.LruCache([]const u8, cover_mod.Pixels, 5, 
 pub const max_cover_raw_cache_bytes = 32 * 1024 * 1024;
 pub const max_cover_decoded_cache_bytes = 48 * 1024 * 1024;
 
+/// Shared, mutex-guarded cover caches (ROD-243). Hoisted out of `CoverState` so the
+/// single-cover path and the Discover grid both fetch against the *same* URL-keyed
+/// LRUs — a cover fetched in Browse is reused by Discover (and vice-versa) for free.
+///
+/// The mutex is what makes these previously one-at-a-time caches safe under N
+/// concurrent cover workers. Before ROD-243 the only safety came from
+/// `cover_state.zig` joining the prior thread before spawning the next, so exactly
+/// one worker ever touched the caches; the grid breaks that invariant.
+///
+/// Lock discipline (implemented in `loadCoverPixels`): every dupe of a slice that
+/// lives in — or was just inserted into — a cache happens while `mu` is held;
+/// `decodeCoverBody` and the network fetch run *unlocked* so a slow decode/fetch
+/// never stalls another worker. Note `LruCache.get` is itself a writer (it promotes
+/// the hit to most-recent), so even a pure lookup must hold the lock.
+pub const CoverCaches = struct {
+    mu: std.Io.Mutex = .init,
+    raw: RawCoverCache = .{},
+    decoded: DecodedCoverCache = .{},
+
+    /// Teardown only — call after every cover worker has joined, so nothing a
+    /// worker still references is freed out from under it.
+    pub fn deinit(self: *CoverCaches, gpa: Allocator) void {
+        self.decoded.deinit(gpa);
+        self.decoded = .{};
+        self.raw.deinit(gpa);
+        self.raw = .{};
+    }
+};
+
 /// One slot of the episode hot-cache: a canonical GPA-owned episode list plus
 /// the Unix-seconds expiry mirroring the DB episode_cache TTL, so the in-memory
 /// mirror never serves data the DB itself would refuse as stale (ROD-130).
@@ -588,14 +617,6 @@ fn postCoverDoneOwned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, fo
     };
 }
 
-fn postCoverDoneCloned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, for_id: []const u8) void {
-    const rgba = gpa.dupe(u8, decoded.rgba) catch {
-        postCoverError(loop, gpa, for_id);
-        return;
-    };
-    postCoverDoneOwned(loop, gpa, .{ .rgba = rgba, .w = decoded.w, .h = decoded.h }, for_id);
-}
-
 // ── On-disk raw cover cache (ROD-171) ────────────────────────────────────────
 // A persistence layer one level below `RawCoverCache`: covers fetched in a prior
 // run are served from `<cacheDir>/covers/<hash>.jpg` on a cold start, sparing the
@@ -700,59 +721,73 @@ fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
     return cover_mod.decodeRgba(gpa, body);
 }
 
-/// Background task: fetch cover bytes and decode them to RGBA.
-/// `url` is task-owned and freed before return. `for_id` is transferred to the
-/// event on success/error and freed by the UI thread there. Cache ownership stays
-/// on the worker side; events get their own RGBA slice.
+/// Insert raw encoded `bytes` into the raw LRU under the lock, taking ownership:
+/// the cache keeps them if accepted, otherwise we free them here. Caller must not
+/// touch `bytes` afterwards (ROD-243).
+fn insertRaw(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: []const u8, bytes: []u8) void {
+    caches.mu.lockUncancelable(io);
+    defer caches.mu.unlock(io);
+    const cached = caches.raw.putOwnedBounded(gpa, url, bytes, max_cover_raw_cache_bytes) catch false;
+    if (!cached) gpa.free(bytes);
+}
+
+/// Store `decoded` in the decoded LRU and return an INDEPENDENT owned copy for the
+/// caller. The clone is taken under the same lock as the insert: once
+/// `putOwnedBounded` accepts the value, `decoded.rgba` *is* the cache's pointer, so
+/// an unlocked dupe could race a concurrent evict-and-free (ROD-243). If the cache
+/// declines the entry the caller still owns `decoded` and we hand it back directly;
+/// if the clone OOMs after a successful insert the cache owns the pixels (no
+/// double-free) and we surface the error.
+fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: []const u8, decoded: cover_mod.Pixels) !cover_mod.Pixels {
+    caches.mu.lockUncancelable(io);
+    defer caches.mu.unlock(io);
+    const cached = caches.decoded.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
+    if (!cached) return decoded; // cache declined — caller keeps the owned pixels
+    const rgba = try gpa.dupe(u8, decoded.rgba); // under lock: `decoded` is now cache-owned
+    return .{ .rgba = rgba, .w = decoded.w, .h = decoded.h };
+}
+
+/// Shared cover load (ROD-243): resolve `url` to gpa-owned, INDEPENDENT decoded
+/// pixels via cache → disk → network, or return an error. The returned `rgba` is
+/// never a cache-owned pointer, so it stays valid past any concurrent eviction —
+/// the caller owns it. Safe for concurrent callers: the single-cover worker and the
+/// Discover grid worker share one `CoverCaches`.
 ///
-/// Runs as the single per-`CoverState` worker — `cover_state.zig` joins the prior
-/// thread before spawning the next — so the raw/decoded LRUs (not thread-safe) and
-/// the disk layer need no lock. A future prefetch pool that breaks that one-at-a-
-/// time invariant must add synchronization here.
-pub fn coverTask(
-    loop: *Loop,
-    gpa: Allocator,
-    io: std.Io,
-    url: []const u8,
-    for_id: []const u8,
-    raw_cache: *RawCoverCache,
-    decoded_cache: *DecodedCoverCache,
-) void {
-    defer gpa.free(url);
-
-    if (decoded_cache.get(url)) |decoded| {
-        postCoverDoneCloned(loop, gpa, decoded, for_id);
-        return;
-    }
-
-    if (raw_cache.get(url)) |body| {
-        const decoded = decodeCoverBody(gpa, body) catch |e| {
-            log.debug("cover decode (cached) failed: {s}", .{@errorName(e)});
-            postCoverError(loop, gpa, for_id);
-            return;
-        };
-        const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
-        if (!cached) {
-            postCoverDoneOwned(loop, gpa, decoded, for_id);
-            return;
+/// Lock rule: every dupe of a slice that lives in (or was just inserted into) a
+/// cache happens while `caches.mu` is held; `decodeCoverBody` and `client.fetch`
+/// run *unlocked* so a slow decode/fetch never stalls another worker.
+pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
+    // 1) Decoded-cache hit: dupe the pixels out under the lock (get() promotes, so
+    //    it mutates — even this read holds the lock).
+    {
+        caches.mu.lockUncancelable(io);
+        defer caches.mu.unlock(io);
+        if (caches.decoded.get(url)) |d| {
+            const rgba = try gpa.dupe(u8, d.rgba);
+            return .{ .rgba = rgba, .w = d.w, .h = d.h };
         }
-        postCoverDoneCloned(loop, gpa, decoded, for_id);
-        return;
     }
 
-    // ROD-171: a raw-LRU miss falls through to disk before the network. A hit
-    // warms both in-memory caches so the rest of this session is a raw hit.
+    // 2) Raw-cache hit: copy the encoded bytes out under the lock, decode unlocked.
+    {
+        const raw_copy: ?[]u8 = blk: {
+            caches.mu.lockUncancelable(io);
+            defer caches.mu.unlock(io);
+            break :blk if (caches.raw.get(url)) |b| try gpa.dupe(u8, b) else null;
+        };
+        if (raw_copy) |rc| {
+            defer gpa.free(rc);
+            const decoded = try decodeCoverBody(gpa, rc);
+            return storeDecodedAndClone(gpa, io, caches, url, decoded);
+        }
+    }
+
+    // 3) ROD-171: a raw-LRU miss falls through to disk before the network. A hit
+    //    warms both in-memory caches so the rest of this session is a raw hit.
     if (readCoverDisk(gpa, io, url)) |disk_body| {
         if (decodeCoverBody(gpa, disk_body)) |decoded| {
-            const raw_cached = raw_cache.putOwnedBounded(gpa, url, disk_body, max_cover_raw_cache_bytes) catch false;
-            if (!raw_cached) gpa.free(disk_body);
-            const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
-            if (!cached) {
-                postCoverDoneOwned(loop, gpa, decoded, for_id);
-                return;
-            }
-            postCoverDoneCloned(loop, gpa, decoded, for_id);
-            return;
+            insertRaw(gpa, io, caches, url, disk_body); // takes ownership of disk_body
+            return storeDecodedAndClone(gpa, io, caches, url, decoded);
         } else |e| {
             // A corrupt/truncated cache file: drop it and refetch from network.
             log.debug("cover disk-cache decode failed: {s}", .{@errorName(e)});
@@ -760,13 +795,11 @@ pub fn coverTask(
         }
     }
 
+    // 4) Network fetch (unlocked), then warm both caches and persist to disk.
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
-    const resp_buf = gpa.alloc(u8, max_cover_encoded_bytes) catch {
-        postCoverError(loop, gpa, for_id);
-        return;
-    };
+    const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
     defer gpa.free(resp_buf);
     var resp_writer: std.Io.Writer = .fixed(resp_buf);
     const res = client.fetch(.{
@@ -778,32 +811,42 @@ pub fn coverTask(
         },
     }) catch |e| {
         log.debug("cover fetch failed: {s}", .{@errorName(e)});
-        postCoverError(loop, gpa, for_id);
-        return;
+        return error.CoverFetchFailed;
     };
     if (res.status != .ok) {
         log.debug("cover fetch HTTP {d}", .{@intFromEnum(res.status)});
-        postCoverError(loop, gpa, for_id);
-        return;
+        return error.CoverFetchFailed;
     }
 
     const body = resp_writer.buffered();
-    const decoded = decodeCoverBody(gpa, body) catch |e| {
-        log.debug("cover decode failed: {s}", .{@errorName(e)});
+    const decoded = try decodeCoverBody(gpa, body);
+    writeCoverDisk(gpa, io, url, body); // ROD-171: persist for the next cold start
+    if (gpa.dupe(u8, body)) |raw_copy| {
+        insertRaw(gpa, io, caches, url, raw_copy);
+    } else |_| {}
+    return storeDecodedAndClone(gpa, io, caches, url, decoded);
+}
+
+/// Background task: load one cover and post it to the UI thread. `url` is task-owned
+/// and freed here; `for_id` transfers to the event on success/error (the UI thread
+/// frees it). The decoded pixels handed to the event are an independent copy (see
+/// `loadCoverPixels`), so a concurrent cache eviction can't invalidate them. One of
+/// N concurrent cover workers sharing `caches` (ROD-243).
+pub fn coverTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    url: []const u8,
+    for_id: []const u8,
+    caches: *CoverCaches,
+) void {
+    defer gpa.free(url);
+    const decoded = loadCoverPixels(gpa, io, url, caches) catch |e| {
+        log.debug("cover load failed: {s}", .{@errorName(e)});
         postCoverError(loop, gpa, for_id);
         return;
     };
-    writeCoverDisk(gpa, io, url, body); // ROD-171: persist for the next cold start
-    if (gpa.dupe(u8, body)) |raw_copy| {
-        const cached = raw_cache.putOwnedBounded(gpa, url, raw_copy, max_cover_raw_cache_bytes) catch false;
-        if (!cached) gpa.free(raw_copy);
-    } else |_| {}
-    const cached = decoded_cache.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
-    if (!cached) {
-        postCoverDoneOwned(loop, gpa, decoded, for_id);
-        return;
-    }
-    postCoverDoneCloned(loop, gpa, decoded, for_id);
+    postCoverDoneOwned(loop, gpa, decoded, for_id);
 }
 
 /// Heartbeat thread: posts .tick every 100ms until `quit` is set.
