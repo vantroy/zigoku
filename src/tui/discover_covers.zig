@@ -187,6 +187,12 @@ pub const DiscoverCovers = struct {
         return &self.slots.items[i];
     }
 
+    /// Const lookup for the render pass (`view/discover.zig` holds `*const App`).
+    pub fn getConst(self: *const DiscoverCovers, url: []const u8) ?*const CoverSlot {
+        const i = self.indexOf(url) orelse return null;
+        return &self.slots.items[i];
+    }
+
     /// Return the slot for `url`, creating an idle one (with an owned key copy) if
     /// absent. Null only on OOM.
     pub fn ensureSlot(self: *DiscoverCovers, gpa: Allocator, url: []const u8) ?*CoverSlot {
@@ -236,10 +242,57 @@ pub const DiscoverCovers = struct {
         _ = self.slots.swapRemove(i);
     }
 
+    /// Transmit the decoded pixels of every ready slot lacking a Kitty image to the
+    /// terminal (ROD-243). UI-thread only — `transmitPreEncodedImage` mutates
+    /// `vx.next_img_id` and writes the tty. Runs once per slot: a transmitted slot
+    /// keeps its `image` and is skipped next frame. No-op without Kitty graphics
+    /// (the grid uses the half-block fallback then). Mirrors `detail.ensureCoverImage`.
+    pub fn ensureImages(self: *DiscoverCovers, gpa: Allocator, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        if (!vx.caps.kitty_graphics) return;
+        for (self.slots.items) |*slot| {
+            if (slot.image != null) continue;
+            const px = slot.pixels orelse continue;
+            if (px.w == 0 or px.h == 0 or px.w > std.math.maxInt(u16) or px.h > std.math.maxInt(u16)) continue;
+            const enc_len = std.base64.standard.Encoder.calcSize(px.rgba.len);
+            const b64 = gpa.alloc(u8, enc_len) catch continue;
+            defer gpa.free(b64);
+            const encoded = std.base64.standard.Encoder.encode(b64, px.rgba);
+            slot.image = vx.transmitPreEncodedImage(writer, encoded, @intCast(px.w), @intCast(px.h), .rgba) catch continue;
+        }
+    }
+
+    /// Release Kitty image ids superseded this frame: each slot's `pending_free_id`
+    /// (a same-url re-decode retired the old image) and every id queued by an
+    /// eviction. UI-thread only (`freeImage` writes the tty). Mirrors
+    /// `CoverState.flushPendingFree`, but over the whole pool.
+    pub fn flushPendingFrees(self: *DiscoverCovers, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        for (self.slots.items) |*slot| {
+            if (slot.pending_free_id) |id| {
+                vx.freeImage(writer, id);
+                slot.pending_free_id = null;
+            }
+        }
+        for (self.pending_free.items) |id| vx.freeImage(writer, id);
+        self.pending_free.clearRetainingCapacity();
+    }
+
+    /// Teardown with image release: free every resident + pending Kitty image (UI
+    /// thread), then the owned memory. Call from `deinitOwnedState` after the cover
+    /// workers join. The quit `_exit` path skips this and relies on the global
+    /// `a=d,q=2` clear; this is the error-unwind/test path. Mirrors `CoverState.freeAll`.
+    pub fn freeAll(self: *DiscoverCovers, gpa: Allocator, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        self.flushPendingFrees(vx, writer);
+        for (self.slots.items) |*slot| {
+            if (slot.image) |img| vx.freeImage(writer, img.id);
+            slot.image = null;
+        }
+        self.deinit(gpa);
+    }
+
     /// Release the pool's owned memory: every slot's url + pixels, then the slot and
-    /// pending-free lists. Kitty images are NOT freed here — at teardown the
-    /// quit-path global clear (`a=d,q=2`) catches them; the render-coupled
-    /// `freeAll(vx, writer)` (next chunk) flushes them explicitly before this.
+    /// pending-free lists. Kitty images are NOT freed here — `freeAll` flushes them
+    /// first on the error-unwind path, and the quit-path global clear (`a=d,q=2`)
+    /// catches them on the normal `_exit`.
     pub fn deinit(self: *DiscoverCovers, gpa: Allocator) void {
         for (self.slots.items) |*s| s.freeOwned(gpa);
         self.slots.deinit(gpa);

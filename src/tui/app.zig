@@ -868,7 +868,7 @@ pub const App = struct {
         self.episodes.deinit(self.gpa);
         self.session.clear(self.gpa);
         self.cover.freeAll(self.gpa, vx, writer);
-        self.discover_covers.deinit(self.gpa);
+        self.discover_covers.freeAll(self.gpa, vx, writer);
         self.cover_caches.deinit(self.gpa);
         if (self.undo) |u| {
             u.free(self.gpa);
@@ -3129,6 +3129,12 @@ pub const App = struct {
     // ── draw: pure render from state ─────────────────────────────────────────
     fn draw(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) !void {
         self.cover.flushPendingFree(vx, writer);
+        // ROD-243: the grid covers' image lifecycle needs vx+writer on the UI thread,
+        // so it runs here (the const view pass only reads slot.image and places it).
+        // Release evicted/superseded grid images, then transmit any newly-decoded
+        // covers while Discover is showing.
+        self.discover_covers.flushPendingFrees(vx, writer);
+        if (self.active_view == .discover) self.discover_covers.ensureImages(self.gpa, vx, writer);
 
         const win = vx.window();
         win.clear();
