@@ -80,13 +80,9 @@ pub const DiscoverState = struct {
     /// `@intFromEnum(window)` (daily=0, weekly=1, monthly=2, all_time=3).
     slots: [4]Slot = .{ .{}, .{}, .{}, .{} },
 
-    /// The slot for the active window (const — render path).
+    /// The slot for the active window (const — render path). The fetch/cache path
+    /// indexes `slots[@intFromEnum(window)]` directly with a mutable App.
     pub fn activeSlot(self: *const DiscoverState) *const Slot {
-        return &self.slots[@intFromEnum(self.window)];
-    }
-
-    /// The slot for the active window (mutable — fetch/cache path).
-    pub fn activeSlotMut(self: *DiscoverState) *Slot {
         return &self.slots[@intFromEnum(self.window)];
     }
 
