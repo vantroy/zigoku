@@ -429,6 +429,125 @@ No other box-drawing anywhere.
 | Metadata sections | 1 blank row between sections |
 | Synopsis | 2-cell left indent, word-wrapped to column width |
 
+### 3.8 Discover — Layout Grammar
+
+Discover is a **full-canvas, single-pane** view (`active_view = .discover`). There is
+no list/detail split and no `active_pane` semantics — the entire terminal canvas is
+one scrollable card grid.
+
+**Row structure (top to bottom):**
+
+```
+┌────────────────── TERMINAL WIDTH ──────────────────┐
+│  TOP BAR               (1 row, §3.4)               │
+│  spacer                (1 row)                      │
+│  WINDOW BAR            (1 row)                      │
+│  spacer                (1 row)                      │
+│  CARD GRID             (all remaining rows, scroll) │
+│  BOTTOM BAR            (1 row, §3.5)               │
+└─────────────────────────────────────────────────────┘
+```
+
+Chrome overhead: **5 rows.** The card grid receives every row between the second
+spacer and the bottom bar.
+
+**Card-grid geometry.** Two width-keyed tiers, consistent with the §3.2/§3.3 cover-size
+breakpoints:
+
+| Terminal width | Cover cell | Slot | Column formula |
+|---|---|---|---|
+| ≥ 80 cols | 20 × 7 | 22 × 11 | `max(1, (w − 2) / 22)` |
+| < 80 cols | 14 × 5 | 16 × 9 | `max(1, (w − 2) / 16)` |
+
+`w − 2` removes the 2-cell left margin (§3.7). Each card occupies one slot
+(`slot_w × slot_h`). The slot height contains the cover block (`cover_h` rows) +
+3 metadata rows (rank+badge, title, view count) + 1 gap row = `slot_h`. Rows
+visible per frame = `(content_h − 2) / slot_h`, where `content_h − 2` removes the
+window bar row and its spacer from the content height.
+
+**Window-toggle bar.** One row at y = 2 (after top bar + spacer), left margin 2 cells.
+Content: `Daily · Weekly · Monthly · All-Time`.
+
+| State | Token | Modifier |
+|---|---|---|
+| Active window label | `state.focus` | bold |
+| Inactive window labels | `text.muted` | — |
+| Separator `·` dots | `text.dim` | — |
+
+The bar is **passive** — there is no "window bar focus." The `[`/`]` cycle keys and
+`1`–`4` direct-select keys drive the active window regardless of the grid cursor
+position. A window change clears results, shows the loading state, refetches with
+the appropriate `dateRange` value (§9.6), and resets cursor and scroll.
+
+**Card anatomy.** Each card occupies one slot, rendered top-to-bottom:
+
+1. **Cover block** (`cover_w × cover_h` cells). Kitty image when art is available
+   (ROD-243). Placeholder until then: `bg.surface` fill + rank label `#N` centered
+   in `text.dim`. The fill is the only `bg.surface`-elevated element in the grid;
+   real cover art replaces it entirely in ROD-243.
+2. **Selection marker.** `▸` at the cover's bottom-left cell in `state.focus` when
+   this card is selected. No box border, no background band. When Kitty image is
+   active the marker overlays the cover and the image background is stripped for
+   that cell — a ROD-243 dependency.
+3. **Rank + badge row.** `#N` in `text.primary`. At most one badge follows:
+   - Rank #1: `TOP` in `state.now` + bold.
+   - Current-cour release (exclusive with `TOP`): `NEW` in `state.focus` + bold.
+   Both badges are **derived render-side** from rank index and season/year — they
+   are not payload fields.
+4. **Title row.** Romaji title in `text.primary` (unselected) or `state.focus` + bold
+   (selected). Clipped to `cover_w` columns with `…` (§2.1).
+5. **View count row.** Windowed view count in `text.muted`. Format: `1.4m` /
+   `660.17k` / `892`. Absent/null: `—` in `text.dim`. The count is the windowed
+   metric (`rangeViews`); the All-Time window uses the lifetime total.
+
+**Card token summary:**
+
+| Element | Token | Modifier |
+|---|---|---|
+| Cover placeholder fill | `bg.surface` | — |
+| Cover placeholder rank `#N` | `text.dim` | centered in cover block |
+| Selection `▸` | `state.focus` | cover bottom-left |
+| Rank `#N` (metadata row) | `text.primary` | — |
+| `TOP` badge | `state.now` | bold |
+| `NEW` badge | `state.focus` | bold |
+| Title (unselected) | `text.primary` | clipped with `…` |
+| Title (selected) | `state.focus` | bold, clipped with `…` |
+| View count | `text.muted` | — |
+| View count absent | `text.dim` | `—` placeholder |
+
+**Grid states.** When the results array is empty, one of three states renders centered
+in the card-grid region:
+
+| State | Render | Token |
+|---|---|---|
+| Initial load / window refetch | `⠋ loading popular…` | `state.focus`; escalates to `state.now` + `taking a moment…` after >3 s (§4.8 slow rule) |
+| Empty (no entries returned) | `no entries` | `text.muted` + italic |
+| Error / offline | `[!] can't reach the feed` (heading) · `check your connection` (sub-line) | `state.now` + bold · `text.muted` + italic |
+
+The loading state uses the §4.8 braille spinner and `isSlowPath()` escalation. The
+error state is persistent — the feed is unreachable, not transiently failed. `[`/`]`/
+`1`–`4` retry by refetching the active window; the error clears on the first
+successful response. This follows the §9.3b pattern applied to the Popular feed.
+
+When results are already on screen and a next page is in flight, a load-more footer
+renders below the last visible card row:
+
+| State | Render | Token |
+|---|---|---|
+| Fetching next page | `⠋ loading more…` | `text.muted` + italic |
+| Feed exhausted (last card in view) | `all entries loaded` | `text.dim` |
+
+**Season chip and `·` dot.**
+
+The season chip (§3.4) is **suppressed** in the Discover grid. The view spans all
+popularity windows rather than one show's season context, so the chip has no
+meaningful value here. The chip does appear in the detail zoom when entered from
+Discover (`detail_origin = .discover`) — it shows only the focused show's season+year,
+with no current-cour fallback (matching the zoom rule for Browse/History, §10.3b).
+
+The `·` pane-focus dot is always `state.focus` in Discover. The view is single-pane:
+there is no list/detail split and therefore no dim state.
+
 ---
 
 ## 4. Component States
@@ -1216,6 +1335,58 @@ Notes:
 - If sync takes >3s, the spinner shifts to `state.now` (the design-level "slow"
   threshold) and the label updates to `taking a moment…`.
 
+### 5.7 Discover / Popular
+
+Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
+`slot_w = 22`, `cover_w = 20 × 7`, 5 columns. Card 3 selected.
+
+```
+                                                                                         [context: top bar, full width]
+  ZIGOKU  ░  Popular                                                            ·        [fg+bold name; chrome sep; f chip; f · (always lit — single pane)]
+                                                                                         [spacer row]
+  Daily · Weekly · Monthly · All-Time                                                    [active=Daily f+bold; rest m; separator dots d]
+                                                                                         [spacer row]
+  [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; 20×7 cells each; bg.surface fill]
+  [         ][         ][  ▸      ][         ][         ]                               [card 3 selected: ▸ f at cover bottom-left]
+  [  #1     ][  #2     ][  #3     ][  #4     ][  #5     ]                               [rank d, centered in cover placeholder]
+  [         ][         ][         ][         ][         ]
+  [         ][         ][         ][         ][         ]
+  [         ][         ][         ][         ][         ]
+  [         ][         ][         ][         ][         ]
+  #1 TOP      #2          #3 NEW      #4          #5                                     [rank fg; TOP h+bold; NEW f+bold; at most one badge per card]
+  Frieren: B… FMA: Brothe Vinland S  Mob Psycho  Steins;Ga…                            [title fg; selected (#3) f+bold; clipped to cover_w with …]
+  1.4m        659.29k     892.10k     341.2k      —                                     [view count m; absent → — in d]
+                                                                                         [gap row, part of slot]
+  [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [second card row]
+  ...
+  ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌                             [border.hair dashed rule; next-page fetch in flight]
+  ⠋ loading more…                                                                       [m + italic while page-N fetch in flight]
+
+  ▌  hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit
+```
+
+Notes:
+- Top-bar chip: `Popular` in `state.focus`. Season chip suppressed (§3.8).
+- `·` dot: always `state.focus` — single pane, no dim state.
+- Window bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
+  own. Window change triggers a refetch.
+- The `▸` selection marker sits at the cover's bottom-left cell, `state.focus`.
+  No box border, no background band around the card.
+- `TOP` is always rank #1 (`state.now` + bold). `NEW` is a current-cour show not
+  ranked #1 (`state.focus` + bold). The two are mutually exclusive.
+- Title clips to `cover_w` (20 cols at the large tier) with `…`. Selected title is
+  `state.focus` + bold; unselected is `text.primary`.
+- View count absent renders `—` in `text.dim` (not an italic annotation — it is a
+  factual placeholder, not an editorial aside, so §1.3 italic-for-annotation does
+  not apply here).
+- `/ search` jumps to Browse and opens its search prompt.
+- The dashed `╌` rule and `⠋ loading more…` footer appear only while the next page
+  is fetching. `all entries loaded` (text.dim, no italic) appears once the feed is
+  exhausted and the last card row is in view.
+- `Enter` opens the full-screen detail zoom (`active_view = .detail`,
+  `detail_origin = .discover`) — the existing `drawDetailPane` pass unchanged.
+  `Esc` returns to Discover. `P` saves to watchlist per the §4.10 path.
+
 ---
 
 ## 6. Interaction & Motion Notes
@@ -1832,6 +2003,59 @@ post-search enrichment needs no flag); it is currently always `false`.
 
 ---
 
+### 9.6 Discover / Popular — Data Layer
+
+The Popular feed uses a dedicated AllAnime persisted query, distinct from the
+universal search query used by Browse.
+
+**Query hash:** `60f50b84bb545fa25ee7f7c8c0adbf8f5cea40f7b1ef8501cbbff70e38589489`
+
+**Variables:** `{ "type": "anime", "size": 20, "dateRange": N, "page": 1, "allowUnknown": false, "allowAdult": false }`
+
+**Window → `dateRange` mapping:**
+
+| Window label | `dateRange` value |
+|---|---|
+| Daily | `1` |
+| Weekly | `7` |
+| Monthly | `30` |
+| All-Time | `0` |
+
+**Per item:** rank position (derived from result index + 1 on the receiving side),
+cover URL, romaji + native title, view count (`rangeViews` for windowed windows;
+lifetime total for All-Time), `showId`. `TOP` and `NEW` badges are **derived
+render-side** — not payload fields. `TOP` is always rank #1; `NEW` is computed from
+the show's season/year against the current cour (the same season-boundary logic as
+§2.3 kanji chips).
+
+**Pagination:** `size: 20` entries per page; `page` increments on each next-page
+fetch. The feed has a practical ceiling of ~500 entries. The next page prefetches
+when the grid cursor comes within 2 card-rows of the last loaded entry. A window
+change resets `page` to 1, clears results, and refetches from the top.
+
+**Per-window slot.** Each window (`Daily` / `Weekly` / `Monthly` / `All-Time`)
+holds its own result list, cursor, scroll position, loading flag, and exhaustion
+flag. Switching windows preserves each slot's state — `Daily` data is not flushed
+when the user briefly visits `Weekly`. A window whose slot is empty at activation
+triggers a fresh fetch.
+
+**Null-degrade rules.** The Popular grid renders whatever fields are present and
+falls back per §9.1 where enrichment hasn't completed:
+
+| Field | Present | Absent fallback |
+|---|---|---|
+| Cover URL | Kitty image (ROD-243) | `bg.surface` placeholder fill (§3.8) |
+| View count | formatted count in `text.muted` | `—` in `text.dim` |
+| Season/year | `NEW` badge derivation possible | `NEW` badge suppressed for that card |
+| Romaji title | shown, clipped | shown as-is (AllAnime always supplies a name) |
+
+The Popular grid does **not** trigger AniList enrichment — it is a ranked popularity
+snapshot, not a search result. Enrichment fires through the Browse search path only.
+Detail zoom from Discover (`Enter`) uses the existing `episodesTask` / `drawDetailPane`
+pipeline, which does enrich on detail entry.
+
+---
+
 ## 10. ROD-72: View System & Focus Model
 
 This section is the implementable specification for view switching, the per-view
@@ -1852,7 +2076,8 @@ keybinds.
 |---|---|---|---|
 | Browse | `active_view = .browse` | Optional (config `landing = "browse"`, §9.2) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
 | History | `active_view = .history` | Default (config `landing = "history"`, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
-| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
+| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History or Discover** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
+| Discover | `active_view = .discover` | No | Single-pane: full-canvas card grid (§3.8, §5.7). No `active_pane` semantics. Reached with `D` or `F4` from any view. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
 **`.detail` is both an `active_pane` value within Browse/History and a standalone `active_view` (the zoom).**
@@ -1910,10 +2135,16 @@ a new user pressing function keys lands in the right place.
 | `F1` | Switch to Browse (equivalent to pressing `H` from History, or a no-op if already in Browse) |
 | `F2` | Switch to History (equivalent to pressing `H` from Browse/Settings) |
 | `F3` | Switch to Settings (equivalent to `S`) |
+| `F4` | Switch to Discover (equivalent to `D` from any view; no-op if already in Discover) |
 
 **F1 from Browse:** no-op. The user is already there.
 **F2 from History:** no-op. The user is already there.
 **F3 from Settings:** no-op. The user is already there.
+**F4 from Discover:** no-op. The user is already there.
+
+`D` is the primary single-key bind for Discover, symmetric with `H` (History) and
+`S` (Settings). `F4` is its discoverable alias, listed in every view's help line
+alongside `F1`/`F2`/`F3`.
 
 F-keys appear in the bottom-bar help line (see §10.5) so they are the primary
 discovery surface for new users. Vim-native users will use `H`/`S` and never
@@ -1958,6 +2189,7 @@ The `·` dot rendered right-aligned in the top bar marks pane-level focus.
 | History | `.list` | `color.fg3` (dim — symmetric with Browse list; History is now a two-pane view) |
 | History | `.detail` | `color.focus` (cyan — detail pane is explicitly selected, same as Browse) |
 | Detail (zoom, `active_view = .detail`) | — | `color.focus` (the full-screen zoom is focused) |
+| Discover | — (single pane) | `color.focus` (always lit; no dim state — §3.8) |
 | Settings | `.list` (only value) | `color.focus` |
 
 **Rationale for Browse/History list dim (now symmetric):** History adopts the same
@@ -1977,7 +2209,8 @@ chip after that (ROD-186). The two are differentiated by color, no separator gly
 |---|---|---|
 | `.browse` | `Browse` | selected show's season+year, else current cour |
 | `.history` | `Watchlist` | selected show's season+year, else current cour |
-| `.detail` | inherits `detail_origin` (`Browse`\|`Watchlist`) | focused show's season+year only — **no** cour fallback |
+| `.detail` | inherits `detail_origin` (`Browse` \| `Watchlist` \| `Popular`) | focused show's season+year only — **no** cour fallback |
+| `.discover` | `Popular` | — (suppressed; §3.8 — no single-show context in the grid) |
 | `.settings` | `Settings` | — (none) |
 
 The season chip sits two spaces after the view label and drops first under width
@@ -2062,10 +2295,10 @@ and its padding. The strings below are written to fit that budget.
 #### Browse — normal, list pane focused
 
 ```
-  ▌  hjkl · / find anime · P save · F1/F2/F3 views · q quit
+  ▌  hjkl · / find anime · P save · F1/F2/F3/F4 views · q quit
 ```
 
-Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `F1`, `F2`, `F3`, `q`.
+Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `F1`, `F2`, `F3`, `F4`, `q`.
 
 #### Browse — normal, detail pane focused
 
@@ -2087,12 +2320,12 @@ within the ~74-char budget:
 #### History — normal, list pane focused
 
 ```
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3/F4 · q quit
 ```
 
-Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `F1`, `F2`, `F3`, `q`.
+Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `F1`, `F2`, `F3`, `F4`, `q`.
 
-Note: the `F1/F2/F3` group is shown together (matching Browse) even though F2
+Note: the `F1/F2/F3/F4` group is shown together (matching Browse) even though F2
 from History is a no-op. `H` is not shown (help line targets newcomers).
 `/ filter` and `l/enter detail` are shown explicitly — History shares Browse's
 pane grammar (ROD-170), and its local filter (ROD-211, distinct from Browse's
@@ -2171,6 +2404,28 @@ The `▌` blink is suppressed in this mode — the field edit cursor takes that
 visual slot. However this help string still displays to confirm what keys are
 available. The `▌` reappears when the edit is committed or cancelled.
 
+#### Discover — normal
+
+```
+  ▌  hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit
+```
+
+Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `F1`, `F2`, `F3`, `F4`, `q`.
+
+`hjkl` navigate the card grid (left/right wrap within a row; up/down move card-rows).
+`enter` opens the detail zoom (`active_view = .detail`, `detail_origin = .discover`).
+`P` saves the selected card to the watchlist per the §4.10 path.
+`[`/`]` cycle the active window (`Daily` → `Weekly` → `Monthly` → `All-Time` and back);
+`1`–`4` select directly.
+`/` jumps to Browse and opens its search prompt — there is no in-view filter in Discover.
+`F4` from Discover is a no-op. `F1`/`F2`/`F3` switch to Browse/History/Settings.
+`q` quits.
+
+At 80 cols this string fits within the ~74-char budget:
+`hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit`
+= 84 chars. It is over budget and will clip; `hjkl move` and `enter open` survive
+the most common clip point, preserving the primary navigation hints.
+
 #### Any view — search active (§3.5 State 2 unchanged)
 
 The bottom bar becomes the search prompt. The help string is replaced by the
@@ -2196,11 +2451,13 @@ ROD-170 as noted):
 /// Struct default is .history; run() seeds it from config.landingEnum() at
 /// startup (ROD-228, §9.2), History remaining the default/fallback.
 /// ROD-170: .detail is now reached from Browse or History (both arms live).
-active_view: enum { browse, history, detail, settings } = .history,
+/// ROD-239: .discover added — full-canvas Popular card grid (§3.8, §5.7).
+active_view: enum { browse, history, detail, settings, discover } = .history,
 
 /// Which pane has keyboard focus within the current view.
 /// ROD-170: History is now a two-pane view. `active_pane` is meaningful in
-/// Browse and History. Settings remains single-pane (.list only).
+/// Browse and History. Settings and Discover are single-pane (.list only /
+/// no pane concept respectively).
 active_pane: enum { list, detail } = .list,
 ```
 
@@ -2215,7 +2472,9 @@ active_pane: enum { list, detail } = .list,
 /// Records which view opened the full-screen zoom, for Esc/Space/h return.
 /// Both arms are now live (ROD-170): .browse when zoomed from Browse,
 /// .history when zoomed from History.
-detail_origin: enum { browse, history } = .browse,
+/// ROD-239: .discover added — Enter on a Discover card opens the zoom;
+/// Esc returns to .discover (active_view = .discover, no pane to restore).
+detail_origin: enum { browse, history, discover } = .browse,
 ```
 
 #### keybind dispatch — ROD-170 amendments to `onKey`
