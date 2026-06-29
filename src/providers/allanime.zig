@@ -28,6 +28,9 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like
 const HASH_SEARCH = "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c";
 const HASH_EPISODES = "043448386c7a686bc2aabfbb6b80f6074e795d350df48015023b079527b0848a";
 const HASH_VIDEO = "d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec";
+// Popular is its OWN persisted op (the `queryPopular` resolver) — a different
+// hash and a different response envelope from search (ROD-239).
+const HASH_POPULAR = "60f50b84bb545fa25ee7f7c8c0adbf8f5cea40f7b1ef8501cbbff70e38589489";
 
 // AES-256-GCM key seed for the `tobeparsed` blob (key = sha256(seed)).
 const GCM_SEED = "Xot36i3lK3:v1";
@@ -48,6 +51,7 @@ fn extJson(comptime hash: []const u8) []const u8 {
 const EXT_SEARCH = extJson(HASH_SEARCH);
 const EXT_EPISODES = extJson(HASH_EPISODES);
 const EXT_VIDEO = extJson(HASH_VIDEO);
+const EXT_POPULAR = extJson(HASH_POPULAR);
 
 /// Provider state. Stateless today, but the struct gives the vtable a real
 /// `self` and a home for future config (debug logging, timeouts — ROD-92).
@@ -74,6 +78,7 @@ pub const AllAnime = struct {
         .name = nameErased,
         .displayName = displayNameErased,
         .search = searchErased,
+        .popular = popularErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
     };
@@ -90,6 +95,10 @@ pub const AllAnime = struct {
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
         return self.search(arena, io, query, opts);
+    }
+    fn popularErased(ptr: *anyopaque, arena: Allocator, io: Io, opts: source.PopularOptions) anyerror![]domain.Anime {
+        const self: *AllAnime = @ptrCast(@alignCast(ptr));
+        return self.popular(arena, io, opts);
     }
     fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
@@ -133,6 +142,51 @@ pub const AllAnime = struct {
     const SShows = struct { edges: []SEdge };
     const SData = struct { shows: SShows };
     const SResp = struct { data: ?SData = null };
+
+    // ── popular (queryPopular) ─────────────────────────────────────────────────
+    // The feed envelope is `data.queryPopular.recommendations[]`, each a
+    // `{ anyCard, pageStatus }`. `anyCard` is field-for-field a search `SEdge`
+    // (plus manga-only extras we ignore), so it parses straight into SEdge and
+    // reuses `edgeToAnime`. Both view counts arrive as JSON *strings*:
+    //   * `rangeViews` — views WITHIN the selected window; the feed's rank key for
+    //     daily/weekly/monthly. Null for the All-Time window.
+    //   * `views` — total lifetime views; the rank key only for All-Time.
+    // We display the windowed metric (`rangeViews ?? views`) so the number always
+    // matches the card order — total views are non-monotonic in a windowed feed
+    // (a show can have more lifetime views yet a lower weekly rank). The TOP/NEW
+    // badges the site renders are NOT in the payload — they're derived client-side.
+    const PStatus = struct {
+        views: ?[]const u8 = null,
+        rangeViews: ?[]const u8 = null,
+        showId: ?[]const u8 = null,
+    };
+    const PRec = struct {
+        // Optional + skipped-if-null below: one malformed recommendation drops its
+        // card rather than failing the whole page (the file's defensive-parse ethos).
+        anyCard: ?SEdge = null,
+        pageStatus: PStatus = .{},
+    };
+    const PPopular = struct { total: u32 = 0, recommendations: []PRec = &.{} };
+    const PData = struct { queryPopular: ?PPopular = null };
+    const PResp = struct { data: ?PData = null };
+
+    /// Map our provider-agnostic window onto AllAnime's `dateRange` (days; the
+    /// site uses 0 for all-time). Confirmed live (ROD-239).
+    fn windowDateRange(w: source.PopularWindow) u32 {
+        return switch (w) {
+            .daily => 1,
+            .weekly => 7,
+            .monthly => 30,
+            .all_time => 0,
+        };
+    }
+
+    /// Parse `pageStatus.views`, which the API sends as a JSON *string*. Null
+    /// (absent / unparsable) degrades to a "—" in the card (render-side).
+    fn parseViews(s: ?[]const u8) ?u64 {
+        const str = s orelse return null;
+        return std.fmt.parseInt(u64, str, 10) catch null;
+    }
 
     /// AllAnime serves most covers straight from AniList's CDN, and the filename
     /// embeds the AniList media id: `…/cover/large/bx182255-hash.jpg` → 182255.
@@ -238,6 +292,38 @@ pub const AllAnime = struct {
         std.mem.sort(domain.Anime, list.items, RankCtx{ .query = query, .tt = opts.translation }, rankGreater);
 
         if (list.items.len > opts.limit) list.shrinkRetainingCapacity(opts.limit);
+        return list.items;
+    }
+
+    // ── popular ────────────────────────────────────────────────────────────────
+
+    pub fn popular(self: *AllAnime, arena: Allocator, io: Io, opts: source.PopularOptions) ![]domain.Anime {
+        _ = self;
+        // Like search, popular's `variables` is a plain object (not stringified).
+        // The popularity window is the site's `dateRange`; nothing here is escaped
+        // (all values are our own numerals + a comptime extensions string).
+        const body = try std.fmt.allocPrint(
+            arena,
+            "{{\"variables\":{{\"type\":\"anime\",\"size\":{d},\"dateRange\":{d},\"page\":{d},\"allowUnknown\":false,\"allowAdult\":false}},\"extensions\":\"{s}\"}}",
+            .{ source.popular_page_size, windowDateRange(opts.window), opts.page, EXT_POPULAR },
+        );
+
+        const raw = try post(arena, io, body, REFERER_API);
+        const parsed = try std.json.parseFromSlice(PResp, arena, raw, .{ .ignore_unknown_fields = true });
+        const pop = (parsed.value.data orelse return error.NoPopularData).queryPopular orelse return error.NoPopularData;
+
+        var list: std.ArrayList(domain.Anime) = .empty;
+        for (pop.recommendations) |rec| {
+            const card = rec.anyCard orelse continue; // drop a malformed entry, keep the page
+            var a = edgeToAnime(card);
+            // Windowed count first (matches the rank); fall back to total views for
+            // the All-Time window, where rangeViews is null.
+            a.view_count = parseViews(rec.pageStatus.rangeViews) orelse parseViews(rec.pageStatus.views);
+            try list.append(arena, a);
+        }
+        // NO re-sort: the server returns the page already in popularity rank, and
+        // rank == array position is the entire point of the feed (contrast search,
+        // which re-ranks by title relevance).
         return list.items;
     }
 
@@ -1119,6 +1205,57 @@ test "edgeToAnime: maps the widened search edge (ROD-181)" {
     try std.testing.expectEqual(@as(?u32, null), f2.year);
     try std.testing.expectEqual(@as(?u64, null), f2.anilist_id);
     try std.testing.expectEqual(@as(?domain.Season, null), f2.season); // bare _id → no season
+}
+
+/// Mirror `popular()`'s per-card view-count rule so the test asserts the shipped
+/// behaviour: windowed `rangeViews` first, then total `views`.
+fn fixtureViewCount(ps: AllAnime.PStatus) ?u64 {
+    return AllAnime.parseViews(ps.rangeViews) orelse AllAnime.parseViews(ps.views);
+}
+
+test "popular: parses queryPopular feed, reuses edge mapping + windowed view counts (ROD-239)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Trimmed live capture. Rec 0: windowed entry — both views + rangeViews, so
+    // the windowed count wins. Rec 1: All-Time-style — total views, rangeViews
+    // absent, so it falls back to views. Rec 2: a bare card with neither → null.
+    // Manga-only extras (availableChapters/lastEpisodeDate) must be ignored.
+    const json =
+        \\{"data":{"queryPopular":{"total":500,"recommendations":[
+        \\{"anyCard":{"_id":"Gcou36nB8su3KWXrr","name":"Tsue to Tsurugi no Wistoria Season 2","englishName":"Wistoria: Wand and Sword Season 2","nativeName":"杖と剣のウィストリア Season 2","thumbnail":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182300-IYkq5KrkQq1V.jpg","airedStart":{"year":2026,"month":3,"date":12},"availableEpisodes":{"sub":13,"dub":9,"raw":0},"score":8.23,"lastEpisodeDate":{"sub":{}},"availableChapters":null},"pageStatus":{"_id":"670c","views":"660170","rangeViews":"12177","showId":"Gcou36nB8su3KWXrr"}},
+        \\{"anyCard":{"_id":"x2","name":"All-Time Show","availableEpisodes":{"sub":24,"dub":24}},"pageStatus":{"views":"2668088","rangeViews":null,"showId":"x2"}},
+        \\{"anyCard":{"_id":"x3","name":"No Views Show","availableEpisodes":{"sub":1,"dub":0}},"pageStatus":{"showId":"x3"}}
+        \\]}}}
+    ;
+    const parsed = try std.json.parseFromSlice(AllAnime.PResp, a, json, .{ .ignore_unknown_fields = true });
+    const pop = parsed.value.data.?.queryPopular.?;
+    try std.testing.expectEqual(@as(u32, 500), pop.total);
+    try std.testing.expectEqual(@as(usize, 3), pop.recommendations.len);
+
+    // Rec 0: anyCard maps through edgeToAnime (id/title/thumb-mined anilist id /
+    // eps); the windowed rangeViews (12177) wins over total views (660170).
+    var r0 = AllAnime.edgeToAnime(pop.recommendations[0].anyCard.?);
+    r0.view_count = fixtureViewCount(pop.recommendations[0].pageStatus);
+    try std.testing.expectEqualStrings("Gcou36nB8su3KWXrr", r0.id);
+    try std.testing.expectEqualStrings("Tsue to Tsurugi no Wistoria Season 2", r0.name);
+    try std.testing.expectEqual(@as(?u64, 182300), r0.anilist_id); // mined from the AniList thumb
+    try std.testing.expectEqual(@as(u32, 13), r0.eps_sub);
+    try std.testing.expectEqual(@as(?u64, 12177), r0.view_count); // windowed, not lifetime
+
+    // Rec 1: rangeViews null (All-Time) → falls back to total views.
+    try std.testing.expectEqual(@as(?u64, 2668088), fixtureViewCount(pop.recommendations[1].pageStatus));
+
+    // Rec 2: neither count present → null (card shows "—").
+    try std.testing.expectEqual(@as(?u64, null), fixtureViewCount(pop.recommendations[2].pageStatus));
+}
+
+test "windowDateRange: maps popularity windows to AllAnime dateRange (ROD-239)" {
+    try std.testing.expectEqual(@as(u32, 1), AllAnime.windowDateRange(.daily));
+    try std.testing.expectEqual(@as(u32, 7), AllAnime.windowDateRange(.weekly));
+    try std.testing.expectEqual(@as(u32, 30), AllAnime.windowDateRange(.monthly));
+    try std.testing.expectEqual(@as(u32, 0), AllAnime.windowDateRange(.all_time)); // all-time
 }
 
 test "edgeToAnime: score rescale clamps over-range and rejects non-finite (ROD-181)" {

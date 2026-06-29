@@ -65,10 +65,15 @@ fn dummyDisplayNameFn(_: *anyopaque) []const u8 {
     return "TestSrc";
 }
 
+fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
+    return &.{};
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
     .search = dummySearchFn,
+    .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
 };
@@ -100,6 +105,9 @@ const GateProvider = struct {
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
+    fn popularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
+        return &.{};
+    }
     fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
         return .{ .url = "" };
     }
@@ -108,6 +116,7 @@ const GateProvider = struct {
         .name = nameFn,
         .displayName = displayNameFn,
         .search = searchFn,
+        .popular = popularFn,
         .episodes = episodesFn,
         .resolve = resolveFn,
     };
@@ -142,6 +151,14 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.search_thread = null;
     }
+    if (app.popular_thread) |t| {
+        t.join();
+        app.popular_thread = null;
+    }
+    if (app.discover_enrich_thread) |t| {
+        t.join();
+        app.discover_enrich_thread = null;
+    }
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -172,6 +189,11 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             alloc.free(d.results);
             alloc.free(d.for_query);
         },
+        .popular_done => |d| {
+            for (d.results) |r| freeOwnedAnime(alloc, r);
+            alloc.free(d.results);
+        },
+        .discover_enriched => |d| freeOwnedAnime(alloc, d.result),
         .cover_done => |d| {
             alloc.free(d.rgba);
             alloc.free(d.for_id);
@@ -495,6 +517,284 @@ test "F1 from browse is a no-op and preserves active_pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
     // active_pane must not be reset — F1 from Browse is a no-op per §10.2
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
+}
+
+test "F4 and D from browse open Discover (ROD-239)" {
+    inline for (.{ keyEv(vaxis.Key.f4, .{}), keyEv('D', .{}) }) |k| {
+        var app: App = .{};
+        app.active_view = .browse;
+        try testTick(&app, k);
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+    }
+}
+
+test "F1 leaves Discover for Browse; F4 in Discover is a no-op (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    try testTick(&app, keyEv(vaxis.Key.f4, .{})); // already in Discover → no-op
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+    try testTick(&app, keyEv(vaxis.Key.f1, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
+test "D in search mode does not switch to Discover (normal-mode guard, ROD-239)" {
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    try testTick(&app, keyEv('D', .{ .shift = true }));
+    // The D→Discover binding is normal-mode only; in search it must fall through
+    // to the query buffer, leaving the view untouched.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
+test "popular_done lands in its own window slot, not the active one (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+
+    // A one-result WEEKLY page arrives while DAILY is the active window.
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "w1", .name = "Weekly Show", .view_count = 39653 });
+    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .weekly, .page = 1 } });
+
+    // Landed in the weekly slot, stamped fresh…
+    const weekly = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.weekly)];
+    try testing.expectEqual(@as(usize, 1), weekly.results.items.len);
+    try testing.expectEqual(@as(u32, 1), weekly.page);
+    try testing.expect(weekly.fetched_at > 0);
+    try testing.expectEqual(@as(?u64, 39653), weekly.results.items[0].view_count);
+    // …and the active daily slot is untouched — no cross-window contamination.
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (ROD-239)" {
+    // Cache HIT: a slot fetched within the TTL must NOT fire a fetch. Observable:
+    // firePopular sets the slot's loading flag before spawning; testTick drains the
+    // worker's .popular_done without processing it, so a fired fetch leaves loading
+    // set. A hit never calls firePopular, so loading stays false.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        defer app.discover.deinit(testing.allocator);
+        app.active_view = .browse;
+        const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "d1", .name = "Daily Show" }));
+        daily.page = 1;
+        daily.fetched_at = store_mod.Store.nowSecs(); // fresh
+        try testTick(&app, keyEv('D', .{}));
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+        try testing.expect(!daily.loading); // cache hit — no fetch fired
+        try testing.expectEqual(@as(usize, 1), daily.results.items.len); // preserved
+    }
+    // Cache MISS: an unfetched slot (page 0) fires a page-1 fetch on entry.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        defer app.discover.deinit(testing.allocator);
+        app.active_view = .browse;
+        try testTick(&app, keyEv(vaxis.Key.f4, .{}));
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+        // Stale/empty → firePopular ran (loading set; the drained .popular_done that
+        // would clear it is freed unprocessed by the test harness).
+        try testing.expect(app.discover.activeSlot().loading);
+    }
+}
+
+test "Discover grid cursor: l advances, g/G jump to ends (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.term_cols = 120;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "Show" }));
+    }
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqual(@as(usize, 1), app.discover.cursor);
+    try testTick(&app, keyEv('G', .{}));
+    try testing.expectEqual(@as(usize, 4), app.discover.cursor); // last
+    try testTick(&app, keyEv('g', .{}));
+    try testing.expectEqual(@as(usize, 0), app.discover.cursor); // first
+}
+
+test "Discover window keys switch the active window and reset the cursor (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    app.discover.cursor = 3;
+    // '2' selects Weekly directly; the cursor resets and the slot (stale) fetches.
+    try testTick(&app, keyEv('2', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
+    try testing.expectEqual(@as(usize, 0), app.discover.cursor);
+    // ']' cycles forward Weekly → Monthly.
+    try testTick(&app, keyEv(']', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .monthly), app.discover.window);
+    // '[' cycles back Monthly → Weekly.
+    try testTick(&app, keyEv('[', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
+}
+
+test "Discover Enter opens the detail zoom for the selected card; Esc returns (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    defer app.episodes.freeResults(testing.allocator); // Enter fires an episode fetch
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "z1", .name = "Zoom Me" }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.detail_origin), .discover), app.detail_origin);
+    // Esc demotes the zoom back to Discover (origin maps home).
+    try testTick(&app, keyEv(vaxis.Key.escape, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+}
+
+test "Discover prefetches the next page near the end; exhausted/loading block it (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.term_cols = 120; // → 5 columns
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "S" }));
+    }
+    daily.page = 1;
+
+    // Cursor at the top is not near the end → no prefetch. (firePopular sets
+    // loading before spawning; the harness drains the dummy page-2 reply without
+    // processing it, so a fired prefetch leaves loading set as the signal.)
+    app.discover.cursor = 0;
+    try testTick(&app, keyEv('k', .{}));
+    try testing.expect(!daily.loading);
+
+    // Cursor near the end → the next page is prefetched.
+    app.discover.cursor = 28;
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expect(daily.loading);
+
+    // Exhausted blocks the prefetch even at the very end.
+    daily.loading = false;
+    daily.exhausted = true;
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expect(!daily.loading);
+}
+
+test "Discover / jumps to Browse search (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    try testTick(&app, keyEv('/', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
+}
+
+test "popular_error marks the window failed and clears its spinner (ROD-239)" {
+    var app: App = .{};
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    daily.loading = true;
+    try testTick(&app, .{ .popular_error = .{ .window = .daily, .cause = error.NetworkDown } });
+    try testing.expect(!daily.loading);
+    try testing.expect(daily.failed); // drives the in-view "can't reach the feed"
+}
+
+test "popular_done persists feed rows to the store (persist like search, ROD-239)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "f1", .name = "Feed Show", .view_count = 12345 });
+    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .daily, .page = 1 } });
+
+    // The window-agnostic facts landed in the store, shareable with Browse. (The
+    // hidden-cache flag is a History-query filter column; getAnime doesn't surface
+    // it, so the row's presence + correct facts is the persist proof here.)
+    const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "f1")).?;
+    try testing.expectEqualStrings("Feed Show", rec.title);
+    try testing.expectEqual(@as(?i64, null), rec.year); // no year in the feed payload row
+}
+
+test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    // A feed card as delivered: no synopsis (anyCard has no description).
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me" }));
+    try testing.expectEqual(@as(?[]const u8, null), daily.results.items[0].description);
+
+    // The lazily-enriched copy arrives (same id, now with a synopsis).
+    const enriched = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me", .description = "A grand tale." });
+    try testTick(&app, .{ .discover_enriched = .{ .result = enriched, .window = .daily } });
+
+    // Merged in place — the zoom now has its synopsis.
+    try testing.expectEqualStrings("A grand tale.", daily.results.items[0].description.?);
+}
+
+test "discover_enriched drops the result when the show is gone from the slot (ROD-239)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    // The slot was cleared/refetched between firing the enrich and its landing, so
+    // the show id no longer matches. The enriched result must be FREED, not leaked
+    // — the test allocator fails the test if the else-branch drops the free.
+    const orphan = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "gone", .name = "Gone", .description = "x" });
+    try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily } });
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "isNewRelease: current-cour match drives NEW; guards return false (ROD-239)" {
+    var app: App = .{};
+    app.now_ms = 1778889600000; // 2026-05-15 UTC → Spring 2026 cour
+    try testing.expect(app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2026 }));
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .fall, .year = 2026 })); // wrong season
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2025 })); // wrong year
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = null, .year = 2026 })); // no season
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = null })); // no year
+    app.now_ms = 0; // before the first tick — never NEW (no false flash on frame zero)
+    try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2026 }));
+}
+
+test "Discover P adds the selected card to the watchlist (ROD-239)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "p1", .name = "Plan Me" }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv('P', .{ .shift = true }));
+    // The add flags a background history reload and lands a row in the store.
+    try testing.expect(app.history_dirty);
+    const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "p1")).?;
+    try testing.expectEqualStrings("Plan Me", rec.title);
 }
 
 test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {
