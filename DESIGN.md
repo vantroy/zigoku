@@ -474,14 +474,23 @@ breakpoints:
 
 | Terminal width | Cover cell | Slot | Column formula |
 |---|---|---|---|
-| ≥ 80 cols | 20 × 7 | 22 × 11 | `max(1, (w − 2) / 22)` |
-| < 80 cols | 14 × 5 | 16 × 9 | `max(1, (w − 2) / 16)` |
+| ≥ 80 cols | 20 × `cover_h` | 22 × (`cover_h`+4) | `max(1, (w − 2) / 22)` |
+| < 80 cols | 14 × `cover_h` | 16 × (`cover_h`+4) | `max(1, (w − 2) / 16)` |
 
 `w − 2` removes the 2-cell left margin (§3.7). Each card occupies one slot
-(`slot_w × slot_h`). The slot height contains the cover block (`cover_h` rows) +
-3 metadata rows (rank+badge, title, view count) + 1 gap row = `slot_h`. Rows
-visible per frame = `(content_h − 2) / slot_h`, where `content_h − 2` removes the
-window bar row and its spacer from the content height.
+(`slot_w × slot_h`). `slot_h = cover_h + 4`: three meta rows (rank+badge+score,
+title, view-count+genre-glyphs) plus one gap row. Rows visible per frame =
+`(content_h − 2) / slot_h`, where `content_h − 2` removes the window bar row and
+its spacer from the content height.
+
+**Adaptive cover height (ROD-247).** `cover_h` is derived from the terminal's
+reported cell pixel dimensions so a ~2:3 AniList poster fills the card width rather
+than pillarboxing inside a too-short box. For a 20-col card on a terminal reporting
+10×22-px cells, `cover_h ≈ 13` and `slot_h = 17`. When cell pixels are unreported
+(tmux, headless, SSH setups that don't answer the pixel metric) the height falls back
+to the pre-fill fixed values — 7 for the large tier, 5 for the small — which are
+always the minimum (the adaptive height never shrinks below them). The trade: taller
+covers mean fewer card-rows above the fold, offset by fuller poster art.
 
 **Window-toggle bar.** One row at y = 2 (after top bar + spacer), left margin 2 cells.
 Content: `[1] Daily · [2] Weekly · [3] Monthly · [4] All-Time`. Each window is
@@ -516,16 +525,36 @@ results, shows the loading state, refetches with the appropriate `dateRange` val
    text-on-base. No box border, no background band. The marker does not touch the
    cover cell, so cover art is never masked or composited. Combined selection cue:
    `▸` in the gutter + title in `state.focus` + bold.
-3. **Rank + badge row.** `#N` in `text.primary`. At most one badge follows:
+3. **Rank + badge + score row (row 0).** `#N` in `text.primary`, left-anchored.
+   At most one badge follows the rank:
    - Rank #1: `TOP` in `state.now` + bold.
    - Current-cour release (exclusive with `TOP`): `NEW` in `state.focus` + bold.
    Both badges are **derived render-side** from rank index and season/year — they
    are not payload fields.
-4. **Title row.** Romaji title in `text.primary` (unselected) or `state.focus` + bold
-   (selected). Clipped to `cover_w` columns with `…` (§2.1).
-5. **View count row.** Windowed view count in `text.muted`. Format: `1.4m` /
-   `660.17k` / `892`. Absent/null: `—` in `text.dim`. The count is the windowed
-   metric (`rangeViews`); the All-Time window uses the lifetime total.
+   A **score badge** `[NN]` / `[--]` is right-anchored at the cover edge on the same
+   row, never colliding with the left-anchored rank (they grow from opposite ends).
+   Tier colour per §2.2 with one exception: the 91+ tier is capped at `text.primary`
+   on cards — `state.now` is reserved for the `TOP` rank pointer (§0
+   one-magenta-at-a-time), so a top-scored #1 card does not double-paint both `TOP`
+   and the badge in hot+bold. `[--]` in `text.dim` for unenriched or null scores.
+4. **Title row (row 1).** Romaji title in `text.primary` (unselected) or `state.focus`
+   + bold (selected). Clipped to `cover_w` columns with `…` (§2.1).
+5. **View count + genre row (row 2).** Windowed view count in `text.muted`,
+   left-anchored. Format: `1.4m` / `660.17k` / `892`. Absent/null: `—` in `text.dim`.
+   The count is the windowed metric (`rangeViews`); the All-Time window uses the
+   lifetime total. Up to two **genre glyphs** are right-anchored at the cover edge on
+   the same row, in `text.dim`, single-space separated — ambient glyph texture rather
+   than a label; the full genre list lives in the zoom detail pane. Monochrome BMP
+   symbols (not emoji) so they render deterministically over tmux/Kitty/SSH. The
+   single space is what keeps the pair legible; `text.dim` keeps them as texture (a
+   brighter tier made them compete with the view-count). Absent for unenriched or
+   genre-unmapped cards. Vocabulary: §3.8a.
+6. **Gap row (row 3).** Empty — gives the grid visual breathing room between card rows.
+7. **Peek row (when space allows).** After the last full card row, any leftover
+   vertical band (≥ 3 rows tall) renders the tops of the **next card-row's covers**,
+   clipped to the band height. This signals "more content below" instead of dead space.
+   No meta rows appear in the peek band — covers only. The load-more footer yields to
+   the peek row and renders only when the peek band is absent.
 
 **Card token summary:**
 
@@ -537,10 +566,13 @@ results, shows the loading state, refetches with the appropriate `dateRange` val
 | Rank `#N` (metadata row) | `text.primary` | — |
 | `TOP` badge | `state.now` | bold |
 | `NEW` badge | `state.focus` | bold |
+| Score badge `[NN]` | §2.2 tier colour; 91+ capped at `text.primary` on cards | right-anchored at cover edge, rank row |
+| Score badge `[--]` (unenriched / null) | `text.dim` | right-anchored at cover edge, rank row |
 | Title (unselected) | `text.primary` | clipped with `…` |
 | Title (selected) | `state.focus` | bold, clipped with `…` |
 | View count | `text.muted` | — |
 | View count absent | `text.dim` | `—` placeholder |
+| Genre glyphs (≤ 2) | `text.dim` | right-anchored at cover edge, view-count row; single-space separated |
 
 **Grid states.** When the results array is empty, one of three states renders centered
 in the card-grid region:
@@ -566,14 +598,47 @@ renders below the last visible card row:
 
 **Season chip and `·` dot.**
 
-The season chip (§3.4) is **suppressed** in the Discover grid. The view spans all
-popularity windows rather than one show's season context, so the chip has no
-meaningful value here. The chip does appear in the detail zoom when entered from
-Discover (`detail_origin = .discover`) — it shows only the focused show's season+year,
-with no current-cour fallback (matching the zoom rule for Browse/History, §10.3b).
+The season chip (§3.4) tracks the **selected card** in the Discover grid (ROD-247):
+once the page batch enriches the card, the kanji+year chip appears in the top bar
+for the cursor position. When the selected card has no season data (unenriched, or
+the feed returned null) the chip is absent — there is no cour fallback (the grid has
+no ambient single-season context, and a misleading ambient chip would collide with the
+"selected show's season" meaning it carries in Browse/History). The detail zoom
+(`detail_origin = .discover`) follows the same rule.
 
 The `·` pane-focus dot is always `state.focus` in Discover. The view is single-pane:
 there is no list/detail split and therefore no dim state.
+
+### 3.8a Genre Glyph Vocabulary
+
+The genre glyph map covers AniList's fixed genre vocabulary. This table is the
+canonical source — the implementation in `src/tui/view/discover.zig` (`genre_glyphs`
+array) must match it exactly; edit both together (drift is rot). All glyphs are
+monochrome BMP codepoints so they render predictably in any terminal font without
+colour or width ambiguity. Genres not listed here map to no glyph and are silently
+skipped. A card shows at most two glyphs (the first two mappable genres in AniList's
+returned order).
+
+| AniList genre | Glyph | Unicode | Name |
+|---|---|---|---|
+| Action | ⚔ | U+2694 | Crossed swords |
+| Adventure | ⚑ | U+2691 | Flag |
+| Comedy | ☺ | U+263A | Smiling face |
+| Drama | ◆ | U+25C6 | Diamond |
+| Ecchi | ♨ | U+2668 | Hot springs |
+| Fantasy | ⚜ | U+269C | Fleur-de-lis |
+| Horror | ☠ | U+2620 | Skull |
+| Mahou Shoujo | ✿ | U+273F | Flower |
+| Mecha | ⚙ | U+2699 | Gear |
+| Music | ♪ | U+266A | Music note |
+| Mystery | ◈ | U+25C8 | Diamond-in-diamond |
+| Psychological | ◐ | U+25D0 | Half circle |
+| Romance | ♥ | U+2665 | Heart |
+| Sci-Fi | ⬡ | U+2B21 | Hexagon |
+| Slice of Life | ❖ | U+2756 | Ornament |
+| Sports | ◎ | U+25CE | Bullseye |
+| Supernatural | ☽ | U+263D | Crescent moon |
+| Thriller | ↯ | U+21AF | Lightning |
 
 ---
 
@@ -1365,36 +1430,35 @@ Notes:
 ### 5.7 Discover / Popular
 
 Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
-`slot_w = 22`, `cover_w = 20 × 7`, 5 columns. Card 3 selected.
+`slot_w = 22`, `cover_w = 20`, cover height adaptive (fills card width from cell
+pixels; fallback 7 when unreported). 5 columns. Card 3 selected.
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  Popular                                                            ·        [fg+bold name; chrome sep; f chip; f · (always lit — single pane)]
+  ZIGOKU  ░  Discover  冬 2026                                                   ·        [fg+bold name; chrome sep; f Discover tab (active); season chip m — selected card's season when enriched, absent otherwise; f · always lit — single pane]
                                                                                          [spacer row]
-  [1] Daily · [2] Weekly · [3] Monthly · [4] All-Time                                    [active=Daily f+bold; rest m; [N] keys d (active lifts to f); separator dots d]
+  [1] Daily · [2] Weekly · [3] Monthly · [4] All-Time                                    [active=Daily f+bold; rest m; [N] keys m (active lifts to f); separator dots d]
                                                                                          [spacer row]
-  [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; 20×7 cells each; bg.surface fill]
+  [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; cover_h rows each; bg.surface fill — height adaptive (fills card width)]
   [         ][         ][         ][         ][         ]
   [  #1     ][  #2     ][  #3     ][  #4     ][  #5     ]                               [rank d, centered in cover placeholder]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
-  #1 TOP      #2         ▸#3 NEW      #4          #5                                     [rank fg; TOP h+bold; NEW f+bold; ▸ f in left gutter (x-1) marks selected card; at most one badge per card]
+  #1 TOP    [--]  #2     [72]  ▸#3 NEW  [85]  #4   [68]  #5   [--]                     [rank fg; score badge right-anchored at cover edge: [NN] tier-colour (91+ capped fg on cards); [--] d when unenriched; TOP h+bold; NEW f+bold; ▸ f gutter (x-1)]
   Frieren: B… FMA: Brothe Vinland S  Mob Psycho  Steins;Ga…                            [title fg; selected (#3) f+bold; clipped to cover_w with …]
-  1.4m        659.29k     892.10k     341.2k      —                                     [view count m; absent → — in d]
-                                                                                         [gap row, part of slot]
-  [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [second card row]
-  ...
-  ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌                             [border.hair dashed rule; next-page fetch in flight]
-  ⠋ loading more…                                                                       [m + italic while page-N fetch in flight]
+  1.4m      ⚜♨  659.29k  ⚔   892.10k  ⚔   341.2k  ⚜    —                              [count m left-anchored; genre glyphs d right-anchored (§3.8a); absent if unenriched / unmapped]
+                                                                                         [gap row — slot_h = cover_h + 4]
+  [PEEK CVR][PEEK CVR][PEEK CVR][PEEK CVR][PEEK CVR]                                    [peek row: tops of next card-row's covers clipped to leftover band (≥ 3 rows); no meta]
 
   ▌  hjkl move · enter open · P save · [ ] window · / search · q quit
 ```
 
 Notes:
 - Top-bar strip: the `[D]iscover` tab is active (`state.focus` + bold) per §3.4; the
-  mockup above shows the shorthand label. Season chip suppressed (§3.8).
+  mockup above shows the shorthand label. Season chip tracks the selected card's
+  season+year once batch-enriched; absent (no cour fallback) when null — see §3.8.
 - `·` dot: always `state.focus` — single pane, no dim state.
 - Window bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
   own. Window change triggers a refetch.
@@ -1404,15 +1468,22 @@ Notes:
   not touch the cover cell, so cover art is never masked or composited.
 - `TOP` is always rank #1 (`state.now` + bold). `NEW` is a current-cour show not
   ranked #1 (`state.focus` + bold). The two are mutually exclusive.
+- Score badge `[NN]` / `[--]`: right-anchored at the cover edge on the rank row.
+  Tier colour per §2.2; the 91+ tier is capped at `text.primary` on cards —
+  `state.now` is reserved for the `TOP` pointer. `[--]` in `text.dim` for unenriched
+  or null scores.
 - Title clips to `cover_w` (20 cols at the large tier) with `…`. Selected title is
   `state.focus` + bold; unselected is `text.primary`.
-- View count absent renders `—` in `text.dim` (not an italic annotation — it is a
-  factual placeholder, not an editorial aside, so §1.3 italic-for-annotation does
-  not apply here).
+- View count absent renders `—` in `text.dim` (not italic — factual placeholder, §1.3).
+- Genre glyphs (§3.8a): up to 2 monochrome BMP symbols right-anchored at the cover
+  edge on the view-count row, in `text.dim`. Absent for unenriched or genre-unmapped
+  cards. The full genre list is in the detail zoom pane.
+- Gap row is part of `slot_h = cover_h + 4`.
+- Peek row: the leftover vertical band below the last full card row (when ≥ 3 rows
+  remain) shows the tops of the next card-row's covers clipped to that band. The
+  `⠋ loading more…` / `all entries loaded` footer only renders when no peek row is
+  visible. `all entries loaded` is `text.dim`, no italic (status fact, not annotation).
 - `/ search` jumps to Browse and opens its search prompt.
-- The dashed `╌` rule and `⠋ loading more…` footer appear only while the next page
-  is fetching. `all entries loaded` (text.dim, no italic) appears once the feed is
-  exhausted and the last card row is in view.
 - `Enter` opens the full-screen detail zoom (`active_view = .detail`,
   `detail_origin = .discover`) — the existing `drawDetailPane` pass unchanged.
   `Esc` returns to Discover. `P` saves to watchlist per the §4.10 path.
@@ -1665,6 +1736,7 @@ revisited without archaeology.
 | List column 38% / detail 62% at default width | Tested against 120-col and 160-col terminals. 38% gives ~45 chars for the list — enough for most anime titles without truncation. Detail gets the rest. | Adjust if common terminal widths expose truncation problems. |
 | `state.focus` (cyan) gated to the selected, list-focused row; status colors step off it (ROD-194) | One token can't mean both "the cursor" and "this show is airing/watching" — a fully-filled watching bar in `state.focus` was out-shouting the selected row, and pane focus was invisible because the selection looked identical focused or not. Reserving cyan for `selected and list_focused` fixes both: unselected watching/paused step down to `text.muted` (the `▸`/`◐` glyph still carries the status), and losing list focus visibly recedes the selected row (band drops, `▸` dims, title un-bolds). The `·` dot stays as low-weight orientation; the list itself now carries the focus signal. Magenta remains reserved for the §8 status-bar cursor. | If watchlist scanning suffers because watching rows no longer read as a cyan "heat signature" at a glance, trial `state.focus` dim (not full) for unselected watching, or widen the `text.muted`↔`text.dim` gap so watching vs completed bars stay distinct. |
 | `r` (not `:reset`) for progress recompute in History (ROD-193) | The keybind ships now rather than being deferred to `:` command mode because single-level undo (`u`) goes stale after any subsequent key — the recovery window is one action. `r` is non-adjacent to `c` on Colemak-DH, so it can't be mis-keyed in the same motion. Recompute uses strategy A (sorted-index, translation-scoped): `progress` = 1-based ordinal of the last fully-watched row among the `episode_progress` rows present, sorted by `EpisodeNumber.sortKey`. Intentionally under-counts gap-watching (only rows that were started are present). `Store.recomputeProgress` is the single source of truth for these semantics. | If users want a "reset to 0" shortcut independently of strategy-A, note that a show with no fully_watched rows already recomputes to 0 — suggest deleting episode_progress rows via a future `:clear progress` command. |
+| Genre glyphs stay `text.dim` (`fg3`), single-space separated (ROD-247) | The glyphs are ambient texture, not a label — `text.dim` is the register for "present but not asking to be read." The real legibility problem was the two glyphs smushing into one shape, not brightness: a single space between them fixed that. `text.muted` (`fg2`) was tried and reverted — brighter made the glyphs compete with the view-count for attention, which owns that row as the popularity-ranking signal. The spatial split (count left-anchored, glyphs right-anchored at the cover edge) plus the dim tier keeps each in its lane. | If the glyphs prove invisible in practice, widen the inter-glyph gap or drop to one before re-dimming. |
 | Nord `focus` stays hue-shift, **not** a luminance lift (ROD-184: ratified B over A) | ROD-183 flagged that Nord violates the §1.1 focus-clears-`fg`-luminance rule — `focus` (nord8 frost, L 0.475) reads dimmer than `fg` (nord4 snow, L 0.727). Option A was to overdrive `focus` to a snow-storm value (nord6, L≈0.83) so the rule stays universal. Rejected: Nord's `fg` already sits the brightest of the four dark palettes, and lifting `focus` past it would push Nord toward a light-theme read — fighting §0's dark-only constraint. The nord8 hue-shift + bold carries focus distinction without adding luminance, faithful to Nord's own palette relationships. So the focus-clears-`fg`-luminance rule stays non-universal (§1.4): Terminal Ghost / Phosphor / TokyoNight honour it; Nord trades it for hue. This ratifies the ROD-183 doc state as a deliberate call, not a deferred fix — `src/tui/colors.zig` `nord.focus` is unchanged. | If user testing shows the Nord focused row is genuinely hard to locate (hue-shift + bold insufficient), revisit A — but bound any lift so Nord's `focus` does not cross into light-theme luminance. |
 
 ---
@@ -2072,20 +2144,26 @@ flag. Switching windows preserves each slot's state — `Daily` data is not flus
 when the user briefly visits `Weekly`. A window whose slot is empty at activation
 triggers a fresh fetch.
 
+**Batched per-page AniList enrichment (ROD-247).** Each time a page of feed results
+lands, a single AniList call hydrates `score`, `genres`, and `season` for all cards
+on that page. This fires on a dedicated thread slot (`discover_batch_enrich_thread`)
+separate from the Browse enrichment path, so the two cannot block each other. Before
+the batch completes, cards degrade gracefully per the table below; fields fill in
+per-card once the batch lands. Detail zoom from Discover (`Enter`) additionally fires
+the lazy single-card enrich (`discover_enrich_thread`) for any remaining fields, and
+uses the existing `episodesTask` / `drawDetailPane` pipeline.
+
 **Null-degrade rules.** The Popular grid renders whatever fields are present and
-falls back per §9.1 where enrichment hasn't completed:
+falls back where enrichment has not yet completed:
 
 | Field | Present | Absent fallback |
 |---|---|---|
 | Cover URL | cover art — Kitty image, or half-block mosaic on non-Kitty terminals (§3.8) | `bg.surface` placeholder fill (§3.8) |
 | View count | formatted count in `text.muted` | `—` in `text.dim` |
-| Season/year | `NEW` badge derivation possible | `NEW` badge suppressed for that card |
+| Score | `[NN]` badge, tier-coloured per §2.2; 91+ capped at `text.primary` on cards | `[--]` in `text.dim` |
+| Genres | up to 2 genre glyphs in `text.dim`, right-anchored on the view-count row (§3.8a) | glyph pair absent |
+| Season/year | `NEW` badge derivation + top-bar season chip for the selected card | `NEW` badge suppressed; chip absent |
 | Romaji title | shown, clipped | shown as-is (AllAnime always supplies a name) |
-
-The Popular grid does **not** trigger AniList enrichment — it is a ranked popularity
-snapshot, not a search result. Enrichment fires through the Browse search path only.
-Detail zoom from Discover (`Enter`) uses the existing `episodesTask` / `drawDetailPane`
-pipeline, which does enrich on detail entry.
 
 ---
 
@@ -2251,7 +2329,7 @@ differentiated from the rest by color, no separator glyph beyond the `·` dots:
 | `.browse` | `[B]rowse` | selected show's season+year, else current cour |
 | `.history` | `[H]istory` | selected show's season+year, else current cour |
 | `.detail` | inherits `detail_origin` (`[B]rowse` \| `[H]istory` \| `[D]iscover`) | focused show's season+year only — **no** cour fallback |
-| `.discover` | `[D]iscover` | — (suppressed; §3.8 — no single-show context in the grid) |
+| `.discover` | `[D]iscover` | selected card's season+year when enriched; absent if null — no cour fallback (§3.8) |
 | `.settings` | `[S]ettings` | — (none) |
 
 The full strip occupies cols 16–61; the season chip sits two cells after it (col 64)
