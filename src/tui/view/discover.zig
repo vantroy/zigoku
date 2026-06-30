@@ -42,11 +42,12 @@ const POSTER_W_DEN: u32 = 100; // …denominator
 /// it falls back to the pre-fill height. Never shorter than that fallback.
 fn coverHeight(cover_w: u16, fallback: u16, cell_w_px: u16, cell_h_px: u16) u16 {
     if (cell_w_px == 0 or cell_h_px == 0) return fallback;
-    const den = @as(u32, cell_h_px) * POSTER_W_DEN;
-    if (den == 0) return fallback;
+    const den = @as(u32, cell_h_px) * POSTER_W_DEN; // ≥ POSTER_W_DEN > 0 (cell_h_px ≠ 0 above)
     const num = @as(u32, cover_w) * @as(u32, cell_w_px) * POSTER_H_NUM;
     const h: u32 = (num + den / 2) / den; // round to nearest cell
-    return @intCast(@max(@as(u32, fallback), h));
+    // Clamp: never below the fallback, never above u16 — a non-physical pixel report
+    // (e.g. cell_h_px == 1) would otherwise overflow the cast and panic in safe builds.
+    return @intCast(@min(@as(u32, std.math.maxInt(u16)), @max(@as(u32, fallback), h)));
 }
 
 /// Resolve the grid geometry for a content area `w` wide by `content_h` tall.
