@@ -1061,7 +1061,7 @@ wide two-pane layout (§5.4a).
       [████████████████]  24 / 24 eps  · completed 2023-11-02
                                                                                      [d bar, d meta]
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit
 ```
 
 Notes:
@@ -1130,7 +1130,7 @@ record is focused.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3 · q quit                          [list focused; help matches Browse §10.5]
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit                          [list focused; help matches Browse §10.5]
 ```
 
 **History preview — detail stack (authoritative).** The ASCII mocks in this
@@ -1253,7 +1253,7 @@ Live-editable. Full width. No cover art.
     palette                       terminal_ghost                       hjkl to cycle
     landing view                  history                              hjkl to cycle
 
-  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
+  ▌  hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit
 ```
 
 > **Reconciled with shipped code (ROD-138).** This surface drifted from the M4-era
@@ -1364,7 +1364,7 @@ Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
   ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌                             [border.hair dashed rule; next-page fetch in flight]
   ⠋ loading more…                                                                       [m + italic while page-N fetch in flight]
 
-  ▌  hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit
+  ▌  hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit
 ```
 
 Notes:
@@ -1410,7 +1410,9 @@ Notes:
 | `q` | Quit the app from anywhere — normal mode only, so a literal `q` in a search/filter is text. Persists a dirty Settings tab first (ROD-210). |
 | `/` | Open search prompt in bottom bar |
 | `:` | Open command prompt in bottom bar |
-| `H` | Switch to History/Watchlist view (or back to Browse) |
+| `B` | Switch to Browse view |
+| `H` | Switch to History/Watchlist view |
+| `D` | Switch to Discover view |
 | `S` | Switch to Settings view |
 | `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
 | `u` | Undo last status mutation (single-level, History list pane only) |
@@ -1767,13 +1769,13 @@ not covered by §5.
 
 
                                nothing watched yet                                   [m + italic, centered]
-                            F1  find anime in browse                                 [m, centered]
+                            B  find anime in browse                                  [m, centered]
 
 
 
 
                                                                                      [spacer rows]
-  ▌  F1 browse · q quit
+  ▌  B browse · q quit
 ```
 
 Rendering rules:
@@ -1781,8 +1783,9 @@ Rendering rules:
 - `nothing watched yet` — centered in the viewport (horizontal and vertical
   center of the rows between top bar and bottom bar). Color: [m] + italic. Italic
   marks absent-state annotation throughout the app (cf. §9.5), not content.
-- `F1  find anime in browse` — one row below the above, centered. Color: [m].
-  The `F1` is in [f] + bold to match its role as the action. ROD-211: an empty
+- `B  find anime in browse` — one row below the above, centered. Color: [m].
+  The `B` is in [f] + bold to match its role as the action (ROD-249: the surfaced
+  Browse letter, replacing the old `F1` hint). ROD-211: an empty
   watchlist has nothing for `/` to filter, so this first-run line points to Browse
   (where shows are found and added) instead of advertising a dead-end filter. Do
   not underline — the help line already owns the underline treatment for keybinds.
@@ -2063,7 +2066,8 @@ pipeline, which does enrich on detail entry.
 ## 10. ROD-72: View System & Focus Model
 
 This section is the implementable specification for view switching, the per-view
-focus model, F1/F2/F3 keybinds, bottom-bar help strings, and the Esc chain.
+focus model, the B/H/D/S view-switch binds (with F1–F4 aliases), bottom-bar help
+strings, and the Esc chain.
 Everything here is a concrete buildable decision. An implementer should need zero additional
 design calls to implement `active_view`, `active_pane`, and the keybind dispatch
 table below.
@@ -2081,7 +2085,7 @@ keybinds.
 | Browse | `active_view = .browse` | Optional (config `landing = "browse"`, §9.2) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
 | History | `active_view = .history` | Default (config `landing = "history"`, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
 | Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History or Discover** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
-| Discover | `active_view = .discover` | No | Single-pane: full-canvas card grid (§3.8, §5.7). No `active_pane` semantics. Reached with `D` or `F4` from any view. |
+| Discover | `active_view = .discover` | No | Single-pane: full-canvas card grid (§3.8, §5.7). No `active_pane` semantics. Reached with `D` or `F3` from any view. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
 **`.detail` is both an `active_pane` value within Browse/History and a standalone `active_view` (the zoom).**
@@ -2096,7 +2100,7 @@ and §10.7 for the decision log.
 Browse can be selected as the landing view (`landing = "browse"`, §9.2), but until
 the v0.2 Discovery Feeds land there is no feed to populate it — a Browse landing
 opens on its idle search prompt (§9.5). It also becomes live when the user presses
-`F1` or `H` from History.
+`B` or `F1` from History.
 
 ---
 
@@ -2104,19 +2108,25 @@ opens on its idle search prompt (§9.5). It also becomes live when the user pres
 
 #### Primary binds (vim-native, single-key)
 
+Four destinations, each with one vim-native letter. All are normal-mode only (a
+literal letter in a search/filter appends instead of switching), and each is a
+no-op if already on that view.
+
 | Key | Action | From |
 |---|---|---|
-| `H` | Toggle: if in History → switch to Browse; if elsewhere → switch to History | Any view |
-| `S` | Switch to Settings | Any view (except already in Settings → no-op) |
+| `B` | Switch to Browse | Any view (normal mode) |
+| `H` | Switch to History/Watchlist | Any view (normal mode) |
+| `D` | Switch to Discover | Any view (normal mode) |
+| `S` | Switch to Settings | Any view (normal mode) |
 
-`H` is a toggle because Browse has no dedicated single-key jump of its own —
-`F1` reaches it (see below), and `landing = "browse"` (§9.2) can open the app
-straight into Browse. From Browse, pressing `H` returns to History. This matches
-§6.1's current `H` entry.
+Each is a **direct go-to, not a toggle**. ROD-249 retired the old `H` Browse↔History
+toggle: `B` is now Browse's own single-key jump, so `H` from History is simply a
+no-op (press `B` to go back). This removed the one asymmetry — Browse had been the
+only content view without a dedicated letter.
 
-`S` from Settings is a no-op. There is no "toggle Settings" semantic. `q` quits
-the app (persisting a dirty tab first); `F1`/`F2`/`F3`/`H` switch away (also
-persisting). `Esc` does **not** leave Settings — it is a no-op there (ROD-210).
+Leaving Settings via any of these persists a dirty tab (`leaveSettings`). `q` quits
+the app (persisting first); `Esc` does **not** leave Settings — it is a no-op there
+(ROD-210).
 
 **Entering the standalone Detail zoom** is not a view-switch keybind — it is a
 promote. `Space` from `active_pane = .detail` opens `active_view = .detail` at any
@@ -2131,28 +2141,26 @@ the list; `q` no longer backs out — it quits the app (ROD-210, §10.4).
 
 #### F-key aliases (discoverable navigation)
 
-F-keys are aliases for the primary binds. They do the same thing. They exist so
-a new user pressing function keys lands in the right place.
+F-keys are secondary aliases for the primary letter binds — same destinations, in
+the same order. They are kept so a new user mashing function keys still lands
+somewhere sensible. Unlike the letters, they are **global**: they fire in any mode
+(they can't be typed into a search), so no normal-mode guard.
 
 | Key | Action |
 |---|---|
-| `F1` | Switch to Browse (equivalent to pressing `H` from History, or a no-op if already in Browse) |
-| `F2` | Switch to History (equivalent to pressing `H` from Browse/Settings) |
-| `F3` | Switch to Settings (equivalent to `S`) |
-| `F4` | Switch to Discover (equivalent to `D` from any view; no-op if already in Discover) |
+| `F1` | Switch to Browse (= `B`) |
+| `F2` | Switch to History (= `H`) |
+| `F3` | Switch to Discover (= `D`) |
+| `F4` | Switch to Settings (= `S`) |
 
-**F1 from Browse:** no-op. The user is already there.
-**F2 from History:** no-op. The user is already there.
-**F3 from Settings:** no-op. The user is already there.
-**F4 from Discover:** no-op. The user is already there.
+Each is a no-op from its own view (F1 in Browse, F2 in History, F3 in Discover,
+F4 in Settings). ROD-249 reordered these so the content views (F1–F3) come ahead
+of the meta view (F4 = Settings); the pre-overhaul order had Settings at F3 and
+Discover at F4, which is what made the assignments feel arbitrary.
 
-`D` is the primary single-key bind for Discover, symmetric with `H` (History) and
-`S` (Settings). `F4` is its discoverable alias, listed in every view's help line
-alongside `F1`/`F2`/`F3`.
-
-F-keys appear in the bottom-bar help line (see §10.5) so they are the primary
-discovery surface for new users. Vim-native users will use `H`/`S` and never
-need them. Both coexist without conflict.
+The bottom-bar help line surfaces the **letters** (`B/H/D/S`), not the F-keys
+(§10.5): the letters are more memorable and the help line is the discovery
+surface. The F-keys remain as a quiet fallback. Both coexist without conflict.
 
 **libvaxis key matching for F-keys:**
 
@@ -2272,9 +2280,10 @@ there is no level back — Esc is a no-op rather than a quit trigger.
 **Why Esc from History/Settings (.list) is a no-op (ROD-210):** Esc means "peel
 one transient layer," never "switch base view." Over a base-view list there is no
 layer to peel, so Esc does nothing — History stays History, Settings stays
-Settings. Base-view changes are explicit: `F1`/`F2`/`F3` and the `H` toggle. This
-retires the old "Esc-mashing dumps you on Browse" behavior, where Esc silently
-switched the base view once the last transient layer was peeled.
+Settings. Base-view changes are explicit: the `B`/`H`/`D`/`S` letters (and their
+`F1`–`F4` aliases). This retires the old "Esc-mashing dumps you on Browse"
+behavior, where Esc silently switched the base view once the last transient layer
+was peeled.
 
 **Why zoom Esc lands on `.detail`, not `.list`:** the user arrived at zoom via
 the detail pane. Esc undoes one step. Skipping back to list would be jarring —
@@ -2299,10 +2308,10 @@ and its padding. The strings below are written to fit that budget.
 #### Browse — normal, list pane focused
 
 ```
-  ▌  hjkl · / find anime · P save · F1/F2/F3/F4 views · q quit
+  ▌  hjkl · / find anime · P save · B/H/D/S views · q quit
 ```
 
-Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `F1`, `F2`, `F3`, `F4`, `q`.
+Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `B`, `H`, `D`, `S`, `q`.
 
 #### Browse — normal, detail pane focused
 
@@ -2324,13 +2333,14 @@ within the ~74-char budget:
 #### History — normal, list pane focused
 
 ```
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3/F4 · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit
 ```
 
-Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `F1`, `F2`, `F3`, `F4`, `q`.
+Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `B`, `H`, `D`, `S`, `q`.
 
-Note: the `F1/F2/F3/F4` group is shown together (matching Browse) even though F2
-from History is a no-op. `H` is not shown (help line targets newcomers).
+Note: the `B/H/D/S` view letters are shown together (matching Browse) even though
+`H` from History is a no-op (ROD-249 surfaces the letters; the F-key aliases are
+the quiet fallback).
 `/ filter` and `l/enter detail` are shown explicitly — History shares Browse's
 pane grammar (ROD-170), and its local filter (ROD-211, distinct from Browse's
 catalogue search) isn't obvious in a watchlist without the hint. Over budget at
@@ -2372,29 +2382,29 @@ Underlined: `h`, `j`, `k`, `l`, `enter`, `space`, `esc`.
 #### History — empty (no records)
 
 ```
-  ▌  F1 browse · q quit
+  ▌  B browse · q quit
 ```
 
-Underlined: `F1`, `q`.
+Underlined: `B`, `q`.
 
 This is the §9.2 empty state. Minimal help — the `/` filter is suppressed (nothing
 to filter), and the screen itself already names the state and points to Browse
-(`nothing watched yet` / `F1 find anime in browse`).
+(`nothing watched yet` / `B find anime in browse`).
 
 #### Settings — normal
 
 ```
-  ▌  hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit
+  ▌  hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `F1`, `F2`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `B`, `H`, `D`, `q`.
 
 Settings persists a dirty tab on the way out, so `q` reads `q save+quit`
-(ROD-210; the `+` signals one press does both). `F1`/`F2` are surfaced so
-*leaving without quitting* is discoverable — they switch to Browse/History and
-persist, mirroring how the other views advertise their view-switches. `Esc` is a
-no-op here — the field-edit cancel lives in the edit-mode line below. This
-matches the §5.5 mock.
+(ROD-210; the `+` signals one press does both). `B`/`H`/`D` are surfaced so
+*leaving without quitting* is discoverable — they switch to Browse/History/Discover
+and persist, mirroring how the other views advertise their view-switches. `S` is
+omitted (it is a no-op inside Settings). `Esc` is a no-op here — the field-edit
+cancel lives in the edit-mode line below. This matches the §5.5 mock.
 
 #### Settings — field under edit
 
@@ -2411,24 +2421,24 @@ available. The `▌` reappears when the edit is committed or cancelled.
 #### Discover — normal
 
 ```
-  ▌  hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit
+  ▌  hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `F1`, `F2`, `F3`, `F4`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `B`, `H`, `D`, `S`, `q`.
 
 `hjkl` navigate the card grid (left/right wrap within a row; up/down move card-rows).
 `enter` opens the detail zoom (`active_view = .detail`, `detail_origin = .discover`).
 `P` saves the selected card to the watchlist per the §4.10 path.
 `[`/`]` cycle the active window (`Daily` → `Weekly` → `Monthly` → `All-Time` and back);
-`1`–`4` select directly.
+`1`–`4` select directly (ROD-248 annotates these in the window bar itself).
 `/` jumps to Browse and opens its search prompt — there is no in-view filter in Discover.
-`F4` from Discover is a no-op. `F1`/`F2`/`F3` switch to Browse/History/Settings.
+`D` from Discover is a no-op. `B`/`H`/`S` switch to Browse/History/Settings.
 `q` quits.
 
-At 80 cols this string fits within the ~74-char budget:
-`hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit`
-= 84 chars. It is over budget and will clip; `hjkl move` and `enter open` survive
-the most common clip point, preserving the primary navigation hints.
+At 80 cols this string runs ~80 chars — over the ~74-char budget, so it clips;
+`hjkl move` and `enter open` survive the most common clip point, preserving the
+primary navigation hints. (The `B/H/D/S views` letters are 4 chars shorter than
+the old `F1/F2/F3/F4 views`, so the line clips a touch less than before.)
 
 #### Any view — search active (§3.5 State 2 unchanged)
 
@@ -2541,8 +2551,8 @@ if (key.matches(vaxis.Key.escape, .{})) {
         self.active_pane = if (self.term_w >= pane_split_min) .detail else .list;
     }
     // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed the
-    // old History/Settings → Browse jump — base-view switches go through
-    // F1/F2/F3 and the H toggle.
+    // old History/Settings → Browse jump — base-view switches go through the
+    // B/H/D/S letters (and their F1-F4 aliases).
     return;
 }
 ```
@@ -2574,7 +2584,7 @@ if (self.input_mode == .normal and key.matches('q', .{})) {
 | Decision | Rationale | Revisit trigger |
 |---|---|---|
 | F-keys are aliases, not primary binds | H/S are already in §6.1 and the codebase. Adding F-keys as separate primary binds would create two authoritative tables to keep in sync. Aliases give discoverability without forking the semantic. | If a future milestone removes H/S (unlikely), promote F-keys to primary. |
-| F-keys appear in help line; H/S do not | The help line targets users who are not already vim-native. Showing H/S alongside F1/F2/F3 doubles the character cost for no benefit — the vim user already knows H/S. If both appear, the line gets crowded and both become less legible. | If user feedback shows H/S are missed, add them as secondary text in a second help mode toggled by `?`. |
+| ~~F-keys appear in help line; letters do not~~ → **reversed (ROD-249)**: the help line shows the letters `B/H/D/S`; F-keys are the quiet fallback | The original call optimized for newcomers mashing F-keys, but the F-key order was unmemorable (Settings wedged at F3, Discover at F4) and the more-memorable letters stayed hidden — inverting the discoverability hierarchy. ROD-249 made the four view-switch letters symmetric (`B`/`H`/`D`/`S`, dropping the `H` toggle) and surfaces them in the help line. They are also *shorter* than `F1/F2/F3/F4`, so the line crowds less, not more. | If newcomers miss the F-keys, add them back as a `?` help overlay rather than to the always-on line. |
 | `·` stays lit at `color.focus` in single-pane views (Settings) | Dimming or hiding the `·` in Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
 | `·` is dim for Browse/History list, lit for Browse/History detail (ROD-170) | History is now a two-pane view. The `·` follows the same Browse logic: dim on list (default, no secondary selection), lit cyan on detail (user has gone deeper). The prior History rule ("always lit — single-pane") is retired. Color is always cyan; magenta is reserved for the §8 status-bar cursor. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
 | Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
