@@ -337,12 +337,40 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         vis += 1;
     }
 
-    // Load-more footer, on the row just below the last card slot (no overlap).
-    // "loading more…" while the next page is in flight (results already on screen,
-    // so it's a page-N fetch, not the initial spinner); "all entries loaded" once
-    // the feed is exhausted and the last card is actually in view (ROD-239).
     const footer_y: u16 = grid_top + geo.rows_visible * geo.slot_h;
-    if (footer_y < top + visible) {
+    const content_bottom: u16 = top + visible;
+
+    // Peek row (ROD-247): fill the leftover band below the last full row with the
+    // TOP of the next card-row's covers, so the grid signals "more below" instead of
+    // leaving dead space. Covers only — the meta would fall outside the band — and
+    // the cover height is clamped to the band so it can never overdraw the bottom
+    // bar. Kitty art scales to the band, so it reads best when the leftover is tall
+    // (a short band narrows the poster); a clean bottom-crop isn't possible since
+    // vaxis sizes images to the window rather than cropping.
+    const peek_band: u16 = content_bottom -| footer_y;
+    const peek_start: usize = startc + @as(usize, geo.rows_visible) * geo.cols;
+    const peeked = peek_band >= 3 and peek_start < results.len;
+    if (peeked) {
+        var pgeo = geo;
+        pgeo.cover_h = peek_band; // bound the cover to the band; never spills past content
+        var c: usize = 0;
+        while (c < geo.cols and peek_start + c < results.len) : (c += 1) {
+            const px: u16 = 2 + @as(u16, @intCast(c)) * geo.slot_w;
+            const a = results[peek_start + c];
+            const prank: []const u8 = if (vis < scratch.score.len)
+                (std.fmt.bufPrint(&scratch.score[vis], "#{d}", .{peek_start + c + 1}) catch "#")
+            else
+                "#";
+            drawCoverCell(self, win, px, footer_y, pgeo, prank, @intCast(prank.len), a);
+            vis += 1;
+        }
+    }
+
+    // Load-more footer, on the row just below the last card slot — only when no peek
+    // row occupies that band. "loading more…" while the next page is in flight
+    // (results already on screen, so it's a page-N fetch, not the initial spinner);
+    // "all entries loaded" once the feed is exhausted and the last card is in view.
+    if (!peeked and footer_y < content_bottom) {
         if (slot.loading) {
             const msg = std.fmt.bufPrint(&scratch.msg, "{s} loading more\u{2026}", .{self.spinnerChar()}) catch "loading more\u{2026}";
             centerText(win, footer_y, w, msg, self.s(self.palette.fg2, .{ .italic = true }));
