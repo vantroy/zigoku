@@ -136,6 +136,19 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
         put(win, rank_y, badge_x, "NEW", self.s(self.palette.focus, .{ .bold = true }));
     }
 
+    // Score badge (ROD-247), right-anchored at the cover edge on the rank row so it
+    // never collides with the left-anchored rank + TOP/NEW. `[NN]` tier-coloured per
+    // §2.2; `[--]` for an unenriched / unrated / no-id card. Renders every frame so
+    // the column doesn't jump when the page batch-enrich lands.
+    if (vis < scratch.disc_badge.len) {
+        const badge: []const u8 = if (a.score) |sc|
+            std.fmt.bufPrint(&scratch.disc_badge[vis], "[{d}]", .{sc}) catch "[--]"
+        else
+            "[--]";
+        const bx = x + geo.cover_w -| @as(u16, @intCast(badge.len));
+        put(win, rank_y, bx, badge, self.scoreStyle(a.score, null));
+    }
+
     const title_sty = if (selected)
         self.s(self.palette.focus, .{ .bold = true })
     else
@@ -156,6 +169,22 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
         put(win, rank_y + 2, x, vs, self.s(self.palette.fg2, .{}));
     } else {
         put(win, rank_y + 2, x, "—", self.s(self.palette.fg3, .{}));
+    }
+
+    // Genre tag (ROD-247) on the spare 4th meta row. Top genres, " · "-joined and
+    // clipped to the card width with the same "…" affordance as the title. Blank for
+    // an unenriched / id-less card — no layout jump, the row height is fixed. Large
+    // cards fit two genres; small cards show one. `tmp` is only the truncate source;
+    // the clipped copy lands in disc_genre[vis], which outlives vx.render() (NOT
+    // scratch.meta[vis] — vaxis still holds that for the view-count row above).
+    if (a.genres.len > 0 and vis < scratch.disc_genre.len) {
+        var tmp: [96]u8 = undefined;
+        const joined: []const u8 = if (geo.cover_w >= 20 and a.genres.len >= 2)
+            (std.fmt.bufPrint(&tmp, "{s} \u{00B7} {s}", .{ a.genres[0], a.genres[1] }) catch a.genres[0])
+        else
+            a.genres[0];
+        const g = render.truncateToWidth(&scratch.disc_genre[vis], joined, geo.cover_w);
+        put(win, rank_y + 3, x, g, self.s(self.palette.fg2, .{}));
     }
 }
 

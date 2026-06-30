@@ -191,10 +191,14 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     }
     try ids_buf.append(arena, ']');
 
+    // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
+    // string — it contains `startDate{year}`, whose braces the format parser would
+    // read as a `{year}` placeholder ("too few arguments"). As an arg its contents
+    // are data, not format syntax.
     const query = try std.fmt.allocPrint(
         arena,
-        "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{" ++ GQL_BATCH_FIELDS ++ "}}}}}}",
-        .{ ids.len, ids_buf.items },
+        "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{{s}}}}}}}",
+        .{ ids.len, ids_buf.items, GQL_BATCH_FIELDS },
     );
     const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
 
