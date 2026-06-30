@@ -241,10 +241,12 @@ pub fn run(
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
     defer app.cover.joinThread();
-    // Discover-grid cover worker: same contract (ROD-243). The quit `_exit` path
-    // skips this defer and abandons the worker (the global Kitty clear drops its
-    // images, nothing is freed); this join covers the error-unwind/test paths.
-    defer if (app.discover_cover_thread) |t| t.join();
+    // Discover-grid cover workers: drain the bounded fan-out (ROD-240). Same
+    // contract as the single-cover join — the quit `_exit` path skips this defer and
+    // abandons the workers (the global Kitty clear drops their images, nothing is
+    // freed); this drain covers the error-unwind/test paths, blocking until every
+    // in-flight cover worker has finished before `loop`/`gpa`/caches tear down.
+    defer app.discover_cover_drain.drain();
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -639,14 +641,14 @@ pub const App = struct {
     /// Bounded to 1 and joined on teardown, same contract as popular_thread.
     discover_enrich_thread: ?std.Thread = null,
 
-    /// Serialized Discover-grid cover worker (ROD-243): one batch in flight at a
-    /// time. `pump` reaps this handle once `discover_cover_active` clears, then
-    /// respawns for the next batch of missing covers; the join is non-blocking
-    /// (the flag guarantees the worker already exited). Joined on teardown too.
-    discover_cover_thread: ?std.Thread = null,
-    /// True while a grid-cover batch runs; lets `pump` skip respawning without a
-    /// blocking join, and is cleared by the worker as its last action.
-    discover_cover_active: std.atomic.Value(bool) = .init(false),
+    /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
+    /// fetched by its own detached `discoverCoverTask`; `pump` caps how many run at
+    /// once at `config.discoverCoverConcurrency` by gating spawns on `inflight`. The
+    /// drain's counter doubles as that live in-flight tally (read each frame to size
+    /// the next top-up) and as the teardown barrier — `drain()` blocks until every
+    /// worker's `finish()` ran, so nothing still references `loop`/`gpa`/`caches`
+    /// when they're torn down (replaces ROD-243's single batch thread + active flag).
+    discover_cover_drain: workers.ThreadDrain = .{},
 
     /// Sub/dub translation for searches.
     translation: domain.Translation = .sub,
@@ -2045,19 +2047,15 @@ pub const App = struct {
     /// Fetch the covers for the visible Discover cards + one prefetch row, then evict
     /// off-screen slots back to the pool cap (ROD-243). Runs on the UI thread from
     /// run(), right after `layout` settles `scroll`, so the grid geometry is known.
-    /// One serialized worker at a time: if a batch is in flight we skip — its results
-    /// land and the next pump picks up whatever is still missing. Covers pop in
-    /// progressively (bounded parallelism is ROD-240). No-op outside Discover and
-    /// under test (the spawn is gated like `cover.sync`).
+    /// Bounded parallelism (ROD-240): each missing cover gets its own detached
+    /// worker, capped at `config.discoverCoverConcurrency` in-flight at once. There
+    /// is no explicit queue — every frame this re-plans against live slot state and
+    /// tops the in-flight set back up to the cap as workers finish, so covers beyond
+    /// the cap wait, scrolled-past cards are never fetched, and fast scrolling can't
+    /// spawn unbounded requests. No-op outside Discover; the spawn is gated under
+    /// test (the plan + the in-flight mark still run, so tests exercise both).
     pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io) void {
         if (self.active_view != .discover) return;
-        // A batch is still running — let it finish; never stack a second worker.
-        if (self.discover_cover_active.load(.acquire)) return;
-        // Batch done (flag cleared) → reap the finished handle (join returns at once).
-        if (self.discover_cover_thread) |t| {
-            t.join();
-            self.discover_cover_thread = null;
-        }
 
         const w = self.term_cols;
         const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
@@ -2118,54 +2116,68 @@ pub const App = struct {
         const m = plan.eval(chosen[0..n]);
         if (m == 0) return;
 
-        // Snapshot the chosen URLs (gpa-owned) for the worker to consume + free.
-        const batch = self.gpa.alloc([]const u8, m) catch return;
-        var filled: usize = 0;
+        // Bounded fan-out (ROD-240): top the in-flight worker set back up to the
+        // configured cap. Covers beyond the cap simply aren't spawned this frame —
+        // the next pump re-runs against live slot state and picks them up as workers
+        // finish, so the "queue" is implicit and always re-prioritized to the live
+        // viewport (a fetch is never spent on a card scrolled out of view). The cap
+        // is read + clamped every frame, so a config change takes effect live.
+        const cap: usize = self.config.discoverCoverConcurrency();
+        const busy = self.discover_cover_drain.inflight.load(.acquire);
+        if (busy >= cap) return; // every slot busy — let the workers drain first
+        var budget = cap - busy;
+
         for (chosen[0..m]) |ci| {
-            const dup = self.gpa.dupe(u8, urls[ci]) catch {
-                for (batch[0..filled]) |u| self.gpa.free(u);
-                self.gpa.free(batch);
-                return;
-            };
-            batch[filled] = dup;
-            filled += 1;
-        }
+            if (budget == 0) break;
+            const url = urls[ci];
 
-        // Mark the chosen slots in-flight from the BORROWED `urls` (stable for this
-        // synchronous pump) — NEVER from `batch`. The worker owns `batch` the instant
-        // it spawns and frees it (`defer gpa.free(urls)`); a cache-hit batch resolves
-        // in microseconds, so iterating `batch` here would race that free → a
-        // use-after-free on the hot path (ROD-243 review). Done before the spawn so
-        // the in-test path exercises it too; the spawn-failure catch below resets
-        // these slots — a stranded `.loading` slot is eviction-protected AND skipped
-        // by the planner, so it would never recover on its own.
-        for (chosen[0..m]) |ci| self.discover_covers.markLoading(self.gpa, urls[ci]);
+            // Mark in-flight BEFORE spawning, from the BORROWED `urls` (stable for
+            // this synchronous pump) — never from the dup the worker takes ownership
+            // of. A stranded `.loading` slot is eviction-protected AND skipped by the
+            // planner, so every early-out below resets it or it would never recover
+            // (ROD-243). Done before the spawn so the in-test path exercises it too.
+            self.discover_covers.markLoading(self.gpa, url);
 
-        // No real worker under test — the spawn is the only threaded line; the
-        // build + mark above is what tests exercise. Free the snapshot and return.
-        if (builtin.is_test) {
-            for (batch) |u| self.gpa.free(u);
-            self.gpa.free(batch);
-            return;
-        }
-
-        self.discover_cover_active.store(true, .release);
-        self.discover_cover_thread = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
-            loop, self.gpa, io, batch, &self.cover_caches, &self.discover_cover_active,
-        }) catch {
-            self.discover_cover_active.store(false, .release);
-            // No worker will resolve these — reset the slots we just marked so the
-            // next pump retries (a stranded `.loading` slot never recovers, ROD-243
-            // re-review). Reset by URL value; markLoading retained no borrow.
-            for (chosen[0..m]) |ci| {
-                if (self.discover_covers.get(urls[ci])) |slot| {
-                    if (slot.status == .loading) slot.status = .idle;
-                }
+            // No real worker under test — the mark above is what tests exercise; the
+            // spawn is the only threaded line. Spend the budget so the loop still
+            // bounds itself, then continue without a thread.
+            if (builtin.is_test) {
+                budget -= 1;
+                continue;
             }
-            for (batch) |u| self.gpa.free(u);
-            self.gpa.free(batch);
-            return;
-        };
+
+            // Snapshot the url (gpa-owned) for the worker to consume + free; it owns
+            // the dup the instant it spawns and transfers it to the result event.
+            const owned_url = self.gpa.dupe(u8, url) catch {
+                self.resetLoadingSlot(url);
+                continue;
+            };
+
+            // Account for the worker before the spawn so the teardown drain can never
+            // observe a gap (ROD-179); rebalance + reset the slot on a spawn failure
+            // (nothing else would resolve this url, leaving it stranded `.loading`).
+            self.discover_cover_drain.begin();
+            const t = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
+                loop, self.gpa, io, owned_url, &self.cover_caches, &self.discover_cover_drain,
+            }) catch {
+                self.discover_cover_drain.finish();
+                self.resetLoadingSlot(url);
+                self.gpa.free(owned_url);
+                continue;
+            };
+            t.detach(); // fire-and-forget; the drain barrier is the only synchronization.
+            budget -= 1;
+        }
+    }
+
+    /// Reset a slot stranded in `.loading` back to `.idle` (ROD-240): when the worker
+    /// for `url` never launches (dup OOM / spawn failure) nothing will resolve it,
+    /// and a `.loading` slot is eviction-protected and skipped by the planner — so it
+    /// would never recover without this. No-op if the slot is gone or isn't loading.
+    fn resetLoadingSlot(self: *App, url: []const u8) void {
+        if (self.discover_covers.get(url)) |slot| {
+            if (slot.status == .loading) slot.status = .idle;
+        }
     }
 
     /// Evict the off-screen Discover cover slots overflowing the pool cap, dropping
