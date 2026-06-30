@@ -88,9 +88,10 @@ fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
     var col: u16 = 2;
     for (labels, keys, 0..) |label, keyhint, i| {
         const on = i == active;
-        // The `[N]` hint reads as a dim annotation off the active window; it lifts
-        // to the focus tone on the active one so that entry still reads as a unit.
-        const key_sty = if (on) self.s(self.palette.focus, .{}) else self.s(self.palette.fg3, .{});
+        // The `[N]` hint reads at text.muted (fg2) off the active window — legible,
+        // since it's the binding we're teaching (text.dim buries it against bg_base);
+        // it lifts to the focus tone on the active one so that entry reads as a unit.
+        const key_sty = if (on) self.s(self.palette.focus, .{}) else self.s(self.palette.fg2, .{});
         const label_sty = if (on) self.s(self.palette.focus, .{ .bold = true }) else self.s(self.palette.fg2, .{});
         put(win, row, col, keyhint, key_sty);
         col += @as(u16, @intCast(keyhint.len)) + 1; // "[N] "

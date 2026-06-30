@@ -1002,9 +1002,12 @@ pub const App = struct {
     pub fn topBarSeasonChip(self: *App) []const u8 {
         switch (self.active_view) {
             .settings => return "",
-            // Discover renders no per-row season chip in the grid scaffold (the
-            // selected-card season chip is a later refinement); a discover-origin
-            // zoom likewise shows none until that selection is wired.
+            // The Discover GRID shows no season chip: the popular feed nulls
+            // `season`/`airedStart` (like score — season.year was null 30/30 every
+            // live fetch), so a selected card has no season to show. Lighting this
+            // up rides on ROD-247's batched AniList enrichment (which also feeds
+            // score + genres). The discover-origin ZOOM does show it — it enriches
+            // the card on Enter (fireDiscoverEnrich), see the .detail arm below.
             .discover => return "",
             .detail => switch (self.detail_origin) {
                 .browse => {
