@@ -984,6 +984,31 @@ test "discover_batch_enriched drops every result when the slot is cleared (ROD-2
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
 }
 
+test "mergeEnrichedFillNull fills gaps without clobbering either side (ROD-247)" {
+    const gpa = testing.allocator;
+    // Live card already batch-enriched (score + genres); the incoming zoom result has
+    // the synopsis but a null score. The merge keeps the score AND gains the synopsis —
+    // neither concurrent enricher clobbers the other.
+    var live = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .score = 88, .genres = &.{"Action"} });
+    defer workers.freeOwnedAnime(gpa, live);
+    var incoming = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .description = "A tale." });
+    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
+    try testing.expectEqual(@as(?u32, 88), live.score); // kept
+    try testing.expectEqual(@as(usize, 1), live.genres.len); // kept
+    try testing.expectEqualStrings("A tale.", live.description.?); // gained
+    // `incoming` is fully consumed (transferred fields nulled, the rest freed in the
+    // helper) — the test allocator fails on any leak or double-free.
+
+    // Reverse arrival order: live has the synopsis, incoming carries score + genres.
+    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .description = "Tale two." });
+    defer workers.freeOwnedAnime(gpa, live2);
+    var incoming2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .score = 73, .genres = &.{"Drama"} });
+    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
+    try testing.expectEqualStrings("Tale two.", live2.description.?); // kept
+    try testing.expectEqual(@as(?u32, 73), live2.score); // gained
+    try testing.expectEqual(@as(usize, 1), live2.genres.len); // gained
+}
+
 test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
     var app: App = .{};
     app.gpa = testing.allocator;
