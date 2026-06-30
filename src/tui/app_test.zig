@@ -159,12 +159,10 @@ fn testTick(app: *App, event: Event) !void {
         app.discover_enrich_thread = null;
     }
     // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
-    // worker from ever spawning in tests), but joined defensively so a future test
-    // that drives the spawn path can't strand a thread on a torn-down loop (ROD-243).
-    if (app.discover_cover_thread) |t| {
-        t.join();
-        app.discover_cover_thread = null;
-    }
+    // workers from ever spawning in tests), but drained defensively so a future test
+    // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
+    // fan-out now, so it's a drain barrier rather than a single join (ROD-240).
+    app.discover_cover_drain.drain();
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -662,6 +660,105 @@ test "Discover Enter opens the detail zoom for the selected card; Esc returns (R
     // Esc demotes the zoom back to Discover (origin maps home).
     try testTick(&app, keyEv(vaxis.Key.escape, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
+}
+
+fn countLoadingCovers(app: *App) usize {
+    var n: usize = 0;
+    for (app.discover_covers.slots.items) |slot| {
+        if (slot.status == .loading) n += 1;
+    }
+    return n;
+}
+
+test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping already-loading slots (ROD-240)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    defer app.discover_covers.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    // Roomy 120x40 terminal → large tier (5 cols), 3 visible rows + 1 prefetch =
+    // a 20-card window, so all 8 cards below are in range to fetch.
+    app.term_cols = 120;
+    app.term_rows = 40;
+    // Cap concurrency at 3 so the per-pump wave size is observable.
+    app.config.discover_cover_concurrency = 3;
+
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const thumb = try std.fmt.bufPrint(&buf, "https://img/{d}.jpg", .{i});
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
+            .id = "x",
+            .name = "Show",
+            .thumb = thumb, // dupeOwnedAnime copies it, so the stack buffer is safe
+        }));
+    }
+
+    const io = std.testing.io;
+    var loop = initTestLoop();
+
+    // The is_test gate skips the real spawn, but the budget loop still marks slots
+    // `.loading` — so each pump marks exactly `cap` NEW slots: the per-pump budget
+    // caps the wave (8 eligible, only `cap` marked), and the planner skips slots
+    // already marked loading so a wave never re-selects one. This proves the
+    // per-frame half of the bound; the cap-minus-in-flight half (`busy` > 0) is
+    // proved separately below, since `busy` stays 0 here (no worker decrements it).
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 3), countLoadingCovers(&app)); // wave 1
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 6), countLoadingCovers(&app)); // wave 2
+    // Only 2 cards remain — the cap is an upper bound, not a quota.
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
+    // Everything is now in flight → a further pump marks nothing new (never exceeds
+    // the visible set regardless of how many pumps fire — fast scroll can't pile up).
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
+}
+
+test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    defer app.discover_covers.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    app.term_cols = 120;
+    app.term_rows = 40;
+    app.config.discover_cover_concurrency = 3;
+
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const thumb = try std.fmt.bufPrint(&buf, "https://img/{d}.jpg", .{i});
+        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
+            .id = "x",
+            .name = "Show",
+            .thumb = thumb,
+        }));
+    }
+
+    const io = std.testing.io;
+    var loop = initTestLoop();
+
+    // Simulate 2 cover workers already in flight (the drain counter is the live
+    // tally). With cap 3 the pump may start only ONE more — `budget = cap - busy` —
+    // which is the actual guard behind "never more than N downloads at once".
+    app.discover_cover_drain.inflight.store(2, .release);
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
+
+    // Already at the cap → the pump starts nothing new this frame.
+    app.discover_cover_drain.inflight.store(3, .release);
+    app.pumpDiscoverCovers(&loop, io);
+    try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
+
+    // Required before any drain(): no real workers exist to decrement the simulated
+    // tally, so a non-zero inflight would make a teardown drain() spin forever.
+    app.discover_cover_drain.inflight.store(0, .release);
 }
 
 test "Discover prefetches the next page near the end; exhausted/loading block it (ROD-239)" {
