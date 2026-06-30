@@ -330,12 +330,22 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         return;
     }
     if (self.history.len == 0) {
-        // First-run absent state (§9.5): on an empty watchlist the `/` filter has
-        // nothing to filter, so point the user to Browse (where shows are found
-        // and added) instead of advertising a dead-end prompt (ROD-211).
-        const mid = top + visible / 2;
-        centerText(win, mid -| 1, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));
-        centerKeyHint(win, mid + 1, w, "B", self.s(self.palette.focus, .{ .bold = true }), "  find anime in browse", self.s(self.palette.fg2, .{}));
+        // First-run absent state (§9.5): an empty watchlist is, by definition, a
+        // user who doesn't yet know what to watch — so point them at Discover (the
+        // zero-input popular feed, ROD-247), not Browse's blank `/` prompt that
+        // demands a title up front (ROD-254 supersedes ROD-211's Browse pointer).
+        // Three-element block mirrors Browse's own absent state (browse.zig): the
+        // `B search` hint recedes to fg3 for the users who *do* know the title.
+        //
+        // Draw into a content-height child window (like Browse's list pane) so the
+        // taller three-row block clips to the content area instead of overdrawing
+        // the top bar — History's list path uses absolute root coords, which let
+        // `mid -| 2` reach row 0 on a very short terminal (ROD-254 review).
+        const pane = win.child(.{ .y_off = top, .width = w, .height = visible });
+        const mid = visible / 2;
+        centerText(pane, mid -| 2, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));
+        centerKeyHint(pane, mid, w, "D", self.s(self.palette.focus, .{ .bold = true }), "  see what's popular", self.s(self.palette.fg2, .{}));
+        centerKeyHint(pane, mid + 2, w, "B", self.s(self.palette.focus, .{ .bold = true }), "  search for a show", self.s(self.palette.fg3, .{}));
         return;
     }
 
