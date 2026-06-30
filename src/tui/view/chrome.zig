@@ -76,7 +76,8 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     // metadata beside the strip, never crowding the right `·`. Only in the full
     // strip (it drops first under width pressure). Content via topBarSeasonChip:
     // the selected show's season+year, current-cour fallback for list views, the
-    // focused show's season in the zoom; "" in Discover/Settings.
+    // focused show's season in the zoom; the selected card's season in Discover once
+    // enriched (ROD-247); "" in Settings.
     if (full) {
         const season = self.topBarSeasonChip();
         if (season.len > 0) {

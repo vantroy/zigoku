@@ -158,6 +158,10 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.discover_enrich_thread = null;
     }
+    if (app.discover_batch_enrich_thread) |t| {
+        t.join();
+        app.discover_batch_enrich_thread = null;
+    }
     // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
     // workers from ever spawning in tests), but drained defensively so a future test
     // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
@@ -198,6 +202,10 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             alloc.free(d.results);
         },
         .discover_enriched => |d| freeOwnedAnime(alloc, d.result),
+        .discover_batch_enriched => |d| {
+            for (d.results) |r| freeOwnedAnime(alloc, r);
+            alloc.free(d.results);
+        },
         .cover_done => |d| {
             alloc.free(d.rgba);
             alloc.free(d.for_id);
@@ -932,6 +940,93 @@ test "discover_enriched drops the result when the show is gone from the slot (RO
     const orphan = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "gone", .name = "Gone", .description = "x" });
     try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily } });
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "discover_batch_enriched merges N cards into the slot by id, drops stale (ROD-247)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    // Three feed cards as delivered: score null, genres empty (the popular shape).
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 }));
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "b", .name = "B", .anilist_id = 2 }));
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "c", .name = "C", .anilist_id = 3 }));
+
+    // The page batch lands: two cards now carry score/genres/season; the third
+    // result is a stale id no longer in the slot (must be FREED, not leaked — the
+    // test allocator fails the test otherwise).
+    const results = try testing.allocator.alloc(Anime, 3);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1, .score = 88, .genres = &.{ "Action", "Comedy" }, .season = .fall, .year = 2023 });
+    results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "b", .name = "B", .anilist_id = 2, .score = 75 });
+    results[2] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "stale", .name = "Stale", .anilist_id = 9, .score = 50 });
+    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily } });
+
+    // Cards a + b enriched in place; card c untouched; the stale result dropped.
+    try testing.expectEqual(@as(?u32, 88), daily.results.items[0].score);
+    try testing.expect(daily.results.items[0].season.? == .fall);
+    try testing.expectEqual(@as(usize, 2), daily.results.items[0].genres.len);
+    try testing.expectEqual(@as(?u32, 75), daily.results.items[1].score);
+    try testing.expectEqual(@as(?u32, null), daily.results.items[2].score);
+}
+
+test "discover_batch_enriched drops every result when the slot is cleared (ROD-247)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    // Slot cleared/refetched between firing the batch and its landing — no id
+    // matches, so all results must be freed (test allocator catches a leak).
+    const results = try testing.allocator.alloc(Anime, 2);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "X", .anilist_id = 1, .score = 60 });
+    results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "y", .name = "Y", .anilist_id = 2, .score = 70 });
+    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily } });
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+}
+
+test "mergeEnrichedFillNull fills gaps without clobbering either side (ROD-247)" {
+    const gpa = testing.allocator;
+    // Live card already batch-enriched (score + genres); the incoming zoom result has
+    // the synopsis but a null score. The merge keeps the score AND gains the synopsis —
+    // neither concurrent enricher clobbers the other.
+    var live = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .score = 88, .genres = &.{"Action"} });
+    defer workers.freeOwnedAnime(gpa, live);
+    var incoming = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .description = "A tale." });
+    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
+    try testing.expectEqual(@as(?u32, 88), live.score); // kept
+    try testing.expectEqual(@as(usize, 1), live.genres.len); // kept
+    try testing.expectEqualStrings("A tale.", live.description.?); // gained
+    // `incoming` is fully consumed (transferred fields nulled, the rest freed in the
+    // helper) — the test allocator fails on any leak or double-free.
+
+    // Reverse arrival order: live has the synopsis, incoming carries score + genres.
+    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .description = "Tale two." });
+    defer workers.freeOwnedAnime(gpa, live2);
+    var incoming2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .score = 73, .genres = &.{"Drama"} });
+    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
+    try testing.expectEqualStrings("Tale two.", live2.description.?); // kept
+    try testing.expectEqual(@as(?u32, 73), live2.score); // gained
+    try testing.expectEqual(@as(usize, 1), live2.genres.len); // gained
+}
+
+test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    app.discover.cursor = 0;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+
+    // Enriched card: season + year present → "<kanji> <year>".
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .season = .fall, .year = 2023 }));
+    const chip = app.topBarSeasonChip();
+    try testing.expect(std.mem.indexOf(u8, chip, "2023") != null);
+    try testing.expect(std.mem.indexOf(u8, chip, domain.Season.fall.kanji()) != null);
+
+    // Unenriched card (season still null from the feed) → no chip, no cour fallback.
+    daily.results.items[0].season = null;
+    try testing.expectEqualStrings("", app.topBarSeasonChip());
 }
 
 test "isNewRelease: current-cour match drives NEW; guards return false (ROD-239)" {

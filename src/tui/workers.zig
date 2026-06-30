@@ -236,6 +236,54 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     }
 }
 
+/// Merge an enriched copy into the live card, filling ONLY the fields the live card
+/// still lacks (live wins) — the concurrency-safe replacement for `live.* = incoming`
+/// (ROD-247). The Discover slot now has two concurrent enrichers (the page batch and
+/// the per-card zoom); a full overwrite from either's fire-time snapshot would clobber
+/// fields the other already filled (zoom lands → batch's score reverts to `[--]`, or
+/// batch lands → zoom's synopsis blanks). Fill-if-null mirrors `applyMetadata`'s
+/// "existing wins" rule, so arrival order no longer matters and no enrichment is lost.
+/// Ownership: adopted fields transfer out of `incoming` (nulled so they aren't freed);
+/// everything `incoming` still holds — including its id/name (live keeps its own) — is
+/// freed here. `live`'s id/name/view_count/eps always win (never touched).
+pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
+    mergeOptText(&live.english_name, &incoming.english_name);
+    mergeOptText(&live.native_name, &incoming.native_name);
+    mergeOptText(&live.thumb, &incoming.thumb);
+    mergeOptText(&live.banner, &incoming.banner);
+    mergeOptText(&live.status, &incoming.status);
+    mergeOptText(&live.description, &incoming.description);
+    mergeOptText(&live.kind, &incoming.kind);
+    mergeStrList(&live.genres, &incoming.genres);
+    mergeStrList(&live.studios, &incoming.studios);
+    if (live.mal_id == null) live.mal_id = incoming.mal_id;
+    if (live.anilist_id == null) live.anilist_id = incoming.anilist_id;
+    if (live.total_episodes == null) live.total_episodes = incoming.total_episodes;
+    if (live.year == null) live.year = incoming.year;
+    if (live.season == null) live.season = incoming.season;
+    if (live.start_date == null) live.start_date = incoming.start_date;
+    if (live.score == null) live.score = incoming.score;
+    freeOwnedAnime(gpa, incoming.*); // frees id/name + every field not transferred above
+}
+
+/// Adopt `incoming`'s string only if `live` lacks one, transferring ownership (the
+/// source is nulled so the subsequent freeOwnedAnime won't double-free it).
+fn mergeOptText(live: *?[]const u8, incoming: *?[]const u8) void {
+    if (live.* == null) {
+        live.* = incoming.*;
+        incoming.* = null;
+    }
+}
+
+/// List variant of mergeOptText: adopt only when live's list is empty; `&.{}` (len 0)
+/// is skipped by freeOwnedAnime, so the transferred slice isn't freed twice.
+fn mergeStrList(live: *[]const []const u8, incoming: *[]const []const u8) void {
+    if (live.*.len == 0) {
+        live.* = incoming.*;
+        incoming.* = &.{};
+    }
+}
+
 /// Background task: search and post results back to the UI thread.
 pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, query: []const u8, page: u32, translation: domain.Translation) void {
     // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
@@ -423,6 +471,62 @@ pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime,
     loop.postEvent(.{ .discover_enriched = .{ .result = a, .window = window } }) catch {
         freeOwnedAnime(gpa, a);
     };
+}
+
+/// Batch-enrich a whole Discover feed page from AniList in ONE fetch (ROD-247):
+/// score + genres + season, the card signals the popular feed nulls. `stubs` are
+/// gpa-owned copies of the page's cards (the caller filtered to those with a
+/// mineable anilist_id); ownership transfers to the discover_batch_enriched event
+/// on success, or is freed here on a post failure — the same contract as
+/// `enrichTask`. `window` routes the merge to the right per-window slot.
+///
+/// One arena feeds N shows: every enriched field is deep-copied into GPA by
+/// `applyMetadata` while the arena is still live, so nothing aliases the parse
+/// arena after teardown. The genres/description slices are arena-borrowed — this
+/// is the UAF trap, and the ordering (copy in the loop, `defer arena.deinit()`)
+/// is what defuses it.
+pub fn discoverBatchEnrichTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    stubs: []Anime,
+    window: source_mod.PopularWindow,
+) void {
+    var posted = false;
+    defer if (!posted) {
+        for (stubs) |a| freeOwnedAnime(gpa, a);
+        gpa.free(stubs);
+    };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // The caller already filtered to cards with an anilist_id; collect them for the
+    // batch query, guarding a stray null so it can't poison the join.
+    var ids: std.ArrayList(u64) = .empty;
+    for (stubs) |a| {
+        if (a.anilist_id) |id| ids.append(arena.allocator(), id) catch {};
+    }
+
+    // One round trip for the whole page. An empty return (offline / no matches)
+    // leaves every stub unchanged — the merge is then a harmless self-replace and
+    // the page stays at [--], mirroring discoverEnrichTask's miss behavior.
+    const metas = anilist.enrichBatch(arena.allocator(), io, ids.items) catch &.{};
+    for (stubs) |*a| {
+        const id = a.anilist_id orelse continue;
+        for (metas) |meta| {
+            if (meta.anilist_id == id) {
+                applyMetadata(gpa, a, meta); // deep-copies out of the arena
+                break;
+            }
+        }
+    }
+
+    loop.postEvent(.{ .discover_batch_enriched = .{ .results = stubs, .window = window } }) catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return; // `posted` stays false → the defer frees stubs
+    };
+    posted = true;
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are

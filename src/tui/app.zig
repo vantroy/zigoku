@@ -162,6 +162,11 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    // Seed the cell-pixel cache from the initial resize (the .winsize event was
+    // drained above, so read vaxis's settled screen) — Discover's cover-fill height
+    // needs it on the first frame (ROD-247).
+    app.term_x_pixel = @intCast(vx.screen.width_pix);
+    app.term_y_pixel = @intCast(vx.screen.height_pix);
     // Resolve the cover-cache path once for the Settings "cover art cache" row,
     // HOME-collapsed for display. Best-effort: a missing cache home leaves this
     // null and the row falls back to a literal (ROD-225).
@@ -238,6 +243,7 @@ pub fn run(
     defer if (app.enrich_thread) |t| t.join();
     defer if (app.popular_thread) |t| t.join();
     defer if (app.discover_enrich_thread) |t| t.join();
+    defer if (app.discover_batch_enrich_thread) |t| t.join();
     defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
@@ -278,7 +284,13 @@ pub fn run(
         // Resize is a vaxis-lifecycle concern (it reallocates the screen), so
         // run() owns it — that keeps tick() a pure state fold, testable without
         // a tty. tick() still sees the event; it just doesn't touch the screen.
-        if (event == .winsize) try vx.resize(gpa, writer, event.winsize);
+        if (event == .winsize) {
+            try vx.resize(gpa, writer, event.winsize);
+            // Cache pixel metrics for the Discover cover-fill height (ROD-247);
+            // term_cols/term_rows are reseeded in layout() right after tick().
+            app.term_x_pixel = @intCast(vx.screen.width_pix);
+            app.term_y_pixel = @intCast(vx.screen.height_pix);
+        }
         try app.tick(event, &loop, io, provider);
 
         // ROD-191: reap a finished reload. Its terminal event (success OR failure)
@@ -525,6 +537,16 @@ pub const RenderScratch = struct {
     /// rarer and wider, but `truncateToWidth` self-guards on the byte budget before
     /// overrunning regardless.
     title: [256][80]u8 = undefined,
+    /// Per-card Discover score badges ("[NN]"/"[--]", ROD-247), right-anchored on
+    /// the card rank row. Separate from `score` (the Browse list form) and from the
+    /// card's rank string because all three can live on screen the same frame; same
+    /// outlive-vx.render() contract. [8] covers "[100]" with slack.
+    disc_badge: [256][8]u8 = undefined,
+    /// Per-card Discover genre glyphs (up to two monochrome symbols, ROD-247),
+    /// right-anchored on the view-count row. Blank for unenriched/unmapped cards.
+    /// Same outlive-vx.render() contract as `title`. [48] is ample for two ≤4-byte
+    /// glyphs.
+    disc_genre: [256][48]u8 = undefined,
 };
 
 /// Single-level undo record for manual watch-state mutations (ROD-193). Tagged
@@ -651,6 +673,12 @@ pub const App = struct {
     /// Bounded to 1 and joined on teardown, same contract as popular_thread.
     discover_enrich_thread: ?std.Thread = null,
 
+    /// Handle for the most recent Discover page batch-enrich thread (ROD-247).
+    /// Separate from discover_enrich_thread so pressing Enter to zoom fires its own
+    /// enrich immediately instead of blocking on a ~500ms page batch. Bounded to 1
+    /// and joined on teardown, same contract as discover_enrich_thread.
+    discover_batch_enrich_thread: ?std.Thread = null,
+
     /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
     /// fetched by its own detached `discoverCoverTask`; `pump` caps how many run at
     /// once at `config.discoverCoverConcurrency` by gating spawns on `inflight`. The
@@ -768,6 +796,12 @@ pub const App = struct {
     /// the Discover cover `pump` (run from run(), not layout) can resolve the grid
     /// geometry from the last settled frame (ROD-243).
     term_rows: u16 = 0,
+    /// Last-seen terminal size in PIXELS, cached at each vaxis resize (run() owns
+    /// resize). 0 when the terminal doesn't report pixel metrics (tmux/headless).
+    /// Divided by term_cols/term_rows to get the cell aspect, which sizes the
+    /// Discover covers so a poster fills its width instead of pillarboxing (ROD-247).
+    term_x_pixel: u16 = 0,
+    term_y_pixel: u16 = 0,
     /// Last tick timestamp (ms). Updated on every .tick event; used by draw functions.
     now_ms: i64 = 0,
     /// Toast queue (oldest first). null = empty slot.
@@ -999,16 +1033,29 @@ pub const App = struct {
     /// one show, so it shows only that show's season with no cour fallback (an
     /// unenriched show shows no chip, never a misleading season). Settings has no
     /// show context (per the header layout) and shows no chip.
+    /// Terminal cell size in pixels as `.{ w, h }`, or `.{ 0, 0 }` when the terminal
+    /// doesn't report pixel metrics (tmux/headless). Discover sizes its cover boxes
+    /// from this so a poster fills its width (ROD-247); 0 → the fixed fallback height.
+    pub fn cellPx(self: *const App) [2]u16 {
+        if (self.term_cols == 0 or self.term_rows == 0 or self.term_x_pixel == 0 or self.term_y_pixel == 0)
+            return .{ 0, 0 };
+        return .{ self.term_x_pixel / self.term_cols, self.term_y_pixel / self.term_rows };
+    }
+
     pub fn topBarSeasonChip(self: *App) []const u8 {
         switch (self.active_view) {
             .settings => return "",
-            // The Discover GRID shows no season chip: the popular feed nulls
-            // `season`/`airedStart` (like score — season.year was null 30/30 every
-            // live fetch), so a selected card has no season to show. Lighting this
-            // up rides on ROD-247's batched AniList enrichment (which also feeds
-            // score + genres). The discover-origin ZOOM does show it — it enriches
-            // the card on Enter (fireDiscoverEnrich), see the .detail arm below.
-            .discover => return "",
+            // The Discover GRID chip reads the selected card's season once it's
+            // batch-enriched (ROD-247): the popular feed nulls season/airedStart, so
+            // a freshly-loaded card shows no chip until the page batch lands, then
+            // the kanji+year appears. An unenriched / no-id card stays season-null →
+            // "" (never a misleading cour fallback here, matching the zoom arm).
+            .discover => {
+                const a = self.selectedDiscoverAnime() orelse return "";
+                if (a.season != null and a.year != null)
+                    return self.seasonChipText(a.season, a.year);
+                return "";
+            },
             .detail => switch (self.detail_origin) {
                 .browse => {
                     const a = self.selectedAnime() orelse return "";
@@ -1667,6 +1714,11 @@ pub const App = struct {
                     self.discover.cursor = 0;
                     self.discover.scroll = 0;
                 }
+                // ROD-247: batch-enrich the cards just appended — one AniList fetch
+                // hydrates score + genres + season for the [offset, offset+added)
+                // slice. Only the new page is sent (earlier pages are already
+                // enriched), so the cost is one round trip per "load more".
+                self.fireDiscoverBatchEnrich(loop, io, ev.window, offset, added);
             },
 
             .popular_error => |ev| {
@@ -1691,8 +1743,11 @@ pub const App = struct {
                 var merged_at: ?usize = null;
                 for (items, 0..) |*live, i| {
                     if (std.mem.eql(u8, live.id, ev.result.id)) {
-                        freeOwnedAnime(self.gpa, live.*);
-                        live.* = ev.result;
+                        // Fill-if-null merge, not a full overwrite: the page batch may
+                        // have enriched this same card concurrently — keep both sides'
+                        // fields (ROD-247 race fix).
+                        var inc = ev.result;
+                        workers.mergeEnrichedFillNull(self.gpa, live, &inc);
                         merged_at = i;
                         break;
                     }
@@ -1705,6 +1760,42 @@ pub const App = struct {
                 if (self.discover_enrich_thread) |t| {
                     t.join();
                     self.discover_enrich_thread = null;
+                }
+            },
+
+            .discover_batch_enriched => |ev| {
+                // Merge each batch-enriched card back into its window slot by id —
+                // same merge-by-id + free-orphan contract as discover_enriched,
+                // fanned over the whole page. The cursor/page may have moved or the
+                // slot been refetched, so an unmatched result is a stale drop.
+                const idx = @intFromEnum(ev.window);
+                const items = self.discover.slots[idx].results.items;
+                var merged_any = false;
+                for (ev.results) |enriched| {
+                    var merged = false;
+                    for (items) |*live| {
+                        if (std.mem.eql(u8, live.id, enriched.id)) {
+                            // Fill-if-null merge, not a full overwrite: a concurrent
+                            // zoom enrich may hold this card too — keep both sides'
+                            // fields (ROD-247 race fix).
+                            var inc = enriched;
+                            workers.mergeEnrichedFillNull(self.gpa, live, &inc);
+                            merged = true;
+                            merged_any = true;
+                            break;
+                        }
+                    }
+                    if (!merged) freeOwnedAnime(self.gpa, enriched); // slot moved on — drop
+                }
+                self.gpa.free(ev.results);
+                // Persist the whole slot once (idempotent upserts) rather than
+                // tracking each scattered merge position — N ≤ ~50 local rows.
+                if (merged_any) {
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len);
+                }
+                if (self.discover_batch_enrich_thread) |t| {
+                    t.join();
+                    self.discover_batch_enrich_thread = null;
                 }
             },
             .search_enriched => |ev| {
@@ -2044,6 +2135,54 @@ pub const App = struct {
         };
     }
 
+    /// Batch-enrich the Discover page just appended (ROD-247): one AniList fetch
+    /// hydrates score + genres + season for the [offset, offset+count) slice of
+    /// `window`'s slot (.discover_batch_enriched). Only cards with a mineable
+    /// anilist_id are sent — the worker joins AniList results by that id, and an
+    /// id-less card can't be enriched anyway (it stays [--]). Bounds to one thread,
+    /// separate from the zoom enrich so Enter never blocks on it. No-op in tests.
+    fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
+        if (builtin.is_test) return;
+        if (count == 0) return;
+        const idx = @intFromEnum(window);
+        const items = self.discover.slots[idx].results.items;
+        const hi = @min(offset + count, items.len);
+        if (offset >= hi) return;
+
+        var stubs: std.ArrayList(Anime) = .empty;
+        defer stubs.deinit(self.gpa); // no-op after a successful toOwnedSlice
+        for (items[offset..hi]) |a| {
+            if (a.anilist_id == null) continue; // can't join an id-less card
+            const copy = dupeOwnedAnime(self.gpa, a) catch {
+                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+                return;
+            };
+            stubs.append(self.gpa, copy) catch {
+                freeOwnedAnime(self.gpa, copy);
+                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+                return;
+            };
+        }
+        if (stubs.items.len == 0) return; // no enrichable cards on this page
+
+        const owned = stubs.toOwnedSlice(self.gpa) catch {
+            for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+            return;
+        };
+
+        if (self.discover_batch_enrich_thread) |t| {
+            t.join();
+            self.discover_batch_enrich_thread = null;
+        }
+        self.discover_batch_enrich_thread = std.Thread.spawn(.{}, workers.discoverBatchEnrichTask, .{
+            loop, self.gpa, io, owned, window,
+        }) catch {
+            for (owned) |stub| freeOwnedAnime(self.gpa, stub);
+            self.gpa.free(owned);
+            return;
+        };
+    }
+
     /// Pool cap for Discover-grid covers (ROD-243): retain roughly two large-tier
     /// grid pages of recently-seen *off-screen* covers so scrolling back stays
     /// instant without unbounded memory. On-screen and in-flight slots are never
@@ -2072,7 +2211,8 @@ pub const App = struct {
 
         const w = self.term_cols;
         const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
-        const geo = discover_view.geometry(w, visible);
+        const cp = self.cellPx();
+        const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
         if (geo.cols == 0 or geo.rows_visible == 0) return;
 
         const items = self.discover.activeSlot().results.items;
@@ -3370,7 +3510,8 @@ pub const App = struct {
             // Discover: keep the cursor's card-row inside the grid viewport. scroll
             // is a card-row offset; geometry resolves cols + the visible row budget.
             .discover => {
-                const geo = discover_view.geometry(w, visible);
+                const cp = self.cellPx();
+                const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
                 if (geo.rows_visible == 0 or geo.cols == 0) {
                     self.discover.scroll = 0;
                 } else {
