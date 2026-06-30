@@ -14,6 +14,28 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-01
+
+### Added
+
+- **Discover view**: a new top-level view — `D` from anywhere — showing popular anime as a navigable cover grid. Time window switches with keys `1`–`4` (Daily / Weekly / Monthly / All-Time), each with its own scroll position and page cache; pressing load-more pages forward. The view handles loading, empty, and offline states without falling over. Opening a card zooms to a detail panel where the synopsis loads lazily.
+
+- **Cover art in Discover**: covers render inline in each grid cell — Kitty graphics where the terminal supports it, half-block characters everywhere else — fetched with bounded concurrency, scaled to fill the cell, and written to the disk cache so a revisit costs nothing. A peek row fills the partial band below the last complete row with the next batch of covers, signalling that more is below.
+
+- **AniList metadata on Discover cards**: each card shows a tier-coloured score badge, genre glyphs, and a season/year chip. The AllAnime popular feed does not carry reliable score, genre, or season data; a single batched AniList request per page fills the gap while keeping load latency low. Long titles are ellipsis-truncated so they never overflow the cell.
+
+- **Persistent tab strip and symmetric view keys**: a tab strip across the top of the screen now names all active views at all times. Single-key switching is symmetric across the app — `B` Browse, `H` History, `D` Discover, `S` Settings — and the Discover window bar is annotated with its `1`–`4` keys. Views were also renamed for consistency.
+
+- **`--version` / `-V`**: the CLI now prints the build version and exits.
+
+- **First-run empty-watchlist guidance updated**: an empty History view now leads with Discover ("see what's popular") as the primary next step, with Browse ("search for a show") as the secondary. Previously it pointed only at Browse's blank search prompt.
+
+### Fixed
+
+- **Kitty cover acknowledgements now fully quieted**: pending acks are already drained on quit to keep them from surfacing in the shell. Cover placements and deletions are now additionally issued with the quiet flag — via a pinned libvaxis build — so the terminal never queues them in the first place. This closes the paths the drain alone couldn't cover: acks arriving mid-load when the user quits before the batch completes, and the transmit/delete reply pairs that bled through in tmux and SSH sessions.
+
+- **Discover time-window cycle no longer overflows at the end**: pressing the cycle key past All-Time wrapped a too-narrow index and landed on an out-of-range window. The index type now covers the full range correctly.
+
 ## [0.1.5] - 2026-06-28
 
 ### Added
@@ -126,7 +148,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vantroy/zigoku/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/vantroy/zigoku/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/vantroy/zigoku/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/vantroy/zigoku/compare/v0.1.2...v0.1.3
