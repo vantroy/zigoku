@@ -425,6 +425,62 @@ pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime,
     };
 }
 
+/// Batch-enrich a whole Discover feed page from AniList in ONE fetch (ROD-247):
+/// score + genres + season, the card signals the popular feed nulls. `stubs` are
+/// gpa-owned copies of the page's cards (the caller filtered to those with a
+/// mineable anilist_id); ownership transfers to the discover_batch_enriched event
+/// on success, or is freed here on a post failure — the same contract as
+/// `enrichTask`. `window` routes the merge to the right per-window slot.
+///
+/// One arena feeds N shows: every enriched field is deep-copied into GPA by
+/// `applyMetadata` while the arena is still live, so nothing aliases the parse
+/// arena after teardown. The genres/description slices are arena-borrowed — this
+/// is the UAF trap, and the ordering (copy in the loop, `defer arena.deinit()`)
+/// is what defuses it.
+pub fn discoverBatchEnrichTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    stubs: []Anime,
+    window: source_mod.PopularWindow,
+) void {
+    var posted = false;
+    defer if (!posted) {
+        for (stubs) |a| freeOwnedAnime(gpa, a);
+        gpa.free(stubs);
+    };
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // The caller already filtered to cards with an anilist_id; collect them for the
+    // batch query, guarding a stray null so it can't poison the join.
+    var ids: std.ArrayList(u64) = .empty;
+    for (stubs) |a| {
+        if (a.anilist_id) |id| ids.append(arena.allocator(), id) catch {};
+    }
+
+    // One round trip for the whole page. An empty return (offline / no matches)
+    // leaves every stub unchanged — the merge is then a harmless self-replace and
+    // the page stays at [--], mirroring discoverEnrichTask's miss behavior.
+    const metas = anilist.enrichBatch(arena.allocator(), io, ids.items) catch &.{};
+    for (stubs) |*a| {
+        const id = a.anilist_id orelse continue;
+        for (metas) |meta| {
+            if (meta.anilist_id == id) {
+                applyMetadata(gpa, a, meta); // deep-copies out of the arena
+                break;
+            }
+        }
+    }
+
+    loop.postEvent(.{ .discover_batch_enriched = .{ .results = stubs, .window = window } }) catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        return; // `posted` stays false → the defer frees stubs
+    };
+    posted = true;
+}
+
 /// Background task: pull history and post it back to the UI thread. Errors are
 /// reported as a toast-able message rather than crashing the worker.
 pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {

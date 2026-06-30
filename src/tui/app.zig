@@ -238,6 +238,7 @@ pub fn run(
     defer if (app.enrich_thread) |t| t.join();
     defer if (app.popular_thread) |t| t.join();
     defer if (app.discover_enrich_thread) |t| t.join();
+    defer if (app.discover_batch_enrich_thread) |t| t.join();
     defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
@@ -525,6 +526,16 @@ pub const RenderScratch = struct {
     /// rarer and wider, but `truncateToWidth` self-guards on the byte budget before
     /// overrunning regardless.
     title: [256][80]u8 = undefined,
+    /// Per-card Discover score badges ("[NN]"/"[--]", ROD-247), right-anchored on
+    /// the card rank row. Separate from `score` (the Browse list form) and from the
+    /// card's rank string because all three can live on screen the same frame; same
+    /// outlive-vx.render() contract. [8] covers "[100]" with slack.
+    disc_badge: [256][8]u8 = undefined,
+    /// Per-card Discover genre tags (top 1-2, " · "-joined, ROD-247), clipped to the
+    /// card width. Blank for unenriched/no-id cards (no layout jump — slot_h is
+    /// fixed). Same outlive-vx.render() contract as `title`. [48] holds two clipped
+    /// genre names plus the separator for the widest card.
+    disc_genre: [256][48]u8 = undefined,
 };
 
 /// Single-level undo record for manual watch-state mutations (ROD-193). Tagged
@@ -650,6 +661,12 @@ pub const App = struct {
     /// Handle for the most recent Discover lazy zoom-enrich thread (ROD-239).
     /// Bounded to 1 and joined on teardown, same contract as popular_thread.
     discover_enrich_thread: ?std.Thread = null,
+
+    /// Handle for the most recent Discover page batch-enrich thread (ROD-247).
+    /// Separate from discover_enrich_thread so pressing Enter to zoom fires its own
+    /// enrich immediately instead of blocking on a ~500ms page batch. Bounded to 1
+    /// and joined on teardown, same contract as discover_enrich_thread.
+    discover_batch_enrich_thread: ?std.Thread = null,
 
     /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
     /// fetched by its own detached `discoverCoverTask`; `pump` caps how many run at
@@ -1667,6 +1684,11 @@ pub const App = struct {
                     self.discover.cursor = 0;
                     self.discover.scroll = 0;
                 }
+                // ROD-247: batch-enrich the cards just appended — one AniList fetch
+                // hydrates score + genres + season for the [offset, offset+added)
+                // slice. Only the new page is sent (earlier pages are already
+                // enriched), so the cost is one round trip per "load more".
+                self.fireDiscoverBatchEnrich(loop, io, ev.window, offset, added);
             },
 
             .popular_error => |ev| {
@@ -1705,6 +1727,39 @@ pub const App = struct {
                 if (self.discover_enrich_thread) |t| {
                     t.join();
                     self.discover_enrich_thread = null;
+                }
+            },
+
+            .discover_batch_enriched => |ev| {
+                // Merge each batch-enriched card back into its window slot by id —
+                // same merge-by-id + free-orphan contract as discover_enriched,
+                // fanned over the whole page. The cursor/page may have moved or the
+                // slot been refetched, so an unmatched result is a stale drop.
+                const idx = @intFromEnum(ev.window);
+                const items = self.discover.slots[idx].results.items;
+                var merged_any = false;
+                for (ev.results) |enriched| {
+                    var merged = false;
+                    for (items) |*live| {
+                        if (std.mem.eql(u8, live.id, enriched.id)) {
+                            freeOwnedAnime(self.gpa, live.*);
+                            live.* = enriched;
+                            merged = true;
+                            merged_any = true;
+                            break;
+                        }
+                    }
+                    if (!merged) freeOwnedAnime(self.gpa, enriched); // slot moved on — drop
+                }
+                self.gpa.free(ev.results);
+                // Persist the whole slot once (idempotent upserts) rather than
+                // tracking each scattered merge position — N ≤ ~50 local rows.
+                if (merged_any) {
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len);
+                }
+                if (self.discover_batch_enrich_thread) |t| {
+                    t.join();
+                    self.discover_batch_enrich_thread = null;
                 }
             },
             .search_enriched => |ev| {
@@ -2040,6 +2095,54 @@ pub const App = struct {
             loop, self.gpa, io, copy, window,
         }) catch {
             freeOwnedAnime(self.gpa, copy);
+            return;
+        };
+    }
+
+    /// Batch-enrich the Discover page just appended (ROD-247): one AniList fetch
+    /// hydrates score + genres + season for the [offset, offset+count) slice of
+    /// `window`'s slot (.discover_batch_enriched). Only cards with a mineable
+    /// anilist_id are sent — the worker joins AniList results by that id, and an
+    /// id-less card can't be enriched anyway (it stays [--]). Bounds to one thread,
+    /// separate from the zoom enrich so Enter never blocks on it. No-op in tests.
+    fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
+        if (builtin.is_test) return;
+        if (count == 0) return;
+        const idx = @intFromEnum(window);
+        const items = self.discover.slots[idx].results.items;
+        const hi = @min(offset + count, items.len);
+        if (offset >= hi) return;
+
+        var stubs: std.ArrayList(Anime) = .empty;
+        defer stubs.deinit(self.gpa); // no-op after a successful toOwnedSlice
+        for (items[offset..hi]) |a| {
+            if (a.anilist_id == null) continue; // can't join an id-less card
+            const copy = dupeOwnedAnime(self.gpa, a) catch {
+                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+                return;
+            };
+            stubs.append(self.gpa, copy) catch {
+                freeOwnedAnime(self.gpa, copy);
+                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+                return;
+            };
+        }
+        if (stubs.items.len == 0) return; // no enrichable cards on this page
+
+        const owned = stubs.toOwnedSlice(self.gpa) catch {
+            for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
+            return;
+        };
+
+        if (self.discover_batch_enrich_thread) |t| {
+            t.join();
+            self.discover_batch_enrich_thread = null;
+        }
+        self.discover_batch_enrich_thread = std.Thread.spawn(.{}, workers.discoverBatchEnrichTask, .{
+            loop, self.gpa, io, owned, window,
+        }) catch {
+            for (owned) |stub| freeOwnedAnime(self.gpa, stub);
+            self.gpa.free(owned);
             return;
         };
     }
