@@ -246,7 +246,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
 
 const testing = std.testing;
 
-test "card title clips to the card width with a trailing … at both tiers (ROD-245)" {
+test "truncateToWidth clips to the card cover_w with a trailing … at both tiers (ROD-245)" {
     // The title row gets exactly `cover_w` columns; a wider title must cut on a
     // grapheme boundary with the "…" affordance (§2.1/§3.8), and a title that fits
     // must pass through untouched (no spurious ellipsis). truncateToWidth owns the

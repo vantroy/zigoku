@@ -517,10 +517,12 @@ pub const RenderScratch = struct {
     hist_header: [8][24]u8 = undefined,
     /// Per-card Discover title strings, ellipsis-truncated to the card width
     /// (ROD-245). vaxis holds the printed slice by reference, so the truncated copy
-    /// must outlive vx.render() — same contract as `meta`/`score`. [80] is the
-    /// safe byte ceiling for a 20-col card title: at most 19 clusters survive (the
-    /// 20th col is reserved for "…"), and the densest real grapheme is ~4 bytes →
-    /// 19×4 + 3 ("…") = 79; `truncateToWidth` self-guards beyond that regardless.
+    /// must outlive vx.render() — same contract as `meta`/`score`. [80] is the safe
+    /// byte ceiling for a 20-col card title: at most 19 display columns survive (the
+    /// 20th is reserved for "…"), and the densest *single code point* is 4 bytes →
+    /// 19×4 + 3 ("…") = 79. Grapheme clusters spanning multiple code points are
+    /// rarer and wider, but `truncateToWidth` self-guards on the byte budget before
+    /// overrunning regardless.
     title: [256][80]u8 = undefined,
 };
 
