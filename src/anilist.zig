@@ -191,6 +191,12 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     }
     try ids_buf.append(arena, ']');
 
+    // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50:
+    // the caller feeds at most one feed page (popular_page_size = 30 in source.zig), so
+    // ids.len ≤ 50 holds today. If the feed page size is ever raised past 50, AniList
+    // 400s the whole query → postGql returns null → the page silently degrades to
+    // `[--]`. Chunk the ids (or clamp perPage) before crossing that line.
+    //
     // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
     // string — it contains `startDate{year}`, whose braces the format parser would
     // read as a `{year}` placeholder ("too few arguments"). As an arg its contents
@@ -226,37 +232,46 @@ fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
-    var resp_aw = std.Io.Writer.Allocating.init(arena);
+    // Cap the response at a fixed buffer rather than an unbounded Allocating writer
+    // (ROD-247): a hostile/MITM'd server could otherwise dribble a multi-GB body and
+    // OOM the process before any timeout. Any real AniList reply (even a 50-id batch)
+    // is well under 100 KB; 2 MB is a 20× margin. An over-cap body overflows the fixed
+    // writer → fetch errors → null (graceful "no enrichment"), mirroring the cover path.
+    const resp_buf = arena.alloc(u8, 2 * 1024 * 1024) catch return null;
+    var resp_w: std.Io.Writer = .fixed(resp_buf);
     const res = client.fetch(.{
         .location = .{ .url = ENDPOINT },
         .method = .POST,
         .payload = body,
-        .response_writer = &resp_aw.writer,
+        .response_writer = &resp_w,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "Accept", .value = "application/json" },
         },
     }) catch return null;
     if (res.status != .ok) return null;
-    return resp_aw.writer.buffered();
+    return resp_w.buffered();
 }
 
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
+    // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
+    // that render straight to terminal cells; see stripControls. thumb is a URL
+    // (validated separately on fetch), season is an enum, the rest are scalars.
     return .{
         .anilist_id = m.id,
         .mal_id = m.idMal,
-        .title_english = m.title.english,
-        .title_native = m.title.native,
+        .title_english = try stripControlsOpt(arena, m.title.english),
+        .title_native = try stripControlsOpt(arena, m.title.native),
         .thumb = m.coverImage.large,
         .total_episodes = m.episodes,
         .year = m.seasonYear,
         .season = if (m.season) |s| domain.Season.fromString(s) else null,
         .start_date = startDate(m.startDate),
-        .status = m.status,
-        .kind = m.format,
-        .genres = m.genres, // arena-borrowed; the worker deep-copies into GPA
+        .status = try stripControlsOpt(arena, m.status),
+        .kind = try stripControlsOpt(arena, m.format),
+        .genres = try stripControlsList(arena, m.genres), // arena-owned; worker deep-copies into GPA
         .studios = try studioNames(arena, m.studios),
-        .description = if (m.description) |d| try sanitizeDescription(arena, d) else null,
+        .description = if (m.description) |d| try stripControls(arena, try sanitizeDescription(arena, d)) else null,
         .score = m.averageScore,
     };
 }
@@ -282,10 +297,46 @@ fn studioNames(arena: Allocator, s: Studios) ![]const []const u8 {
     var i: usize = 0;
     for (s.nodes) |node| {
         if (node.name) |name| {
-            out[i] = name;
+            out[i] = try stripControls(arena, name);
             i += 1;
         }
     }
+    return out;
+}
+
+/// Drop C0 control bytes (0x00–0x1F) and DEL (0x7F) from an AniList-sourced string
+/// before it reaches a terminal cell (ROD-247 hardening). The escape-injection vector
+/// — an OSC/CSI sequence smuggled in a genre or synopsis — is blocked downstream by
+/// vaxis skipping zero-width graphemes, but that's an *implicit* framework property
+/// (it breaks under `.word` wrap, or if the text is logged/exported). Stripping at
+/// ingestion makes the defense explicit, mode-independent, and testable. Returns the
+/// input unchanged when it's already clean (the common case — no allocation).
+fn stripControls(arena: Allocator, raw: []const u8) ![]const u8 {
+    var has_ctrl = false;
+    for (raw) |c| {
+        if (c < 0x20 or c == 0x7F) {
+            has_ctrl = true;
+            break;
+        }
+    }
+    if (!has_ctrl) return raw;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len);
+    for (raw) |c| {
+        if (c < 0x20 or c == 0x7F) continue;
+        out.appendAssumeCapacity(c);
+    }
+    return out.items;
+}
+
+fn stripControlsOpt(arena: Allocator, raw: ?[]const u8) !?[]const u8 {
+    return if (raw) |r| try stripControls(arena, r) else null;
+}
+
+fn stripControlsList(arena: Allocator, list: []const []const u8) ![]const []const u8 {
+    if (list.len == 0) return &.{};
+    const out = try arena.alloc([]const u8, list.len);
+    for (list, 0..) |s, i| out[i] = try stripControls(arena, s);
     return out;
 }
 
@@ -631,6 +682,21 @@ test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
     try std.testing.expect(metas[1].season == null);
     try std.testing.expect(metas[1].start_date == null);
     try std.testing.expectEqual(@as(?u32, null), metas[1].year);
+}
+
+test "stripControls drops C0 + DEL bytes from AniList text (ROD-247)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // CSI colour smuggled in a title, OSC-52 clipboard in a genre, a lone ESC in a
+    // synopsis, BEL/DEL in a studio name — every control byte must be dropped.
+    try std.testing.expectEqualStrings("Hero[31m", try stripControls(a, "Hero\x1b[31m"));
+    try std.testing.expectEqualStrings("Action]52;c;QQ", try stripControls(a, "Action\x1b]52;c;QQ\x07"));
+    try std.testing.expectEqualStrings("A tale.", try stripControls(a, "A \x1btale."));
+    try std.testing.expectEqualStrings("Studio", try stripControls(a, "S\x7ftudio"));
+    // Clean input is returned unchanged (and not reallocated — same pointer).
+    const clean = "Slice of Life";
+    try std.testing.expectEqual(clean.ptr, (try stripControls(a, clean)).ptr);
 }
 
 test "sanitizeDescription strips tags and decodes common entities" {
