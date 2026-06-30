@@ -523,8 +523,8 @@ test "F1 from browse is a no-op and preserves active_pane" {
     try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
 }
 
-test "F4 and D from browse open Discover (ROD-239)" {
-    inline for (.{ keyEv(vaxis.Key.f4, .{}), keyEv('D', .{}) }) |k| {
+test "F3 and D from browse open Discover (ROD-239, remapped ROD-249)" {
+    inline for (.{ keyEv(vaxis.Key.f3, .{}), keyEv('D', .{}) }) |k| {
         var app: App = .{};
         app.active_view = .browse;
         try testTick(&app, k);
@@ -532,10 +532,10 @@ test "F4 and D from browse open Discover (ROD-239)" {
     }
 }
 
-test "F1 leaves Discover for Browse; F4 in Discover is a no-op (ROD-239)" {
+test "F1 leaves Discover for Browse; F3 in Discover is a no-op (ROD-239, remapped ROD-249)" {
     var app: App = .{};
     app.active_view = .discover;
-    try testTick(&app, keyEv(vaxis.Key.f4, .{})); // already in Discover → no-op
+    try testTick(&app, keyEv(vaxis.Key.f3, .{})); // already in Discover → no-op
     try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
     try testTick(&app, keyEv(vaxis.Key.f1, .{}));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
@@ -548,6 +548,50 @@ test "D in search mode does not switch to Discover (normal-mode guard, ROD-239)"
     try testTick(&app, keyEv('D', .{ .shift = true }));
     // The D→Discover binding is normal-mode only; in search it must fall through
     // to the query buffer, leaving the view untouched.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+}
+
+test "B and F1 from history switch to Browse (ROD-249)" {
+    inline for (.{ keyEv('B', .{}), keyEv(vaxis.Key.f1, .{}) }) |k| {
+        var app: App = .{};
+        var recs = sampleHistory();
+        app.setHistory(&recs);
+        app.active_view = .history;
+        try testTick(&app, k);
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
+    }
+}
+
+test "H is a direct goto, not a toggle: Browse→History, History→no-op (ROD-249)" {
+    // The old H toggled Browse↔History; it is now a plain go-to-History. From
+    // Browse it switches; from History it is a no-op (B is the way back).
+    var app: App = .{};
+    var recs = sampleHistory();
+    app.setHistory(&recs);
+    app.active_view = .browse;
+    try testTick(&app, keyEv('H', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    // Pressing H again from History must NOT flip back to Browse (no toggle).
+    try testTick(&app, keyEv('H', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+}
+
+test "F4 and S from browse open Settings (ROD-249)" {
+    inline for (.{ keyEv(vaxis.Key.f4, .{}), keyEv('S', .{}) }) |k| {
+        var app: App = .{};
+        app.active_view = .browse;
+        try testTick(&app, k);
+        try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
+    }
+}
+
+test "S in search mode does not switch to Settings (normal-mode guard, ROD-249)" {
+    // Pre-ROD-249, S lacked the normal-mode guard the other view letters carried,
+    // so a literal S in a search switched views. The symmetric rewrite fixes it.
+    var app: App = .{};
+    app.active_view = .browse;
+    app.input_mode = .search;
+    try testTick(&app, keyEv('S', .{ .shift = true }));
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
@@ -598,7 +642,7 @@ test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (
         app.gpa = testing.allocator;
         defer app.discover.deinit(testing.allocator);
         app.active_view = .browse;
-        try testTick(&app, keyEv(vaxis.Key.f4, .{}));
+        try testTick(&app, keyEv(vaxis.Key.f3, .{}));
         try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
         // Stale/empty → firePopular ran (loading set; the drained .popular_done that
         // would clear it is freed unprocessed by the test harness).
@@ -1201,12 +1245,12 @@ test "History `r` recompute-to-0 clears the episode resume marker (ROD-193 revie
     try testing.expectEqual(@as(?usize, null), app.episodes.resume_idx);
 }
 
-test "F1/H from History reset the viewport before Browse reads it (ROD-139 H1, ROD-210)" {
+test "F1/B from History reset the viewport before Browse reads it (ROD-139 H1, ROD-210)" {
     // list_top is a physical-row offset in History but an entry index in Browse —
     // leaving History must clear it so a stale physical value can't leak across.
-    // ROD-210 retired the q/Esc → Browse jump; F1 and the H toggle are now the
-    // only History → Browse paths, and they own the reset.
-    inline for (.{ vaxis.Key.f1, 'H' }) |k| {
+    // ROD-210 retired the q/Esc → Browse jump; F1 and B are now the only
+    // History → Browse paths (ROD-249 dropped the H toggle), and they own the reset.
+    inline for (.{ vaxis.Key.f1, 'B' }) |k| {
         var app: App = .{};
         var recs = sampleHistory();
         app.setHistory(&recs);
@@ -1221,30 +1265,17 @@ test "F1/H from History reset the viewport before Browse reads it (ROD-139 H1, R
     }
 }
 
-test "H from history toggles to browse" {
-    var app: App = .{};
-    var recs = sampleHistory();
-    app.setHistory(&recs);
-    app.active_view = .history;
-    try testTick(&app, keyEv('H', .{ .shift = true }));
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
-}
+// (The old "H toggles" pair retired with ROD-249 — H is now a direct goto;
+// covered by "H is a direct goto, not a toggle" above.)
 
-test "H from browse toggles to history" {
-    var app: App = .{};
-    var recs = sampleHistory();
-    app.setHistory(&recs);
-    app.active_view = .browse;
-    try testTick(&app, keyEv('H', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
-}
-
-test "F3 / S from any view switches to settings" {
-    for ([_]@TypeOf(@as(App, undefined).active_view){ .browse, .history }) |from_view| {
-        var app: App = .{};
-        app.active_view = from_view;
-        try testTick(&app, keyEv(vaxis.Key.f3, .{}));
-        try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
+test "F4 / S from any view switches to settings (ROD-249)" {
+    inline for (.{ keyEv(vaxis.Key.f4, .{}), keyEv('S', .{}) }) |k| {
+        for ([_]@TypeOf(@as(App, undefined).active_view){ .browse, .history, .discover }) |from_view| {
+            var app: App = .{};
+            app.active_view = from_view;
+            try testTick(&app, k);
+            try testing.expectEqual(@as(@TypeOf(app.active_view), .settings), app.active_view);
+        }
     }
 }
 
@@ -1696,7 +1727,7 @@ test "browse list pane detail render info uses selected anime" {
 }
 
 test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
-    // Repro: a focused History detail loads an episode grid; pressing H toggles to
+    // Repro: a focused History detail loads an episode grid; pressing B switches to
     // Browse and resets pane focus to .list, but leaves episodes.results loaded
     // (the fetch/clear is lazy — it fires on the next detail entry). The Browse
     // two-pane draws drawDetailPane on every frame, so the grid must be gated on a
@@ -1718,8 +1749,8 @@ test "Browse preview hides a stale episode grid carried over from History detail
     // Focused History detail → the grid is its own surface, so it renders.
     try testing.expect(app.episodeGridVisible());
 
-    // H toggles to Browse and resets focus to the list. The stale episodes survive.
-    try testTick(&app, keyEv('H', .{ .shift = true }));
+    // B switches to Browse and resets focus to the list. The stale episodes survive.
+    try testTick(&app, keyEv('B', .{}));
     try testing.expectEqual(.browse, app.active_view);
     try testing.expectEqual(.list, app.active_pane);
     try testing.expect(app.episodes.results != null); // stale state still present…
@@ -4300,8 +4331,10 @@ test "entering settings resets cursor, editing state, and input_mode" {
     app.input_mode = .search;
     app.active_view = .browse;
 
-    // F3 switches to settings — the onKey F3 handler resets these.
-    try testTick(&app, keyEv(vaxis.Key.f3, .{}));
+    // F4 switches to settings — the onKey F4 handler resets these. (F4 is the
+    // unguarded F-key, so it fires even though we start in search mode; the S
+    // letter is normal-mode-guarded and would append instead — ROD-249.)
+    try testTick(&app, keyEv(vaxis.Key.f4, .{}));
     try testing.expectEqual(.settings, app.active_view);
     try testing.expectEqual(@as(usize, 0), app.settings.cursor);
     try testing.expect(!app.settings.editing);
