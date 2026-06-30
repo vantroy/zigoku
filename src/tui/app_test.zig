@@ -4265,12 +4265,15 @@ test "settings save round-trip — q writes file, load reads back mutations" {
     try testing.expectEqualStrings("/alt/mpv", loaded.mpv_path);
 }
 
-test "F1/F2/H from a dirty Settings tab persist on the way out (ROD-210 H1)" {
-    // Acceptance criterion 2: "switching away via F-key persists settings." With
-    // a null config path the save can't write, but the warn toast proves
-    // leaveSettings (hence saveSettings) ran — i.e. all three call-sites are
-    // wired. Guards against a dropped leaveSettings() on any of F1/F2/H.
-    inline for (.{ vaxis.Key.f1, vaxis.Key.f2, 'H' }) |k| {
+test "B/H/D + F1/F2/F3 from a dirty Settings tab persist on the way out (ROD-210 H1, ROD-249)" {
+    // Acceptance criterion 2: "switching away persists settings." With a null
+    // config path the save can't write, but the warn toast proves leaveSettings
+    // (hence saveSettings) ran. Exhaustive over every exit-from-Settings path: the
+    // browse / history / discover blocks each call leaveSettings, reached by either
+    // the F-key or the letter. S/F4 is NOT an exit (it's a no-op — already in
+    // Settings), so it is excluded. Guards against a dropped leaveSettings() on any
+    // block (ROD-249 added the Discover/D exit, previously uncovered).
+    inline for (.{ vaxis.Key.f1, vaxis.Key.f2, vaxis.Key.f3, 'B', 'H', 'D' }) |k| {
         var app: App = .{};
         app.gpa = testing.allocator;
         app.active_view = .settings;
