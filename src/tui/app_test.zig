@@ -670,7 +670,7 @@ fn countLoadingCovers(app: *App) usize {
     return n;
 }
 
-test "pumpDiscoverCovers bounds in-flight cover fetches to the configured cap (ROD-240)" {
+test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping already-loading slots (ROD-240)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     defer app.discover.deinit(testing.allocator);
@@ -700,8 +700,11 @@ test "pumpDiscoverCovers bounds in-flight cover fetches to the configured cap (R
     var loop = initTestLoop();
 
     // The is_test gate skips the real spawn, but the budget loop still marks slots
-    // `.loading` — so each pump marks exactly `cap` NEW slots: `busy` stays 0 (no
-    // worker decrements it), and the planner skips slots already marked loading.
+    // `.loading` — so each pump marks exactly `cap` NEW slots: the per-pump budget
+    // caps the wave (8 eligible, only `cap` marked), and the planner skips slots
+    // already marked loading so a wave never re-selects one. This proves the
+    // per-frame half of the bound; the cap-minus-in-flight half (`busy` > 0) is
+    // proved separately below, since `busy` stays 0 here (no worker decrements it).
     app.pumpDiscoverCovers(&loop, io);
     try testing.expectEqual(@as(usize, 3), countLoadingCovers(&app)); // wave 1
     app.pumpDiscoverCovers(&loop, io);
@@ -753,7 +756,9 @@ test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
     app.pumpDiscoverCovers(&loop, io);
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
-    app.discover_cover_drain.inflight.store(0, .release); // clear the simulated tally
+    // Required before any drain(): no real workers exist to decrement the simulated
+    // tally, so a non-zero inflight would make a teardown drain() spin forever.
+    app.discover_cover_drain.inflight.store(0, .release);
 }
 
 test "Discover prefetches the next page near the end; exhausted/loading block it (ROD-239)" {

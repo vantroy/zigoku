@@ -2124,7 +2124,8 @@ pub const App = struct {
         // is read + clamped every frame, so a config change takes effect live.
         const cap: usize = self.config.discoverCoverConcurrency();
         const busy = self.discover_cover_drain.inflight.load(.acquire);
-        if (busy >= cap) return; // every slot busy — let the workers drain first
+        if (busy >= cap) return; // at or above the cap — let the workers drain first
+        // (>, not just ==, since a live cap decrease can leave busy above the new cap)
         var budget = cap - busy;
 
         for (chosen[0..m]) |ci| {
