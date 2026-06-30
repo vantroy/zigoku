@@ -48,9 +48,12 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     if (w >= 40) {
         for (keys, labels, 0..) |keyhint, label, i| {
             const on = i == active_idx;
-            // Abbreviated: the bracket carries the active weight (no label follows).
-            // Full: the bracket stays plain focus and the label carries the bold.
-            const key_sty = if (on) self.s(self.palette.focus, .{ .bold = !full }) else self.s(self.palette.fg3, .{});
+            // The bracketed key is the whole point of the strip, so an inactive
+            // `[X]` reads at text.muted (fg2) — NOT text.dim, which is near-invisible
+            // against bg_base and buries the very hint we're teaching. Abbreviated:
+            // the bracket carries the active weight (no label follows). Full: the
+            // bracket stays plain focus and the label carries the bold.
+            const key_sty = if (on) self.s(self.palette.focus, .{ .bold = !full }) else self.s(self.palette.fg2, .{});
             put(win, 0, col, keyhint, key_sty);
             col += @as(u16, @intCast(keyhint.len));
             if (full) {

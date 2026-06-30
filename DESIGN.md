@@ -360,7 +360,7 @@ Single row. Full terminal width. Content:
   **passive**: no tab focus model, no `j`/`k` into it — the bracketed letters fire
   the existing normal-mode binds from anywhere (§6.1/§10.2). Styling: active tab —
   `[X]` in `state.focus`, label in `state.focus` + bold; inactive — `[X]` in
-  `text.dim`, label in `text.muted`; separator `·` in `text.dim`. The detail zoom is
+  `text.muted`, label in `text.muted`; separator `·` in `text.dim`. The detail zoom is
   not a tab destination — it highlights the `detail_origin` tab (`[B]rowse` /
   `[H]istory` / `[D]iscover`), so the strip still reads "where you came from."
 - Season/year kanji chip (ROD-186): an add-on two cells after the strip, in
@@ -493,7 +493,7 @@ bindings in place.
 | Active window label | `state.focus` | bold |
 | Inactive window labels | `text.muted` | — |
 | Active window `[N]` key | `state.focus` | — (lifts with the label so the entry reads as a unit) |
-| Inactive window `[N]` keys | `text.dim` | — (reads as a quiet annotation) |
+| Inactive window `[N]` keys | `text.muted` | — (legible — it's the binding being taught; `text.dim` buries it) |
 | Separator `·` dots | `text.dim` | — |
 
 The bar is **passive** — there is no "window bar focus." The `[`/`]` cycle keys and
@@ -2032,7 +2032,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
 | Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. `detail_two_col_min = 100` remains for the full-screen zoom's internal two-column split (full canvas, not the ~58% pane). | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
-| First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist points to Browse (its `/` filter has nothing to filter); active search/filter counts carry a `[catalogue · N]` / `[watchlist · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the bonus `P save` line recedes to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | When the v0.2 Discovery Feeds land and Browse auto-populates, revisit the empty-Browse copy so `search the catalogue` and the feed don't relabel twice. |
+| First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist points to Browse (its `/` filter has nothing to filter); active search/filter counts carry a `[catalogue · N]` / `[history · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the bonus `P save` line recedes to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | When the v0.2 Discovery Feeds land and Browse auto-populates, revisit the empty-Browse copy so `search the catalogue` and the feed don't relabel twice. |
 
 ---
 
@@ -2257,7 +2257,8 @@ differentiated from the rest by color, no separator glyph beyond the `·` dots:
 The full strip occupies cols 16–61; the season chip sits two cells after it (col 64)
 and drops first under width pressure (w < 76). Below w = 64 the strip abbreviates to
 `[B] · [H] · [D] · [S]`; the abbreviated strip and the `·` always survive (§3.4). The
-inactive tabs render `text.muted` labels with `text.dim` bracket keys. ROD-186 retired
+inactive tabs render `text.muted` labels with `text.muted` bracket keys (the key is
+the hint being taught — `text.dim` buries it against bg_base). ROD-186 retired
 the old `.browse` `⠋ search` spinner stub — Browse is a live feed now, and search
 status lives in the bottom bar (`/query_` + `[catalogue · N]`), so the top bar no
 longer doubles as a search indicator. The season chip is `text.muted` so it reads
