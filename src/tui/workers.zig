@@ -861,40 +861,41 @@ pub fn coverTask(
     postCoverDoneOwned(loop, gpa, decoded, for_id);
 }
 
-/// Background task: load a batch of Discover-grid covers serially, posting each as
-/// it lands (ROD-243). `urls` is a gpa-owned slice of gpa-owned url strings owned
-/// by this task: each url transfers to its result event (the UI thread frees it),
-/// and the backing slice is freed here. `active` is App's "a cover batch is in
-/// flight" flag, cleared as the very last action so the UI thread's pump can tell
-/// the batch finished and reap this thread without a blocking join. At most this
-/// worker plus the single-cover worker touch `caches` at once — safe under its lock
-/// (see `loadCoverPixels`). One serialized batch at a time: App joins/reaps this
-/// before spawning the next, so there is never a second grid worker.
+/// Background task: load ONE Discover-grid cover and post it (ROD-240). `url` is a
+/// gpa-owned string owned by this task; it transfers to the result event (the UI
+/// thread frees it) on both the done and error paths, and is freed here only if the
+/// post itself fails. `drain` bounds the worker fan-out: the pump caps how many of
+/// these run at once (`config.discoverCoverConcurrency`) by gating spawns on
+/// `drain.inflight`, and `finish()` runs as the worker's LAST action (after the
+/// final `postEvent`) so the teardown `drain()` can never unblock while a worker
+/// might still touch `loop`/`gpa` (ROD-179). N of these plus the single-cover
+/// worker may touch `caches` concurrently — safe under its lock (see
+/// `loadCoverPixels`). The per-frame pump replaces the old batch worker: instead of
+/// one thread draining a snapshot, each frame tops the in-flight set back up to the
+/// cap against live slot state, so a fetch is never spent on a card already scrolled
+/// past.
 pub fn discoverCoverTask(
     loop: *Loop,
     gpa: Allocator,
     io: std.Io,
-    urls: [][]const u8,
+    url: []const u8,
     caches: *CoverCaches,
-    active: *std.atomic.Value(bool),
+    drain: *ThreadDrain,
 ) void {
-    defer active.store(false, .release);
-    defer gpa.free(urls);
-    for (urls) |url| {
-        if (loadCoverPixels(gpa, io, url, caches)) |px| {
-            loop.postEvent(.{ .discover_cover_done = .{
-                .url = url,
-                .rgba = px.rgba,
-                .width = px.w,
-                .height = px.h,
-            } }) catch {
-                gpa.free(px.rgba);
-                gpa.free(url);
-            };
-        } else |e| {
-            log.debug("discover cover load failed: {s}", .{@errorName(e)});
-            loop.postEvent(.{ .discover_cover_error = url }) catch gpa.free(url);
-        }
+    defer drain.finish();
+    if (loadCoverPixels(gpa, io, url, caches)) |px| {
+        loop.postEvent(.{ .discover_cover_done = .{
+            .url = url,
+            .rgba = px.rgba,
+            .width = px.w,
+            .height = px.h,
+        } }) catch {
+            gpa.free(px.rgba);
+            gpa.free(url);
+        };
+    } else |e| {
+        log.debug("discover cover load failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .discover_cover_error = url }) catch gpa.free(url);
     }
 }
 

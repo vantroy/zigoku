@@ -38,6 +38,12 @@ pub const Config = struct {
     kanji_chips: bool = true,
     palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord" | "tokyonight"
     landing: []const u8 = "history", // "history" | "browse" | "last_watched" (ROD-228)
+    /// Max simultaneous Discover-grid cover downloads (ROD-240). The pump tops up
+    /// to this many in-flight fetches each frame; covers beyond the cap wait for a
+    /// slot to free. Read through `discoverCoverConcurrency`, which clamps it to a
+    /// sane range so a 0 can't stall every fetch and a silly value can't spawn a
+    /// thread storm.
+    discover_cover_concurrency: u32 = 4,
 
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
@@ -55,6 +61,24 @@ pub const Config = struct {
         if (std.mem.eql(u8, self.landing, "browse")) return .browse;
         if (std.mem.eql(u8, self.landing, "last_watched")) return .last_watched;
         return .history;
+    }
+
+    /// Lower / upper bound for `discover_cover_concurrency`. 1 keeps fetches making
+    /// forward progress (0 would stall the grid forever); 16 caps the worst-case
+    /// thread fan-out — the visible+prefetch set bounds it far lower in practice, so
+    /// this is only a guard against a hand-edited config asking for hundreds.
+    pub const discover_cover_concurrency_min: u32 = 1;
+    pub const discover_cover_concurrency_max: u32 = 16;
+
+    /// `discover_cover_concurrency` clamped to `[min, max]` (ROD-240). Every
+    /// consumer reads through this so the bound is enforced in exactly one place —
+    /// the raw field stays whatever the file said (round-trips unchanged on save).
+    pub fn discoverCoverConcurrency(self: Config) u32 {
+        return std.math.clamp(
+            self.discover_cover_concurrency,
+            discover_cover_concurrency_min,
+            discover_cover_concurrency_max,
+        );
     }
 };
 
@@ -124,6 +148,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqual(want.kanji_chips, got.kanji_chips);
     try testing.expectEqualStrings(want.palette, got.palette);
     try testing.expectEqualStrings(want.landing, got.landing);
+    try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
 }
 
 test "empty struct literal yields all defaults" {
@@ -173,6 +198,7 @@ test "serialized config round-trips back through parse" {
         .kanji_chips = false,
         .palette = "nord",
         .landing = "browse",
+        .discover_cover_concurrency = 8,
     };
 
     var aw = std.Io.Writer.Allocating.init(a);
@@ -194,4 +220,13 @@ test "landingEnum maps browse and last_watched, defaults everything else to hist
     try testing.expectEqual(.history, (Config{ .landing = "history" }).landingEnum());
     try testing.expectEqual(.history, (Config{ .landing = "garbage" }).landingEnum());
     try testing.expectEqual(.history, (Config{}).landingEnum()); // default
+}
+
+test "discoverCoverConcurrency clamps to [min, max], default passes through" {
+    try testing.expectEqual(@as(u32, 4), (Config{}).discoverCoverConcurrency()); // default
+    try testing.expectEqual(@as(u32, 6), (Config{ .discover_cover_concurrency = 6 }).discoverCoverConcurrency());
+    // 0 would stall every fetch — floored to the minimum.
+    try testing.expectEqual(Config.discover_cover_concurrency_min, (Config{ .discover_cover_concurrency = 0 }).discoverCoverConcurrency());
+    // A hand-edited absurd value is capped, not honoured.
+    try testing.expectEqual(Config.discover_cover_concurrency_max, (Config{ .discover_cover_concurrency = 9999 }).discoverCoverConcurrency());
 }
