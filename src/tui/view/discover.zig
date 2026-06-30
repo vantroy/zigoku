@@ -248,7 +248,10 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
             if (shown >= 2) break;
             const sym = genreGlyph(gname);
             if (sym.len == 0) continue;
-            if (glen + sym.len > scratch.disc_genre[vis].len) break;
+            const sep: []const u8 = if (shown > 0) " " else ""; // space so two glyphs don't smush
+            if (glen + sep.len + sym.len > scratch.disc_genre[vis].len) break;
+            @memcpy(scratch.disc_genre[vis][glen .. glen + sep.len], sep);
+            glen += sep.len;
             @memcpy(scratch.disc_genre[vis][glen .. glen + sym.len], sym);
             glen += sym.len;
             shown += 1;
@@ -256,6 +259,9 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
         if (glen > 0) {
             const glyphs = scratch.disc_genre[vis][0..glen];
             const gw: u16 = @intCast(vaxis.gwidth.gwidth(glyphs, .unicode));
+            // text.dim: ambient texture, not a label. fg2 was tried and reverted — it
+            // made the glyphs compete with the view-count; the space (above) is what
+            // fixed legibility, not brightness.
             put(win, rank_y + 2, x + geo.cover_w -| gw, glyphs, self.s(self.palette.fg3, .{}));
         }
     }
