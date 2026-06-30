@@ -21,37 +21,68 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     put(win, 0, 2, "地獄 zigoku", self.s(self.palette.fg, .{ .bold = true }));
     if (w > 16) put(win, 0, 14, "░", self.s(self.palette.chrome, .{}));
 
-    // The view-label chip after the separator (§10.3b). ROD-186: Browse's old
-    // `⠋ search` spinner stub retires — search status lives in the bottom bar — so
-    // every view now reads a static identity chip in state.focus.
-    const chip_col: u16 = 16;
-    const chip: []const u8 = switch (self.active_view) {
-        .history => "Watchlist",
+    // View tab strip after the separator (§3.4/§10.3b, ROD-250): all four views,
+    // the active one highlighted, each bracketing its view-switch key — the same
+    // passive idiom as the §3.8 window bar (no tab focus model; the bracketed
+    // letters just fire the existing normal-mode binds). In the zoom the active tab
+    // follows detail_origin, so it still reads "where you came from". Every segment
+    // is a static literal — no scratch lifetime concern.
+    const strip_col: u16 = 16;
+    const active_idx: usize = switch (self.active_view) {
+        .browse => 0,
+        .history => 1,
+        .discover => 2,
+        .settings => 3,
         .detail => switch (self.detail_origin) {
-            .browse => "Browse",
-            .history => "Watchlist",
-            .discover => "Popular",
+            .browse => 0,
+            .history => 1,
+            .discover => 2,
         },
-        .settings => "Settings",
-        .browse => "Browse",
-        .discover => "Popular",
     };
-    put(win, 0, chip_col, chip, self.s(self.palette.focus, .{}));
+    const keys = [_][]const u8{ "[B]", "[H]", "[D]", "[S]" };
+    const labels = [_][]const u8{ "rowse", "istory", "iscover", "ettings" };
+    // Width tiers (§3.4): the full strip (cols 16–61) must clear the right `·`;
+    // below w=64 abbreviate to the bracketed keys only; below w=40, a single label.
+    const full = w >= 64;
+    var col: u16 = strip_col;
+    if (w >= 40) {
+        for (keys, labels, 0..) |keyhint, label, i| {
+            const on = i == active_idx;
+            // Abbreviated: the bracket carries the active weight (no label follows).
+            // Full: the bracket stays plain focus and the label carries the bold.
+            const key_sty = if (on) self.s(self.palette.focus, .{ .bold = !full }) else self.s(self.palette.fg3, .{});
+            put(win, 0, col, keyhint, key_sty);
+            col += @as(u16, @intCast(keyhint.len));
+            if (full) {
+                const label_sty = if (on) self.s(self.palette.focus, .{ .bold = true }) else self.s(self.palette.fg2, .{});
+                put(win, 0, col, label, label_sty);
+                col += @as(u16, @intCast(label.len));
+            }
+            if (i + 1 < keys.len) {
+                put(win, 0, col + 1, "·", self.s(self.palette.fg3, .{}));
+                col += 3;
+            }
+        }
+    } else {
+        // Too narrow for the strip — fall back to the single active label.
+        const single = [_][]const u8{ "Browse", "History", "Discover", "Settings" };
+        put(win, 0, strip_col, single[active_idx], self.s(self.palette.focus, .{ .bold = true }));
+    }
 
-    // ROD-186: the season/year chip rides two spaces after the view label, in
-    // text.muted (fg2) so it reads as metadata beside the cyan identity chip and
-    // never competes with the cyan `·` dot at the right edge (per the header layout).
-    // Content (App.topBarSeasonChip): the selected show's season+year, falling back
-    // to the current cour; "" in Settings and for unenriched shows in the zoom.
-    const season = self.topBarSeasonChip();
-    if (season.len > 0) {
-        // chip is ASCII; one kanji is 3 bytes / 2 display cells, so display width
-        // is byte len minus the kanji's extra byte.
-        const season_w: u16 = @as(u16, @intCast(season.len)) - 1;
-        const season_col: u16 = chip_col + @as(u16, @intCast(chip.len)) + 2;
-        // Drop the chip before it would crowd the `·` at w-2 (keep ≥3 cells of air).
-        if (w > season_col + season_w + 4) {
-            put(win, 0, season_col, season, self.s(self.palette.fg2, .{}));
+    // Season/year chip two cells after the full strip, in text.muted (ROD-186) —
+    // metadata beside the strip, never crowding the right `·`. Only in the full
+    // strip (it drops first under width pressure). Content via topBarSeasonChip:
+    // the selected show's season+year, current-cour fallback for list views, the
+    // focused show's season in the zoom; "" in Discover/Settings.
+    if (full) {
+        const season = self.topBarSeasonChip();
+        if (season.len > 0) {
+            // one kanji is 3 bytes / 2 display cells, so display width = len - 1.
+            const season_w: u16 = @as(u16, @intCast(season.len)) - 1;
+            const season_col: u16 = col + 2;
+            if (w > season_col + season_w + 4) {
+                put(win, 0, season_col, season, self.s(self.palette.fg2, .{}));
+            }
         }
     }
 
@@ -143,7 +174,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
-            .list => "hjkl · / find anime · P save · B/H/D/S views · q quit",
+            .list => "hjkl · / find anime · P save · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
             .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
@@ -154,7 +185,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .history => if (self.history.len == 0)
             "B browse · q quit"
         else switch (self.active_pane) {
-            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit",
+            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
             // preview band there is no grid, so enter/space drill into the zoom.
             .detail => if (w >= App.zoom_min)
@@ -164,11 +195,11 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
-        .discover => "hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit",
+        .discover => "hjkl move · enter open · P save · [ ] window · / search · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
-            "hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit",
+            "hjkl navigate · space toggle · enter edit · q save+quit",
     };
     putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
 }

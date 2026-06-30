@@ -348,28 +348,46 @@ that does **not** contain the grid, so they are exempt — `drawCover` takes a
 Single row. Full terminal width. Content:
 
 ```
-  ZIGOKU  ░  Browse  冬 2026
+  ZIGOKU  ░  [B]rowse · [H]istory · [D]iscover · [S]ettings  冬 2026
 ```
 
 - App name: `text.primary` + bold. Always visible, never interactive.
 - `░` separator: `border.hair`.
-- View-label chip: `state.focus`. Names the surface — `Browse` / `Watchlist` /
-  `Settings` (the detail zoom inherits its origin's label). This is the navigation
-  identity chip.
-- Season/year kanji chip (ROD-186): an add-on two spaces after the view label, in
-  `text.muted` so it reads as metadata distinct from the cyan identity chip beside
-  it (and never competes with the cyan `·` at the right edge). Content: the
-  currently selected show's season+year when a row is selected and both are known;
-  otherwise the current real-world cour from the system clock (AniList's season
-  boundaries — 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov — with December rolled
-  into next year's Winter, so it agrees with the show chips). The detail zoom is the
-  exception: committed to one show, it shows only that show's season with no cour
-  fallback. Settings shows no season chip (no show context). Drops first on narrow
-  widths (below ~36 cols), the view label and `·` survive.
+- View tab strip (ROD-250): a persistent four-tab strip naming every view, with the
+  active one highlighted — the same passive idiom as the §3.8 window bar. Each tab
+  brackets its view-switch key letter (`[B]rowse · [H]istory · [D]iscover ·
+  [S]ettings`), so the strip both shows *where you are* and teaches the keys. It is
+  **passive**: no tab focus model, no `j`/`k` into it — the bracketed letters fire
+  the existing normal-mode binds from anywhere (§6.1/§10.2). Styling: active tab —
+  `[X]` in `state.focus`, label in `state.focus` + bold; inactive — `[X]` in
+  `text.dim`, label in `text.muted`; separator `·` in `text.dim`. The detail zoom is
+  not a tab destination — it highlights the `detail_origin` tab (`[B]rowse` /
+  `[H]istory` / `[D]iscover`), so the strip still reads "where you came from."
+- Season/year kanji chip (ROD-186): an add-on two cells after the strip, in
+  `text.muted` so it reads as metadata distinct from the cyan strip (and never
+  competes with the cyan `·` at the right edge). Content: the currently selected
+  show's season+year when a row is selected and both are known; otherwise the
+  current real-world cour from the system clock (AniList's season boundaries — 冬
+  Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov — with December rolled into next year's
+  Winter, so it agrees with the show chips). The detail zoom is the exception:
+  committed to one show, it shows only that show's season with no cour fallback.
+  Discover and Settings show no season chip. The chip drops first under width
+  pressure (below w ≈ 76).
 - Right-aligned: active pane indicator (a `·` in `state.focus` color to mark which
   pane has keyboard focus — list or detail).
 
-No search bar. No breadcrumbs. No tabs. The top bar is read-only context, not UI.
+**Width degradation:** w ≥ 76 — full strip + season chip · 64 ≤ w < 76 — full strip,
+no chip · 40 ≤ w < 64 — abbreviated strip `[B] · [H] · [D] · [S]` (active `[X]` =
+focus + bold, inactive = dim), no chip · w < 40 — single active label fallback. The
+abbreviated strip and the right `·` always survive.
+
+No search bar. No breadcrumbs. The strip is read-only state (it displays where you
+are; it does not accept input) — the top bar stays read-only context, not UI.
+
+*(The full-screen view mockups in §5 and §9 still render the top bar in shorthand —
+the single active label, e.g. `ZIGOKU ░ Watchlist` — to keep those wide diagrams
+legible. This section is the canonical top-bar spec; a mockup refresh to the strip
+is a follow-up doc pass.)*
 
 ### 3.5 Bottom Bar / Command Line
 
@@ -1068,7 +1086,7 @@ wide two-pane layout (§5.4a).
       [████████████████]  24 / 24 eps  · completed 2023-11-02
                                                                                      [d bar, d meta]
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit
 ```
 
 Notes:
@@ -1137,7 +1155,7 @@ record is focused.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit                          [list focused; help matches Browse §10.5]
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit                          [list focused; help matches Browse §10.5]
 ```
 
 **History preview — detail stack (authoritative).** The ASCII mocks in this
@@ -1260,7 +1278,7 @@ Live-editable. Full width. No cover art.
     palette                       terminal_ghost                       hjkl to cycle
     landing view                  history                              hjkl to cycle
 
-  ▌  hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit
+  ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
 > **Reconciled with shipped code (ROD-138).** This surface drifted from the M4-era
@@ -1371,11 +1389,12 @@ Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
   ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌ ╌                             [border.hair dashed rule; next-page fetch in flight]
   ⠋ loading more…                                                                       [m + italic while page-N fetch in flight]
 
-  ▌  hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit
+  ▌  hjkl move · enter open · P save · [ ] window · / search · q quit
 ```
 
 Notes:
-- Top-bar chip: `Popular` in `state.focus`. Season chip suppressed (§3.8).
+- Top-bar strip: the `[D]iscover` tab is active (`state.focus` + bold) per §3.4; the
+  mockup above shows the shorthand label. Season chip suppressed (§3.8).
 - `·` dot: always `state.focus` — single pane, no dim state.
 - Window bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
   own. Window change triggers a refetch.
@@ -2165,9 +2184,11 @@ F4 in Settings). ROD-249 reordered these so the content views (F1–F3) come ahe
 of the meta view (F4 = Settings); the pre-overhaul order had Settings at F3 and
 Discover at F4, which is what made the assignments feel arbitrary.
 
-The bottom-bar help line surfaces the **letters** (`B/H/D/S`), not the F-keys
-(§10.5): the letters are more memorable and the help line is the discovery
-surface. The F-keys remain as a quiet fallback. Both coexist without conflict.
+The **top-bar tab strip** (§3.4, ROD-250) is the discovery surface for the view
+letters: it shows `[B]rowse · [H]istory · [D]iscover · [S]ettings` persistently,
+with the bracketed letter on each tab. The F-keys remain as a quiet fallback. The
+bottom-bar help line no longer carries the view keys (ROD-250 removed the
+`B/H/D/S` group — see §10.5), since the strip is the one canonical place for them.
 
 **libvaxis key matching for F-keys:**
 
@@ -2221,24 +2242,26 @@ The `·` is always rendered. It does not disappear in single-pane views. Its
 persistent presence at a fixed right-aligned position is the anchor that makes
 the top bar feel stable across view transitions.
 
-Top bar rendering by view — a view-label chip after `░`, plus a season/year add-on
-chip after that (ROD-186). The two are differentiated by color, no separator glyph:
+Top bar rendering by view — a four-tab strip after `░` (ROD-250), plus a season/year
+add-on chip after the strip (ROD-186). The strip's active tab and the season chip are
+differentiated from the rest by color, no separator glyph beyond the `·` dots:
 
-| `active_view` | View-label chip (`color.focus`) | Season chip (`color.fg2` / text.muted) |
+| `active_view` | Active tab (`color.focus`, label bold) | Season chip (`color.fg2` / text.muted) |
 |---|---|---|
-| `.browse` | `Browse` | selected show's season+year, else current cour |
-| `.history` | `Watchlist` | selected show's season+year, else current cour |
-| `.detail` | inherits `detail_origin` (`Browse` \| `Watchlist` \| `Popular`) | focused show's season+year only — **no** cour fallback |
-| `.discover` | `Popular` | — (suppressed; §3.8 — no single-show context in the grid) |
-| `.settings` | `Settings` | — (none) |
+| `.browse` | `[B]rowse` | selected show's season+year, else current cour |
+| `.history` | `[H]istory` | selected show's season+year, else current cour |
+| `.detail` | inherits `detail_origin` (`[B]rowse` \| `[H]istory` \| `[D]iscover`) | focused show's season+year only — **no** cour fallback |
+| `.discover` | `[D]iscover` | — (suppressed; §3.8 — no single-show context in the grid) |
+| `.settings` | `[S]ettings` | — (none) |
 
-The season chip sits two spaces after the view label and drops first under width
-pressure (below ~36 cols); the view label and the `·` always survive. ROD-186
-retired the old `.browse` `⠋ search` spinner stub — Browse is a live feed now, and
-search status lives in the bottom bar (`/query_` + `[catalogue · N]`), so the top bar
-no longer doubles as a search indicator. The two-cyan problem (view label and
-season chip were both specced `color.focus`) is resolved by demoting the season
-chip to `text.muted`, matching how season/year reads in History rows (§5.4).
+The full strip occupies cols 16–61; the season chip sits two cells after it (col 64)
+and drops first under width pressure (w < 76). Below w = 64 the strip abbreviates to
+`[B] · [H] · [D] · [S]`; the abbreviated strip and the `·` always survive (§3.4). The
+inactive tabs render `text.muted` labels with `text.dim` bracket keys. ROD-186 retired
+the old `.browse` `⠋ search` spinner stub — Browse is a live feed now, and search
+status lives in the bottom bar (`/query_` + `[catalogue · N]`), so the top bar no
+longer doubles as a search indicator. The season chip is `text.muted` so it reads
+distinct from the cyan strip, matching how season/year reads in History rows (§5.4).
 
 #### 10.3c `h` / `l` behavior by view
 
@@ -2315,10 +2338,10 @@ and its padding. The strings below are written to fit that budget.
 #### Browse — normal, list pane focused
 
 ```
-  ▌  hjkl · / find anime · P save · B/H/D/S views · q quit
+  ▌  hjkl · / find anime · P save · q quit
 ```
 
-Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `B`, `H`, `D`, `S`, `q`.
+Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
 
 #### Browse — normal, detail pane focused
 
@@ -2340,14 +2363,14 @@ within the ~74-char budget:
 #### History — normal, list pane focused
 
 ```
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit
 ```
 
-Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `B`, `H`, `D`, `S`, `q`.
+Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `q`.
 
-Note: the `B/H/D/S` view letters are shown together (matching Browse) even though
-`H` from History is a no-op (ROD-249 surfaces the letters; the F-key aliases are
-the quiet fallback).
+Note: the view keys are NOT in this line — the top-bar tab strip (§3.4, ROD-250)
+carries `[B]rowse · [H]istory · [D]iscover · [S]ettings` persistently, so the
+bottom bar spends its width on view-specific actions instead.
 `/ filter` and `l/enter detail` are shown explicitly — History shares Browse's
 pane grammar (ROD-170), and its local filter (ROD-211, distinct from Browse's
 catalogue search) isn't obvious in a watchlist without the hint. Over budget at
@@ -2401,10 +2424,10 @@ to filter), and the screen itself already names the state and points to Browse
 #### Settings — normal
 
 ```
-  ▌  hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit
+  ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `B`, `H`, `D`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `q`.
 
 Settings persists a dirty tab on the way out, so `q` reads `q save+quit`
 (ROD-210; the `+` signals one press does both). `B`/`H`/`D` are surfaced so
@@ -2428,10 +2451,10 @@ available. The `▌` reappears when the edit is committed or cancelled.
 #### Discover — normal
 
 ```
-  ▌  hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit
+  ▌  hjkl move · enter open · P save · [ ] window · / search · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `B`, `H`, `D`, `S`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `q`.
 
 `hjkl` navigate the card grid (left/right wrap within a row; up/down move card-rows).
 `enter` opens the detail zoom (`active_view = .detail`, `detail_origin = .discover`).
@@ -2439,13 +2462,12 @@ Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `B`, `H`, `D`, `S`,
 `[`/`]` cycle the active window (`Daily` → `Weekly` → `Monthly` → `All-Time` and back);
 `1`–`4` select directly (ROD-248 annotates these in the window bar itself).
 `/` jumps to Browse and opens its search prompt — there is no in-view filter in Discover.
-`D` from Discover is a no-op. `B`/`H`/`S` switch to Browse/History/Settings.
-`q` quits.
+The view keys (`D` is a no-op here; `B`/`H`/`S` switch away) live in the top-bar
+tab strip (§3.4), not this line. `q` quits.
 
-At 80 cols this string runs ~80 chars — over the ~74-char budget, so it clips;
-`hjkl move` and `enter open` survive the most common clip point, preserving the
-primary navigation hints. (The `B/H/D/S views` letters are 4 chars shorter than
-the old `F1/F2/F3/F4 views`, so the line clips a touch less than before.)
+At 80 cols this string is 64 chars — within the ~74-char budget, so it no longer
+clips. Dropping the `B/H/D/S views` group from the bottom bar (ROD-250, now that the
+top strip carries the view keys) is what bought the headroom.
 
 #### Any view — search active (§3.5 State 2 unchanged)
 
@@ -2591,7 +2613,7 @@ if (self.input_mode == .normal and key.matches('q', .{})) {
 | Decision | Rationale | Revisit trigger |
 |---|---|---|
 | F-keys are aliases, not primary binds | H/S are already in §6.1 and the codebase. Adding F-keys as separate primary binds would create two authoritative tables to keep in sync. Aliases give discoverability without forking the semantic. | If a future milestone removes H/S (unlikely), promote F-keys to primary. |
-| ~~F-keys appear in help line; letters do not~~ → **reversed (ROD-249)**: the help line shows the letters `B/H/D/S`; F-keys are the quiet fallback | The original call optimized for newcomers mashing F-keys, but the F-key order was unmemorable (Settings wedged at F3, Discover at F4) and the more-memorable letters stayed hidden — inverting the discoverability hierarchy. ROD-249 made the four view-switch letters symmetric (`B`/`H`/`D`/`S`, dropping the `H` toggle) and surfaces them in the help line. They are also *shorter* than `F1/F2/F3/F4`, so the line crowds less, not more. | If newcomers miss the F-keys, add them back as a `?` help overlay rather than to the always-on line. |
+| ~~F-keys appear in help line; letters do not~~ → **reversed (ROD-249), relocated (ROD-250)**: the view keys are surfaced as a persistent top-bar tab strip; F-keys are the quiet fallback | The original call optimized for newcomers mashing F-keys, but the F-key order was unmemorable (Settings wedged at F3, Discover at F4) and the more-memorable letters stayed hidden — inverting the discoverability hierarchy. ROD-249 made the four view-switch letters symmetric (`B`/`H`/`D`/`S`, dropping the `H` toggle) and surfaced them. ROD-250 then moved that surfacing out of the bottom help line into a persistent top-bar tab strip (§3.4) — one canonical home for the view keys, which also freed the bottom bar (the Discover help line went from over-budget to within budget). | If newcomers miss the F-keys, add them back as a `?` help overlay rather than to the always-on line. |
 | `·` stays lit at `color.focus` in single-pane views (Settings) | Dimming or hiding the `·` in Settings would make the top bar layout feel different per view — a width/position shift that reads as instability. A stable `·` at a fixed position is less interesting to notice, which is the goal. | No revisit expected. |
 | `·` is dim for Browse/History list, lit for Browse/History detail (ROD-170) | History is now a two-pane view. The `·` follows the same Browse logic: dim on list (default, no secondary selection), lit cyan on detail (user has gone deeper). The prior History rule ("always lit — single-pane") is retired. Color is always cyan; magenta is reserved for the §8 status-bar cursor. | If user testing shows the dim state is missed as a focus indicator, invert: lit on list, brighter on detail. |
 | Esc does not quit from Browse | Matches vim idiom and prevents accidental quit. `q` is the quit key throughout; Esc is "one level back." In Browse with list focus and no modal open, there is no level back — so Esc is a no-op rather than a quit trigger. | If user feedback consistently expects Esc-to-quit, add a "press Esc again to quit" two-step. |
