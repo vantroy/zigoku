@@ -2651,7 +2651,13 @@ pub const App = struct {
         // of the grid cursor (the segmented bar is passive).
         if (key.matches(']', .{}) or key.matches('[', .{})) {
             const n = std.meta.fields(source_mod.PopularWindow).len;
-            const cur = @intFromEnum(self.discover.window);
+            // Widen to usize BEFORE the arithmetic (ROD-246): `@intFromEnum` infers
+            // the enum's minimum tag type — u2 for a 4-member enum. The forward
+            // `cur + 1` peer-resolves to u2 (the `comptime_int` 1 carries no width of
+            // its own), so it overflows when cur == 3 (all_time) and panics. The
+            // backward `cur + n - 1` escaped only because `n` is usize, peer-resolving
+            // cur upward; the explicit cast makes both branches do the math in usize.
+            const cur: usize = @intFromEnum(self.discover.window);
             const next = if (key.matches(']', .{})) (cur + 1) % n else (cur + n - 1) % n;
             self.setDiscoverWindow(@enumFromInt(next), loop, io, provider);
             return;
