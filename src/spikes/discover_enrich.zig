@@ -160,10 +160,10 @@ pub fn main(init: std.process.Init) !void {
         try fills.append(arena, f);
 
         try out.print("  {d:>2}    {d:>5.0}ms      {d:>3}/{d:<3}  {d:>3}/{d:<2}  {d:>3}/{d:<2}  {d:>3}/{d:<2}  {d:>3}/{d:<2}\n", .{
-            r + 1,                ms(elapsed), f.returned,
-            ids.len,    f.score,  f.returned,
-            f.genres,   f.returned, f.season,
-            f.returned, f.chip,   f.returned,
+            r + 1,      ms(elapsed), f.returned,
+            ids.len,    f.score,     f.returned,
+            f.genres,   f.returned,  f.season,
+            f.returned, f.chip,      f.returned,
         });
         try out.flush();
     }
