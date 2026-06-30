@@ -97,7 +97,7 @@ fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
 
 /// One feed card: a placeholder cover cell with the rank centered, then the rank,
 /// title, and view-count metadata rows. `vis` indexes the per-frame scratch slots
-/// (the formatted rank/views must outlive vx.render — RenderScratch contract).
+/// (the formatted rank/title/views must outlive vx.render — RenderScratch contract).
 fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16, y: u16, geo: Geometry, vis: usize, idx: usize, a: Anime, selected: bool) void {
     // Rank string — reused for the in-cell placeholder and the metadata row.
     const rank: []const u8 = if (vis < scratch.score.len)
@@ -131,7 +131,16 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
         self.s(self.palette.focus, .{ .bold = true })
     else
         self.s(self.palette.fg, .{});
-    putClipped(win, rank_y + 1, x, geo.cover_w, a.name, title_sty);
+    // Truncate to the card width with a trailing "…" affordance (ROD-245) rather
+    // than putClipped's silent cell-boundary clip (DESIGN §2.1/§3.8). The truncated
+    // copy lives in scratch so it outlives vx.render(); past the 256-slot cap we
+    // fall back to the silent clip (no scratch slot to hold an ellipsised copy).
+    if (vis < scratch.title.len) {
+        const t = render.truncateToWidth(&scratch.title[vis], a.name, geo.cover_w);
+        put(win, rank_y + 1, x, t, title_sty);
+    } else {
+        putClipped(win, rank_y + 1, x, geo.cover_w, a.name, title_sty);
+    }
 
     if (a.view_count) |vc| {
         const vs: []const u8 = if (vis < scratch.meta.len) formatViews(&scratch.meta[vis], vc) else "";
@@ -233,4 +242,30 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
             centerText(win, footer_y, w, "all entries loaded", self.s(self.palette.fg3, .{}));
         }
     }
+}
+
+const testing = std.testing;
+
+test "truncateToWidth clips to the card cover_w with a trailing … at both tiers (ROD-245)" {
+    // The title row gets exactly `cover_w` columns; a wider title must cut on a
+    // grapheme boundary with the "…" affordance (§2.1/§3.8), and a title that fits
+    // must pass through untouched (no spurious ellipsis). truncateToWidth owns the
+    // cut — this pins the card's contract at its real per-tier widths.
+    var buf: [80]u8 = undefined;
+    const wide = "Ore dake Level Up na Ken"; // 24 cols, wider than either tier
+
+    const large = geometry(120, 40); // w >= 80 → cover_w 20
+    try testing.expectEqual(@as(u16, 20), large.cover_w);
+    const cut_l = render.truncateToWidth(&buf, wide, large.cover_w);
+    try testing.expect(std.mem.endsWith(u8, cut_l, "\u{2026}"));
+    try testing.expect(vaxis.gwidth.gwidth(cut_l, .unicode) <= large.cover_w);
+
+    const small = geometry(70, 40); // w < 80 → cover_w 14
+    try testing.expectEqual(@as(u16, 14), small.cover_w);
+    const cut_s = render.truncateToWidth(&buf, wide, small.cover_w);
+    try testing.expect(std.mem.endsWith(u8, cut_s, "\u{2026}"));
+    try testing.expect(vaxis.gwidth.gwidth(cut_s, .unicode) <= small.cover_w);
+
+    // A title that already fits the wider tier is returned verbatim.
+    try testing.expectEqualStrings("Frieren", render.truncateToWidth(&buf, "Frieren", large.cover_w));
 }
