@@ -18,13 +18,20 @@ const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
+// ROD-247 batched Discover enrichment: the card-signal subset only. Deliberately
+// NARROWER than GQL_FIELDS — no `description`, title, or studios — so one fetch
+// hydrating a whole page (~30-50 cards) stays light. The synopsis stays lazy-on-
+// zoom (workers.discoverEnrichTask, keyed on `description == null`); fetching
+// dozens of synopses per page would be bytes for text nobody's reading yet. Keep
+// this set and GQL_FIELDS divergent on purpose.
+const GQL_BATCH_FIELDS = "id averageScore genres season seasonYear startDate{year}";
 
 // Both queries are interpolated raw into a JSON body with `{s}`, so they must
 // contain nothing that needs JSON-string escaping. Enforce at comptime rather
 // than reaching for std.json.stringify on a constant — if someone adds a quote
 // or control char to the selection set, this fails the build, not a 400 at runtime.
 comptime {
-    for (GQL_SEARCH ++ GQL_BY_ID) |c| {
+    for (GQL_SEARCH ++ GQL_BY_ID ++ GQL_BATCH_FIELDS) |c| {
         if (c == '"' or c == '\\' or c < 0x20) {
             @compileError("GraphQL query contains a character that needs JSON escaping; build the request body with std.json instead of {s} interpolation");
         }
@@ -161,6 +168,52 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
     const data = parsed.value.data orelse return null;
     const best = bestMatch(show, data.Page.media) orelse return null;
     return try mediaToMeta(arena, best);
+}
+
+/// Batch-enrich a page of Discover cards in ONE AniList round trip (ROD-247).
+/// `ids` are AniList media ids the caller mined from cover thumbs; cards without
+/// one are filtered out upstream. Returns an arena-owned `Metadata` per returned
+/// media, each tagged with its `anilist_id` (via `mediaToMeta`) so the caller can
+/// join results back to cards by id — AniList does not guarantee response order
+/// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
+/// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
+/// `enrich` path's null-on-miss contract. Only allocation failures propagate.
+pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
+    if (ids.len == 0) return &.{};
+
+    // `id_in:[1,2,3]` — integers only, so the list is JSON-safe interpolated raw,
+    // the same trust basis as the comptime-guarded GQL_BATCH_FIELDS.
+    var ids_buf: std.ArrayList(u8) = .empty;
+    try ids_buf.append(arena, '[');
+    for (ids, 0..) |id, i| {
+        if (i != 0) try ids_buf.append(arena, ',');
+        try ids_buf.print(arena, "{d}", .{id});
+    }
+    try ids_buf.append(arena, ']');
+
+    const query = try std.fmt.allocPrint(
+        arena,
+        "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{" ++ GQL_BATCH_FIELDS ++ "}}}}}}",
+        .{ ids.len, ids_buf.items },
+    );
+    const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
+
+    const raw = postGql(arena, io, body) orelse return &.{};
+    return pageToMetas(arena, raw) catch &.{};
+}
+
+/// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
+/// from `enrichBatch` so the mapping is unit-testable without a live POST (same
+/// seam as `mediaToMeta`). Arena-borrowed slices; the worker deep-copies to GPA.
+fn pageToMetas(arena: Allocator, raw: []const u8) ![]const Metadata {
+    const parsed = try std.json.parseFromSlice(Resp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    });
+    const data = parsed.value.data orelse return &.{};
+    const media = data.Page.media;
+    const out = try arena.alloc(Metadata, media.len);
+    for (media, 0..) |m, i| out[i] = try mediaToMeta(arena, m);
+    return out;
 }
 
 /// POST a GraphQL body to AniList; returns the response bytes (arena-owned) or
@@ -543,6 +596,37 @@ test "mediaToMeta maps the widened by-id response shape (ROD-140)" {
     try std.testing.expectEqual(@as(usize, 1), meta.studios.len);
     try std.testing.expectEqualStrings("Madhouse", meta.studios[0]);
     try std.testing.expectEqualStrings("An elf & her party.", meta.description.?);
+}
+
+test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A two-card page: one fully populated, one with no genres / null season —
+    // the card that must degrade to [--] and no season chip. An unknown field
+    // (siteUrl) must be skipped by ignore_unknown_fields.
+    const json =
+        \\{"data":{"Page":{"media":[
+        \\{"id":182255,"averageScore":89,"genres":["Adventure","Drama","Fantasy"],"season":"FALL","seasonYear":2023,"startDate":{"year":2023},"siteUrl":"x"},
+        \\{"id":1,"averageScore":null,"genres":[],"season":null,"seasonYear":null,"startDate":{"year":null}}
+        \\]}}}
+    ;
+    const metas = try pageToMetas(a, json);
+    try std.testing.expectEqual(@as(usize, 2), metas.len);
+    // Fully enriched card — id tags it for join-back, all three signals present.
+    try std.testing.expectEqual(@as(?u64, 182255), metas[0].anilist_id);
+    try std.testing.expectEqual(@as(?u32, 89), metas[0].score);
+    try std.testing.expectEqual(@as(usize, 3), metas[0].genres.len);
+    try std.testing.expectEqual(domain.Season.fall, metas[0].season.?);
+    try std.testing.expectEqual(@as(u32, 2023), metas[0].start_date.?.year);
+    try std.testing.expectEqual(@as(?u32, 2023), metas[0].year);
+    // Graceful-degrade card — still id-tagged, but no score/genre/season+year.
+    try std.testing.expectEqual(@as(?u64, 1), metas[1].anilist_id);
+    try std.testing.expectEqual(@as(?u32, null), metas[1].score);
+    try std.testing.expectEqual(@as(usize, 0), metas[1].genres.len);
+    try std.testing.expect(metas[1].season == null);
+    try std.testing.expect(metas[1].start_date == null);
+    try std.testing.expectEqual(@as(?u32, null), metas[1].year);
 }
 
 test "sanitizeDescription strips tags and decodes common entities" {
