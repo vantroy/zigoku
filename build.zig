@@ -103,6 +103,20 @@ pub fn build(b: *std.Build) void {
     const spike_http_step = b.step("spike-http", "ROD-55: AniList HTTP search spike");
     spike_http_step.dependOn(&run_spike_http.step);
 
+    // spike-enrich: batched AniList enrichment per feed page (ROD-247 decision gate).
+    const spike_enrich = b.addExecutable(.{
+        .name = "spike-enrich",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/discover_enrich.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_enrich = b.addRunArtifact(spike_enrich);
+    if (b.args) |args| run_spike_enrich.addArgs(args);
+    const spike_enrich_step = b.step("spike-enrich", "ROD-247: batched AniList enrichment spike");
+    spike_enrich_step.dependOn(&run_spike_enrich.step);
+
     // spike-sqlite: SQLite via raw C interop (ROD-56). Links libc + system sqlite3.
     const spike_sqlite_mod = b.createModule(.{
         .root_source_file = b.path("src/spikes/sqlite_store.zig"),
