@@ -143,7 +143,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
     const help: []const u8 = switch (self.active_view) {
         .browse => switch (self.active_pane) {
-            .list => "hjkl · / find anime · P save · F1/F2/F3/F4 views · q quit",
+            .list => "hjkl · / find anime · P save · B/H/D/S views · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
             .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
@@ -152,9 +152,9 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         // Browse detail line, adding the Space zoom only where the grid lives
         // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
         .history => if (self.history.len == 0)
-            "F1 browse · q quit"
+            "B browse · q quit"
         else switch (self.active_pane) {
-            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · F1/F2/F3/F4 · q quit",
+            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · B/H/D/S · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
             // preview band there is no grid, so enter/space drill into the zoom.
             .detail => if (w >= App.zoom_min)
@@ -164,11 +164,11 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
-        .discover => "hjkl move · enter open · P save · [ ] window · / search · F1/F2/F3/F4 views · q quit",
+        .discover => "hjkl move · enter open · P save · [ ] window · / search · B/H/D/S views · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else
-            "hjkl navigate · space toggle · enter edit · F1/F2 views · q save+quit",
+            "hjkl navigate · space toggle · enter edit · B/H/D views · q save+quit",
     };
     putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
 }

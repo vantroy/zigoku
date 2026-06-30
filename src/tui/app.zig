@@ -147,7 +147,8 @@ pub fn run(
     // ttyRun lines 164–167) and/or CPR-derived key_press events: vaxis's
     // explicit_width/scaled_text queries produce \e[1;1R which Parser.zig decodes
     // as F3-no-mods ('R' => Key.f3); Loop.zig's guard only consumes F3+shift/alt,
-    // so F3-no-mods leaks through and would trigger our Settings keybind. The
+    // so F3-no-mods leaks through and would trigger our Discover keybind (ROD-249;
+    // it was Settings before the F3/F4 swap). The
     // tty.getWinsize() call below compensates for any swallowed .winsize event.
     while (loop.tryEvent() catch null) |_| {}
 
@@ -2504,44 +2505,19 @@ pub const App = struct {
             return;
         }
 
-        // View switching — F-keys (discoverable, §10.2) and H/S (vim-native, §6.1).
-        // F2 = "go to History" — no-op if already there (spec §10.2 F2 from History).
-        // H = toggle Browse ↔ History (distinct from F2).
-        if (key.matches(vaxis.Key.f2, .{})) {
-            if (self.active_view != .history) {
-                if (self.active_view == .settings) self.leaveSettings(io);
-                self.active_view = .history;
-                self.active_pane = .list;
-                self.list_cursor = 0;
-                self.list_top = 0;
-            }
-            return;
-        }
-        if (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))) {
-            if (self.active_view == .settings) self.leaveSettings(io);
-            self.active_view = if (self.active_view == .history) .browse else .history;
-            self.active_pane = .list;
-            self.list_cursor = 0;
-            self.list_top = 0;
-            return;
-        }
-        if (key.matches(vaxis.Key.f3, .{}) or
-            key.matches('S', .{ .shift = true }) or key.matches('S', .{}))
+        // View switching (ROD-249) — four destinations, each a symmetric pair: an
+        // F-key alias (F1-F4, discoverable §10.2) and a vim-native letter (§6.1):
+        //   F1/B Browse · F2/H History · F3/D Discover · F4/S Settings.
+        // The F-keys are global (can't be typed into a search); each letter carries
+        // the normal-mode guard so a literal B/H/D/S in a search/filter appends to
+        // the query instead of switching. Each is a no-op if already on that view;
+        // leaving Settings persists a dirty tab (leaveSettings). H is a DIRECT goto,
+        // not a toggle — from History it is now a no-op, and B is the way back to
+        // Browse (the old H ↔ toggle is gone). Match shift+letter and bare letter
+        // for the cross-terminal reason as the g/G nav.
+        if (key.matches(vaxis.Key.f1, .{}) or
+            (self.input_mode == .normal and (key.matches('B', .{ .shift = true }) or key.matches('B', .{}))))
         {
-            if (self.active_view != .settings) {
-                self.active_view = .settings;
-                self.active_pane = .list;
-                self.list_cursor = 0;
-                self.list_top = 0;
-                // Land on a clean Settings state: top row, not editing, and
-                // never inheriting a stray search mode from the prior view.
-                self.settings.reset();
-                self.input_mode = .normal;
-            }
-            return;
-        }
-        // F1 = "go to Browse" — no-op if already there (spec §10.2 F1 from Browse).
-        if (key.matches(vaxis.Key.f1, .{})) {
             if (self.active_view != .browse) {
                 if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .browse;
@@ -2551,11 +2527,19 @@ pub const App = struct {
             }
             return;
         }
-        // F4 / D = "go to Discover" (ROD-239) — both unbound before this, no
-        // conflicts. F4 is global like the other F-keys; D carries the normal-mode
-        // guard (a literal "d" in a search/filter must append, not switch). Match
-        // shift+'D' and bare 'D' for the cross-terminal reason as the G/H nav.
-        if (key.matches(vaxis.Key.f4, .{}) or
+        if (key.matches(vaxis.Key.f2, .{}) or
+            (self.input_mode == .normal and (key.matches('H', .{ .shift = true }) or key.matches('H', .{}))))
+        {
+            if (self.active_view != .history) {
+                if (self.active_view == .settings) self.leaveSettings(io);
+                self.active_view = .history;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+            }
+            return;
+        }
+        if (key.matches(vaxis.Key.f3, .{}) or
             (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
         {
             if (self.active_view != .discover) {
@@ -2567,6 +2551,21 @@ pub const App = struct {
                 // Cache-or-fetch the active window on entry: a fresh slot renders
                 // instantly, a stale/empty one fires a page-1 fetch (ROD-239).
                 self.refreshDiscover(loop, io, provider);
+            }
+            return;
+        }
+        if (key.matches(vaxis.Key.f4, .{}) or
+            (self.input_mode == .normal and (key.matches('S', .{ .shift = true }) or key.matches('S', .{}))))
+        {
+            if (self.active_view != .settings) {
+                self.active_view = .settings;
+                self.active_pane = .list;
+                self.list_cursor = 0;
+                self.list_top = 0;
+                // Land on a clean Settings state: top row, not editing, and
+                // never inheriting a stray search mode from the prior view.
+                self.settings.reset();
+                self.input_mode = .normal;
             }
             return;
         }
@@ -2805,7 +2804,7 @@ pub const App = struct {
 
     /// Peel focus back one layer (ROD-170 focus model): h/← and Esc both demote a
     /// step — zoom → origin pane (or list if there's no room) → list. A base-view
-    /// list is a no-op (base-view changes go through F1/F2/F3 + H; q quits). The
+    /// list is a no-op (base-view changes go through B/H/D/S + F1-F4; q quits). The
     /// two keys share this transition; they stay distinct blocks (verbatim from
     /// onKey) rather than dedup, so a behavior change would show as a real diff.
     /// Returns true when `key` is h/←/Esc (consumed). Search-mode Esc never reaches
@@ -2853,7 +2852,7 @@ pub const App = struct {
             }
             // Any base-view list (Browse/History/Settings): no-op. ROD-210 removed
             // the old History/Settings → Browse jump — base-view changes happen
-            // only via F1/F2/F3 and the H toggle. q quits.
+            // only via the B/H/D/S letters (and their F1-F4 aliases). q quits.
             return true;
         }
         return false;
@@ -3171,7 +3170,7 @@ pub const App = struct {
         return true;
     }
 
-    /// Persist Settings on the way out — a base-view switch (F1/F2/H) or a quit
+    /// Persist Settings on the way out — a base-view switch (B/H/D or F1/F2/F3) or a quit
     /// (q/Ctrl-C). Saves only when the tab is dirty, so tabbing through Settings
     /// unchanged neither rewrites the config file nor toasts. ROD-210 moved
     /// persistence here off the retired `q → .save_and_exit` verdict. `dirty` is
