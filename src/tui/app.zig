@@ -1743,8 +1743,11 @@ pub const App = struct {
                 var merged_at: ?usize = null;
                 for (items, 0..) |*live, i| {
                     if (std.mem.eql(u8, live.id, ev.result.id)) {
-                        freeOwnedAnime(self.gpa, live.*);
-                        live.* = ev.result;
+                        // Fill-if-null merge, not a full overwrite: the page batch may
+                        // have enriched this same card concurrently — keep both sides'
+                        // fields (ROD-247 race fix).
+                        var inc = ev.result;
+                        workers.mergeEnrichedFillNull(self.gpa, live, &inc);
                         merged_at = i;
                         break;
                     }
@@ -1772,8 +1775,11 @@ pub const App = struct {
                     var merged = false;
                     for (items) |*live| {
                         if (std.mem.eql(u8, live.id, enriched.id)) {
-                            freeOwnedAnime(self.gpa, live.*);
-                            live.* = enriched;
+                            // Fill-if-null merge, not a full overwrite: a concurrent
+                            // zoom enrich may hold this card too — keep both sides'
+                            // fields (ROD-247 race fix).
+                            var inc = enriched;
+                            workers.mergeEnrichedFillNull(self.gpa, live, &inc);
                             merged = true;
                             merged_any = true;
                             break;

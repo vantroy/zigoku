@@ -236,6 +236,54 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     }
 }
 
+/// Merge an enriched copy into the live card, filling ONLY the fields the live card
+/// still lacks (live wins) — the concurrency-safe replacement for `live.* = incoming`
+/// (ROD-247). The Discover slot now has two concurrent enrichers (the page batch and
+/// the per-card zoom); a full overwrite from either's fire-time snapshot would clobber
+/// fields the other already filled (zoom lands → batch's score reverts to `[--]`, or
+/// batch lands → zoom's synopsis blanks). Fill-if-null mirrors `applyMetadata`'s
+/// "existing wins" rule, so arrival order no longer matters and no enrichment is lost.
+/// Ownership: adopted fields transfer out of `incoming` (nulled so they aren't freed);
+/// everything `incoming` still holds — including its id/name (live keeps its own) — is
+/// freed here. `live`'s id/name/view_count/eps always win (never touched).
+pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
+    mergeOptText(&live.english_name, &incoming.english_name);
+    mergeOptText(&live.native_name, &incoming.native_name);
+    mergeOptText(&live.thumb, &incoming.thumb);
+    mergeOptText(&live.banner, &incoming.banner);
+    mergeOptText(&live.status, &incoming.status);
+    mergeOptText(&live.description, &incoming.description);
+    mergeOptText(&live.kind, &incoming.kind);
+    mergeStrList(&live.genres, &incoming.genres);
+    mergeStrList(&live.studios, &incoming.studios);
+    if (live.mal_id == null) live.mal_id = incoming.mal_id;
+    if (live.anilist_id == null) live.anilist_id = incoming.anilist_id;
+    if (live.total_episodes == null) live.total_episodes = incoming.total_episodes;
+    if (live.year == null) live.year = incoming.year;
+    if (live.season == null) live.season = incoming.season;
+    if (live.start_date == null) live.start_date = incoming.start_date;
+    if (live.score == null) live.score = incoming.score;
+    freeOwnedAnime(gpa, incoming.*); // frees id/name + every field not transferred above
+}
+
+/// Adopt `incoming`'s string only if `live` lacks one, transferring ownership (the
+/// source is nulled so the subsequent freeOwnedAnime won't double-free it).
+fn mergeOptText(live: *?[]const u8, incoming: *?[]const u8) void {
+    if (live.* == null) {
+        live.* = incoming.*;
+        incoming.* = null;
+    }
+}
+
+/// List variant of mergeOptText: adopt only when live's list is empty; `&.{}` (len 0)
+/// is skipped by freeOwnedAnime, so the transferred slice isn't freed twice.
+fn mergeStrList(live: *[]const []const u8, incoming: *[]const []const u8) void {
+    if (live.*.len == 0) {
+        live.* = incoming.*;
+        incoming.* = &.{};
+    }
+}
+
 /// Background task: search and post results back to the UI thread.
 pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, query: []const u8, page: u32, translation: domain.Translation) void {
     // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
