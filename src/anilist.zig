@@ -18,13 +18,20 @@ const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
+// ROD-247 batched Discover enrichment: the card-signal subset only. Deliberately
+// NARROWER than GQL_FIELDS — no `description`, title, or studios — so one fetch
+// hydrating a whole page (~30-50 cards) stays light. The synopsis stays lazy-on-
+// zoom (workers.discoverEnrichTask, keyed on `description == null`); fetching
+// dozens of synopses per page would be bytes for text nobody's reading yet. Keep
+// this set and GQL_FIELDS divergent on purpose.
+const GQL_BATCH_FIELDS = "id averageScore genres season seasonYear startDate{year}";
 
 // Both queries are interpolated raw into a JSON body with `{s}`, so they must
 // contain nothing that needs JSON-string escaping. Enforce at comptime rather
 // than reaching for std.json.stringify on a constant — if someone adds a quote
 // or control char to the selection set, this fails the build, not a 400 at runtime.
 comptime {
-    for (GQL_SEARCH ++ GQL_BY_ID) |c| {
+    for (GQL_SEARCH ++ GQL_BY_ID ++ GQL_BATCH_FIELDS) |c| {
         if (c == '"' or c == '\\' or c < 0x20) {
             @compileError("GraphQL query contains a character that needs JSON escaping; build the request body with std.json instead of {s} interpolation");
         }
@@ -163,43 +170,108 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
     return try mediaToMeta(arena, best);
 }
 
+/// Batch-enrich a page of Discover cards in ONE AniList round trip (ROD-247).
+/// `ids` are AniList media ids the caller mined from cover thumbs; cards without
+/// one are filtered out upstream. Returns an arena-owned `Metadata` per returned
+/// media, each tagged with its `anilist_id` (via `mediaToMeta`) so the caller can
+/// join results back to cards by id — AniList does not guarantee response order
+/// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
+/// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
+/// `enrich` path's null-on-miss contract. Only allocation failures propagate.
+pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
+    if (ids.len == 0) return &.{};
+
+    // `id_in:[1,2,3]` — integers only, so the list is JSON-safe interpolated raw,
+    // the same trust basis as the comptime-guarded GQL_BATCH_FIELDS.
+    var ids_buf: std.ArrayList(u8) = .empty;
+    try ids_buf.append(arena, '[');
+    for (ids, 0..) |id, i| {
+        if (i != 0) try ids_buf.append(arena, ',');
+        try ids_buf.print(arena, "{d}", .{id});
+    }
+    try ids_buf.append(arena, ']');
+
+    // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50:
+    // the caller feeds at most one feed page (popular_page_size = 30 in source.zig), so
+    // ids.len ≤ 50 holds today. If the feed page size is ever raised past 50, AniList
+    // 400s the whole query → postGql returns null → the page silently degrades to
+    // `[--]`. Chunk the ids (or clamp perPage) before crossing that line.
+    //
+    // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
+    // string — it contains `startDate{year}`, whose braces the format parser would
+    // read as a `{year}` placeholder ("too few arguments"). As an arg its contents
+    // are data, not format syntax.
+    const query = try std.fmt.allocPrint(
+        arena,
+        "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{{s}}}}}}}",
+        .{ ids.len, ids_buf.items, GQL_BATCH_FIELDS },
+    );
+    const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
+
+    const raw = postGql(arena, io, body) orelse return &.{};
+    return pageToMetas(arena, raw) catch &.{};
+}
+
+/// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
+/// from `enrichBatch` so the mapping is unit-testable without a live POST (same
+/// seam as `mediaToMeta`). Arena-borrowed slices; the worker deep-copies to GPA.
+fn pageToMetas(arena: Allocator, raw: []const u8) ![]const Metadata {
+    const parsed = try std.json.parseFromSlice(Resp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    });
+    const data = parsed.value.data orelse return &.{};
+    const media = data.Page.media;
+    const out = try arena.alloc(Metadata, media.len);
+    for (media, 0..) |m, i| out[i] = try mediaToMeta(arena, m);
+    return out;
+}
+
 /// POST a GraphQL body to AniList; returns the response bytes (arena-owned) or
 /// null on transport/HTTP failure. Caller parses the shape it expects.
 fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
-    var resp_aw = std.Io.Writer.Allocating.init(arena);
+    // Cap the response at a fixed buffer rather than an unbounded Allocating writer
+    // (ROD-247): a hostile/MITM'd server could otherwise dribble a multi-GB body and
+    // OOM the process before any timeout. Any real AniList reply (even a 50-id batch)
+    // is well under 100 KB; 2 MB is a 20× margin. An over-cap body overflows the fixed
+    // writer → fetch errors → null (graceful "no enrichment"), mirroring the cover path.
+    const resp_buf = arena.alloc(u8, 2 * 1024 * 1024) catch return null;
+    var resp_w: std.Io.Writer = .fixed(resp_buf);
     const res = client.fetch(.{
         .location = .{ .url = ENDPOINT },
         .method = .POST,
         .payload = body,
-        .response_writer = &resp_aw.writer,
+        .response_writer = &resp_w,
         .extra_headers = &.{
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "Accept", .value = "application/json" },
         },
     }) catch return null;
     if (res.status != .ok) return null;
-    return resp_aw.writer.buffered();
+    return resp_w.buffered();
 }
 
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
+    // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
+    // that render straight to terminal cells; see stripControls. thumb is a URL
+    // (validated separately on fetch), season is an enum, the rest are scalars.
     return .{
         .anilist_id = m.id,
         .mal_id = m.idMal,
-        .title_english = m.title.english,
-        .title_native = m.title.native,
+        .title_english = try stripControlsOpt(arena, m.title.english),
+        .title_native = try stripControlsOpt(arena, m.title.native),
         .thumb = m.coverImage.large,
         .total_episodes = m.episodes,
         .year = m.seasonYear,
         .season = if (m.season) |s| domain.Season.fromString(s) else null,
         .start_date = startDate(m.startDate),
-        .status = m.status,
-        .kind = m.format,
-        .genres = m.genres, // arena-borrowed; the worker deep-copies into GPA
+        .status = try stripControlsOpt(arena, m.status),
+        .kind = try stripControlsOpt(arena, m.format),
+        .genres = try stripControlsList(arena, m.genres), // arena-owned; worker deep-copies into GPA
         .studios = try studioNames(arena, m.studios),
-        .description = if (m.description) |d| try sanitizeDescription(arena, d) else null,
+        .description = if (m.description) |d| try stripControls(arena, try sanitizeDescription(arena, d)) else null,
         .score = m.averageScore,
     };
 }
@@ -225,10 +297,46 @@ fn studioNames(arena: Allocator, s: Studios) ![]const []const u8 {
     var i: usize = 0;
     for (s.nodes) |node| {
         if (node.name) |name| {
-            out[i] = name;
+            out[i] = try stripControls(arena, name);
             i += 1;
         }
     }
+    return out;
+}
+
+/// Drop C0 control bytes (0x00–0x1F) and DEL (0x7F) from an AniList-sourced string
+/// before it reaches a terminal cell (ROD-247 hardening). The escape-injection vector
+/// — an OSC/CSI sequence smuggled in a genre or synopsis — is blocked downstream by
+/// vaxis skipping zero-width graphemes, but that's an *implicit* framework property
+/// (it breaks under `.word` wrap, or if the text is logged/exported). Stripping at
+/// ingestion makes the defense explicit, mode-independent, and testable. Returns the
+/// input unchanged when it's already clean (the common case — no allocation).
+fn stripControls(arena: Allocator, raw: []const u8) ![]const u8 {
+    var has_ctrl = false;
+    for (raw) |c| {
+        if (c < 0x20 or c == 0x7F) {
+            has_ctrl = true;
+            break;
+        }
+    }
+    if (!has_ctrl) return raw;
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len);
+    for (raw) |c| {
+        if (c < 0x20 or c == 0x7F) continue;
+        out.appendAssumeCapacity(c);
+    }
+    return out.items;
+}
+
+fn stripControlsOpt(arena: Allocator, raw: ?[]const u8) !?[]const u8 {
+    return if (raw) |r| try stripControls(arena, r) else null;
+}
+
+fn stripControlsList(arena: Allocator, list: []const []const u8) ![]const []const u8 {
+    if (list.len == 0) return &.{};
+    const out = try arena.alloc([]const u8, list.len);
+    for (list, 0..) |s, i| out[i] = try stripControls(arena, s);
     return out;
 }
 
@@ -543,6 +651,52 @@ test "mediaToMeta maps the widened by-id response shape (ROD-140)" {
     try std.testing.expectEqual(@as(usize, 1), meta.studios.len);
     try std.testing.expectEqualStrings("Madhouse", meta.studios[0]);
     try std.testing.expectEqualStrings("An elf & her party.", meta.description.?);
+}
+
+test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A two-card page: one fully populated, one with no genres / null season —
+    // the card that must degrade to [--] and no season chip. An unknown field
+    // (siteUrl) must be skipped by ignore_unknown_fields.
+    const json =
+        \\{"data":{"Page":{"media":[
+        \\{"id":182255,"averageScore":89,"genres":["Adventure","Drama","Fantasy"],"season":"FALL","seasonYear":2023,"startDate":{"year":2023},"siteUrl":"x"},
+        \\{"id":1,"averageScore":null,"genres":[],"season":null,"seasonYear":null,"startDate":{"year":null}}
+        \\]}}}
+    ;
+    const metas = try pageToMetas(a, json);
+    try std.testing.expectEqual(@as(usize, 2), metas.len);
+    // Fully enriched card — id tags it for join-back, all three signals present.
+    try std.testing.expectEqual(@as(?u64, 182255), metas[0].anilist_id);
+    try std.testing.expectEqual(@as(?u32, 89), metas[0].score);
+    try std.testing.expectEqual(@as(usize, 3), metas[0].genres.len);
+    try std.testing.expectEqual(domain.Season.fall, metas[0].season.?);
+    try std.testing.expectEqual(@as(u32, 2023), metas[0].start_date.?.year);
+    try std.testing.expectEqual(@as(?u32, 2023), metas[0].year);
+    // Graceful-degrade card — still id-tagged, but no score/genre/season+year.
+    try std.testing.expectEqual(@as(?u64, 1), metas[1].anilist_id);
+    try std.testing.expectEqual(@as(?u32, null), metas[1].score);
+    try std.testing.expectEqual(@as(usize, 0), metas[1].genres.len);
+    try std.testing.expect(metas[1].season == null);
+    try std.testing.expect(metas[1].start_date == null);
+    try std.testing.expectEqual(@as(?u32, null), metas[1].year);
+}
+
+test "stripControls drops C0 + DEL bytes from AniList text (ROD-247)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // CSI colour smuggled in a title, OSC-52 clipboard in a genre, a lone ESC in a
+    // synopsis, BEL/DEL in a studio name — every control byte must be dropped.
+    try std.testing.expectEqualStrings("Hero[31m", try stripControls(a, "Hero\x1b[31m"));
+    try std.testing.expectEqualStrings("Action]52;c;QQ", try stripControls(a, "Action\x1b]52;c;QQ\x07"));
+    try std.testing.expectEqualStrings("A tale.", try stripControls(a, "A \x1btale."));
+    try std.testing.expectEqualStrings("Studio", try stripControls(a, "S\x7ftudio"));
+    // Clean input is returned unchanged (and not reallocated — same pointer).
+    const clean = "Slice of Life";
+    try std.testing.expectEqual(clean.ptr, (try stripControls(a, clean)).ptr);
 }
 
 test "sanitizeDescription strips tags and decodes common entities" {
