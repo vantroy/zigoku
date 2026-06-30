@@ -142,9 +142,9 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         const cnt: []const u8 = if (q.len == 0)
             ""
         else if (n > 0)
-            std.fmt.bufPrint(&self.cnt_scratch, "[watchlist · {d}]", .{n}) catch ""
+            std.fmt.bufPrint(&self.cnt_scratch, "[history · {d}]", .{n}) catch ""
         else
-            "[watchlist · 0]";
+            "[history · 0]";
         if (cnt.len > 0) {
             const cnt_col: u16 = if (w > @as(u16, @intCast(cnt.len)) + 1) w - @as(u16, @intCast(cnt.len)) - 1 else 0;
             if (cnt_col > cursor_col + 1) {
