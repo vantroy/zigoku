@@ -72,6 +72,16 @@ pub const Event = union(enum) {
         result: Anime,
         window: source_mod.PopularWindow,
     },
+    /// A whole Discover feed page batch-enriched from AniList in one fetch
+    /// (ROD-247) — score + genres + season, the card signals the popular feed
+    /// nulls. `results` is gpa-allocated (each Anime's strings owned); App merges
+    /// each into `window`'s slot by id and takes ownership (orphans freed). Distinct
+    /// from `discover_enriched` (the per-card zoom path) so the page batch and a
+    /// zoom enrich never share a thread handle or block each other.
+    discover_batch_enriched: struct {
+        results: []Anime,
+        window: source_mod.PopularWindow,
+    },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.
     search_enriched: struct {
