@@ -984,6 +984,26 @@ test "discover_batch_enriched drops every result when the slot is cleared (ROD-2
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
 }
 
+test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.discover.window = .daily;
+    app.discover.cursor = 0;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+
+    // Enriched card: season + year present → "<kanji> <year>".
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .season = .fall, .year = 2023 }));
+    const chip = app.topBarSeasonChip();
+    try testing.expect(std.mem.indexOf(u8, chip, "2023") != null);
+    try testing.expect(std.mem.indexOf(u8, chip, domain.Season.fall.kanji()) != null);
+
+    // Unenriched card (season still null from the feed) → no chip, no cour fallback.
+    daily.results.items[0].season = null;
+    try testing.expectEqualStrings("", app.topBarSeasonChip());
+}
+
 test "isNewRelease: current-cour match drives NEW; guards return false (ROD-239)" {
     var app: App = .{};
     app.now_ms = 1778889600000; // 2026-05-15 UTC → Spring 2026 cour
