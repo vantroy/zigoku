@@ -335,7 +335,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         // and added) instead of advertising a dead-end prompt (ROD-211).
         const mid = top + visible / 2;
         centerText(win, mid -| 1, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));
-        centerKeyHint(win, mid + 1, w, "F1", self.s(self.palette.focus, .{ .bold = true }), "  find anime in browse", self.s(self.palette.fg2, .{}));
+        centerKeyHint(win, mid + 1, w, "B", self.s(self.palette.focus, .{ .bold = true }), "  find anime in browse", self.s(self.palette.fg2, .{}));
         return;
     }
 
