@@ -466,18 +466,25 @@ visible per frame = `(content_h − 2) / slot_h`, where `content_h − 2` remove
 window bar row and its spacer from the content height.
 
 **Window-toggle bar.** One row at y = 2 (after top bar + spacer), left margin 2 cells.
-Content: `Daily · Weekly · Monthly · All-Time`.
+Content: `[1] Daily · [2] Weekly · [3] Monthly · [4] All-Time`. Each window is
+prefixed with its `1`–`4` direct-select key (ROD-248) so the bar teaches its own
+bindings in place.
 
 | State | Token | Modifier |
 |---|---|---|
 | Active window label | `state.focus` | bold |
 | Inactive window labels | `text.muted` | — |
+| Active window `[N]` key | `state.focus` | — (lifts with the label so the entry reads as a unit) |
+| Inactive window `[N]` keys | `text.dim` | — (reads as a quiet annotation) |
 | Separator `·` dots | `text.dim` | — |
 
 The bar is **passive** — there is no "window bar focus." The `[`/`]` cycle keys and
 `1`–`4` direct-select keys drive the active window regardless of the grid cursor
-position. A window change clears results, shows the loading state, refetches with
-the appropriate `dateRange` value (§9.6), and resets cursor and scroll.
+position; the inline `[N]` annotations make those direct-select keys discoverable
+without a focus model (ROD-248 — the j/k-into-the-bar idea was considered and
+dropped: it would collide with the card-grid `j`/`k`). A window change clears
+results, shows the loading state, refetches with the appropriate `dateRange` value
+(§9.6), and resets cursor and scroll.
 
 **Card anatomy.** Each card occupies one slot, rendered top-to-bottom:
 
@@ -1346,7 +1353,7 @@ Full-canvas card grid. 120-col terminal, large card tier (≥ 80 cols):
                                                                                          [context: top bar, full width]
   ZIGOKU  ░  Popular                                                            ·        [fg+bold name; chrome sep; f chip; f · (always lit — single pane)]
                                                                                          [spacer row]
-  Daily · Weekly · Monthly · All-Time                                                    [active=Daily f+bold; rest m; separator dots d]
+  [1] Daily · [2] Weekly · [3] Monthly · [4] All-Time                                    [active=Daily f+bold; rest m; [N] keys d (active lifts to f); separator dots d]
                                                                                          [spacer row]
   [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; 20×7 cells each; bg.surface fill]
   [         ][         ][         ][         ][         ]

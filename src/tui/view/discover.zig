@@ -74,19 +74,27 @@ fn fillRect(win: vaxis.Window, x: u16, y: u16, w: u16, h: u16, bg: vaxis.Color) 
     child.fill(.{ .style = .{ .bg = bg } });
 }
 
-/// The window-toggle segmented bar: active window in state.focus+bold, the rest in
-/// text.muted, separator dots in text.dim. Passive — the keys driving it live in
-/// app.zig's onDiscoverKey.
+/// The window-toggle segmented bar: each window prefixed with its `1`-`4`
+/// direct-select key (ROD-248) — `[1] Daily · [2] Weekly · …` — so the bar teaches
+/// its own bindings. Active window in state.focus+bold, the rest in text.muted,
+/// separator dots in text.dim. Passive — the keys driving it live in app.zig's
+/// onDiscoverKey.
 fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
     const labels = [_][]const u8{ "Daily", "Weekly", "Monthly", "All-Time" };
+    // Static `[N]` literals — vaxis holds the printed slice by reference, so a
+    // bufPrint'd scratch would dangle; the keys are fixed (1-4), so literals fit.
+    const keys = [_][]const u8{ "[1]", "[2]", "[3]", "[4]" };
     const active = @intFromEnum(self.discover.window);
     var col: u16 = 2;
-    for (labels, 0..) |label, i| {
-        const style = if (i == active)
-            self.s(self.palette.focus, .{ .bold = true })
-        else
-            self.s(self.palette.fg2, .{});
-        put(win, row, col, label, style);
+    for (labels, keys, 0..) |label, keyhint, i| {
+        const on = i == active;
+        // The `[N]` hint reads as a dim annotation off the active window; it lifts
+        // to the focus tone on the active one so that entry still reads as a unit.
+        const key_sty = if (on) self.s(self.palette.focus, .{}) else self.s(self.palette.fg3, .{});
+        const label_sty = if (on) self.s(self.palette.focus, .{ .bold = true }) else self.s(self.palette.fg2, .{});
+        put(win, row, col, keyhint, key_sty);
+        col += @as(u16, @intCast(keyhint.len)) + 1; // "[N] "
+        put(win, row, col, label, label_sty);
         col += @as(u16, @intCast(label.len));
         if (i + 1 < labels.len) {
             put(win, row, col + 1, "·", self.s(self.palette.fg3, .{}));
