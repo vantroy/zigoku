@@ -195,7 +195,7 @@ with surrounding spaces for visual separation (color alone distinguishes a chip)
 | Not yet aired | `放映前` | SOON | `state.focus` |
 | Hiatus | `休止中` | HIATUS | `state.warn` |
 | Cancelled | `中止` | DROPPED | `text.dim` |
-| Season year | `冬 2026` | Winter 2026 | `state.focus` |
+| Season year | `冬 2026` | Winter 2026 | `text.muted` (demoted from `state.focus` so two top-bar chips don't blur — ROD-186 §8) |
 
 Season kanji: 春 (spring), 夏 (summer), 秋 (autumn), 冬 (winter).
 
@@ -371,8 +371,9 @@ Single row. Full terminal width. Content:
   Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov — with December rolled into next year's
   Winter, so it agrees with the show chips). The detail zoom is the exception:
   committed to one show, it shows only that show's season with no cour fallback.
-  Discover and Settings show no season chip. The chip drops first under width
-  pressure (below w ≈ 76).
+  Discover tracks the selected card's season+year once it's enriched (absent if
+  null — no cour fallback; §3.8/§10.3b); Settings shows no chip. The chip drops
+  first under width pressure (below w ≈ 76).
 - Right-aligned: active pane indicator (a `·` in `state.focus` color to mark which
   pane has keyboard focus — list or detail).
 
@@ -1829,10 +1830,12 @@ spec just isn't settled — and would return in the title's row when added.
 The app opens to the History/Watchlist view **by default**. The landing view is a
 config setting (`landing` in `config.zon`, surfaced as the Settings "landing view"
 cycle row — ROD-228); History stays the default and the fallback for any
-unrecognized value. History is home because it is the only view backed by real
-data on launch: AllAnime is search-first (no proven popular-feed endpoint), so a
-Browse landing shows its idle search prompt (§9.5) until the v0.2 Discovery Feeds
-land. The cycle offers all three live landings — **History**, **Browse**, and
+unrecognized value. History is home because it is the only configured
+landing backed by real data on launch: a Browse landing shows its idle search
+prompt (§9.5) — Browse is catalogue *search*, not a feed. The popular feed now
+lives in its own **Discover** view (§9.6); surfacing Discover as a landing option
+is its own follow-up (ROD-242). The cycle offers all three live landings —
+**History**, **Browse**, and
 **last watched** (ROD-229): the last opens the most-recently-watched show's detail
 pane parked on its resume episode, and falls back to History whenever there is
 nothing to resume (empty history, every row never played, or a failed episode
@@ -2099,12 +2102,12 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Score placeholder `[--/100]` (detail) / `[--]` (list) in [d] rather than omitting the score field | Preserving the score reservation keeps column alignment stable whether or not a score is present. A missing field would shift the surrounding layout when scores arrive from enrichment. | If Rod finds the placeholder visually noisy across a full list of null scores, omit it and accept the reflow. |
 | Kanji chips fully omitted when null (not a placeholder) | An empty chip `[ ]` or a dim `放映中?` is worse than nothing. The chip's meaning is the kanji — without data it is just noise. The detail header still reads clearly without it. | Now that enrichment fills `status`, chips appear automatically; the omission is the per-anime fallback for shows with no AniList hit. |
 | No watchlist status glyph on Browse / search-result rows | History rows are loaded **from** the local store, so their watch-state is already in hand — that is why History ships status chips (§5.4). Browse results come from AllAnime over the network and carry no watch-state; a glyph there would mean a per-row local-DB (or cache) lookup the search path doesn't otherwise do. Adding that to the fast search path for a glyph isn't a trade Terminal Ghost makes. | If watch-state is ever cheap to have at search time — results joined against the store in one pass, or membership held in an in-memory cache — the glyph becomes nearly free; revisit then. |
-| History is the **default** landing view; the landing is configurable (ROD-228) | AllAnime has no proven "popular feed" GET endpoint (it's search-first via POST). A Browse idle view with a populated list has no data source yet (until the v0.2 Discovery Feeds land), so History is the honest default and the fallback for any unrecognized value. The setting cashes in the earlier "add a settings toggle" plan: a Browse landing shows its idle search prompt (§9.5) until feeds land, and `last_watched` opens the most-recently-watched show on its resume episode (ROD-229), falling back to History when there is nothing to resume. | When the v0.2 Discovery Feeds land, a Browse landing auto-populates and becomes a first-class choice rather than just the search prompt. |
+| History is the **default** landing view; the landing is configurable (ROD-228) | A **Browse** landing has no auto-populated content — Browse is catalogue *search*, so it lands on its idle search prompt (§9.5). History is therefore the honest default (and the fallback for any unrecognized value). The popular feed now exists as its own **Discover** view (§9.6), but it is not yet a landing-cycle option. The setting also offers `last_watched` — opens the most-recently-watched show on its resume episode (ROD-229), falling back to History when there is nothing to resume. | Surfacing **Discover** as a landing-cycle choice is a follow-up (ROD-242). |
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
 | Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. `detail_two_col_min = 100` remains for the full-screen zoom's internal two-column split (full canvas, not the ~58% pane). | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
-| First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist points to Browse (its `/` filter has nothing to filter); active search/filter counts carry a `[catalogue · N]` / `[history · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the bonus `P save` line recedes to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | When the v0.2 Discovery Feeds land and Browse auto-populates, revisit the empty-Browse copy so `search the catalogue` and the feed don't relabel twice. |
+| First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist points to Browse (its `/` filter has nothing to filter); active search/filter counts carry a `[catalogue · N]` / `[history · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the bonus `P save` line recedes to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | The popular feed shipped as the separate **Discover** view, not in Browse — so the empty-Browse "search the catalogue" copy stands (Browse stays search-only). Revisit only if Browse ever gains auto-populated content. |
 
 ---
 
@@ -2201,10 +2204,10 @@ reached with `Space` from a focused detail pane in **either** Browse or History 
 do the same). `q` no longer backs out — it quits the app (ROD-210). See §10.4 for the full Esc chain,
 and §10.7 for the decision log.
 
-Browse can be selected as the landing view (`landing = "browse"`, §9.2), but until
-the v0.2 Discovery Feeds land there is no feed to populate it — a Browse landing
-opens on its idle search prompt (§9.5). It also becomes live when the user presses
-`B` or `F1` from History.
+Browse can be selected as the landing view (`landing = "browse"`, §9.2), but it is
+catalogue *search* — there is no feed to populate it, so a Browse landing opens on
+its idle search prompt (§9.5). The popular feed lives in the separate **Discover**
+view (§9.6). Browse also becomes live when the user presses `B` or `F1` from History.
 
 ---
 
