@@ -187,7 +187,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         // Browse detail line, adding the Space zoom only where the grid lives
         // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
         .history => if (self.history.len == 0)
-            "B browse · q quit"
+            "D discover · B browse · q quit"
         else switch (self.active_pane) {
             .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit",
             // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
