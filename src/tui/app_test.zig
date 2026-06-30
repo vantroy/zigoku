@@ -644,6 +644,30 @@ test "Discover window keys switch the active window and reset the cursor (ROD-23
     try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
 }
 
+test "Discover window cycle wraps at both boundaries without overflow (ROD-246)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+
+    // ']' from all_time must wrap forward to daily. Pre-ROD-246 this PANICKED:
+    // @intFromEnum yields the enum's min tag type (u2 for 4 members), so `cur + 1`
+    // at cur == 3 (all_time) overflowed u2. A Debug test build would abort here.
+    app.discover.window = .all_time;
+    try testTick(&app, keyEv(']', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .daily), app.discover.window);
+
+    // '[' from daily wraps the other way to all_time.
+    try testTick(&app, keyEv('[', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .all_time), app.discover.window);
+
+    // A full forward sweep of all four windows returns to the start — every step,
+    // including the all_time→daily wrap, holds.
+    app.discover.window = .daily;
+    for (0..4) |_| try testTick(&app, keyEv(']', .{}));
+    try testing.expectEqual(@as(@TypeOf(app.discover.window), .daily), app.discover.window);
+}
+
 test "Discover Enter opens the detail zoom for the selected card; Esc returns (ROD-239)" {
     var app: App = .{};
     app.gpa = testing.allocator;
