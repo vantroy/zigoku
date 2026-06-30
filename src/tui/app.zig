@@ -162,6 +162,11 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    // Seed the cell-pixel cache from the initial resize (the .winsize event was
+    // drained above, so read vaxis's settled screen) — Discover's cover-fill height
+    // needs it on the first frame (ROD-247).
+    app.term_x_pixel = @intCast(vx.screen.width_pix);
+    app.term_y_pixel = @intCast(vx.screen.height_pix);
     // Resolve the cover-cache path once for the Settings "cover art cache" row,
     // HOME-collapsed for display. Best-effort: a missing cache home leaves this
     // null and the row falls back to a literal (ROD-225).
@@ -279,7 +284,13 @@ pub fn run(
         // Resize is a vaxis-lifecycle concern (it reallocates the screen), so
         // run() owns it — that keeps tick() a pure state fold, testable without
         // a tty. tick() still sees the event; it just doesn't touch the screen.
-        if (event == .winsize) try vx.resize(gpa, writer, event.winsize);
+        if (event == .winsize) {
+            try vx.resize(gpa, writer, event.winsize);
+            // Cache pixel metrics for the Discover cover-fill height (ROD-247);
+            // term_cols/term_rows are reseeded in layout() right after tick().
+            app.term_x_pixel = @intCast(vx.screen.width_pix);
+            app.term_y_pixel = @intCast(vx.screen.height_pix);
+        }
         try app.tick(event, &loop, io, provider);
 
         // ROD-191: reap a finished reload. Its terminal event (success OR failure)
@@ -531,10 +542,10 @@ pub const RenderScratch = struct {
     /// card's rank string because all three can live on screen the same frame; same
     /// outlive-vx.render() contract. [8] covers "[100]" with slack.
     disc_badge: [256][8]u8 = undefined,
-    /// Per-card Discover genre tags (top 1-2, " · "-joined, ROD-247), clipped to the
-    /// card width. Blank for unenriched/no-id cards (no layout jump — slot_h is
-    /// fixed). Same outlive-vx.render() contract as `title`. [48] holds two clipped
-    /// genre names plus the separator for the widest card.
+    /// Per-card Discover genre glyphs (up to two monochrome symbols, ROD-247),
+    /// right-anchored on the view-count row. Blank for unenriched/unmapped cards.
+    /// Same outlive-vx.render() contract as `title`. [48] is ample for two ≤4-byte
+    /// glyphs.
     disc_genre: [256][48]u8 = undefined,
 };
 
@@ -785,6 +796,12 @@ pub const App = struct {
     /// the Discover cover `pump` (run from run(), not layout) can resolve the grid
     /// geometry from the last settled frame (ROD-243).
     term_rows: u16 = 0,
+    /// Last-seen terminal size in PIXELS, cached at each vaxis resize (run() owns
+    /// resize). 0 when the terminal doesn't report pixel metrics (tmux/headless).
+    /// Divided by term_cols/term_rows to get the cell aspect, which sizes the
+    /// Discover covers so a poster fills its width instead of pillarboxing (ROD-247).
+    term_x_pixel: u16 = 0,
+    term_y_pixel: u16 = 0,
     /// Last tick timestamp (ms). Updated on every .tick event; used by draw functions.
     now_ms: i64 = 0,
     /// Toast queue (oldest first). null = empty slot.
@@ -1016,6 +1033,15 @@ pub const App = struct {
     /// one show, so it shows only that show's season with no cour fallback (an
     /// unenriched show shows no chip, never a misleading season). Settings has no
     /// show context (per the header layout) and shows no chip.
+    /// Terminal cell size in pixels as `.{ w, h }`, or `.{ 0, 0 }` when the terminal
+    /// doesn't report pixel metrics (tmux/headless). Discover sizes its cover boxes
+    /// from this so a poster fills its width (ROD-247); 0 → the fixed fallback height.
+    pub fn cellPx(self: *const App) [2]u16 {
+        if (self.term_cols == 0 or self.term_rows == 0 or self.term_x_pixel == 0 or self.term_y_pixel == 0)
+            return .{ 0, 0 };
+        return .{ self.term_x_pixel / self.term_cols, self.term_y_pixel / self.term_rows };
+    }
+
     pub fn topBarSeasonChip(self: *App) []const u8 {
         switch (self.active_view) {
             .settings => return "",
@@ -2179,7 +2205,8 @@ pub const App = struct {
 
         const w = self.term_cols;
         const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
-        const geo = discover_view.geometry(w, visible);
+        const cp = self.cellPx();
+        const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
         if (geo.cols == 0 or geo.rows_visible == 0) return;
 
         const items = self.discover.activeSlot().results.items;
@@ -3477,7 +3504,8 @@ pub const App = struct {
             // Discover: keep the cursor's card-row inside the grid viewport. scroll
             // is a card-row offset; geometry resolves cols + the visible row budget.
             .discover => {
-                const geo = discover_view.geometry(w, visible);
+                const cp = self.cellPx();
+                const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
                 if (geo.rows_visible == 0 or geo.cols == 0) {
                     self.discover.scroll = 0;
                 } else {
