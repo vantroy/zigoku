@@ -1598,7 +1598,7 @@ Cache the decoded pixel buffer — do not re-fetch from network on resize.
 AppState {
     active_view:   enum { browse, history, detail, settings }  // which view (§10.1)
     active_pane:   enum { list, detail }                       // pane focus within a view (§10.3)
-    detail_origin: enum { browse, history }                    // where .detail was entered from, for the Esc chain (§10.4)
+    detail_origin: enum { browse, history, discover }          // where .detail was entered from, for the Esc chain (§10.4)
     input_mode:    enum { normal, search }                     // command-line (`:`) input is future M4+ (§3.5)
     list_cursor:   usize
     detail_scroll: usize
@@ -2118,7 +2118,7 @@ keybinds.
 Browse's and History's right-hand detail *pane* (§10.3, reached with `l`/`Enter`) is the
 default "triage scrub" surface. The standalone Detail view is the full-screen zoom (§5.3),
 reached with `Space` from a focused detail pane in **either** Browse or History when `w ≥ 100`.
-`detail_origin` records the entry point (`.browse` or `.history`); both arms are now live.
+`detail_origin` records the entry point (`.browse`, `.history`, or `.discover` — ROD-243); all arms are live.
 `Esc` from zoom demotes back to the two-pane with `active_pane = .detail` (`Space`/`h`
 do the same). `q` no longer backs out — it quits the app (ROD-210). See §10.4 for the full Esc chain,
 and §10.7 for the decision log.
