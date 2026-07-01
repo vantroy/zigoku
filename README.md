@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/vantroy/zigoku/actions/workflows/ci.yml/badge.svg)](https://github.com/vantroy/zigoku/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/vantroy/zigoku?color=08872B)](https://github.com/vantroy/zigoku/releases/latest)
-[![License: GPL-3.0](https://img.shields.io/github/license/vantroy/zigoku?color=blue)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue)](LICENSE)
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/)
 [![Platform](https://img.shields.io/badge/platform-Linux-555)](https://github.com/vantroy/zigoku/releases/latest)
 
@@ -102,10 +102,22 @@ app-wide, not just the Settings tab.*
 The binary shells out to whatever `mpv` is on your `PATH` to play video.
 Without it, you get a browser. A very nice browser, but still.
 
-### AUR (Arch Linux) — coming soon
+### AUR (Arch Linux)
 
-Will be `paru -S zigoku` once published. AUR new-account registrations are
-currently closed, so the package can't be created until that changes.
+`paru -S zigoku` (or `yay`) is the goal, but AUR new-account registration has
+been closed since mid-June 2026, so the package isn't on the registry yet. The
+[`PKGBUILD`](packaging/aur/zigoku/PKGBUILD) is done and tested, though — build it
+straight from the repo in the meantime:
+
+```sh
+git clone https://github.com/vantroy/zigoku.git
+cd zigoku/packaging/aur/zigoku
+makepkg -si          # compiles the release with your system Zig, then installs
+```
+
+It's a from-source package: it links your system `sqlite` and pulls `mpv` at
+runtime. The moment registration reopens, this lands on the AUR and the one-liner
+above becomes `paru -S zigoku`.
 
 ### macOS: Homebrew
 
@@ -267,7 +279,11 @@ A record of the journey — `ROD-NN` issue IDs in commit messages map to each mi
 
 ## License
 
-[GPL-3.0](LICENSE). Our reference for the AllAnime protocol, anipy-cli, is
-GPL-3.0; even though Zigoku reimplements the protocol rather than copying code,
-GPL-3.0 keeps the lineage unambiguous — and it's a license we're happy to
-carry anyway.
+[GPL-3.0-or-later](LICENSE). Zigoku is free software: you can redistribute it
+and/or modify it under the terms of the GNU General Public License as published
+by the Free Software Foundation, either version 3 of the License, or (at your
+option) any later version.
+
+Our reference for the AllAnime protocol, anipy-cli, is GPL-3.0; even though
+Zigoku reimplements the protocol rather than copying code, a GPL license keeps
+the lineage unambiguous — and it's one we're happy to carry anyway.
