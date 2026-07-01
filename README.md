@@ -60,21 +60,11 @@ its detail.*
 *Watchlist, scrolled into `planning`: grouped status headers, per-show progress bars,
 and the real cover for whichever title is selected.*
 
-![Settings — palette row focused](docs/media/settings.png)
+![Themes tour — Settings palette cycle re-theming a live detail view](docs/media/stills.gif)
 
-*Settings, palette row focused — four built-in themes: `terminal_ghost`, `phosphor`,
-`nord`, `tokyonight`.*
-
-![Themes tour — palette cycle re-theming a live detail view](docs/media/stills.gif)
-
-*Themes tour: cycling the palette in Settings — `terminal_ghost` → `phosphor` → `nord`
-→ `tokyonight` — then jumping back to the watchlist detail to show the re-theme already
-applied, live.*
-
-![Detail re-themed to tokyonight — episode grid with resume marker](docs/media/detail-themed.png)
-
-*The watchlist detail re-themed to `tokyonight` — cover, kanji chips, synopsis, and the
-episode grid with its resume `▸` marker, all repainted app-wide, not just the Settings tab.*
+*Themes tour: cycle the palette in Settings — `terminal_ghost` → `phosphor` → `nord` →
+`tokyonight` — then jump back to a live detail to see the re-theme already applied
+app-wide, not just the Settings tab.*
 
 ---
 
