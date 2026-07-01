@@ -30,6 +30,11 @@ pub fn build(b: *std.Build) void {
     // Strip debug info — release artifacts only. See exe creation below.
     const strip = b.option(bool, "strip", "Strip debug info from the binary") orelse false;
 
+    // Position-independent executable. Off by default (release artifacts are
+    // static-musl, dev builds want a plain exe); the AUR source package passes
+    // -Dpie for Arch's standard hardening (ROD-146).
+    const pie = b.option(bool, "pie", "Build a position-independent executable") orelse false;
+
     const mod = b.addModule("zigoku", .{
         .root_source_file = b.path("src/root.zig"),
         // Needed because this module is also the root of a test executable.
@@ -85,6 +90,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    exe.pie = pie;
     b.installArtifact(exe);
 
     // ── Spikes ────────────────────────────────────────────────────────────────
