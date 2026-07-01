@@ -1,0 +1,8 @@
+# Only PKGBUILD and .SRCINFO are tracked here. `makepkg` runs in-place in this
+# dir (see the README install steps), so everything else is build scratch —
+# src/, pkg/, the git+ source checkouts, the built package, downloaded tarballs.
+# Whitelist rather than blacklist so new deps can't leak a checkout into a commit.
+*
+!.gitignore
+!PKGBUILD
+!.SRCINFO
