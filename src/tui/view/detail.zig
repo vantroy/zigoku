@@ -20,14 +20,18 @@ const putClipped = render.putClipped;
 const centerText = render.centerText;
 const drawWrappedText = render.drawWrappedText;
 
-/// Width (in cols) at and above which a History-opened detail pane splits into
-/// two columns (cover + header left, synopsis + grid right) — ROD-113. Aligns
-/// with the §3.2 cover-art tier so the right column is always ≥ ~34 cols.
+/// Pane width (in cols) at and above which a History-opened detail pane splits
+/// into two columns (cover + header left, synopsis + grid right) — ROD-113.
+/// Measured against the detail *pane* width, not the terminal (ROD-258), so the
+/// split only engages when the columns genuinely fit. At the threshold this
+/// splits into a 38-col left (cover + header) and a ~60-col right (synopsis +
+/// grid), both widening with the pane.
 pub const detail_two_col_min: u16 = 100;
 
-/// Pure predicate for the two-column gate, exposed for tests.
-pub fn isTwoColumn(w: u16) bool {
-    return w >= detail_two_col_min;
+/// Pure predicate for the two-column gate — `pane_w` is the detail pane width
+/// the columns will be carved from, not the terminal (ROD-258). Exposed for tests.
+pub fn isTwoColumn(pane_w: u16) bool {
+    return pane_w >= detail_two_col_min;
 }
 
 /// §3.3 cover-width tier from the effective pane/column width (ROD-170): the
@@ -521,7 +525,7 @@ fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16) void 
     drawEpisodeGrid(self, grid_win, w, grid_h);
 }
 
-pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, term_w: u16, two_col: bool) void {
+pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win: vaxis.Window, w: u16, h: u16, two_col: bool) void {
     if (w < 10) return;
 
     const info = self.detailRenderInfo();
@@ -535,14 +539,19 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     const show_grid = self.episodeGridVisible();
 
     // Two-column layout (ROD-113): cover + header on the left (~38%), synopsis +
-    // episode grid on the right. Only engaged for History-opened detail at wide
-    // widths; the narrow Browse preview and sub-100-col terminals keep the
-    // single vertical stack. Mirrors the §3.2 list/detail split grammar.
-    // Gate on terminal width, not the pane width `w`: the pane is `term_w - 2`,
-    // so a `w`-based gate would lag the History list preview's ≥100 boundary by
-    // 2 cols (you'd get a preview but a single-column detail at 100–101 cols).
-    // ROD-113 review.
-    if (two_col and isTwoColumn(term_w)) {
+    // episode grid on the right. Only engaged for History-opened detail; the
+    // narrow Browse preview keeps the single vertical stack. Mirrors the §3.2
+    // list/detail split grammar.
+    // Gate on the pane width `w`, not the terminal (ROD-258): with the History
+    // list co-visible the detail pane is `term - list` (see paneSplit), far
+    // narrower than the terminal. The old term-width gate force-split a ~58-col
+    // pane at term 100 into a ~22-col cover column that clipped the meta line.
+    // `w` is the width the columns are actually carved from, so two-column
+    // engages only when the pane can afford it (detail_two_col_min cols of pane,
+    // term ≥ 168 once the 38% list is subtracted); below that the
+    // single-column stack renders instead. The trade is a ~2-col shift of the
+    // full-screen zoom's boundary (pane there is term-2) — cosmetic, and correct.
+    if (two_col and isTwoColumn(w)) {
         // Floor of 20 keeps the 20-col cover block fitting the left column even
         // when the gate drops (ROD-170's persistent-pane threshold). Dead at the
         // current ≥100 gate (38-col min) but load-bearing once the gate lowers.

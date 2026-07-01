@@ -473,6 +473,21 @@ test "detail two-column gate trips at 100 cols and falls back below (ROD-113)" {
     try testing.expect(detail_view.isTwoColumn(160));
 }
 
+test "two-column gate is keyed on pane width, not the terminal (ROD-258)" {
+    // Regression: with the History list co-visible the detail pane is `term - list`
+    // (paneSplit), far narrower than the terminal. The old term-width gate
+    // force-split a ~58-col pane at term 100 and clipped the meta line. The gate
+    // now consults the pane width, so two-column stays off until the pane itself
+    // reaches the min — even though the terminal is well past 100.
+    try testing.expect(App.paneSplit(101).detail_w < detail_view.detail_two_col_min);
+    try testing.expect(!detail_view.isTwoColumn(App.paneSplit(101).detail_w));
+    // Cramp band: term 140 still leaves the pane under the threshold.
+    try testing.expect(!detail_view.isTwoColumn(App.paneSplit(140).detail_w));
+    // Wide enough: once the pane genuinely has detail_two_col_min cols the split
+    // engages (≈ term 169+ after the 38% list is subtracted).
+    try testing.expect(detail_view.isTwoColumn(App.paneSplit(180).detail_w));
+}
+
 test "history preview split engages only with a focused record (ROD-113)" {
     // The wide-History split is gated on `selectedHistoryRecord() != null`, so
     // empty/loading/error states (no focused record) keep the single column.

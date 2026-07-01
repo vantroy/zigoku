@@ -3425,7 +3425,7 @@ pub const App = struct {
                     history.draw(self, &self.scratch, win, top, visible, sp.list_w, sp.list_w -| 2);
                     const detail_win = win.child(.{ .x_off = @intCast(sp.detail_x), .y_off = top, .width = sp.detail_w, .height = visible });
                     if (self.active_pane == .detail and w >= zoom_min) {
-                        detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, visible, w, true);
+                        detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, visible, true);
                     } else {
                         detail.drawHistoryPreview(self, vx, writer, detail_win, sp.detail_w, visible, rec);
                     }
@@ -3447,14 +3447,14 @@ pub const App = struct {
                 const detail_win = win.child(.{ .x_off = @intCast(sp.detail_x), .y_off = top, .width = sp.detail_w, .height = pane_h });
 
                 browse.drawBrowseList(self, &self.scratch, list_win, pane_h, sp.list_w);
-                detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, pane_h, w, false);
+                detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, pane_h, false);
             },
 
             .detail => {
                 const detail_win = win.child(.{ .x_off = 2, .y_off = top, .width = body_w, .height = visible });
                 // Two-column only for History-opened detail (ROD-113 scope); the
                 // Browse-opened detail view keeps the single stack.
-                detail.drawDetailPane(self, vx, writer, detail_win, body_w, visible, w, self.detail_origin == .history);
+                detail.drawDetailPane(self, vx, writer, detail_win, body_w, visible, self.detail_origin == .history);
             },
 
             .settings => settings.drawSettings(self, win, top, visible, w),
