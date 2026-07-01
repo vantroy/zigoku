@@ -1,0 +1,35 @@
+# discover.kbeats — Discover feed tour (→ discover.gif). The ROD-247 ranked cover wall
+# in motion: covers load, the selection sweeps the grid, then the ranking window cycles
+# (Daily → Weekly → Monthly) and a whole new wall of real covers loads each time.
+#
+# READ-ONLY: shift+d nav, hjkl move, 1/2/3/4 ranking tabs. No mutating keys (the runner
+# lints them). Content is LIVE (AllAnime + AniList) so the exact shows vary per run.
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/discover.kbeats   → docs/media/discover.gif
+
+sleep 2
+key shift+d
+sleep 7s                  # live feed load (AllAnime queryPopular + AniList covers)
+
+record discover.gif fps=15 width=960
+sleep 800ms
+
+# sweep the selection across the grid — highlight moves cover to cover
+key l
+sleep 650ms
+key l
+sleep 650ms
+key l
+sleep 650ms
+key j                     # drop into the second cover row
+sleep 750ms
+key l
+sleep 650ms
+key k                     # back up to the top row
+sleep 900ms
+
+# switch the ranking window once — a fresh wall of covers loads
+key 2                     # Weekly
+sleep 6s                  # live reload; long hold so the loaded wall is the resting frame
+
+endrecord
