@@ -759,8 +759,15 @@ pub const App = struct {
     ep_scratch: [512][16]u8 = undefined,
     /// Stable storage for the detail-pane score line.
     detail_score_buf: [32]u8 = undefined,
-    /// Stable storage for the "N eps" metadata line in drawDetailPane.
+    /// Stable storage for the detail meta grammar (ROD-260). `detail_meta_buf`
+    /// holds the formatted episode-count value; `detail_meta_fields` the ordered
+    /// field list both renderers (drawMetaLine / drawMetaRail) read. vaxis cells
+    /// hold slices into these, not copies, so both must outlive the frame — hence
+    /// App-owned, like the season/score buffers below (the ROD-141 dangling-buffer
+    /// lesson). Sized for the eventual field union (the AniList-enrichment
+    /// follow-up adds studios/source/duration/rank between Format and the tail).
     detail_meta_buf: [32]u8 = undefined,
+    detail_meta_fields: [6]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack
     /// local would dangle by `render()` and emit garbage.
@@ -1345,8 +1352,6 @@ pub const App = struct {
     pub const DetailRenderInfo = struct {
         anime: ?Anime,
         title: []const u8,
-        meta: []const u8,
-        has_meta: bool,
     };
 
     pub fn detailRenderInfo(self: *App) DetailRenderInfo {
@@ -1355,14 +1360,67 @@ pub const App = struct {
             if (a.name.len > 0) a.name else "—"
         else
             "—";
-        const meta: []const u8 = if (anime) |a| blk: {
-            const eps = a.episodeCount(self.translation);
-            if (eps > 0) break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{eps}) catch "? eps";
-            if (a.total_episodes) |total| break :blk std.fmt.bufPrint(&self.detail_meta_buf, "{d} eps", .{total}) catch "? eps";
-            break :blk "? eps";
-        } else "? eps";
-        const has_meta = if (anime) |a| a.episodeCount(self.translation) > 0 or a.total_episodes != null else false;
-        return .{ .anime = anime, .title = title, .meta = meta, .has_meta = has_meta };
+        return .{ .anime = anime, .title = title };
+    }
+
+    /// One detail-metadata field (ROD-260). Both the compact `drawMetaLine` and
+    /// the roomy `drawMetaRail` render from a shared, ordered `[]MetaField`, so
+    /// the two forms can't drift — same source, same order, same value strings.
+    pub const MetaField = struct {
+        /// Rail-form label ("Episodes"/"Format"/"Studios") — ≤ 8 chars, the rail
+        /// aligns values at a fixed column past the 8-col label gutter.
+        label: []const u8,
+        /// The value, identical in both forms: the rail draws it after the label,
+        /// the compact line joins it with `·`. Formatted values live in the
+        /// App-owned buffers above so vaxis's slice outlives the frame.
+        value: []const u8,
+        /// Compact-line-only unit suffix (" eps") for a field whose rail label
+        /// already implies the unit — empty for everything else. Lets `Episodes 13`
+        /// (rail) and `13 eps` (line) share one `value` without a second string.
+        unit: []const u8 = "",
+        /// Render `value` in `fg3` (dim) rather than `fg2` — the "? eps" count
+        /// degrade only; present enrichment is always `fg2`.
+        dim: bool = false,
+    };
+
+    /// The ordered detail-metadata fields (ROD-260), highest-priority first so a
+    /// height-starved rail sheds from the bottom (Episodes, emitted first, never
+    /// drops). Phase 1 ships the enrichment that survives to the store: Episodes
+    /// (always) and Format (the persisted `kind`) — no network, no schema change.
+    /// The AniList-enrichment follow-up slots studios/source/duration between
+    /// Format and the tail (and a rail-only rank) once those fields are fetched
+    /// and persisted; because both renderers iterate the list generically, that
+    /// lands here as data only — no renderer change. A field is emitted only when
+    /// it has a value (§9.1: no empty segment, no orphan `·`, no bare rail row);
+    /// Episodes is the floor, degrading to a dim "?" so neither form renders empty.
+    pub fn detailMetaFields(self: *App) []const MetaField {
+        var n: usize = 0;
+        const a = self.renderedDetailAnime() orelse {
+            self.detail_meta_fields[0] = .{ .label = "Episodes", .value = "?", .unit = " eps", .dim = true };
+            return self.detail_meta_fields[0..1];
+        };
+
+        // Episodes — the floor field. fg2 real count when either the per-track
+        // count or the AniList total is known, else a dim "?" degrade.
+        const eps = a.episodeCount(self.translation);
+        const total: ?u32 = if (eps > 0) eps else a.total_episodes;
+        if (total) |t| {
+            const v = std.fmt.bufPrint(&self.detail_meta_buf, "{d}", .{t}) catch "?";
+            self.detail_meta_fields[n] = .{ .label = "Episodes", .value = v, .unit = " eps" };
+        } else {
+            self.detail_meta_fields[n] = .{ .label = "Episodes", .value = "?", .unit = " eps", .dim = true };
+        }
+        n += 1;
+
+        // Format (AniList `kind`, e.g. "TV") — omitted entirely when absent.
+        if (a.kind) |kind| {
+            if (kind.len > 0) {
+                self.detail_meta_fields[n] = .{ .label = "Format", .value = kind };
+                n += 1;
+            }
+        }
+
+        return self.detail_meta_fields[0..n];
     }
 
     fn currentDetailSourceName(self: *const App, provider: SourceProvider) []const u8 {
