@@ -1,72 +1,109 @@
 # docs/media — capture manifest
 
-How the README's screenshots & demo are produced and regenerated. Two sources:
+How the README's screenshots & demo are produced and regenerated. **One pipeline:**
+a real **kitty** driven inside a headless **Xvfb**, screenshotted / recorded at the
+pixel level. This replaces the old vhs tapes — the reason is cover art.
 
-- **vhs** (scripted, checked-in `.tape` files) — flow, layout, navigation. Drives
-  the real binary headlessly via [`capture-launch.sh`](capture-launch.sh).
-  **Covers render as halfblock here** — vhs's terminal has no Kitty graphics.
-- **Hand-captured** (Rod, real terminal) — the Kitty-graphics **cover-art** shots.
-  vhs physically can't render these; they're shot in bare ghostty/kitty (no tmux —
-  tmux also strips Kitty graphics).
+The Kitty graphics protocol ships cover art as **pixels** to the framebuffer, not as
+text cells. vhs (and every cell-grid recorder — asciinema, termtosvg, agg) models the
+terminal as a grid of cells, so it renders covers as `▀` halfblocks and can never
+capture one. Driving a real kitty and grabbing its framebuffer is the only way — and
+it means every asset, including the hero gif and the Discover feed, shows **real
+covers** (ROD-255).
 
-All assets are **120×40** (the app's design grid). For vhs that's
-`Set Width 1264` / `Set Height 886` at `FontSize 16` / `Padding 16`.
+Default capture is a roomy **1600×1000** Xvfb screen (font size 16 ≈ a 150×51 grid), so
+the Discover feed shows **two full rows** of cover art. Views that don't reflow to fill
+that width — the single-pane detail and the settings list — are shrunk per-grab with a
+`resize` beat (see below) so they read balanced instead of half-empty. kitty ignores
+`initial_window_width` under a bare (no-WM) Xvfb, so the runner sets the size with
+`xdotool windowsize` after launch and lets the app reflow.
 
-## Regenerate (vhs assets)
+## Regenerate
 
 ```sh
-zig build                         # tapes drive ./zig-out/bin/zigoku — build first
-vhs docs/media/demo.tape          # → demo.gif (hero; LIVE search, content varies)
-vhs docs/media/stills.tape        # → stills.gif + watchlist.png, settings.png,
-                                  #   detail-themed.png (themes tour; local, deterministic)
+zig build                                        # beats drive ./zig-out/bin/zigoku
+./docs/media/capture-kitty.sh docs/media/demo.kbeats     # → demo.gif (hero)
+./docs/media/capture-kitty.sh docs/media/discover.kbeats # → discover.gif (Discover tour)
+./docs/media/capture-kitty.sh docs/media/browse.kbeats   # → browse.gif (Browse search tour)
+./docs/media/capture-kitty.sh docs/media/covers.kbeats   # → detail-cover / browse-covers / history .png
+./docs/media/capture-kitty.sh docs/media/stills.kbeats   # → stills.gif + watchlist / settings / detail-themed .png
 ```
 
-Requires `vhs`, `ttyd`, `ffmpeg` on PATH (verified with vhs v0.11.0).
+Requires `Xvfb`, `kitty`, `xdotool`, `xdpyinfo`, `ffmpeg`, `gifski`, ImageMagick
+(`import` + `magick`) on PATH (verified with kitty 0.47, ffmpeg + gifski, Mesa llvmpipe
+software GL).
 
-> **demo.tape is live, stills.tape is not.** `demo.tape` hits live AllAnime +
-> AniList, so the show/cover varies per run; if it lands on the empty Watchlist,
-> the search returned nothing (slow/rate-limited) — re-run. `stills.tape` only
-> navigates the local watchlist + settings + cached detail, so it's deterministic.
+> **Content is live where it says so.** `demo`, `discover`, `browse`, and `covers`
+> beats read your real store / the live Discover feed / live AllAnime search, so the
+> exact shows/covers vary per run. That's by design (ROD-148/247). If a live search or
+> feed is slow, a tour may catch a `searching…`/`loading…` frame — re-run or lengthen
+> the sleep. Timing is tunable per beats file.
+
+## The `.kbeats` format
+
+A beats file is a line-oriented capture script the runner interprets against a live
+zigoku. Comments start with `#`. Commands:
+
+| Beat | Effect |
+|---|---|
+| `key <spec> [<spec>…]` | send key chords via xdotool (`key shift+h`, `key j j j`, `key Return`) |
+| `type <text>` | type literal text (search boxes) |
+| `sleep <dur>` | wait — `900ms`, `2.5s`, or bare seconds |
+| `resize <W>x<H>` | resize the window (app reflows); use before a `grab` that wants a narrower/shorter frame. Never mid-`record`. |
+| `grab <file.png>` | screenshot the framebuffer, crop to the window, write to `docs/media/` |
+| `record <file.gif> [fps=N] [width=N]` … `endrecord` | x11grab the window, encode with gifski |
+
+It's the same iterate loop as a vhs tape: edit the beats, re-run, eyeball, adjust
+`sleep`/keys. See `demo.kbeats` for a worked example.
 
 ## Asset list
 
-| File | Source | Shows |
+| File | Beats | Shows |
 |---|---|---|
-| `demo.gif` | vhs · `demo.tape` | **Hero:** Watchlist → Browse → search → enriched detail → episode grid, play-ready. |
-| `stills.gif` | vhs · `stills.tape` | **Themes tour:** watchlist → settings palette cycle → re-themed detail. |
-| `watchlist.png` | vhs · `stills.tape` | Populated watchlist (terminal_ghost), grouped status + progress bars. |
-| `settings.png` | vhs · `stills.tape` | Settings tab, palette row focused (themes). |
-| `detail-themed.png` | vhs · `stills.tape` | Two-pane detail re-themed to **tokyonight**. |
-| `detail-cover.png` | hand-capture | Detail with **real Kitty-graphics cover art** + kanji chips + synopsis + grid. |
-| `history.png` | hand-capture | Real watchlist: grouped headers + progress bars. |
-| `browse-covers.png` | hand-capture | Second real-cover-art angle. |
+| `demo.gif` | `demo.kbeats` | **Hero:** watchlist master-detail with **live cover art** (cover updates per selection) → typed filter down to the Frieren detail. |
+| `discover.gif` | `discover.kbeats` | **Discover tour:** the ranked cover wall — sweep the grid, switch the ranking window, a fresh wall of covers loads. |
+| `browse.gif` | `browse.kbeats` | **Browse tour:** live catalogue search — type a query and real covers stream into the two-pane results. |
+| `stills.gif` | `stills.kbeats` | **Themes tour:** Settings palette cycle re-theming a two-pane detail. |
+| `watchlist.png` | `stills.kbeats` | Populated watchlist (default **terminal_ghost**), grouped status + progress bars. |
+| `settings.png` | `stills.kbeats` | Settings tab, palette row focused. |
+| `detail-themed.png` | `stills.kbeats` | Two-pane detail re-themed to **tokyonight**. |
+| `detail-cover.png` | `covers.kbeats` | **Discover** #1 detail: real cover + kanji chips + score + synopsis + episode grid. |
+| `browse-covers.png` | `covers.kbeats` | **Discover feed:** a wall of real Kitty-graphics cover art (ROD-247). |
+| `history.png` | `covers.kbeats` | Real watchlist master-detail, scrolled to a planning-group cover. |
 
-Captions for the Kitty-graphics shots should note the terminal (kitty / ghostty /
-WezTerm); the vhs assets show covers as the halfblock fallback.
+**On the hero's ending:** the play beat can't be shown headlessly — mpv is stubbed, so
+"→ play" lives in the caption + the status-bar affordance, and the hero ends on the
+enriched detail. Deliberate, not missing.
 
-**On the hero's ending:** `demo.gif` stops on the detail pane + episode grid with
-the `enter play` affordance lit — *not* an mpv playback frame. Headless, the play
-key hands off to a stubbed mpv that exits instantly, so the app jumps back to the
-Watchlist — a dead end. A terminal gif can't show mpv's video window anyway, so
-"→ play" lives in the caption + the status-bar affordance. Deliberate, not missing.
+## Safety (the live watchlist is never touched)
+
+The runner reuses `capture-launch.sh` verbatim (stubbed mpv, real store) and adds two
+guards on top:
+
+- **Read-only lint.** The runner refuses to run any beats file containing a
+  watchlist-mutating key — `P` (add), `p/x/c/w` (status), `r` (reset), `u` (undo) — a
+  single-char `type` command (`type p`), or a `grab`/`record` path that isn't a basename.
+  Vet a beats file safely with `capture-kitty.sh --check <file>` (lints only, never boots
+  Xvfb or touches the store). **Caveat:** a real run drives the REAL store, and the lint
+  can't catch a multi-char `type` sent *outside* an open `/` search (its chars reach the
+  app as commands) or a 2nd `Return` in a Discover detail (plays). The durable fix is a
+  store-level read-only mode — tracked as a follow-up. Until then: `--check`, and keep
+  every `type` inside a `/`…search span.
+- **Config isolation.** `XDG_CONFIG_HOME` points at an empty throwaway dir, so the
+  Settings/palette tour's save is discarded and the app renders in the **default**
+  palette (deterministic media, independent of your personal config). The data store
+  (`XDG_DATA_HOME`) is left real, so covers/watchlist are your actual library.
 
 ## Tuning notes (verified)
 
-- Geometry: `Set Width 1264` / `Set Height 886` at `FontSize 16` / `Padding 16` =
-  exactly **120 cols × 40 rows** (vhs Width/Height are pixels, not cells).
-- A `Screenshot` must be followed by another frame (a `Sleep`) or vhs drops it.
-- `Output "x.png"` makes a *directory* of frame layers in vhs 0.11 — don't use it for
-  stills; use the `Screenshot` command.
-- vhs has **no F-keys**, so views switch via **`H`** (Browse↔History) and **`S`**
-  (Settings). The launcher uses the **real store**, so the app boots into the
-  **Watchlist** — tapes press `H` to reach Browse before searching.
-- **Colour:** zigoku emits truecolor in colon-style SGR (`\e[38:2:R:G:Bm`), which vhs
-  mis-parses (greens → burnt orange). `capture-launch.sh` exports
-  `VAXIS_FORCE_LEGACY_SGR=1` (semicolon form vhs reads) + `COLORTERM=truecolor`. The
-  app also honours `COLORTERM` → `caps.rgb` (`src/tui/app.zig`). Without these, orange.
-- **Real-store safety:** capture runs on `~/.local/share/zigoku`, but the tapes are
-  watchlist-read-only and mpv is stubbed. Browse search upserts enrichment with
-  `history_visible=0` (invisible in History) and `MAX(...)` on conflict, so it never
-  floods History or un-hides anything. Never add P/play/status keys to a tape.
-  ⚠️ `stills.tape` cycles the palette and the `H` exiting Settings **saves** it — your
-  next normal launch boots the last palette (tokyonight). Cycle back or reset if unwanted.
+- **kitty must present under Xvfb:** the runner sets `-o linux_display_server=x11` +
+  `KITTY_ENABLE_WAYLAND=0`. Without it kitty runs but never paints to the framebuffer.
+- **`unset TMUX`:** if TMUX leaks in, kitten/vaxis emit the tmux-passthrough form of the
+  graphics protocol, which a non-tmux kitty rejects — no cover. The runner unsets it.
+- **Colour is accurate:** real kitty parses colon-style SGR correctly, so the old vhs
+  `VAXIS_FORCE_LEGACY_SGR` workaround is unnecessary (greens stay green).
+- **Sizing (GitHub budget):** hero gif **< 3 MB**, stills **< 500 KB**. `grab` auto-
+  quantizes a still to a 256-colour PNG only if it would bust the budget (the Discover
+  cover-wall needs it; nothing else does) — no visible banding, no downscale.
+- **Software GL** (llvmpipe) is plenty at 15fps. On a compressed FS, `du` under-reports
+  on-disk size — the runner reports logical bytes (`stat`) so the budget check is honest.
