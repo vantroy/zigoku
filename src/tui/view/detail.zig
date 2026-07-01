@@ -429,7 +429,7 @@ fn drawHairline(self: *App, win: vaxis.Window, w: u16, row: u16) void {
 /// Title + chips + score/genres + hairline + episode-count metadata stack
 /// (ROD-141). Returns the next free row. `h` bounds each step so a short pane
 /// never overdraws.
-fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderInfo, start_row: u16) u16 {
+fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderInfo, start_row: u16, bloom: bool) u16 {
     var row = drawTitle(self, win, w, info, start_row);
 
     // Alternate titles (english + native) — only present when the Anime has them.
@@ -453,10 +453,65 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
         row += 1;
     }
 
-    // Metadata: episode count, falling back to AniList total when needed.
-    if (row < h) {
-        const meta_style = if (info.has_meta) self.s(self.palette.fg2, .{}) else self.s(self.palette.fg3, .{});
-        putClipped(win, row, 0, w, info.meta, meta_style);
+    // Metadata (ROD-260): the same ordered fields render as a compact `·`-joined
+    // line in every single-column state, or bloom into a labeled rail filling the
+    // two-column left column's dead space (`bloom`). One source, two densities —
+    // the convergent primitive, so Browse / narrow / zoom all carry the metadata.
+    const fields = self.detailMetaFields();
+    if (bloom) {
+        row = drawMetaRail(self, win, w, h, fields, row);
+    } else if (row < h) {
+        row = drawMetaLine(self, win, w, fields, row);
+    }
+    return row;
+}
+
+/// Compact metadata line (ROD-260): field values joined by ` · `, one row — the
+/// convergent form rendered in every single-column detail state. Emits
+/// segment-by-segment against a running column cursor (mirroring drawScore's
+/// genre loop) so a long studios value clips at the pane edge instead of folding
+/// onto the hairline, and a separator is placed only *between* emitted fields —
+/// no orphan `·` when a field is absent (§9.1). Returns the next free row.
+fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaField, start_row: u16) u16 {
+    var col: u16 = 0;
+    for (fields, 0..) |f, i| {
+        if (col >= w) break;
+        if (i > 0) {
+            col = win.print(
+                &.{.{ .text = " · ", .style = self.s(self.palette.fg3, .{}) }},
+                .{ .row_offset = start_row, .col_offset = col, .wrap = .none },
+            ).col;
+            if (col >= w) break;
+        }
+        const val_style = self.s(if (f.dim) self.palette.fg3 else self.palette.fg2, .{});
+        col = win.print(&.{
+            .{ .text = f.value, .style = val_style },
+            .{ .text = f.unit, .style = val_style },
+        }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none }).col;
+    }
+    return start_row + 1;
+}
+
+/// Roomy metadata rail (ROD-260): the same fields stacked as `Label  Value`,
+/// filling the two-column left column below the header. Renders top-down in
+/// priority order, so a pane too short to hold every row drops the lowest-priority
+/// fields off the bottom first (Episodes, drawn first, never drops). Fixed 8-col
+/// label gutter + 2 spaces aligns values at column 10 across every detail view, so
+/// scanning between shows never retrains the eye. The rail label is the unit, so
+/// values omit the compact form's ` eps` suffix. Returns the next free row.
+fn drawMetaRail(self: *App, win: vaxis.Window, w: u16, h: u16, fields: []const App.MetaField, start_row: u16) u16 {
+    const label_w: u16 = 8; // longest label ("Episodes"); values align past a 2-space gap
+    const value_x: u16 = label_w + 2;
+    var row = start_row;
+    for (fields) |f| {
+        if (row >= h) break;
+        // Clip the label to its own gutter, not the full pane: a future over-length
+        // label truncates here instead of bleeding into the value column (ROD-260 rev).
+        putClipped(win, row, 0, @min(w, label_w), f.label, self.s(self.palette.fg3, .{}));
+        if (value_x < w) {
+            const val_style = self.s(if (f.dim) self.palette.fg3 else self.palette.fg2, .{});
+            putClipped(win, row, value_x, w - value_x, f.value, val_style);
+        }
         row += 1;
     }
     return row;
@@ -562,7 +617,10 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         const right_win = win.child(.{ .x_off = @intCast(right_x), .y_off = 0, .width = right_w, .height = h });
 
         const lrow = drawCover(self, vx, writer, left_win, info.anime, w, null);
-        _ = drawHeader(self, left_win, left_w, h, info, lrow);
+        // The left column ends at the header — no synopsis/grid competes for its
+        // rows here (those live in the right column), so the metadata blooms into
+        // the labeled rail, filling what would otherwise be dead space (ROD-260).
+        _ = drawHeader(self, left_win, left_w, h, info, lrow, true);
 
         // Two-column: synopsis gets the full right column height minus the grid
         // reservation — no synopsis cap needed here, the column is dedicated.
@@ -584,7 +642,9 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     // → row 30; grid gets the final 2 rows. Cover=19, synopsis=2, grid=2. (Proven
     // by the "ROD-137 invariant" test below; constants are the single source.)
     var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
-    row = drawHeader(self, win, w, h, info, row);
+    // Single column: the synopsis + grid follow the header in the same column, so
+    // the metadata stays the compact one-line form (no room to bloom) — ROD-260.
+    row = drawHeader(self, win, w, h, info, row, false);
     if (show_grid) {
         const cap = synopsisCap(if (h > row) h - row else 0);
         row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
