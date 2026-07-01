@@ -1872,6 +1872,48 @@ test "detail meta fields carry episodes then format in priority order (ROD-260)"
     app.search.results.deinit(std.testing.allocator);
 }
 
+test "detail meta fields floor to a dim '?' when no show is focused (ROD-260)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+
+    // No results at all → renderedDetailAnime() resolves null. The floor still
+    // emits exactly one Episodes field so neither render form is ever empty.
+    try testing.expect(app.detailRenderInfo().anime == null);
+    const fields = app.detailMetaFields();
+    try testing.expectEqual(@as(usize, 1), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("?", fields[0].value);
+    try testing.expectEqualStrings(" eps", fields[0].unit);
+    try testing.expect(fields[0].dim);
+}
+
+test "detail meta fields degrade episodes to a dim '?' for an unenriched show (ROD-260)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+
+    // A show with no per-track count and no AniList total — the not-yet-aired /
+    // unenriched case. Episodes still renders, as a dim "?" rather than a number.
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+        // eps_sub / eps_dub default 0, total_episodes / kind default null.
+    });
+
+    const fields = app.detailMetaFields();
+    try testing.expectEqual(@as(usize, 1), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("?", fields[0].value);
+    try testing.expect(fields[0].dim);
+
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
+}
+
 test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
     // Repro: a focused History detail loads an episode grid; pressing B switches to
     // Browse and resets pane focus to .list, but leaves episodes.results loaded

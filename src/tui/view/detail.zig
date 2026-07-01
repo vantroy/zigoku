@@ -500,11 +500,14 @@ fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaF
 /// scanning between shows never retrains the eye. The rail label is the unit, so
 /// values omit the compact form's ` eps` suffix. Returns the next free row.
 fn drawMetaRail(self: *App, win: vaxis.Window, w: u16, h: u16, fields: []const App.MetaField, start_row: u16) u16 {
-    const value_x: u16 = 10; // 8-col label ("Episodes") + 2 spaces
+    const label_w: u16 = 8; // longest label ("Episodes"); values align past a 2-space gap
+    const value_x: u16 = label_w + 2;
     var row = start_row;
     for (fields) |f| {
         if (row >= h) break;
-        putClipped(win, row, 0, w, f.label, self.s(self.palette.fg3, .{}));
+        // Clip the label to its own gutter, not the full pane: a future over-length
+        // label truncates here instead of bleeding into the value column (ROD-260 rev).
+        putClipped(win, row, 0, @min(w, label_w), f.label, self.s(self.palette.fg3, .{}));
         if (value_x < w) {
             const val_style = self.s(if (f.dim) self.palette.fg3 else self.palette.fg2, .{});
             putClipped(win, row, value_x, w - value_x, f.value, val_style);
