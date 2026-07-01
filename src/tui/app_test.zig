@@ -455,15 +455,15 @@ test "paneSplit clamps the list column to a 30-col floor at narrow widths" {
     try testing.expectEqual(@as(u16, 30), sp.list_w); // 60*38/100 = 22 → floored to 30
 }
 
-test "two-pane split engages at 60, zoom/grid at 100 (ROD-170)" {
+test "two-pane split engages at 60 — the single detail-surface threshold (ROD-170/ROD-259)" {
     // ROD-170 unified Browse + History on pane_split_min and lowered it 100→60.
+    // ROD-259 retired the separate zoom_min=100 grid gate: detail focus now
+    // carries the in-pane grid at every two-pane width, so pane_split_min is the
+    // one threshold that governs the detail surface.
     try testing.expectEqual(@as(u16, 60), App.pane_split_min);
-    try testing.expectEqual(@as(u16, 100), App.zoom_min);
     // The gating predicate the .history arm uses: w >= pane_split_min.
     try testing.expect(59 < App.pane_split_min);
     try testing.expect(60 >= App.pane_split_min);
-    // The two-pane preview engages strictly before the interactive grid/zoom.
-    try testing.expect(App.pane_split_min < App.zoom_min);
 }
 
 test "detail two-column gate trips at 100 cols and falls back below (ROD-113)" {
@@ -2034,27 +2034,23 @@ test "Enter in single-column history (<60) opens the zoom + fetches (ROD-170)" {
     app.episodes.freeResults(app.gpa);
 }
 
-test "Enter in a 60-99 detail pane zooms instead of playing (ROD-170)" {
+test "Enter in a 60-99 detail pane plays, not zooms (ROD-259)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
-    app.active_pane = .detail; // focused on the gridless preview pane
+    app.active_pane = .detail; // focused on the in-pane grid (present at 60-99 now)
     app.term_cols = 80;
 
-    // Episodes are loaded (fetched on focus). If Enter wrongly played, it would
-    // start this episode — the bug ROD reported. It must drill to the zoom instead.
-    app.episodes.results = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "1" }});
-    app.episodes.for_id = try std.testing.allocator.dupe(u8, "a");
-    app.episodes.cursor = 0;
-
+    // No episodes loaded, so firePlay hits its `results orelse return` guard and
+    // spawns no playback thread. We assert the ROUTING that ROD-259 changed: Enter
+    // in the focused pane drills to play and no longer promotes to the full-screen
+    // zoom (the pre-259 dead step, back when the 60-99 pane was gridless).
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
-    try testing.expectEqual(.detail, app.active_view); // drilled into the zoom
-    try testing.expectEqual(.detail, app.active_pane); // pane focus carried into the zoom
-    try testing.expect(!app.playing); // …and did NOT start playback
-
-    app.episodes.freeResults(app.gpa);
+    try testing.expectEqual(.history, app.active_view); // stayed in the two-pane — no zoom
+    try testing.expectEqual(.detail, app.active_pane);
+    try testing.expect(!app.playing);
 }
 
 test "q from the zoom quits — Esc/h own the demote (ROD-170, ROD-210)" {
@@ -3837,21 +3833,23 @@ test "ROD-229: resume landing seeds the grouped ordinal so meta and grid stay on
     app.episodes.freeResults(app.gpa);
 }
 
-test "ROD-229: resume landing opens the zoom below zoom_min so the grid is visible" {
-    // The 60–99 band is the trap: the two-pane detail renders here, but its
-    // in-pane episode grid does NOT (that needs >= zoom_min) — it's a no-grid
-    // preview. A resume landing must show the grid, so below zoom_min it opens the
-    // full-screen zoom instead of focusing a gridless pane (the regression guard).
+test "ROD-259: resume landing focuses the in-pane grid at 60–99, no forced zoom" {
+    // The two-pane detail carries the in-pane grid at every width now (ROD-259),
+    // so a resume landing in the 60–99 band focuses the pane (grid visible)
+    // instead of promoting to the full-screen zoom — the pre-259 behavior this
+    // supersedes (originally the ROD-229 gridless-preview workaround).
     var app: App = .{};
     app.gpa = testing.allocator;
     app.config.landing = "last_watched";
-    app.term_cols = 80; // two-pane width, but below zoom_min → no in-pane grid
+    app.term_cols = 80; // two-pane width → in-pane grid, no zoom needed
     var recs = twoShowResumeHistory();
 
     try testTick(&app, .{ .history_loaded = &recs });
 
-    // The standalone zoom (the grid surface at any width), same grouped target.
-    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    // Stays in the History two-pane with the detail pane focused (the grid lives
+    // there), not the standalone zoom; same grouped target + fetched episodes.
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .history), app.active_view);
+    try testing.expectEqual(@as(@TypeOf(app.active_pane), .detail), app.active_pane);
     try testing.expectEqual(@as(usize, 1), app.list_cursor);
     try testing.expectEqualStrings("fr", app.episodes.for_id.?);
 

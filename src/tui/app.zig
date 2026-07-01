@@ -2500,14 +2500,13 @@ pub const App = struct {
         const ordinal = history.ordinalOf(self, rec.source, rec.source_id) orelse return;
         self.list_cursor = ordinal;
         // Open whichever surface actually SHOWS the episode grid at this width —
-        // the grid parked on the resume episode is the whole point. Only `>=
-        // zoom_min` renders the in-pane grid in the two-pane detail (below that
-        // the focused pane is a no-grid preview — see drawContent's history arm),
-        // so anything narrower goes straight to the full-screen zoom, the grid
-        // surface at any width. The spawn-failure call site runs before the first
-        // layout(), so term_cols is 0 there → the zoom branch, the correct
-        // single-surface fallback.
-        if (self.term_cols >= zoom_min) {
+        // the grid parked on the resume episode is the whole point. The two-pane
+        // detail renders the in-pane grid at any two-pane width now (ROD-259), so
+        // >= pane_split_min focuses the pane; below that (single column, no pane)
+        // the full-screen zoom is the only grid surface. The spawn-failure call
+        // site runs before the first layout(), so term_cols is 0 there → the zoom
+        // branch, the correct single-surface fallback.
+        if (self.term_cols >= pane_split_min) {
             self.active_pane = .detail;
             self.fireEpisodesForId(loop, io, provider, rec.source_id);
         } else {
@@ -2900,15 +2899,15 @@ pub const App = struct {
                 }
             },
             .history => {
-                // ROD-170: l/Enter mirrors Browse but "drills toward the grid."
-                // The grid lives in the in-pane view (>= zoom_min) or the zoom
-                // (any width). History never prefetches (ROD-156), so the fetch
-                // fires here on focus, against the just-focused record.
+                // ROD-170/ROD-259: l/Enter drills toward the grid, exactly like
+                // Browse. The in-pane grid renders wherever the two-pane exists
+                // (>= pane_split_min); below that the zoom is the only grid surface.
+                // History never prefetches (ROD-156), so the fetch fires here on
+                // focus, against the just-focused record.
                 if (self.active_pane == .list) {
                     if (self.selectedHistoryRecord()) |rec| {
                         if (self.term_cols >= pane_split_min) {
-                            // Two-pane: focus the detail pane + fetch (ready for
-                            // the in-pane grid at >= zoom_min, or the zoom below).
+                            // Two-pane: focus the detail pane + fetch its grid.
                             self.active_pane = .detail;
                             self.fireEpisodesForId(loop, io, provider, rec.source_id);
                         } else if (key.matches(vaxis.Key.enter, .{})) {
@@ -2917,21 +2916,10 @@ pub const App = struct {
                         }
                     }
                 } else if (key.matches(vaxis.Key.enter, .{})) {
-                    if (self.term_cols >= zoom_min) {
-                        // In-pane grid is visible → play the focused episode.
-                        self.firePlay(loop, io, provider);
-                    } else {
-                        // 60-99 preview pane (no in-pane grid): drill into the
-                        // zoom to reach the grid (already fetched on focus).
-                        self.detail_origin = .history;
-                        self.active_view = .detail;
-                        // active_pane is already .detail here (this is the
-                        // active_pane != .list arm), but set it explicitly to match
-                        // openHistoryZoom/openBrowseZoom — the zoom's grid render now
-                        // reads the focus model via episodeGridVisible (ROD-222), so
-                        // no zoom-entry path should leave it to entry-state luck.
-                        self.active_pane = .detail;
-                    }
+                    // Detail pane focused: the in-pane grid is present at every
+                    // two-pane width now (ROD-259) → play the focused episode.
+                    // Space still promotes to the full-screen zoom for a roomier grid.
+                    self.firePlay(loop, io, provider);
                 }
             },
             .detail => {
@@ -3360,12 +3348,10 @@ pub const App = struct {
     /// right-side detail pane, mirroring the Browse split. ROD-170 lowered this
     /// from 100 to 60 and unified Browse + History onto it: both views show the
     /// two-pane preview from 60 cols up. Below it, a single full-width list.
+    /// ROD-259 made it the single detail-surface threshold: detail focus carries
+    /// the in-pane grid at every two-pane width (the old zoom_min=100 grid gate,
+    /// which withheld it from History at 60-99, is retired).
     pub const pane_split_min: u16 = 60;
-
-    /// Width (in cols) at and above which the detail pane carries the interactive
-    /// episode grid and the Space-to-zoom affordance (ROD-170). Between
-    /// `pane_split_min` and this, the detail pane is the no-grid preview stack.
-    pub const zoom_min: u16 = 100;
 
     /// How long a fetched Popular-feed window stays fresh in the in-memory cache
     /// (ROD-239). Re-opening Discover or flipping back to a window within this
@@ -3409,12 +3395,11 @@ pub const App = struct {
                 // the right-side detail from pane_split_min (60) up — only when a
                 // record is focused, so empty/loading/error states keep the
                 // full-width single column (which also sidesteps the empty-state
-                // centering edge case). With the detail pane focused at >= zoom_min
-                // the pane is the full drawDetailPane (interactive episode grid);
-                // otherwise it's the no-grid preview stack — which covers list
-                // focus at every width and detail focus in the 60-99 band (no grid
-                // there). Rendering the grid only on focus also sidesteps stale
-                // episodes: the fetch fires on focus, never on cursor move.
+                // centering edge case). Detail focus renders the full drawDetailPane
+                // (interactive episode grid) at every two-pane width, matching Browse
+                // (ROD-259); list focus keeps the no-grid preview stack — a light
+                // glance while navigating. Rendering the grid only on focus also
+                // sidesteps stale episodes: the fetch fires on focus, never on cursor move.
                 const rec_opt = if (w >= pane_split_min) self.selectedHistoryRecord() else null;
                 if (rec_opt) |rec| {
                     const sp = paneSplit(w);
@@ -3424,7 +3409,7 @@ pub const App = struct {
                     // list pane instead of bleeding under the preview.
                     history.draw(self, &self.scratch, win, top, visible, sp.list_w, sp.list_w -| 2);
                     const detail_win = win.child(.{ .x_off = @intCast(sp.detail_x), .y_off = top, .width = sp.detail_w, .height = visible });
-                    if (self.active_pane == .detail and w >= zoom_min) {
+                    if (self.active_pane == .detail) {
                         detail.drawDetailPane(self, vx, writer, detail_win, sp.detail_w, visible, true);
                     } else {
                         detail.drawHistoryPreview(self, vx, writer, detail_win, sp.detail_w, visible, rec);
