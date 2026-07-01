@@ -23,8 +23,9 @@ const drawWrappedText = render.drawWrappedText;
 /// Pane width (in cols) at and above which a History-opened detail pane splits
 /// into two columns (cover + header left, synopsis + grid right) — ROD-113.
 /// Measured against the detail *pane* width, not the terminal (ROD-258), so the
-/// split only engages when the columns genuinely fit. Aligns with the §3.2
-/// cover-art tier so the right column stays ≥ ~34 cols.
+/// split only engages when the columns genuinely fit. At the threshold this
+/// splits into a 38-col left (cover + header) and a ~60-col right (synopsis +
+/// grid), both widening with the pane.
 pub const detail_two_col_min: u16 = 100;
 
 /// Pure predicate for the two-column gate — `pane_w` is the detail pane width
@@ -547,7 +548,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     // pane at term 100 into a ~22-col cover column that clipped the meta line.
     // `w` is the width the columns are actually carved from, so two-column
     // engages only when the pane can afford it (detail_two_col_min cols of pane,
-    // ≈ term ≥ ~169 once the 38% list is subtracted); below that the
+    // term ≥ 168 once the 38% list is subtracted); below that the
     // single-column stack renders instead. The trade is a ~2-col shift of the
     // full-screen zoom's boundary (pane there is term-2) — cosmetic, and correct.
     if (two_col and isTwoColumn(w)) {
