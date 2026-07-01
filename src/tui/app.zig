@@ -3008,8 +3008,8 @@ pub const App = struct {
             self.active_pane == .detail)
         {
             // Promote a focused detail pane to the zoom. Works at any two-pane
-            // width: at 60-99 the zoom is how you reach the grid the pane omits
-            // (episodes were already fetched when the pane took focus).
+            // width — the zoom is a roomier grid than the in-pane one, not the
+            // only way to reach it (episodes were fetched when the pane took focus).
             self.detail_origin = if (self.active_view == .history) .history else .browse;
             self.active_view = .detail;
         } else if (self.active_view == .history and self.active_pane == .list and
@@ -3029,10 +3029,11 @@ pub const App = struct {
 
     /// Episode-grid cursor (ROD-170): while any detail surface is focused, j/k/g/G
     /// move the episode cursor. Consumes *every* key in that context (returns true)
-    /// — non-nav keys are inert there, matching the pre-split fallthrough. At 60-99
-    /// History has no in-pane grid (ep_len == 0), so j/k are inert and h returns to
-    /// the list. Returns false when no detail surface is focused, leaving j/k/g/G
-    /// to onListCursorKey.
+    /// — non-nav keys are inert there, matching the pre-split fallthrough. The grid
+    /// renders at every two-pane width now (ROD-259), so j/k move a visible cursor
+    /// whenever episodes are loaded; while they are still loading (ep_len == 0) the
+    /// keys are inert but still consumed. Returns false when no detail surface is
+    /// focused, leaving j/k/g/G to onListCursorKey.
     fn onEpisodeGridKey(self: *App, key: vaxis.Key) bool {
         const in_grid = (self.active_view == .browse and self.active_pane == .detail) or
             self.active_view == .detail or

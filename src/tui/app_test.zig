@@ -2001,13 +2001,13 @@ test "Enter in history focuses the detail pane + fires episodes at zoom width (R
     app.episodes.freeResults(app.gpa);
 }
 
-test "Enter in history at 60-99 focuses the preview pane + fetches (ROD-170)" {
+test "Enter in history at 60-99 focuses the in-pane grid + fetches (ROD-170/ROD-259)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
-    app.term_cols = 80; // preview tier: focus the pane + fetch (so the zoom is ready)
+    app.term_cols = 80; // two-pane: focus the pane + fetch its in-pane grid
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
     try testing.expectEqual(.history, app.active_view);
@@ -2162,14 +2162,14 @@ test "Space in the zoom demotes back to the two-pane detail focus (ROD-170)" {
     try testing.expectEqual(.detail, app.active_pane);
 }
 
-test "Space promotes from a 60-99 preview pane to the zoom (ROD-170)" {
+test "Space promotes from a 60-99 detail pane to the zoom (ROD-170/ROD-259)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     var recs = sampleHistory();
     app.setHistory(&recs);
     app.active_view = .history;
     app.active_pane = .detail;
-    app.term_cols = 80; // preview tier: the zoom is how you reach the grid
+    app.term_cols = 80; // two-pane: Space promotes the in-pane grid to the roomier zoom
 
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expectEqual(.detail, app.active_view); // promoted to the zoom
