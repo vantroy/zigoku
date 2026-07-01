@@ -1,0 +1,48 @@
+# demo.kbeats — hero demo (retires demo.tape). Watchlist master-detail with LIVE
+# Kitty-graphics cover art, then a typed filter down to a known cover. The point of
+# ROD-255: covers render as REAL pixels here, not the vhs halfblock fallback.
+#
+# READ-ONLY (safe on the real store): only H (nav), j/k (move), / + type (filter),
+# l (detail). The runner lints out any mutating key. NB: no `Return` inside a Discover
+# detail (that plays) — the hero stays in the watchlist view and ends on `l`.
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/demo.kbeats   → docs/media/demo.gif
+
+sleep 2                 # boot + splash settle
+key shift+h             # into the watchlist two-pane (real store)
+sleep 1200ms
+
+# Pre-warm the cover cache with a silent scroll pass BEFORE recording, so the right-pane
+# cover paints instantly during the take instead of flashing the "no art yet" placeholder
+# on each selection change (ROD-255 review).
+key j j j
+sleep 400ms
+key k k k
+sleep 900ms
+
+record demo.gif fps=15 width=960
+sleep 700ms
+
+# Browse the watchlist — the right-pane cover updates per selection (now warm, no flash).
+# Long holds so the painted cover dominates each beat.
+key j
+sleep 1400ms
+key j
+sleep 1400ms
+key j
+sleep 1400ms
+
+# Filter to a known cover — typing animates frame-to-frame.
+key slash
+sleep 300ms
+type frieren
+sleep 600ms
+key Return
+sleep 1500ms
+
+# Open the detail and REST on it — the money frame (cover + kanji chips + synopsis).
+# End here: this is the best-looking frame, so it's the loop point.
+key l
+sleep 2600ms
+
+endrecord

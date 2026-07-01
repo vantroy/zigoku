@@ -1,0 +1,45 @@
+# stills.kbeats — populated-watchlist + themes tour (retires stills.tape). Cycles the
+# palette in Settings to re-theme a cover detail, then lands on the re-themed view.
+#
+# SAFE: config is ISOLATED by the runner (XDG_CONFIG_HOME → a throwaway), so the
+# palette-save on leaving Settings never touches your real ~/.config/zigoku. READ-ONLY
+# on the watchlist; no mutating keys (the runner lints them out).
+#
+# TUNABLE: the `j` count to reach the palette row depends on the Settings layout — if
+# settings.png isn't focused on `palette`, adjust the count. (Rod tweaks timing/keys.)
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/stills.kbeats
+
+sleep 2
+key shift+h
+sleep 1500ms
+grab watchlist.png              # populated watchlist, grouped status + progress bars
+
+key shift+s
+sleep 1500ms
+key j j j j j j j               # down to the palette row (Interface section)
+sleep 600ms
+resize 1280x800                 # narrow — good for the settings still AND the tour gif
+                                # (can't resize mid-record, so record the whole tour here)
+grab settings.png               # settings, palette row focused
+sleep 500ms
+
+record stills.gif fps=15 width=960
+sleep 700ms
+key l                           # cycle palette forward: terminal_ghost → phosphor
+sleep 1300ms
+key l                           # → nord
+sleep 1300ms
+key l                           # → tokyonight
+sleep 1300ms
+key shift+h                     # back to the re-themed watchlist (SAVES → toast fires)
+# Hold past the toast's 2.5s auto-dismiss so the re-themed frames are clean (ROD-255
+# review): the "settings saved" toast otherwise overlaps the footer and clips the synopsis.
+sleep 2800ms
+key l                           # focus the detail (re-themed cover), toast now gone
+sleep 1400ms
+endrecord                       # gif ends on the clean re-themed detail
+
+resize 1596x996                 # back to wide for the two-pane re-themed detail still
+sleep 800ms
+grab detail-themed.png          # two-pane detail, re-themed to tokyonight, toast-free
