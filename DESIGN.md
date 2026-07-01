@@ -288,17 +288,17 @@ Sample widths:
 | 120 cols | 45 | ≈70 | 20-col cover |
 | 160 cols | 60 | ≈95 | 20-col cover |
 
-**Named threshold constants (as-built / ROD-170):**
+**Named threshold constants (as-built / ROD-170, `zoom_min` retired ROD-259):**
 
 | Constant | File | Value | Meaning |
 |---|---|---|---|
-| `App.pane_split_min` | `app.zig` | `60` | Both Browse and History split to two panes at or above this width. Below this, single-column list only. |
-| `App.zoom_min` | `app.zig` | `100` | At or above this width the interactive episode grid renders **in-pane** (and `Enter` plays from it; `Space` promotes to the zoom). Below it the in-pane grid is suppressed — the grid is reached via the full-screen zoom, which `Enter`/`Space` open at any width. |
-| `detail_two_col_min` | `view/detail.zig` | `100` | Gates the two-internal-column split (§5.4a) wherever a detail pane is drawn, keyed to that pane's own width — not the terminal (ROD-258). Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term − 2`). |
+| `App.pane_split_min` | `app.zig` | `60` | Both Browse and History split to two panes at or above this width; below it, single-column list only. Also the single detail-surface threshold (ROD-259): at or above this width, a focused detail pane renders its interactive episode grid **in-pane** and `Enter` plays from it; `Space` still promotes to the roomier full-screen zoom at any width. The old `App.zoom_min = 100` mid-tier gate — which withheld the in-pane grid from History at 60–99 cols, forcing `Enter`/`Space` to drill into the zoom just to reach it — is deleted. |
+| `detail_two_col_min` | `view/detail.zig` | `100` | Gates the two-internal-column split (§5.4a) wherever a detail pane is drawn, keyed to that pane's own width — not the terminal (ROD-258). Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term − 2`). Unrelated to the retired `zoom_min` — this constant is untouched by ROD-259. |
 
-The `zoom_min = 100` threshold aligns with the §5.3 episode grid — grid columns
-`≈ detail_w / 5` give ≈ 8 usable columns at 100 cols, adequate for the 12–26 ep
-majority. The zoom earns its keep for long-runners at 160+ cols (≈ 14 columns, §5.4a).
+The `pane_split_min = 60` threshold is now where this in-pane grid begins —
+grid columns `≈ detail_w / 5` give a narrow but real ≈ 5 columns at 60 cols,
+growing to ≈ 8 usable columns at 100 cols, adequate for the 12–26 ep majority.
+The zoom earns its keep for long-runners at 160+ cols (≈ 14 columns, §5.4a).
 
 ### 3.3 Cover Art Block
 
@@ -1063,8 +1063,10 @@ Notes:
 
 ### 5.3 Detail Zoom — Full-Screen
 
-The user pressed `Space` from a focused detail pane (`active_pane = .detail`,
-`w ≥ 100`). `active_view` becomes `.detail` (full-screen zoom). The list is gone;
+The user pressed `Space` from a focused detail pane (`active_pane = .detail`) —
+promotion has no width gate, any two-pane width qualifies (`w ≥ pane_split_min`);
+the 120-col terminal below is one illustration of it. `active_view` becomes
+`.detail` (full-screen zoom). The list is gone;
 the canvas is all detail. `Esc` demotes back to the two-pane view with `active_pane
 = .detail`. This surface is reached identically from Browse and History.
 
@@ -1180,17 +1182,20 @@ History now uses the same two-pane grammar as Browse. The section title remains
 
 **Width tiers:**
 
-The grid lives in **one of two places**: the in-pane view (`w ≥ 100`) or the
-full-screen zoom (any width). `Enter`/`Space` "drill toward the grid":
+The grid lives in **one of two places**: the in-pane view (`w ≥ pane_split_min`,
+i.e. any two-pane width) or the full-screen zoom (any width, roomier). Below
+`pane_split_min` there is no pane at all, so `Enter`/`Space` "drill toward the grid"
+by opening the zoom directly:
 
 | `w` | Layout |
 |---|---|
 | `w < 60` | Single-column list (§5.4). Clamp `active_pane = .list`. No pane to focus, so `Enter`/`Space` open the **zoom** directly (the only detail surface here). |
-| `60 ≤ w < 100` | Two panes. Detail = preview stack (cover + title + alt titles + score + chips + synopsis). No *in-pane* grid. Pane toggle `h`/`l` works; `Enter`/`Space` from the focused pane promote to the **zoom** to reach the grid. |
+| `60 ≤ w < 100` | Two panes. Detail = full `drawDetailPane` with the interactive grid in-pane (narrower here: `detail_w ≈ 25` at `w = 60` → ≈ 5 grid columns). Pane toggle `h`/`l` works; `Enter` plays the focused episode; `Space` promotes to the roomier full-screen **zoom**. |
 | `w ≥ 100` | Two panes. Detail = full `drawDetailPane` with the interactive grid in-pane. `Enter` plays the focused episode; `Space` promotes to the zoom. |
 
-Episodes fetch on focus at any two-pane width (`w ≥ 60`), so the zoom always has
-its grid ready; below 60 the fetch fires when `Enter`/`Space` open the zoom.
+Episodes fetch on focus at any two-pane width (`w ≥ 60`), so the in-pane grid (or
+the zoom, if promoted) always has its data ready; below 60 the fetch fires when
+`Enter`/`Space` open the zoom.
 
 Empty / loading / error states (no focused record) fall back to the §5.4
 single-column layout — no half-empty split. The split only engages when a
@@ -1271,14 +1276,16 @@ Notes:
 - The detail pane uses `paneSplit(w)` geometry (§3.2). At 120 cols: list_w=45,
   detail_w≈70. Cover tier from `detail_w`: ≥40 → 20-col cover.
 - The focused entry drives the detail pane. Focus change = immediate update.
-- No *in-pane* grid at `60 ≤ w < 100`. The in-pane grid appears only when
-  `w ≥ 100` and `active_pane = .detail`; below that the grid is reached via the
-  zoom (`Enter`/`Space` from the focused preview pane).
-- `Space` (any two-pane width) and, at `60 ≤ w < 100`, `Enter` from detail-pane
-  focus promote to the full-screen zoom (`active_view = .detail`, §5.3). At
-  `w ≥ 100` `Enter` plays instead (the grid is in-pane). `Esc`/`Space` demote
-  back to the two-pane (`active_pane = .detail`) when there's room, else to the
-  list (`w < 60`); `q` quits the app (ROD-210 — Esc/Space/`h` own the demote).
+- The in-pane grid renders whenever the detail pane has focus, at every two-pane
+  width (`w ≥ pane_split_min` = 60, `active_pane = .detail`) — narrower at 60–99
+  cols (`detail_w ≈ 25` → ≈ 5 columns), roomier from 100 up. `zoom_min` is retired
+  (ROD-259); `pane_split_min` is the only detail-surface threshold now.
+- `Enter` from a focused detail pane plays the focused episode, at any two-pane
+  width — the grid is always in-pane there. `Space` (any two-pane width, and
+  directly from the `w < 60` list) promotes to the roomier full-screen zoom
+  (`active_view = .detail`, §5.3). `Esc`/`Space` demote back to the two-pane
+  (`active_pane = .detail`) when there's room, else to the list (`w < 60`); `q`
+  quits the app (ROD-210 — Esc/Space/`h` own the demote).
 - The row-1 right-meta column (`[▸12]`, `○`, `◐` episode badge) is **deferred**
   (ROD-227): row 1 is title-only at every width, so the title takes full `list_w`.
   When the §5.4 meta returns it would re-earn its column on the wider terminals.
@@ -2116,7 +2123,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Persistent source-error toast (not auto-dismiss) | A 2.5s toast for "network is gone" is misleading — it disappears and the user thinks the problem resolved. A persistent toast with a bottom-bar state change is honest about the ongoing condition. | The recovery path (first successful response) clears it automatically, so there is no manual-dismiss burden. |
 | Startup loading screen skipped under ~200ms | A flash of a loading screen for a DB that opens in 50ms is worse than nothing — it reads as a glitch. The threshold is a design-level call, not a perf target. | Tune if the DB open is consistently slower or faster on target hardware. |
 | Cover block uses 7 / 5 character rows, not 28 / 20 | Spec §3.2 states `20×28` and `14×20` cell blocks. Implementation renders `cover_h = 7` (≥60 detail cols) and `cover_h = 5` (≥40 detail cols). The aspect ratio is preserved (7/5 = 28/20 = 1.4). The 4× scale-down reflects practical terminal character-row heights — a 28-row cover block would dominate the detail pane. | Revisit when Kitty protocol image support lands; pixel-accurate sizing may allow larger cover blocks without dominating the layout. |
-| Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. At the time, `detail_two_col_min = 100` was zoom-only, gated on the terminal width (full canvas, not the ~58% pane) — see the ROD-258 row below, which re-keys it to the pane width and pulls the persistent two-pane split under the same gate. | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
+| Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. **Resolved (ROD-259):** this is historical — `zoom_min` was retired and the in-pane grid now renders at every two-pane width from `pane_split_min` (60) up; see the `ROD-259: retire zoom_min` row in §10.7. At the time, `detail_two_col_min = 100` was zoom-only, gated on the terminal width (full canvas, not the ~58% pane) — see the ROD-258 row below, which re-keys it to the pane width and pulls the persistent two-pane split under the same gate. | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
 | `detail_two_col_min` re-keyed from terminal width to detail-pane width (ROD-258) | The History two-pane force-split the detail into two internal columns whenever the *terminal* was ≥ 100 cols, but with the list co-visible the detail pane is only `term − list` (~58 cols at term 100) — a ~22-col cover column that clipped the meta line. `isTwoColumn` now gates on the pane width the columns are actually carved from (`w`, not `term`). One constant, two surfaces: the History persistent two-pane needs its `detail_w` pane to clear 100, i.e. `term ≥ 168` (once the 38% list is subtracted) — considerably higher than the old `term ≥ 100`. The full-screen zoom's pane is `body_w = term − 2`, so its threshold only shifts ~2 cols, to `term ≥ 102` — cosmetic. | If `term ≥ 168` proves too conservative for the persistent split in practice (most 100–167-col users stay single-column), consider a lower threshold dedicated to that surface instead of sharing the zoom's gate. |
 | First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist originally pointed to Browse (its `/` filter has nothing to filter) — repointed to **Discover** in ROD-254 once that zero-input feed shipped (see below); active search/filter counts carry a `[catalogue · N]` / `[history · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the receded secondary hint (`P save`, the empty-History `B search`) drops to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | **Done (ROD-254):** the popular feed shipped as the separate **Discover** view (ROD-247), so the empty-History pointer moved Browse → Discover (an empty watchlist is a user who doesn't yet know what to watch — Discover's job). Empty-Browse "search the catalogue" still stands (Browse stays search-only). |
 
@@ -2202,14 +2209,15 @@ keybinds.
 |---|---|---|---|
 | Browse | `active_view = .browse` | Optional (config `landing = "browse"`, §9.2) | Two-pane: list column + detail column (§3.2). `w < 60` collapses to list only. |
 | History | `active_view = .history` | Default (config `landing = "history"`, §9.2) | Two-pane: list + detail, identical grammar to Browse (ROD-170, §5.4a). `w < 60` collapses to list only. |
-| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History or Discover** at any width — and via `Enter` when there is no in-pane grid (`60 ≤ w < 100`), or directly from the History list at `w < 60`. The universal grid surface. |
+| Detail | `active_view = .detail` | No | Full-screen zoom: detail + episode grid (§5.3). Reached with `Space` from a focused detail pane in **Browse or History or Discover** at any width, or directly from the History list at `w < 60` (no pane to focus). The universal grid surface — the in-pane pane also carries its own (narrower) grid from `pane_split_min` up, so `Enter` there plays instead of promoting (ROD-259). |
 | Discover | `active_view = .discover` | No | Single-pane: full-canvas card grid (§3.8, §5.7). No `active_pane` semantics. Reached with `D` or `F3` from any view. |
 | Settings | `active_view = .settings` | No | Single-pane: full-width settings rows (§5.5) |
 
 **`.detail` is both an `active_pane` value within Browse/History and a standalone `active_view` (the zoom).**
 Browse's and History's right-hand detail *pane* (§10.3, reached with `l`/`Enter`) is the
 default "triage scrub" surface. The standalone Detail view is the full-screen zoom (§5.3),
-reached with `Space` from a focused detail pane in **either** Browse or History when `w ≥ 100`.
+reached with `Space` from a focused detail pane in **either** Browse or History at
+any two-pane width (`w ≥ pane_split_min`, ROD-259 — previously gated at `w ≥ 100`).
 `detail_origin` records the entry point (`.browse`, `.history`, or `.discover` — ROD-243); all arms are live.
 `Esc` from zoom demotes back to the two-pane with `active_pane = .detail` (`Space`/`h`
 do the same). `q` no longer backs out — it quits the app (ROD-210). See §10.4 for the full Esc chain,
@@ -2248,12 +2256,14 @@ the app (persisting first); `Esc` does **not** leave Settings — it is a no-op 
 
 **Entering the standalone Detail zoom** is not a view-switch keybind — it is a
 promote. `Space` from `active_pane = .detail` opens `active_view = .detail` at any
-two-pane width in **either Browse or History**; at `60 ≤ w < 100` `Enter` from the
-focused pane promotes too (no in-pane grid to play), and at `w < 60` `Enter`/`Space`
-from the History list open the zoom directly (no pane to focus). At `w ≥ 100`
-`Enter` from the detail pane plays instead — the grid is in-pane. `Esc`/`Space`
-demote back to the two-pane (`active_pane = .detail`) when there's room, else to
-the list; `q` no longer backs out — it quits the app (ROD-210, §10.4).
+two-pane width in **either Browse or History** — no width gate; the zoom is always
+available as the roomier grid. `Enter` from a focused detail pane plays the focused
+episode instead, at any two-pane width — the in-pane grid is present from
+`pane_split_min` up (ROD-259 retired the old `60 ≤ w < 100` drill-to-zoom gap). At
+`w < 60` there is no pane, so `Enter`/`Space` from the History list open the zoom
+directly. `Esc`/`Space` demote back to the two-pane (`active_pane = .detail`) when
+there's room, else to the list; `q` no longer backs out — it quits the app
+(ROD-210, §10.4).
 `Enter`/`l` from the list step into the in-view detail *pane* first
 (§10.3c) whenever there is one (`w ≥ 60`).
 
@@ -2445,9 +2455,11 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
 Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
 Note: `q` quits the app (ROD-210) — `h`/`Esc` return focus to the list. Browse uses this string at all two-pane
-widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. At
-`60 ≤ w < 100` there is no in-pane grid, but `Enter` plays the loaded
-episode and `Space` promotes to the full-screen zoom. Episodes load on detail
+widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. The
+in-pane grid renders at every two-pane width (narrower at `60 ≤ w < 100`:
+`detail_w ≈ 25` at `w = 60` → ≈ 5 columns) — Browse has always shown it there;
+`Enter` plays the focused episode and `Space` promotes to the full-screen zoom.
+Episodes load on detail
 entry, not on list hover (ROD-202: parity with History — scrolling Browse never
 fires a fetch). At 80 cols the string fits
 within the ~74-char budget:
@@ -2477,19 +2489,23 @@ catalogue search) isn't obvious in a watchlist without the hint. Over budget at
 
 Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
-Identical to Browse detail pane focused — symmetric two-pane grammar.
+Identical to Browse detail pane focused — symmetric two-pane grammar. Also
+identical, since ROD-259, to History's `60 ≤ w < 100` tier below — the
+bottom-bar hint no longer varies within History's two-pane range.
 
-#### History — normal, detail pane focused (60 ≤ w < 100, no zoom)
+#### History — normal, detail pane focused (60 ≤ w < 100)
 
 ```
-  ▌  enter/space zoom · h back · q quit
+  ▌  hjkl scroll · h back · enter play · space zoom · q quit
 ```
 
-Underlined: `enter`, `space`, `h`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
 
-No in-pane grid at this width. Both `Enter` and `Space` drill into the
-full-screen zoom (the only path to the grid here). The help string makes
-that explicit: `enter/space zoom`.
+The in-pane grid renders at this width too now (ROD-259) — narrower
+(`detail_w ≈ 25` at `w = 60` → ≈ 5 columns) but real. `Enter` plays the focused
+episode directly; `Space` still promotes to the roomier full-screen zoom.
+Identical string to the `w ≥ 100` tier above — History's bottom-bar hint no
+longer has a mid-tier variant.
 
 #### Detail (zoom) — normal
 
@@ -2649,9 +2665,11 @@ if (key.matches(' ', .{})) {
         // Demote: same as Esc from zoom.
         self.active_view = if (self.detail_origin == .browse) .browse else .history;
         self.active_pane = .detail;
-    } else if (self.active_pane == .detail and self.term_w >= zoom_min and
+    } else if (self.active_pane == .detail and
         (self.active_view == .browse or self.active_view == .history))
     {
+        // ROD-259: no width gate here — the in-pane grid (and the roomier zoom
+        // it promotes to) is available at every two-pane width.
         self.detail_origin = if (self.active_view == .browse) .browse else .history;
         self.active_view = .detail;
     }
@@ -2714,7 +2732,8 @@ if (self.input_mode == .normal and key.matches('q', .{})) {
 | `active_view` and `active_pane` are separate from §7.6's `mode` enum | The §7.6 `mode` enum collapses view and detail-open state into one field. ROD-72 does not implement detail navigation — that is ROD-74. Introducing `mode` now would mean a stub `detail` branch with no backing implementation, which creates dead code and misleads future readers about what is wired. The two-field approach is honest about the current build state. | **Resolved (ROD-74 / ROD-180):** detail navigation landed and the two-field model was *kept*, not collapsed into `mode`. `.detail` was promoted to a standalone `active_view` (see §10.1) while remaining an `active_pane` value in Browse; `mode` was never introduced. The two fields proved the right shape. |
 | Browse top-bar chip renders `⠋ search` in `color.fg3` instead of the spec's season/year kanji in `color.focus` | Browse is a stub in M3 — there is no feed and no active season context to display. Rendering the kanji chip in `color.focus` would promise a season that doesn't exist. The spinner glyph + dim color signals "idle, awaiting search" and matches the Browse content area's own empty-state treatment. The spec's kanji chip is the target state for when Browse has a live feed (ROD-73+). | **Resolved (ROD-186):** Browse now has a live feed, so the spinner stub retired. Rather than *replace* the chip slot, the season/year chip was added *beside* the view label as an add-on (Rod's call — "huge amount of space there"), forcing a differentiation decision (next row). |
 | **ROD-186: season chip is an add-on in `text.muted`, not a replacement in `color.focus`** | The original §3.4/§10.3b spec gave the season chip `color.focus` as the *only* chip. The coexistence decision (keep the view label, add the season chip) put two chips side by side — both specced cyan, which would blur into one blob (§2.3: chips are distinguished by color alone, no boxes). Demoting the season chip to `text.muted` (fg2) makes them distinct with zero extra glyphs, matches how season/year already reads in History rows (§5.4), and leaves `color.focus` to mean one thing on the left (view identity) while the cyan `·` owns the right edge. Content rule (Rod): selected show's season+year, falling back to the current cour from the system clock — except the detail zoom, which is committed to one show and shows only its season (no fallback). Rejected: a `░`/`·` separator between the two cyan chips (adds chrome, §0). | If user testing shows the muted season chip is missed, brighten it one step (text.muted → text.primary) before reaching for `color.focus`. |
-| **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, title/meta/cover update on cursor move; episodes load on detail-pane entry, not hover — ROD-202) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, `w ≥ 100`) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
+| **ROD-170: "demote not retire" — one navigation grammar, two zoom levels** (ROD-183 amendment) | The original ticket scope said "retire `active_view == .detail`." The amendment (ROD-170 comment, 2026-06-20) corrects this: the full-screen detail is not retired — it is demoted to an opt-in zoom, shared symmetrically by Browse and History. Two use cases are both real: *triage scrub* (persistent two-pane preview — list stays put, title/meta/cover update on cursor move; episodes load on detail-pane entry, not hover — ROD-202) and *committed engagement* (full-screen zoom — detail gets the whole canvas + denser episode grid). The two-pane is the default; zoom is earned. The density argument: at 120 cols the persistent pane gives ~8 grid columns (adequate for 12–26 ep titles); full-screen gives ~14 (meaningful gain for long-runners like One Piece/Naruto). The zoom earns its keep for dense content without inflicting it on everyone. History adopts the Browse two-pane grammar (h/l pane toggle, same `·` dim/lit logic, same width tiers) and both views share the same zoom key (`Space` from `active_pane = .detail`, any two-pane width — `w ≥ pane_split_min`; ROD-259 dropped this from the original `w ≥ 100` gate, see the `ROD-259: retire zoom_min` row below) and Esc-demote semantics. `detail_origin` (`.browse`\|`.history`) was previously `.history`-only; both arms are now live. | Revisit if the episode grid in the persistent pane turns out to be sufficient for all practical content (would argue for removing the zoom as unnecessary complexity). |
 | **ROD-170: `Space` as zoom toggle (promote + demote)** | Available keys at the time of selection: Enter already plays episodes from the detail pane, so Enter-to-zoom would collide with Enter-to-play. `Space` is unused in Browse/History (it is Settings-only as a toggle). `Space` = "expand/contract zoom" is a familiar idiom (Preview in macOS Finder, spacebar-preview in many TUIs). Symmetric toggle (same key promotes and demotes) is more learnable than an asymmetric promote-only with Esc-only demote. `Esc` still demotes as the canonical "back" key; `Space` and `Esc` are equivalent in zoom context. Rejected alternatives: `z` (vim `zt`/`zb` center-scroll ambiguity), `o` (unused but less obvious), `Tab` (reserved for future pane cycling). | If `Space` collides with a future keybind, `z` is the next candidate. |
 | **ROD-170: zoom Esc demotes to `.detail` pane, not `.list`** | The user arrived at zoom via `Space` from `active_pane = .detail`. Esc undoes one step — demoting to the detail pane is the precise inverse; jumping straight to `.list` would skip a level, jarring on a long episode list the user was navigating. `Space`/`h` demote identically. (Exception: at `w < 60` there is no pane to land on, so they demote to the single-column list.) ROD-210 retired `q` as a "full back-out" — `q` quits now, and Esc/`Space`/`h` are the only demote path. | No revisit expected. |
-| **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on detail-pane entry at any two-pane width (Browse and History, ROD-202), so the zoom's grid is always ready once the detail pane has been entered. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | Revisit if a future design gives the 60–99 pane its own usable in-pane grid — that would remove the Enter-drills-to-zoom hop. |
+| **ROD-170: zoom is the universal grid surface — `Enter` drills toward the grid (Phase B smoke-test correction)** | The original Phase B reconciliation specced the zoom as `Space`-only, gated at `w ≥ 100`, with `Enter`/`l` a no-op at `w < 60` and the 60–99 pane a pure preview. Smoke testing surfaced two bugs: (1) at `60 ≤ w < 100` the gridless preview still let `Enter` call `firePlay` against stale episodes — playing an episode you can't see; (2) at `w < 60` `Enter`/`Space` dead-ended, leaving detail unreachable on a narrow terminal. Both share one root: play/zoom weren't tied to where the grid is actually visible. Corrected model: the grid lives in the in-pane view (`w ≥ 100`) or the full-screen zoom (any width), and `Enter` "drills toward the grid, then plays" — `<60` list opens the zoom, `60–99` pane opens the zoom (not play), `≥100` pane plays, zoom plays. `Space` opens the zoom from any detail context (and from the `<60` list directly). Episodes fetch on detail-pane entry at any two-pane width (Browse and History, ROD-202), so the zoom's grid is always ready once the detail pane has been entered. Demote is width-aware: back to the pane (`w ≥ 60`) or the list (`w < 60`). This supersedes the "zoom not available below 100 / Enter no-op at `<60`" wording in the original §5.4a/§10.1/§10.2 reconciliation, corrected in-place (history kept: see the Phase B review commit). | **Resolved (ROD-259):** the 60–99 pane now renders its own in-pane grid — see the row below. |
+| **ROD-259: retire `zoom_min` — the in-pane grid renders at every two-pane width** | The previous row's trigger fired. History's detail pane withheld its episode grid below `zoom_min` (100), so focusing an item at 60–99 cols landed on a gridless preview and `Enter`/`Space` had to drill an extra step into the full-screen zoom just to reach the grid — a dead step Browse never had (Browse has rendered its in-pane grid from `pane_split_min` up since ROD-170). ROD-259 unifies the two: the in-pane grid now renders wherever the two-pane exists, keyed off `pane_split_min` alone. Consequences: at 60–99, `Enter` from a focused detail pane now plays the focused episode instead of drilling to the zoom (`Space` still promotes to it, for a roomier grid — §5.4a); resume-landing focuses the in-pane grid instead of force-opening the zoom; the History bottom-bar hint collapses to one line at every two-pane width (the 60–99-only two-line variant is gone). `zoom_min` is deleted from `app.zig` — `pane_split_min = 60` is the single detail-surface threshold for both Browse and History. | No revisit expected — this was the terminal case for the two-pane grid threshold; a future change would need a new reason to reintroduce a mid-tier gate. |

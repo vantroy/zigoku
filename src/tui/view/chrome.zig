@@ -184,18 +184,13 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // ROD-170: History is a two-pane like Browse. List focus keeps the
         // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
-        // Browse detail line, adding the Space zoom only where the grid lives
-        // (>= zoom_min) — in the 60-99 preview band there is nothing to play/zoom.
+        // Browse detail line — the in-pane grid renders at every two-pane width
+        // now (ROD-259), so enter plays and Space promotes to the roomy zoom.
         .history => if (self.history.len == 0)
             "D discover · B browse · q quit"
         else switch (self.active_pane) {
             .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit",
-            // At >= zoom_min the grid is in-pane (enter plays); in the 60-99
-            // preview band there is no grid, so enter/space drill into the zoom.
-            .detail => if (w >= App.zoom_min)
-                "hjkl scroll · h back · enter play · space zoom · q quit"
-            else
-                "enter/space zoom · h back · q quit",
+            .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
