@@ -27,35 +27,44 @@ A terminal anime browser & player, built from scratch in [Zig](https://ziglang.o
 
 ## Screenshots / Demo
 
-![Demo — Watchlist, Browse, search, enriched detail, episode grid](docs/media/demo.gif)
+![Demo — live watchlist cover art, filtered down to a title's detail](docs/media/demo.gif)
 
-*Hero: Watchlist → Browse → search → enriched detail → episode grid, play-ready.
-The `enter` affordance is lit on the episode row — playback hands off to `mpv` from there.
-Covers render as halfblock cells here; the Kitty-graphics shots below show true cover art.*
+*Hero: real cover art, painted straight to the framebuffer via the Kitty graphics
+protocol — no halfblocks, no ASCII. The watchlist's cover repaints on every selection,
+a filter narrows the list to one title, and its detail rests on cover, kanji chips, and
+synopsis.*
 
 ---
 
-![Detail pane with Kitty-graphics cover art, kanji chips, synopsis, and episode grid](docs/media/detail-cover.png)
+![Discover — a ranked wall of real cover art, sweeping and reloading live](docs/media/discover.gif)
 
-*Detail pane with real cover art rendered via the Kitty graphics protocol (kitty / ghostty / WezTerm),
-kanji metadata chips, reflowed synopsis, and the episode grid with resume `▸` / watched `●` markers.*
+*Discover: a ranked wall of real cover art — ten shows a screen, across `Daily` /
+`Weekly` / `Monthly` / `All-Time`. Moving the selection sweeps cover to cover; switching
+the ranking window reloads a fresh wall, live from AllAnime + AniList.*
 
-![Browse — live search results with the focused show's cover art rendered inline](docs/media/browse-covers.png)
+![Discover detail — cover, kanji chips, score, synopsis, and episode grid](docs/media/detail-cover.png)
 
-*Browse: a live search (`dragon ball`) with results on the left and the focused show's cover art
-rendered inline via Kitty graphics on the right — kanji chips and synopsis alongside.*
+*Discover detail: one result opened — real cover art, kanji metadata chips, AniList
+score, reflowed synopsis, and the episode grid, in a single pane.*
 
-![Watchlist — grouped status headers and progress bars](docs/media/history.png)
+---
 
-*Real watchlist: grouped status headers (`Watching`, `Planning`, …) and per-show progress bars.*
+![Browse — live catalogue search, results and cover art streaming in](docs/media/browse.gif)
 
-![Settings tab — palette row focused](docs/media/settings.png)
+*Browse: type a query and the catalogue search runs live — results and their cover art
+stream into the two-pane view as AllAnime and AniList answer. Opening a result lands on
+its detail.*
 
-*Settings tab with the palette row focused — four built-in themes: `terminal_ghost`, `phosphor`, `nord`, `tokyonight`.*
+![Watchlist — grouped status headers, progress bars, cover on selection](docs/media/history.png)
 
-![Themes tour — palette cycle through all four themes](docs/media/stills.gif)
+*Watchlist, scrolled into `planning`: grouped status headers, per-show progress bars,
+and the real cover for whichever title is selected.*
 
-*Themes tour: palette cycle through `terminal_ghost` → `phosphor` → `nord` → `tokyonight`.*
+![Themes tour — Settings palette cycle re-theming a live detail view](docs/media/stills.gif)
+
+*Themes tour: cycle the palette in Settings — `terminal_ghost` → `phosphor` → `nord` →
+`tokyonight` — then jump back to a live detail to see the re-theme already applied
+app-wide, not just the Settings tab.*
 
 ---
 
@@ -68,6 +77,9 @@ rendered inline via Kitty graphics on the right — kanji chips and synopsis alo
   statuses, grouped headers, fuzzy filtering. Add from browse with `P`; move state
   with `p`/`x`/`c`/`w`/`P`; recompute progress with `r`; undo with `u`. Watchlist
   refreshes in-session after playback.
+- **Discover**: a ranked feed of what's trending — `Daily` / `Weekly` / `Monthly` /
+  `All-Time` windows of popular titles with real cover art, AniList scores, and view
+  counts; save a pick straight to the watchlist.
 - **Cover art** via Kitty graphics where supported, halfblock cells elsewhere —
   fetched asynchronously, behind LRU caches.
 - **Search → resolve → play**: AllAnime catalog search, episode listing, stream

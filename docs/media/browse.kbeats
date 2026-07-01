@@ -1,0 +1,33 @@
+# browse.kbeats — Browse (catalogue search) tour (→ browse.gif). Live AllAnime search
+# with AniList cover enrichment: type a query and real cover art streams in, then open a
+# result. READ-ONLY: shift+b nav, / + type to search, hjkl/l to navigate. The `P` (save)
+# key the Browse status bar offers is mutating and refused by the runner's lint.
+#
+# Content is LIVE, so the exact results/covers vary per run (re-run if the search is slow).
+#
+# Run:  ./docs/media/capture-kitty.sh docs/media/browse.kbeats   → docs/media/browse.gif
+
+sleep 2
+key shift+b
+sleep 1500ms
+
+record browse.gif fps=15 width=960
+sleep 900ms
+
+# search the catalogue — typing animates, then results + covers stream in
+key slash
+sleep 400ms
+type chainsaw man
+sleep 700ms
+key Return
+sleep 8s                  # live AllAnime search + AniList cover enrichment
+
+# walk the results, then open one
+key j
+sleep 900ms
+key j
+sleep 900ms
+key l
+sleep 4s                  # detail: cover + chips + synopsis
+
+endrecord
