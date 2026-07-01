@@ -293,7 +293,7 @@ Sample widths:
 | Constant | File | Value | Meaning |
 |---|---|---|---|
 | `App.pane_split_min` | `app.zig` | `60` | Both Browse and History split to two panes at or above this width; below it, single-column list only. Also the single detail-surface threshold (ROD-259): at or above this width, a focused detail pane renders its interactive episode grid **in-pane** and `Enter` plays from it; `Space` still promotes to the roomier full-screen zoom at any width. The old `App.zoom_min = 100` mid-tier gate — which withheld the in-pane grid from History at 60–99 cols, forcing `Enter`/`Space` to drill into the zoom just to reach it — is deleted. |
-| `detail_two_col_min` | `view/detail.zig` | `100` | Gates the two-internal-column split (§5.4a) wherever a detail pane is drawn, keyed to that pane's own width — not the terminal (ROD-258). Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term − 2`). Unrelated to the retired `zoom_min` — this constant is untouched by ROD-259. |
+| `detail_two_col_min` | `view/detail.zig` | `100` | Gates the two-internal-column split (§5.4a) wherever a detail pane is drawn, keyed to that pane's own width — not the terminal (ROD-258). Governs both the History persistent two-pane (engages at `term ≥ 168`, once the 38% list is subtracted) and the full-screen zoom's internal split (engages at `term ≥ 102`, since the zoom's pane is `term − 2`). Unrelated to the retired `zoom_min` — this constant is untouched by ROD-259. Clearing it is also one of the two conditions that bloom the §5.3a metadata rail (ROD-260) — the other is the surface's own `two_col` flag, which Browse-origin detail never sets. |
 
 The `pane_split_min = 60` threshold is now where this in-pane grid begins —
 grid columns `≈ detail_w / 5` give a narrow but real ≈ 5 columns at 60 cols,
@@ -1014,7 +1014,7 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
   · Made in Abyss                          [83/100]   放映中  冬 2024                   [h chip, f chip]
   · Demon Slayer                           [81/100]  ✦ [96/100] · Fantasy · Adventure  [h+bold score, d·, m genres]
   · Jujutsu Kaisen                         [80/100]  ─────────────────────────────     [border.hair rule]
-  · Chainsaw Man                           [78/100]   28 eps  · TV  · 23 min           [m metadata]
+  · Chainsaw Man                           [78/100]   28 eps  · TV                     [m metadata]
   · Spy × Family                           [76/100]  ─────────────────────────────     [border.hair rule]
                                                        An elf mage who once defeated…   [m synopsis, word-wrapped]
                                                        the Demon King now wanders the
@@ -1045,7 +1045,7 @@ The user pressed `/`. The bottom bar becomes the search prompt. The list filters
   · From the New World                     [71/100]   放映中  冬 2024
   · Fruits Basket                          [70/100]  ✦ [96/100] · Fantasy · Adventure
                                                      ─────────────────────────────
-                                                      28 eps  · TV  · 23 min
+                                                      28 eps  · TV
                                                      ─────────────────────────────
                                                       An elf mage who once defeated…
 
@@ -1070,7 +1070,9 @@ the 120-col terminal below is one illustration of it. `active_view` becomes
 the canvas is all detail. `Esc` demotes back to the two-pane view with `active_pane
 = .detail`. This surface is reached identically from Browse and History.
 
-120-col terminal — zoom entered from Browse or History:
+120-col terminal — zoom entered from History (the metadata rail below only blooms
+for a History-origin zoom, §5.3a; entered from Browse at the same width, the
+metadata stays the compact `28 eps · TV` line):
 
 ```
                                                                                          [context: top bar, full width]
@@ -1080,7 +1082,8 @@ the canvas is all detail. `Esc` demotes back to the two-pane view with `active_p
   [   20 × 7 cells      ]    放映中  冬 2024                                            [h chip, f chip]
   [                     ]   ✦ [96/100] · Fantasy · Adventure · Drama                   [h+bold score, d·, m genres]
                             ─────────────────────────────────────────────────────       [border.hair]
-                             28 eps · TV · 23 min · Madhouse                            [m metadata]
+                             Episodes  28                                                [d label, m value]
+                             Format    TV                                                [d label, m value]
                             ─────────────────────────────────────────────────────       [border.hair]
                              An elf mage who once defeated the Demon King now            [m synopsis, word-wrapped]
                              wanders the continent without purpose, until she
@@ -1119,6 +1122,64 @@ Notes:
 - The two-column internal split (cover left / content right) uses the same
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
+- The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
+  ROD-260 rail form — see §5.3a for the full grammar, including why it only
+  blooms for a History-origin zoom. Only Episodes and Format ship today; studios,
+  source, duration, a rail-only rank, and the `nextAiringEpisode` countdown (which
+  lands on the chips row, not here) are deferred to ROD-261.
+
+### 5.3a Detail Metadata — Compact Line vs. Labeled Rail (ROD-260)
+
+One ordered field list, two render densities. `App.detailMetaFields()` (`app.zig`)
+returns `[]const MetaField` — `{label, value, unit, dim}` — highest-priority field
+first: **Episodes**, then **Format**. `drawHeader` (`view/detail.zig`) renders that
+list through one of two functions, selected by a `bloom: bool` parameter, so the
+two forms can't drift apart — same source, same order, same value strings:
+
+- **`drawMetaLine`** — the compact form: values joined with ` · ` on one row
+  (separator `fg3`, values `fg2`, `fg3` when a value's `dim` flag is set). A unit
+  suffix renders only here (`13 eps`; Format carries no unit). A separator sits
+  only *between* two emitted fields — an absent field never leaves an orphan `·`
+  (§9.1).
+- **`drawMetaRail`** — the roomy form: `Label  Value` stacked one field per row,
+  an 8-col label gutter (`fg3`) with values aligned at column 10 (`fg2`, `fg3`
+  when `dim`). The rail walks the same priority order top-down, so a pane too
+  short to hold every row drops the **lowest**-priority rows first — Episodes,
+  emitted first, never drops.
+
+**Episodes is the floor.** It always renders, never omitted: when neither the
+per-track count (`eps_sub`/`eps_dub`) nor `total_episodes` is known — no show
+focused, or a show AniList hasn't enriched yet — it degrades to a dim `?` (`fg3`,
+the `dim` flag) instead of disappearing, so neither form is ever empty. Format
+(`kind`, e.g. `TV`) is the one field that *can* be omitted outright: it simply
+isn't emitted when `kind` is null.
+
+**The rail needs two conditions, not one.** `drawHeader`'s `bloom` argument is
+`two_col and isTwoColumn(w)` — the caller's `two_col` flag **and** the pane
+clearing `detail_two_col_min` (100, §3.2). `two_col` is keyed per surface, not
+just by width:
+
+| Surface | `two_col` | Rail engages at |
+|---|---|---|
+| Browse in-pane detail | always `false` | never — always the compact line, at any width (ROD-113 scope: Browse's in-pane detail keeps the single stack) |
+| History in-pane detail (§5.4a) | always `true` | `detail_w ≥ 100`, i.e. `term ≥ 168` |
+| Full-screen zoom, Browse-origin (§5.3) | always `false` | never — always the compact line, at any terminal width |
+| Full-screen zoom, History-origin (§5.3) | always `true` | `body_w ≥ 100`, i.e. `term ≥ 102` |
+
+So width alone doesn't bloom the metadata — a wide Browse-origin zoom still shows
+the compact line, because `detail_origin` gates `two_col` before width is even
+checked (mirrors the pre-existing ROD-113 origin gate on the cover/content split
+itself). History's in-pane split needs a genuinely wide terminal (168 cols)
+because the rail only claims the ~38%-width left column, not the full pane.
+
+**Phase 1 (shipped) fields: Episodes and Format only** — the enrichment that
+already survives to the store, no network call or schema change needed.
+**Deferred to ROD-261:** studios, source, duration, and a rail-only rank slot,
+once an AniList-enrichment pass fetches and persists them (the store has no
+`studios` column yet); and the `nextAiringEpisode` countdown, which lands on the
+**chips row** (`state.now`) rather than this metadata list. Both renderers
+iterate the field list generically, so each addition is a `detailMetaFields`
+data change only — no renderer edits.
 
 ### 5.4 History / Watchlist — Narrow (w < 60) or No Records
 
@@ -1216,7 +1277,7 @@ record is focused.
                                              放映中  冬 2024                             [h chip, f chip; omitted if null]
     ◐ Vinland Saga S2                       [--/100]                                     [d score placeholder]
       [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────           [border.hair]
-                                             28 eps · TV · 24 min                        [m metadata]
+                                             28 eps · TV                                [m metadata]
     ○ Blue Period                           ─────────────────────────────────           [border.hair]
       [██████◐░░░░░░░░░]  5 / 12 eps         An elf mage who once defeated the           [m synopsis, word-wrapped to detail_w]
   ─────────────────────────────────────     Demon King now wanders the
@@ -1259,7 +1320,7 @@ surfaces stay consistent.
                                              放映中  冬 2024
     ◐ Vinland Saga S2                       [--/100]
       [░░░░░░░░░░░░░░░░]  0 / 24 eps        ─────────────────────────────────
-                                             28 eps · TV · 24 min
+                                             28 eps · TV
     ○ Blue Period                           ─────────────────────────────────
       [██████◐░░░░░░░░░]  5 / 12 eps        [1][2][3][4][5][6][▸7][8]                  [interactive grid; d watched, h▸ resume, m unwatched]
   ─────────────────────────────────────     [9][10][11][12][13][14][15][16]
@@ -1292,6 +1353,11 @@ Notes:
 - Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
   `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
   in [m]+italic when synopsis is null; chips omitted when null.
+- The `28 eps · TV` row is the ROD-260 metadata grammar's compact-line form
+  (§5.3a) — `detail_w ≈ 70` at 120 cols is below `detail_two_col_min` (100), so
+  the rail doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`,
+  below). Only Episodes and Format ship; studios/source/duration/rank and the
+  airing countdown are deferred to ROD-261.
 
 ---
 
@@ -1308,7 +1374,8 @@ focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
   [   20 × 7 cells]    放映中  冬 2024
   [               ]   ✦ [96/100] · Fantasy · Adventure · Drama
                       ────────────────────────────────────────────────────────────────────────────────────
-                       28 eps · TV · 23 min · Madhouse
+                       Episodes  28
+                       Format    TV
                       ────────────────────────────────────────────────────────────────────────────────────
                        An elf mage who once defeated the Demon King now wanders the continent…
                       ────────────────────────────────────────────────────────────────────────────────────
@@ -1327,6 +1394,13 @@ persistent two-pane's split (§5.4a above), but keyed to the narrower `detail_w`
 pane, so that surface needs `term ≥ 168` to engage. At 160-col, right_w ≈ 96 gives
 19 grid columns. At 120-col zoom, right_w ≈ 72 gives 14 columns. This is where the
 zoom earns its keep over the pane's ≈8 columns at 120 cols.
+
+Clearing `detail_two_col_min` also blooms the `Episodes` / `Format` rail above
+(§5.3a, ROD-260) — but only because this is a **History-origin** zoom, which is
+the one surface that sets `two_col = true` unconditionally; a Browse-origin zoom
+at the same 160 cols still renders the compact `28 eps · TV` line. Studios,
+source, duration, a rail-only rank, and the airing countdown are deferred to
+ROD-261 — they don't render yet in either form.
 
 ### 5.5 Settings
 
@@ -1798,7 +1872,7 @@ aliases.
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
-| **Detail · episode count** | AllAnime `eps_sub` / `eps_dub`; AniList `total_episodes` | `N eps` for the active translation | `? eps` in `[d]` when both sources are absent; `kind` / `studios` segments omitted |
+| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null | `App.detailMetaFields()` (§5.3a, ROD-260) emits an ordered field list — Episodes then Format — rendered as the compact `N eps · kind` line (single-column surfaces) or the `Label  Value` rail (two-column surfaces) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format omits outright when `kind` is null. Studios, source, duration, a rail-only rank, and the `nextAiringEpisode` countdown (which lands on the chips row) are deferred — ROD-261 |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
