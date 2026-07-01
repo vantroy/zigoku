@@ -21,8 +21,10 @@ that width — the single-pane detail and the settings list — are shrunk per-g
 ## Regenerate
 
 ```sh
-zig build                                       # beats drive ./zig-out/bin/zigoku
+zig build                                        # beats drive ./zig-out/bin/zigoku
 ./docs/media/capture-kitty.sh docs/media/demo.kbeats     # → demo.gif (hero)
+./docs/media/capture-kitty.sh docs/media/discover.kbeats # → discover.gif (Discover tour)
+./docs/media/capture-kitty.sh docs/media/browse.kbeats   # → browse.gif (Browse search tour)
 ./docs/media/capture-kitty.sh docs/media/covers.kbeats   # → detail-cover / browse-covers / history .png
 ./docs/media/capture-kitty.sh docs/media/stills.kbeats   # → stills.gif + watchlist / settings / detail-themed .png
 ```
@@ -31,9 +33,11 @@ Requires `Xvfb`, `kitty`, `xdotool`, `xdpyinfo`, `ffmpeg`, `gifski`, ImageMagick
 (`import` + `magick`) on PATH (verified with kitty 0.47, ffmpeg + gifski, Mesa llvmpipe
 software GL).
 
-> **Content is live where it says so.** `demo.kbeats` and `covers.kbeats` read your
-> real store, so the exact shows/covers vary with your library and the live Discover
-> feed. That's by design (ROD-148/247). Timing is tunable per beats file.
+> **Content is live where it says so.** `demo`, `discover`, `browse`, and `covers`
+> beats read your real store / the live Discover feed / live AllAnime search, so the
+> exact shows/covers vary per run. That's by design (ROD-148/247). If a live search or
+> feed is slow, a tour may catch a `searching…`/`loading…` frame — re-run or lengthen
+> the sleep. Timing is tunable per beats file.
 
 ## The `.kbeats` format
 
@@ -57,6 +61,8 @@ It's the same iterate loop as a vhs tape: edit the beats, re-run, eyeball, adjus
 | File | Beats | Shows |
 |---|---|---|
 | `demo.gif` | `demo.kbeats` | **Hero:** watchlist master-detail with **live cover art** (cover updates per selection) → typed filter down to the Frieren detail. |
+| `discover.gif` | `discover.kbeats` | **Discover tour:** the ranked cover wall — sweep the grid, switch the ranking window, a fresh wall of covers loads. |
+| `browse.gif` | `browse.kbeats` | **Browse tour:** live catalogue search — type a query and real covers stream into the two-pane results. |
 | `stills.gif` | `stills.kbeats` | **Themes tour:** Settings palette cycle re-theming a two-pane detail. |
 | `watchlist.png` | `stills.kbeats` | Populated watchlist (default **terminal_ghost**), grouped status + progress bars. |
 | `settings.png` | `stills.kbeats` | Settings tab, palette row focused. |
