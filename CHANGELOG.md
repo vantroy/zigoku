@@ -14,6 +14,20 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-02
+
+### Changed
+
+- **History's detail view now matches Browse's**: opening a show in History shows its episode grid immediately, at any width — the extra "focus the pane, then press again" step is gone. Browse and History detail now behave identically.
+
+- **Two-column detail no longer cramps at borderline widths**: the layout used to measure the whole terminal to decide whether to split into two columns, which could claim a column too narrow to hold it — clipping genres and metadata. It now measures the pane itself, so the split only triggers when there's genuinely room.
+
+### Added
+
+- **Metadata rail in the detail view**: the empty space below a show's header now shows episode count and format (TV, Movie, etc.) — a compact one-liner in narrow panes, a labeled two-column rail where there's room to spread out.
+
+- **AUR package for Arch Linux**: a `PKGBUILD` for a from-source build is now in the repo (`packaging/aur/zigoku`) — `makepkg -si` builds and installs it against your system Zig, SQLite, and mpv. It isn't on the AUR registry yet (new-account registration has been closed since mid-June), so `paru -S zigoku` isn't live; that lands the moment registration reopens.
+
 ## [0.2.0] - 2026-07-01
 
 ### Added
@@ -148,7 +162,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/vantroy/zigoku/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/vantroy/zigoku/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/vantroy/zigoku/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/vantroy/zigoku/compare/v0.1.3...v0.1.4
