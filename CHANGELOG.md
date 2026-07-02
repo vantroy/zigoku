@@ -14,6 +14,18 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-03
+
+### Changed
+
+- **Discover's first page now fills the screen**: on large monitors, the fixed 30-card page used to leave empty rows below the last card. The grid now keeps loading more pages until it fills the visible viewport (or the feed runs out), and refills again if you resize into more room.
+
+### Fixed
+
+- **The last blank Discover covers now render**: a small share of covers — roughly one or two in fifty — showed as blank placeholders. Two separate causes, both closed: AllAnime serves some cover URLs as a bare relative path the app couldn't fetch, and its cover CDN returns WebP regardless of the file extension, which the app couldn't decode even when the fetch succeeded. Those covers now resolve and decode (WebP included), so the grid fills without the odd gap.
+
+- **Discover no longer freezes the screen while it loads**: switching time windows used to block the whole app until the in-flight fetch returned, because the feed and metadata work ran on the UI thread. That work now runs off-thread, and every request — feed, metadata, and cover — carries a wall-clock deadline, so a slow or unresponsive server can't hang a fetch (or, under sustained load, back new ones up behind it). A bad connection now degrades instead of locking up.
+
 ## [0.2.1] - 2026-07-02
 
 ### Changed
@@ -162,7 +174,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/vantroy/zigoku/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/vantroy/zigoku/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/vantroy/zigoku/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/vantroy/zigoku/compare/v0.1.4...v0.1.5
