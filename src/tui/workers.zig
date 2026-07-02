@@ -351,7 +351,8 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
 /// via the `.popular_done` arm. No query string to thread (the feed has none); a
 /// failure posts `.popular_error` (whose handler clears the slot's loading flag
 /// and marks it failed).
-pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32, drain: *ThreadDrain) void {
+    defer drain.finish(); // ROD-251: detached; account so teardown can drain us
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
@@ -461,7 +462,8 @@ pub fn enrichTask(
 /// `anime` is gpa-owned (the caller duped it); ownership transfers to the
 /// discover_enriched event on success, or is freed here on a post failure.
 /// `window` routes the merge to the right per-window slot.
-pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime, window: source_mod.PopularWindow) void {
+pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime, window: source_mod.PopularWindow, drain: *ThreadDrain) void {
+    defer drain.finish(); // ROD-251: detached; account so teardown can drain us
     var a = anime;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -491,7 +493,9 @@ pub fn discoverBatchEnrichTask(
     io: std.Io,
     stubs: []Anime,
     window: source_mod.PopularWindow,
+    drain: *ThreadDrain,
 ) void {
+    defer drain.finish(); // ROD-251: detached; account so teardown can drain us
     var posted = false;
     defer if (!posted) {
         for (stubs) |a| freeOwnedAnime(gpa, a);
