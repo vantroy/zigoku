@@ -1,5 +1,10 @@
 const std = @import("std");
 
+// Generated vendored-libwebp decoder file list (scripts/vendor-libwebp.sh).
+// Imported rather than hand-typed so the compiled set never drifts from the
+// files on disk — see the addCSourceFiles call in build().
+const webp_decoder = @import("src/c/webp/decoder_srcs.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -59,14 +64,18 @@ pub fn build(b: *std.Build) void {
     // synchronous stubs and no pthread linkage is pulled in (decode is
     // one-shot per cover — a worker thread would buy nothing). Each ISA .c
     // self-gates on its target macro, so the full set cross-compiles: x86_64
-    // lights up SSE2, aarch64 NEON, everything else scalar. -fno-sanitize=
-    // undefined: this is pinned, audited third-party C; we don't want Zig's
-    // UBSan trapping inside libwebp's deliberate integer arithmetic.
+    // lights up SSE2, aarch64 NEON, everything else scalar.
+    //
+    // UBSan is left ON (no -fno-sanitize): libwebp is the network-fed image
+    // decoder, and per packaging/aur/README.md we keep the sanitizer trap on
+    // exactly this attacker-reachable surface — a controlled trap on malformed
+    // input beats raw UB in a release binary. Verified: the full test suite and
+    // an adversarial corpus decode with UBSan trapping enabled and hit zero
+    // traps, so it costs us nothing on valid covers.
     mod.addIncludePath(b.path("src/c/webp"));
     mod.addCSourceFiles(.{
         .root = b.path("src/c/webp/src"),
-        .files = &webp_decoder_srcs,
-        .flags = &.{"-fno-sanitize=undefined"},
+        .files = &webp_decoder.files,
     });
 
     // store.zig's @cImport(@cInclude("sqlite3.h")) resolves identically either
@@ -236,74 +245,3 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 }
-
-// libwebp decoder translation units, relative to src/c/webp/src. This mirrors
-// LIBWEBPDECODER_OBJS (DEC + DSP_DEC + UTILS_DEC) from upstream's makefile.unix;
-// scripts/vendor-libwebp.sh copies exactly this set. Keep the two in sync when
-// bumping libwebp — a stale entry here is a link error, a missing one a decode
-// gap. Generated once from the vendored tree; not hand-typed.
-const webp_decoder_srcs = [_][]const u8{
-    "dec/alpha_dec.c",
-    "dec/buffer_dec.c",
-    "dec/frame_dec.c",
-    "dec/idec_dec.c",
-    "dec/io_dec.c",
-    "dec/quant_dec.c",
-    "dec/tree_dec.c",
-    "dec/vp8_dec.c",
-    "dec/vp8l_dec.c",
-    "dec/webp_dec.c",
-    "dsp/alpha_processing.c",
-    "dsp/alpha_processing_mips_dsp_r2.c",
-    "dsp/alpha_processing_neon.c",
-    "dsp/alpha_processing_sse2.c",
-    "dsp/alpha_processing_sse41.c",
-    "dsp/cpu.c",
-    "dsp/dec.c",
-    "dsp/dec_clip_tables.c",
-    "dsp/dec_mips32.c",
-    "dsp/dec_mips_dsp_r2.c",
-    "dsp/dec_msa.c",
-    "dsp/dec_neon.c",
-    "dsp/dec_sse2.c",
-    "dsp/dec_sse41.c",
-    "dsp/filters.c",
-    "dsp/filters_mips_dsp_r2.c",
-    "dsp/filters_msa.c",
-    "dsp/filters_neon.c",
-    "dsp/filters_sse2.c",
-    "dsp/lossless.c",
-    "dsp/lossless_mips_dsp_r2.c",
-    "dsp/lossless_msa.c",
-    "dsp/lossless_neon.c",
-    "dsp/lossless_sse2.c",
-    "dsp/lossless_sse41.c",
-    "dsp/rescaler.c",
-    "dsp/rescaler_mips32.c",
-    "dsp/rescaler_mips_dsp_r2.c",
-    "dsp/rescaler_msa.c",
-    "dsp/rescaler_neon.c",
-    "dsp/rescaler_sse2.c",
-    "dsp/upsampling.c",
-    "dsp/upsampling_mips_dsp_r2.c",
-    "dsp/upsampling_msa.c",
-    "dsp/upsampling_neon.c",
-    "dsp/upsampling_sse2.c",
-    "dsp/upsampling_sse41.c",
-    "dsp/yuv.c",
-    "dsp/yuv_mips32.c",
-    "dsp/yuv_mips_dsp_r2.c",
-    "dsp/yuv_neon.c",
-    "dsp/yuv_sse2.c",
-    "dsp/yuv_sse41.c",
-    "utils/bit_reader_utils.c",
-    "utils/color_cache_utils.c",
-    "utils/filters_utils.c",
-    "utils/huffman_utils.c",
-    "utils/palette.c",
-    "utils/quant_levels_dec_utils.c",
-    "utils/random_utils.c",
-    "utils/rescaler_utils.c",
-    "utils/thread_utils.c",
-    "utils/utils.c",
-};

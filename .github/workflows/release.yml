@@ -139,6 +139,12 @@ jobs:
           name="zigoku-v${v}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp out/bin/zigoku LICENSE README.md "dist/$name/"
+          # Bundled third-party code ships its license with the binary: libwebp
+          # is BSD-3-Clause plus an additional patent grant, both of which the
+          # license requires we reproduce in materials distributed with it (ROD-244).
+          mkdir -p "dist/$name/licenses"
+          cp src/c/webp/COPYING "dist/$name/licenses/LICENSE.libwebp"
+          cp src/c/webp/PATENTS "dist/$name/licenses/PATENTS.libwebp"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
           # Informational only (the release job re-aggregates on ubuntu); macOS

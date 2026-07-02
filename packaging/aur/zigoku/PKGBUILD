@@ -79,6 +79,11 @@ package() {
   install -Dm755 "$srcdir/out/bin/zigoku" "$pkgdir/usr/bin/zigoku"
   install -Dm644 "$srcdir/$pkgname-$pkgver/LICENSE" \
     "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  # Bundled libwebp is BSD-3 + patent grant; its notices must ship too (ROD-244).
+  install -Dm644 "$srcdir/$pkgname-$pkgver/src/c/webp/COPYING" \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE.libwebp"
+  install -Dm644 "$srcdir/$pkgname-$pkgver/src/c/webp/PATENTS" \
+    "$pkgdir/usr/share/licenses/$pkgname/PATENTS.libwebp"
 }
 
 # Zig strips via -Dstrip; keep makepkg's GNU strip off the finished binary
