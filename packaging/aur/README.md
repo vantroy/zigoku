@@ -44,14 +44,19 @@ links system `libsqlite3` (`bundle-sqlite` defaults off), so it's a runtime
 
 ## Per-release bump
 
-On a new tagged release, update `zigoku/PKGBUILD`:
+Do this as **one commit after the tag lands**: the only value that can't be
+known before the tag — the source-archive sha256 — is computed for you by the
+release workflow, so there's nothing to bump *before* tagging. Update
+`zigoku/PKGBUILD`:
 
 > One-time, at the first release that carries the `build.zig` hardening: add
 > `-Dpie` to the `zig build` line in `build()` (Arch's standard PIE hardening).
 > The stb reproducibility fix is automatic — no flag.
 
 1. Bump `pkgver`; reset `pkgrel=1`.
-2. Refresh the source tarball checksum:
+2. Set `sha256sums[0]` to the source-archive checksum. The **Release** workflow's
+   `aur-checksum` job computes it on the tag and prints a paste-ready block in the
+   run summary (ROD-273) — copy it from there. Local fallback if you'd rather:
    ```sh
    cd packaging/aur/zigoku && updpkgsums          # rewrites the first sha256sums entry
    ```

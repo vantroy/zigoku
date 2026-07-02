@@ -265,3 +265,61 @@ jobs:
             git commit -m "zigoku v${v}"
             git push origin main
           fi
+
+  # ── AUR source-archive checksum — tag pushes only ─────────────────────────
+  # AUR new-account registration is still closed (packaging/aur/README.md), so
+  # nothing is pushed to the registry yet — that end-state mirrors update-tap and
+  # lands when registration reopens (Tier 3). What this DOES kill now is the one
+  # genuinely painful step of the manual per-release bump: the sha256 of GitHub's
+  # on-demand source archive (archive/refs/tags/vX.Y.Z.tar.gz), which is unknowable
+  # until the tag exists. We compute it on the tag and print a paste-ready PKGBUILD
+  # block to the run summary. No mutation, no write-back token, no Arch container,
+  # no new secret — a pure read that replaces a local `updpkgsums`. (ROD-273)
+  aur-checksum:
+    needs: [guard, release]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions: {}   # pure external read + local hash — no GITHUB_TOKEN wanted
+    steps:
+      - name: Compute source-archive sha256 + emit a paste-ready PKGBUILD block
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          url="https://github.com/vantroy/zigoku/archive/refs/tags/v${v}.tar.gz"
+          # Same retry posture as update-tap: the tag exists at push time, but
+          # codeload's CDN can 404 for a beat right after publish — ride it out.
+          # --connect-timeout/--max-time so a stalled connection can't hang the
+          # job to the 6h default (retries only fire on a *completed* failure).
+          curl -fsSL --connect-timeout 30 --max-time 120 \
+            --retry 5 --retry-delay 3 --retry-all-errors "$url" -o src.tar.gz
+          # curl -f gates on HTTP status, not body: a 200 carrying a CDN
+          # interstitial or an incident page would hash clean and we'd print a
+          # confident-but-wrong checksum. Refuse anything that isn't a real
+          # gzip tarball before we hash it.
+          tar tzf src.tar.gz >/dev/null 2>&1 \
+            || { echo "::error::downloaded archive is not a valid gzip tarball — refusing to hash"; exit 1; }
+          sum="$(sha256sum src.tar.gz | awk '{print $1}')"
+          echo "source-archive sha256 for v${v}: ${sum}"
+          # NOTE: GitHub does not durably guarantee auto-generated archive
+          # checksums — they shifted once (Feb 2023) and the stability pledge
+          # lapsed Feb 2024. If a future toolchain change makes makepkg reject
+          # this sha, it's NOT a packaging regression: re-run this job (or
+          # `updpkgsums` locally, see packaging/aur/README.md) to refresh it.
+          # Source-build AUR pins the tag archive by convention; the git-source
+          # deps stay SKIP-pinned by commit, so only this one value can drift.
+          # Land the block in the run summary so the bump is a copy-paste, not a
+          # hunt through logs. Manual for now; Tier 3 pushes it straight to AUR.
+          {
+            echo "### AUR \`packaging/aur/zigoku/PKGBUILD\` bump — v${v}"
+            echo ""
+            echo "Registration is still closed, so this is a manual paste"
+            echo "(steps in \`packaging/aur/README.md\`). Bump these, then regen \`.SRCINFO\`:"
+            echo ""
+            echo '```bash'
+            echo "pkgver=${v}"
+            echo "pkgrel=1"
+            echo "# first entry of the sha256sums=() array:"
+            echo "'${sum}'"
+            echo '```'
+            echo ""
+            echo "Source archive: ${url}"
+          } >> "$GITHUB_STEP_SUMMARY"
