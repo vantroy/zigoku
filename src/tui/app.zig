@@ -345,6 +345,9 @@ pub fn run(
         // ROD-243: fetch the visible grid's covers off-thread once scroll is settled
         // (geometry known). No-op outside Discover / when nothing's missing.
         app.pumpDiscoverCovers(&loop, io, provider);
+        // ROD-272: top the feed up to the visible grid on a large monitor / after a
+        // resize — same settled geometry, debounced by the slot's in-flight flag.
+        app.maybeFillDiscover(&loop, io, provider);
         try app.draw(&vx, writer);
     }
 
@@ -2969,6 +2972,43 @@ pub const App = struct {
         }
     }
 
+    /// Pure fill decision (ROD-272): the loaded feed covers the visible grid once
+    /// it reaches `(rows_visible + 1) * cols` cards — the visible rows plus one peek
+    /// row, matching pumpDiscoverCovers' fetch span so a filled grid also seeds the
+    /// peek band. Returns true when the slot is short of that and a page should fire.
+    /// Split from maybeFillDiscover so the geometry→target math is unit-testable with
+    /// no live fetch. A zero-cell grid (too-small terminal) never needs a fill.
+    fn discoverNeedsFill(len: usize, geo: discover_view.Geometry) bool {
+        if (geo.cols == 0 or geo.rows_visible == 0) return false;
+        const target = (@as(usize, geo.rows_visible) + 1) * @as(usize, geo.cols);
+        return len < target;
+    }
+
+    /// Top the active Discover window up to the visible grid (ROD-272). The feed
+    /// paginates in fixed `popular_page_size` chunks, so on a large monitor the first
+    /// page leaves empty rows below the last card — the cursor-proximity prefetch
+    /// (maybePrefetchDiscover) only fires once the cursor nears the end, and on load
+    /// the cursor sits at 0. This fires the next page whenever the loaded set doesn't
+    /// cover the visible rows (+ peek row), cascading page-by-page until the grid is
+    /// full or the feed is exhausted. Called every frame from run() with the settled
+    /// geometry, so it also refills after a resize grows the viewport. Debounced by
+    /// `slot.loading`: only one page is ever in flight, so it can't spam the feed.
+    fn maybeFillDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        if (self.active_view != .discover) return;
+        const slot = self.discover.activeSlot();
+        // Only cascade an established feed: page 0 is the initial fetch refreshDiscover
+        // owns; loading/exhausted stop it (exhausted is the feed's short-page tail).
+        if (slot.loading or slot.exhausted or slot.page == 0) return;
+
+        const w = self.term_cols;
+        const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
+        const cp = self.cellPx();
+        const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
+        if (discoverNeedsFill(slot.results.items.len, geo)) {
+            self.firePopular(loop, io, provider, self.discover.window, slot.page + 1);
+        }
+    }
+
     /// Switch the active Popular window and cache-or-fetch it (ROD-239). Resets the
     /// grid cursor/scroll; a no-op if already on `window`.
     fn setDiscoverWindow(self: *App, window: source_mod.PopularWindow, loop: *Loop, io: std.Io, provider: SourceProvider) void {
@@ -3677,4 +3717,23 @@ test "discoverPoolSaturated trips at (not before) the soft cap (ROD-264)" {
     try testing.expect(app.discoverPoolSaturated());
     // Leave the counter balanced — hygiene; this bare App is never torn down.
     app.discover_drain.inflight.store(0, .release);
+}
+
+test "discoverNeedsFill: a short first page under-fills a wide grid, a full one doesn't (ROD-272)" {
+    // A wide monitor (270 cols → 12 cards/row, ~5 visible rows on the fallback box)
+    // wants (5+1)*12 = 72 cards to cover the grid + peek row. One popular_page_size
+    // page (30) leaves the bottom rows empty — the bug this tops up.
+    const wide = discover_view.geometry(270, 57, 0, 0);
+    try testing.expectEqual(@as(u16, 12), wide.cols);
+    try testing.expectEqual(@as(u16, 5), wide.rows_visible);
+    try testing.expect(App.discoverNeedsFill(30, wide)); // one page → short → fill
+    try testing.expect(!App.discoverNeedsFill(72, wide)); // exactly the target → full
+    try testing.expect(!App.discoverNeedsFill(100, wide)); // over-full (scrolled) → no fetch
+
+    // A terminal too short to seat even one card-row has no grid to fill — never fetch,
+    // whatever the loaded count, so the guard can't spin a fetch on a 0-row viewport.
+    const tiny = discover_view.geometry(10, 5, 0, 0);
+    try testing.expectEqual(@as(u16, 0), tiny.rows_visible);
+    try testing.expect(!App.discoverNeedsFill(0, tiny));
+    try testing.expect(!App.discoverNeedsFill(30, tiny));
 }
