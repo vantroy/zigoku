@@ -2134,12 +2134,43 @@ pub const App = struct {
         };
     }
 
+    /// Soft cap on concurrently-spawned Discover background workers (ROD-264 #3).
+    /// The feed fetch + zoom enrich + batch enrich each spawn an uncapped raw
+    /// `std.Thread` and share the one `Io.Threaded` pool. A saturation storm (rapid
+    /// paging + zoom + prefetch on a slow link) could pile enough live threads to
+    /// approach the OS thread/fd ceiling — where `std.Thread.spawn` starts failing,
+    /// which is exactly what tips a fetch onto `withDeadline`'s unbounded inline
+    /// fallback (ROD-264 #1; the pool's own `concurrent_limit` is unlimited, so the
+    /// spawn ceiling — not a soft pool cap — is the real trigger). Bounding our own
+    /// fan-out keeps us clear of it, the source-level fix that lets the fallback
+    /// stay as-is. In normal use the in-flight set sits far below this; the cap is a
+    /// backstop, not a tuning dial.
+    const discover_enrich_cap = 8;
+
+    /// True when the Discover worker pool is at the soft cap (ROD-264 #3): the
+    /// caller should DROP its spawn rather than queue it. Every Discover worker is
+    /// idempotent and recovered by a later trigger — `refreshDiscover`'s !loading
+    /// recheck (feed), the `description == null` recheck (zoom), or a window
+    /// re-fetch that re-appends + re-fires (page batch) — so a dropped spawn is
+    /// deferred, not lost, the same drop-and-re-plan the cover pump uses (ROD-240).
+    /// `.acquire` pairs with `finish()`'s release so a just-freed slot is observed
+    /// promptly.
+    fn discoverPoolSaturated(self: *App) bool {
+        return self.discover_drain.inflight.load(.acquire) >= discover_enrich_cap;
+    }
+
     /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Detached and
     /// accounted via `discover_drain` (ROD-251) — never joins a prior in-flight
     /// fetch (that join on the event thread was the UI-freeze this ticket fixed).
     /// Sets the target slot's loading flag; the `.popular_done` arm clears it and
     /// lands the results in that slot (by window — not necessarily the active one).
     fn firePopular(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+        // ROD-264 #3: drop past the soft cap. Left un-set, the slot stays !loading,
+        // so refreshDiscover / the prefetch trigger re-fire once the pool drains.
+        if (self.discoverPoolSaturated()) {
+            log.debug("discover pool at cap ({d}) — dropping feed fetch, will re-fire", .{discover_enrich_cap});
+            return;
+        }
         // ROD-251: detach, don't join a prior in-flight feed fetch — cycling windows
         // (1→2→3→4) on a slow link would otherwise block the event thread on the old
         // fetch's join. Each window writes its own slot (popular_done), so a superseded
@@ -2181,6 +2212,12 @@ pub const App = struct {
     /// No-op in tests (network) and when nothing's missing.
     fn fireDiscoverEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, anime: Anime) void {
         if (builtin.is_test) return;
+        // ROD-264 #3: drop past the soft cap (before allocating the copy). The zoom's
+        // `description == null` recheck re-fires this when the pool drains.
+        if (self.discoverPoolSaturated()) {
+            log.debug("discover pool at cap ({d}) — dropping zoom enrich, will re-fire", .{discover_enrich_cap});
+            return;
+        }
         const copy = dupeOwnedAnime(self.gpa, anime) catch return;
         // ROD-251: detach + account, don't join. The discover_enriched handler merges
         // this back by id and frees an orphan whose card the slot no longer holds, so
@@ -2207,6 +2244,18 @@ pub const App = struct {
     fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
         if (builtin.is_test) return;
         if (count == 0) return;
+        // ROD-264 #3: drop past the soft cap (before building the stub slice).
+        // Unlike the feed fetch / zoom enrich, a page-batch has no recheck: the slot
+        // was already stamped fresh (`.popular_done`, above), so `refreshDiscover`
+        // won't re-fetch until the feed TTL (`feed_ttl_secs`) lapses and the window
+        // is next entered — the page's cards sit at [--] score/genre/season until
+        // then. Per-card zoom enrich still fills a card's metadata on open. Acceptable
+        // degradation, only under real saturation; making a dropped batch re-fire
+        // promptly is a tracked follow-up.
+        if (self.discoverPoolSaturated()) {
+            log.debug("discover pool at cap ({d}) — dropping batch enrich (page keeps [--] until re-fetch)", .{discover_enrich_cap});
+            return;
+        }
         const idx = @intFromEnum(window);
         const items = self.discover.slots[idx].results.items;
         const hi = @min(offset + count, items.len);
@@ -3610,4 +3659,21 @@ test "paletteFromConfig resolves known names and falls back for unknowns" {
     try testing.expectEqual(&colors.tokyonight, paletteFromConfig("tokyonight"));
     try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig("garbage"));
     try testing.expectEqual(&colors.terminal_ghost, paletteFromConfig(""));
+}
+
+test "discoverPoolSaturated trips at (not before) the soft cap (ROD-264)" {
+    var app: App = .{};
+    // Empty pool — always room to spawn.
+    try testing.expect(!app.discoverPoolSaturated());
+    // One below the cap — still room.
+    app.discover_drain.inflight.store(App.discover_enrich_cap - 1, .release);
+    try testing.expect(!app.discoverPoolSaturated());
+    // At the cap — drop. `>=`, not `==`, so a live cap decrease that strands
+    // inflight above the new cap also reads saturated (same guard as the cover pump).
+    app.discover_drain.inflight.store(App.discover_enrich_cap, .release);
+    try testing.expect(app.discoverPoolSaturated());
+    app.discover_drain.inflight.store(App.discover_enrich_cap + 5, .release);
+    try testing.expect(app.discoverPoolSaturated());
+    // Leave the counter balanced — hygiene; this bare App is never torn down.
+    app.discover_drain.inflight.store(0, .release);
 }
