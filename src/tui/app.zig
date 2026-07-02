@@ -2135,13 +2135,16 @@ pub const App = struct {
     }
 
     /// Soft cap on concurrently-spawned Discover background workers (ROD-264 #3).
-    /// The feed fetch + zoom enrich + batch enrich all share `discover_drain` and
-    /// the one `Io.Threaded` pool, and nothing bounded their fan-out — a saturation
-    /// storm (rapid paging + zoom + prefetch on a slow link) could exhaust the pool
-    /// and push a fetch onto `withDeadline`'s unbounded inline fallback, the exact
-    /// hang the deadline exists to kill (ROD-264 #1 — capping the source here is
-    /// what keeps that fallback firing only on genuine single-threaded/OOM builds).
-    /// In normal use the in-flight set stays far below this; the cap is a backstop.
+    /// The feed fetch + zoom enrich + batch enrich each spawn an uncapped raw
+    /// `std.Thread` and share the one `Io.Threaded` pool. A saturation storm (rapid
+    /// paging + zoom + prefetch on a slow link) could pile enough live threads to
+    /// approach the OS thread/fd ceiling — where `std.Thread.spawn` starts failing,
+    /// which is exactly what tips a fetch onto `withDeadline`'s unbounded inline
+    /// fallback (ROD-264 #1; the pool's own `concurrent_limit` is unlimited, so the
+    /// spawn ceiling — not a soft pool cap — is the real trigger). Bounding our own
+    /// fan-out keeps us clear of it, the source-level fix that lets the fallback
+    /// stay as-is. In normal use the in-flight set sits far below this; the cap is a
+    /// backstop, not a tuning dial.
     const discover_enrich_cap = 8;
 
     /// True when the Discover worker pool is at the soft cap (ROD-264 #3): the
@@ -2242,11 +2245,13 @@ pub const App = struct {
         if (builtin.is_test) return;
         if (count == 0) return;
         // ROD-264 #3: drop past the soft cap (before building the stub slice).
-        // Unlike the feed fetch / zoom enrich, a page-batch has no paint-time
-        // recheck, so a dropped batch does NOT re-fire for this page — its cards
-        // keep their [--] score/genre/season glyphs until the window is re-fetched
-        // (which re-appends and re-fires). Per-card zoom enrich still fills a card's
-        // metadata on open. Graceful degradation, and only under real saturation.
+        // Unlike the feed fetch / zoom enrich, a page-batch has no recheck: the slot
+        // was already stamped fresh (`.popular_done`, above), so `refreshDiscover`
+        // won't re-fetch until the feed TTL (`feed_ttl_secs`) lapses and the window
+        // is next entered — the page's cards sit at [--] score/genre/season until
+        // then. Per-card zoom enrich still fills a card's metadata on open. Acceptable
+        // degradation, only under real saturation; making a dropped batch re-fire
+        // promptly is a tracked follow-up.
         if (self.discoverPoolSaturated()) {
             log.debug("discover pool at cap ({d}) — dropping batch enrich (page keeps [--] until re-fetch)", .{discover_enrich_cap});
             return;
@@ -3669,6 +3674,6 @@ test "discoverPoolSaturated trips at (not before) the soft cap (ROD-264)" {
     try testing.expect(app.discoverPoolSaturated());
     app.discover_drain.inflight.store(App.discover_enrich_cap + 5, .release);
     try testing.expect(app.discoverPoolSaturated());
-    // Reset so no teardown drain observes a phantom in-flight worker.
+    // Leave the counter balanced — hygiene; this bare App is never torn down.
     app.discover_drain.inflight.store(0, .release);
 }
