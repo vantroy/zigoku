@@ -49,13 +49,19 @@ pub fn withDeadline(
         return @call(.auto, func, args);
     };
     sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
-        // Timer didn't arm (OOM — the fetch arm already proved concurrency is
-        // available). Awaiting the lone fetch here would reintroduce the very
-        // unbounded hang this race exists to kill, so cancel it and fall back
-        // to the inline, unbounded run instead — same contract as the .done arm.
-        log.warn("deadline timer unavailable — re-running operation inline with no deadline", .{});
+        // Timer didn't arm (OOM — the op arm above already proved concurrency was
+        // available, so the op is *in flight*). We now have no deadline. Two wrong
+        // ways out: the old code cancelled the op and re-invoked `func` — a SECOND
+        // request for one logical call (ROD-264 #2); simply awaiting the op instead
+        // trades that for an *unbounded* hang on a dead socket. That hang also leaks
+        // the caller's concurrency accounting — a worker that never returns never
+        // runs its `defer`s, and a caller-side cap that reads that count then stays
+        // tripped (ROD-264 #1/#3). Do neither: cancel the in-flight op (its blocked
+        // recv is interrupted, so this returns promptly) and surface error.Timeout —
+        // the same bounded outcome as a real timeout, which every caller handles.
+        log.warn("deadline timer unavailable — cancelling operation, surfacing timeout", .{});
         while (sel.cancel()) |_| {}
-        return @call(.auto, func, args);
+        return error.Timeout;
     };
     const first = sel.await() catch {
         while (sel.cancel()) |_| {}
@@ -122,4 +128,35 @@ test "withDeadline: propagates a winning operation's error untouched (ROD-153)" 
         error.Boom,
         withDeadline(io, Io.Duration.fromSeconds(30), failing, .{}),
     );
+}
+
+test "withDeadline: no double-fetch and no unbounded wait when the timer arm can't spawn (ROD-264)" {
+    // Reproduce the timer-arm-failure branch deterministically. A 1-slot pool means
+    // the operation arm takes the only unit of concurrency, so withDeadline's *timer*
+    // arm fails to arm (ConcurrencyUnavailable) — the exact branch ROD-264 #1/#2 fixed.
+    // Contract: cancel the in-flight op and surface error.Timeout (bounded — no hang
+    // on a dead socket), and invoke `func` exactly ONCE (the pre-fix code re-invoked
+    // it inline, a second request for one logical call).
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var calls: std.atomic.Value(u32) = .init(0);
+    const op = struct {
+        fn run(i: Io, c: *std.atomic.Value(u32)) ![]const u8 {
+            _ = c.fetchAdd(1, .acq_rel);
+            // Hold the lone slot past withDeadline's timer-arm attempt (Threaded
+            // decrements busy_count only when the op returns, on the worker), so
+            // the fail branch is hit with no race. The branch's cancel interrupts
+            // this sleep; the op count is what the assertion pins.
+            i.sleep(Io.Duration.fromSeconds(30), .awake) catch {};
+            return "unreachable";
+        }
+    }.run;
+
+    try std.testing.expectError(
+        error.Timeout,
+        withDeadline(io, Io.Duration.fromSeconds(30), op, .{ io, &calls }),
+    );
+    try std.testing.expectEqual(@as(u32, 1), calls.load(.acquire));
 }
