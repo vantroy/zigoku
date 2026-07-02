@@ -32,9 +32,11 @@ class Zigoku < Formula
   end
 
   def install
-    # The tarball is zigoku-v{ver}-{target}/{zigoku,LICENSE,README.md}; brew
-    # strips the single top-level dir, so the binary is at the staging root.
+    # The tarball is zigoku-v{ver}-{target}/{zigoku,LICENSE,README.md,licenses/};
+    # brew strips the single top-level dir, so the binary is at the staging root.
     bin.install "zigoku"
+    # Bundled libwebp is BSD-3 + patent grant; ship its notices alongside ours.
+    doc.install "licenses" if File.directory?("licenses")
   end
 
   test do

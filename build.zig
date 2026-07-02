@@ -1,5 +1,14 @@
 const std = @import("std");
 
+// Generated vendored-libwebp decoder file list (scripts/vendor-libwebp.sh).
+// Imported rather than hand-typed so the compiled set never drifts from the
+// files on disk — see the addCSourceFiles call in build().
+const webp_decoder = @import("src/c/webp/decoder_srcs.zig");
+
+// Decoder-level image-dimension backstop, shared with cover.zig so the stb and
+// libwebp decode-bomb caps can't drift. Injected into the stb shim below.
+const decode_limits = @import("src/decode_limits.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -45,7 +54,38 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addIncludePath(b.path("src/c"));
-    mod.addCSourceFile(.{ .file = b.path("src/c/stb_image_impl.c") });
+    // STBI_MAX_DIMENSIONS is injected from src/decode_limits.zig so the stb and
+    // libwebp decode-bomb backstops share one value (see cover.zig).
+    mod.addCSourceFile(.{
+        .file = b.path("src/c/stb_image_impl.c"),
+        .flags = &.{b.fmt("-DSTBI_MAX_DIMENSIONS={d}", .{decode_limits.max_dimension})},
+    });
+
+    // libwebp decoder subset (ROD-244) — AllAnime's cover CDN serves WebP no
+    // matter the file extension, which stb_image cannot decode. We vendor the
+    // decode-only translation units in-tree (src/c/webp, refreshed by
+    // scripts/vendor-libwebp.sh) and compile them straight into the module —
+    // the same hermetic, assume-nothing stance as stb_image above.
+    //
+    // libwebp self-includes root-relative ("src/dec/vp8i_dec.h"), so the
+    // include path points at the dir that contains that src/ tree. Threads stay
+    // off: we never define WEBP_USE_THREAD, so thread_utils.c collapses to
+    // synchronous stubs and no pthread linkage is pulled in (decode is
+    // one-shot per cover — a worker thread would buy nothing). Each ISA .c
+    // self-gates on its target macro, so the full set cross-compiles: x86_64
+    // lights up SSE2, aarch64 NEON, everything else scalar.
+    //
+    // UBSan is left ON (no -fno-sanitize): libwebp is the network-fed image
+    // decoder, and per packaging/aur/README.md we keep the sanitizer trap on
+    // exactly this attacker-reachable surface — a controlled trap on malformed
+    // input beats raw UB in a release binary. Verified: the full test suite and
+    // an adversarial corpus decode with UBSan trapping enabled and hit zero
+    // traps, so it costs us nothing on valid covers.
+    mod.addIncludePath(b.path("src/c/webp"));
+    mod.addCSourceFiles(.{
+        .root = b.path("src/c/webp/src"),
+        .files = &webp_decoder.files,
+    });
 
     // store.zig's @cImport(@cInclude("sqlite3.h")) resolves identically either
     // way — system header vs amalgamation header — so app code never changes.
