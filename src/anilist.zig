@@ -7,11 +7,20 @@
 
 const std = @import("std");
 const domain = @import("domain.zig");
+const deadline = @import("util/deadline.zig");
+const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const ENDPOINT = "https://graphql.anilist.co";
+// Wall-clock ceiling on any single enrichment POST (ROD-262). std exposes no
+// per-read socket timeout, so a reachable-but-silent AniList would otherwise hang
+// the worker forever (a real hazard once ROD-251 detached these fetches — each
+// stuck one leaks a thread + the 2 MB buffer below). Tighter than AllAnime's 20 s:
+// enrichment is a background side rail, not the user-blocking playback path, and
+// one GraphQL POST (even a 50-id batch) is a single round trip.
+const ANILIST_DEADLINE_S = 10;
 // Shared selection set so the search and by-id queries can never drift apart.
 const GQL_FIELDS = "id idMal title{romaji english native} episodes averageScore status season seasonYear startDate{year month day} format genres studios{nodes{name}} description(asHtml:false) coverImage{large}";
 const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
@@ -177,7 +186,9 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
 /// join results back to cards by id — AniList does not guarantee response order
 /// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
 /// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
-/// `enrich` path's null-on-miss contract. Only allocation failures propagate.
+/// `enrich` path's null-on-miss contract. Only a failure building the query here
+/// propagates; a fetch miss — network, HTTP, over-cap, timeout, or the fetch's own
+/// OOM — degrades to empty like any other miss (postGql swallows it to null).
 pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
     if (ids.len == 0) return &.{};
 
@@ -228,18 +239,24 @@ fn pageToMetas(arena: Allocator, raw: []const u8) ![]const Metadata {
 
 /// POST a GraphQL body to AniList; returns the response bytes (arena-owned) or
 /// null on transport/HTTP failure. Caller parses the shape it expects.
-fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
+/// One enrichment POST, run as a cancelable unit of concurrency by `withDeadline`
+/// (ROD-262). Returns the response body (a slice into `arena`) or errors. Kept
+/// `!`-returning so the deadline race can tell a real result from a timeout: on a
+/// stalled fetch the deadline's cancel turns the blocked recv into error.Canceled,
+/// so this frame unwinds — freeing `client` — instead of hanging. `postGql` maps
+/// every failure back to the graceful null.
+fn fetchGql(arena: Allocator, io: Io, body: []const u8) ![]const u8 {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
     // Cap the response at a fixed buffer rather than an unbounded Allocating writer
     // (ROD-247): a hostile/MITM'd server could otherwise dribble a multi-GB body and
-    // OOM the process before any timeout. Any real AniList reply (even a 50-id batch)
-    // is well under 100 KB; 2 MB is a 20× margin. An over-cap body overflows the fixed
-    // writer → fetch errors → null (graceful "no enrichment"), mirroring the cover path.
-    const resp_buf = arena.alloc(u8, 2 * 1024 * 1024) catch return null;
+    // OOM the process. Any real AniList reply (even a 50-id batch) is well under
+    // 100 KB; 2 MB is a 20× margin. An over-cap body overflows the fixed writer →
+    // fetch errors → null (graceful "no enrichment"), mirroring the cover path.
+    const resp_buf = try arena.alloc(u8, 2 * 1024 * 1024);
     var resp_w: std.Io.Writer = .fixed(resp_buf);
-    const res = client.fetch(.{
+    const res = try client.fetch(.{
         .location = .{ .url = ENDPOINT },
         .method = .POST,
         .payload = body,
@@ -248,9 +265,20 @@ fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "Accept", .value = "application/json" },
         },
-    }) catch return null;
-    if (res.status != .ok) return null;
+    });
+    if (res.status != .ok) return error.HttpNotOk;
     return resp_w.buffered();
+}
+
+/// Enrichment POST bounded by `ANILIST_DEADLINE_S` (ROD-262). Every failure —
+/// network error, non-200, over-cap body, or the deadline firing — collapses to
+/// `null`, the "no enrichment" signal every caller already handles.
+fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
+    return deadline.withDeadline(io, .fromSeconds(ANILIST_DEADLINE_S), fetchGql, .{ arena, io, body }) catch |e| {
+        if (e == error.Timeout)
+            log.debug("anilist POST aborted past {d}s deadline", .{ANILIST_DEADLINE_S});
+        return null;
+    };
 }
 
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {

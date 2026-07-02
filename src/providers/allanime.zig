@@ -16,6 +16,7 @@ const Io = std.Io;
 const domain = @import("../domain.zig");
 const source = @import("../source.zig");
 const log = @import("../log.zig");
+const deadline = @import("../util/deadline.zig");
 
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
@@ -554,7 +555,7 @@ pub const AllAnime = struct {
     /// the caller skips the link.
     fn get(arena: Allocator, io: Io, url: []const u8, referer: []const u8) ![]u8 {
         try guardFetchUrl(url);
-        return withDeadline(io, .fromSeconds(FETCH_DEADLINE_S), fetchBody, .{ arena, io, url, referer }) catch |e| {
+        return deadline.withDeadline(io, .fromSeconds(FETCH_DEADLINE_S), fetchBody, .{ arena, io, url, referer }) catch |e| {
             if (e == error.Timeout)
                 log.debug("allanime GET {s}: aborted past {d}s deadline", .{ url, FETCH_DEADLINE_S });
             return error.HttpNotOk;
@@ -586,55 +587,6 @@ pub const AllAnime = struct {
             return error.HttpNotOk;
         }
         return w.buffered();
-    }
-
-    fn DeadlinePayload(comptime Func: type) type {
-        return @typeInfo(@typeInfo(Func).@"fn".return_type.?).error_union.payload;
-    }
-
-    /// Run `func(args...)`, but abort it if it outlives `deadline`. std offers no
-    /// per-read deadline on a socket, so we race the operation against a timer on a
-    /// separate unit of concurrency and cancel whichever loses. If the timer wins,
-    /// the operation's next cancelation point — the blocked `recv`, which the
-    /// Threaded backend interrupts with a signal — returns `error.Canceled`, the
-    /// task unwinds (freeing its connection), and we surface `error.Timeout`. If
-    /// the runtime can't hand us concurrency (single-threaded build), fall back to
-    /// running inline, unbounded — correct, just without the wall-clock ceiling.
-    fn withDeadline(
-        io: Io,
-        deadline: Io.Duration,
-        comptime func: anytype,
-        args: std.meta.ArgsTuple(@TypeOf(func)),
-    ) anyerror!DeadlinePayload(@TypeOf(func)) {
-        const Ret = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
-        const Outcome = union(enum) { done: Ret, timed_out: void };
-        var buf: [2]Outcome = undefined;
-        var sel: Io.Select(Outcome) = .init(io, &buf);
-        sel.concurrent(.done, func, args) catch return @call(.auto, func, args);
-        sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
-            // Timer didn't arm (OOM — the fetch arm already proved concurrency is
-            // available). Awaiting the lone fetch here would reintroduce the very
-            // unbounded hang this race exists to kill, so cancel it and fall back
-            // to the inline, unbounded run instead — same contract as the .done arm.
-            while (sel.cancel()) |_| {}
-            return @call(.auto, func, args);
-        };
-        const first = sel.await() catch {
-            while (sel.cancel()) |_| {}
-            return error.Timeout;
-        };
-        // await pulled the winner; cancel() requests + joins every loser (looped
-        // until null so each task's resources are reclaimed), so by return the
-        // canceled fetch has fully unwound — no use of `arena` outlives this frame.
-        while (sel.cancel()) |_| {}
-        return switch (first) {
-            .done => |r| r,
-            .timed_out => error.Timeout,
-        };
-    }
-
-    fn sleepTimer(io: Io, deadline: Io.Duration) void {
-        io.sleep(deadline, .awake) catch {}; // .awake = monotonic; cancel → return
     }
 
     /// SSRF policy for every long-tail fetch. Only plain http(s); no userinfo
@@ -1526,55 +1478,6 @@ test "guardFetchUrl: alternate IP encodings blocked (defense-in-depth)" {
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://0x7f.0.0.1/x"));
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://127.1/x")); // short-form
     try std.testing.expectError(error.BlockedHost, AllAnime.guardFetchUrl("http://[::ffff:7f00:1]/x")); // compressed IPv4-mapped
-}
-
-test "withDeadline: aborts an operation that outlives the deadline (ROD-153)" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    // Stands in for a stalled fetch: sleeps far past the deadline. The deadline's
-    // cancel turns the sleep into error.Canceled, so the task never reaches return.
-    const stalled = struct {
-        fn run(i: Io) ![]const u8 {
-            try i.sleep(Io.Duration.fromSeconds(30), .awake);
-            return "unreachable";
-        }
-    }.run;
-    try std.testing.expectError(
-        error.Timeout,
-        AllAnime.withDeadline(io, Io.Duration.fromMilliseconds(20), stalled, .{io}),
-    );
-}
-
-test "withDeadline: returns a fast operation's result untouched (ROD-153)" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const quick = struct {
-        fn run() ![]const u8 {
-            return "ok";
-        }
-    }.run;
-    const out = try AllAnime.withDeadline(io, Io.Duration.fromSeconds(30), quick, .{});
-    try std.testing.expectEqualStrings("ok", out);
-}
-
-test "withDeadline: propagates a winning operation's error untouched (ROD-153)" {
-    // The op losing-or-winning the race must pass its own error through, not have
-    // it masked by the deadline machinery — `fetchBody` leans on this to surface
-    // HttpNotOk. Here the op finishes (with an error) well inside the deadline.
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    const failing = struct {
-        fn run() ![]const u8 {
-            return error.Boom;
-        }
-    }.run;
-    try std.testing.expectError(
-        error.Boom,
-        AllAnime.withDeadline(io, Io.Duration.fromSeconds(30), failing, .{}),
-    );
 }
 
 test "isPrivateV4: multicast and broadcast blocked" {
