@@ -17,6 +17,7 @@ const event_mod = @import("event.zig");
 const Allocator = std.mem.Allocator;
 const Loop = event_mod.Loop;
 const CoverCaches = workers.CoverCaches;
+const SourceProvider = @import("../source.zig").SourceProvider;
 const coverTask = workers.coverTask;
 
 /// The cover/image subsystem (ROD-160). Owns one selection's poster art: the
@@ -265,6 +266,7 @@ pub const CoverState = struct {
         gpa: Allocator,
         loop: *Loop,
         io: std.Io,
+        provider: SourceProvider,
         caches: *CoverCaches,
         now: i64,
         target_id: ?[]const u8,
@@ -315,6 +317,7 @@ pub const CoverState = struct {
             loop,
             gpa,
             io,
+            provider,
             url_copy,
             id_for_event,
             caches,
