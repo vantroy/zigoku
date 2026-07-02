@@ -253,7 +253,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
 pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
     mergeOptText(&live.english_name, &incoming.english_name);
     mergeOptText(&live.native_name, &incoming.native_name);
-    mergeOptText(&live.thumb, &incoming.thumb);
+    mergeCoverPreferAbsolute(gpa, &live.thumb, &incoming.thumb);
     mergeOptText(&live.banner, &incoming.banner);
     mergeOptText(&live.status, &incoming.status);
     mergeOptText(&live.description, &incoming.description);
@@ -277,6 +277,27 @@ fn mergeOptText(live: *?[]const u8, incoming: *?[]const u8) void {
         live.* = incoming.*;
         incoming.* = null;
     }
+}
+
+/// Whether to replace a card's current cover `cur` with an enriched `inc`: adopt
+/// when there's no cover yet, or when `cur` is only a relative ref and `inc` is a
+/// fetchable absolute url (ROD-267). Never downgrades an absolute url to a relative
+/// one, and never swaps one absolute for another (no churn for equal quality).
+fn preferCover(cur: ?[]const u8, inc: ?[]const u8) bool {
+    const incoming = inc orelse return false;
+    const current = cur orelse return true;
+    return !domain.isAbsoluteUrl(current) and domain.isAbsoluteUrl(incoming);
+}
+
+/// Cover-thumb variant of `mergeOptText` that prefers an absolute url over a
+/// relative ref (ROD-267): when `preferCover` says so, adopt `incoming` (transfer
+/// ownership, null the source) and free `live`'s old relative thumb. Otherwise
+/// `live` keeps its thumb and the caller's `freeOwnedAnime` reclaims `incoming`'s.
+fn mergeCoverPreferAbsolute(gpa: Allocator, live: *?[]const u8, incoming: *?[]const u8) void {
+    if (!preferCover(live.*, incoming.*)) return;
+    if (live.*) |old| gpa.free(old);
+    live.* = incoming.*;
+    incoming.* = null;
 }
 
 /// List variant of mergeOptText: adopt only when live's list is empty; `&.{}` (len 0)
@@ -408,7 +429,15 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
-    if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
+    // Prefer a fetchable absolute cover over a relative source ref (ROD-267): an
+    // AniList/MAL url beats a bare `mcovers/…` that only resolves behind the
+    // provider. Free the old relative ref before adopting; a failed dup keeps it.
+    if (preferCover(a.thumb, meta.thumb)) {
+        if (dupeOptText(gpa, meta.thumb) catch null) |t| {
+            if (a.thumb) |old| gpa.free(old);
+            a.thumb = t;
+        }
+    }
     if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
     if (a.kind == null) a.kind = dupeOptText(gpa, meta.kind) catch a.kind;
     if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
@@ -1200,4 +1229,46 @@ test "ThreadDrain.drain blocks until every begun worker has finished (ROD-179)" 
     // precedes the deferred finish) is visible via finish's release / drain's acquire.
     try std.testing.expectEqual(spawned, completed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), drain.inflight.load(.acquire));
+}
+
+test "preferCover: absolute beats relative, never downgrades or churns (ROD-267)" {
+    // Nothing held yet → adopt whatever's present.
+    try std.testing.expect(preferCover(null, "mcovers/x.webp"));
+    try std.testing.expect(preferCover(null, "https://s4.anilist.co/x.jpg"));
+    // Relative held + absolute incoming → upgrade.
+    try std.testing.expect(preferCover("mcovers/x.webp", "https://s4.anilist.co/x.jpg"));
+    // Absolute held → never downgrade to relative, never swap absolute for absolute.
+    try std.testing.expect(!preferCover("https://s4.anilist.co/x.jpg", "mcovers/x.webp"));
+    try std.testing.expect(!preferCover("https://a/x.jpg", "https://b/y.jpg"));
+    // Relative held + relative incoming → no change (neither is fetchable as-is).
+    try std.testing.expect(!preferCover("mcovers/x.webp", "mcovers/y.png"));
+    // Nothing incoming → nothing to adopt.
+    try std.testing.expect(!preferCover("mcovers/x.webp", null));
+    try std.testing.expect(!preferCover(null, null));
+}
+
+test "mergeCoverPreferAbsolute: upgrade frees the old relative thumb, keeps absolute otherwise (ROD-267)" {
+    const gpa = std.testing.allocator; // flags a leak or double-free
+
+    // Upgrade: relative → absolute. The old relative thumb must be freed (else the
+    // testing allocator reports a leak); the absolute's ownership transfers to live.
+    {
+        var live: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
+        var incoming: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
+        mergeCoverPreferAbsolute(gpa, &live, &incoming);
+        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
+        try std.testing.expect(incoming == null); // transferred out
+        gpa.free(live.?);
+    }
+    // No swap: absolute held, relative incoming. live is untouched; incoming stays
+    // owned by us (the real caller's freeOwnedAnime would reclaim it).
+    {
+        var live: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
+        var incoming: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
+        mergeCoverPreferAbsolute(gpa, &live, &incoming);
+        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
+        try std.testing.expect(incoming != null); // not transferred
+        gpa.free(live.?);
+        gpa.free(incoming.?);
+    }
 }

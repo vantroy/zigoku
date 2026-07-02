@@ -318,6 +318,11 @@ pub const Store = struct {
     /// Deliberately does NOT touch user state on conflict (play_count, progress,
     /// list_status, user_rating, notes, added_at, last_watched_at) — re-running a
     /// search must never wipe the viewer's history.
+    ///
+    /// `cover_url` breaks the plain COALESCE "new-if-present" rule to prefer a
+    /// fetchable absolute url over a relative ref (ROD-267): a stored AniList/MAL
+    /// cover is never clobbered by a later `mcovers/…` re-search, so an enriched
+    /// cover stays put on surfaces that never re-enrich (History).
     /// `scratch` joins the genres list into a '\n' blob for binding (only touched
     /// when `a.genres` is non-empty); pass an arena — like `putCachedEpisodes`,
     /// the join isn't freed here, it rides the caller's arena to teardown. It is
@@ -335,7 +340,11 @@ pub const Store = struct {
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
             \\    mal_id         = COALESCE(excluded.mal_id, anime.mal_id),
             \\    anilist_id     = COALESCE(excluded.anilist_id, anime.anilist_id),
-            \\    cover_url      = COALESCE(excluded.cover_url, anime.cover_url),
+            \\    cover_url      = CASE
+            \\        WHEN excluded.cover_url LIKE 'http%' THEN excluded.cover_url
+            \\        WHEN anime.cover_url LIKE 'http%' THEN anime.cover_url
+            \\        ELSE COALESCE(excluded.cover_url, anime.cover_url)
+            \\    END,
             \\    year           = COALESCE(excluded.year, anime.year),
             \\    status         = COALESCE(excluded.status, anime.status),
             \\    description    = COALESCE(excluded.description, anime.description),
@@ -1063,6 +1072,31 @@ test "upsertAnime + loadHistory round-trips" {
     try testing.expectEqual(domain.ListStatus.planning, rows[0].list_status);
     try testing.expectEqual(@as(i64, 0), rows[0].play_count);
     try testing.expect(rows[0].history_visible);
+}
+
+test "upsertAnime cover_url: an absolute cover survives a later relative re-search (ROD-267)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // 1) First search seeds a bare, relative `mcovers/…` cover.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "mcovers/a/b.webp" }, 1000, arena);
+    // 2) Enrichment upserts the absolute AniList cover — an absolute url wins.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "https://s4.anilist.co/x/bx1.jpg" }, 1001, arena);
+    try testing.expectEqualStrings(
+        "https://s4.anilist.co/x/bx1.jpg",
+        (try s.getAnime(arena, T_SOURCE, "x")).?.cover_url.?,
+    );
+    // 3) A later re-search brings the relative cover again — it must NOT clobber the
+    //    stored absolute one, so History (which never re-enriches) keeps the good cover.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "mcovers/a/b.webp" }, 1002, arena);
+    try testing.expectEqualStrings(
+        "https://s4.anilist.co/x/bx1.jpg",
+        (try s.getAnime(arena, T_SOURCE, "x")).?.cover_url.?,
+    );
 }
 
 test "loadHistory excludes hidden metadata-cache rows" {
