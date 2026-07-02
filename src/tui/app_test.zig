@@ -150,18 +150,7 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.search_thread = null;
     }
-    if (app.popular_thread) |t| {
-        t.join();
-        app.popular_thread = null;
-    }
-    if (app.discover_enrich_thread) |t| {
-        t.join();
-        app.discover_enrich_thread = null;
-    }
-    if (app.discover_batch_enrich_thread) |t| {
-        t.join();
-        app.discover_batch_enrich_thread = null;
-    }
+    app.discover_drain.drain(); // Discover feed/enrich workers detach now (ROD-251); wait them out
     // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
     // workers from ever spawning in tests), but drained defensively so a future test
     // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
