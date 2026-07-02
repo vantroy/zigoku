@@ -1015,7 +1015,10 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url
     //    races the fetch against a timer and cancels a stalled host so a silent CDN
     //    can't hang this worker forever (ROD-265); the returned body is a gpa-owned
     //    exact slice we free after decode.
-    const req = provider.coverRequest(gpa, url) catch return error.CoverFetchFailed;
+    const req = provider.coverRequest(gpa, url) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CoverFetchFailed, // bad/blocked ref → cover miss
+    };
     defer gpa.free(req.url);
     const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, req }) catch |e| {
         if (e == error.Timeout)
