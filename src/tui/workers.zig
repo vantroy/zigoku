@@ -883,9 +883,10 @@ const cover_fetch_deadline_s = 20;
 /// The actual cover GET, run as a cancelable unit of concurrency by `withDeadline`
 /// (ROD-265). Owns its `std.http.Client` so a deadline cancel unwinds this frame —
 /// freeing the connection — instead of leaving a socket blocked in `recv`. Returns
-/// the encoded body as an exact, gpa-owned slice (the caller frees it); every
-/// failure collapses to `error.CoverFetchFailed`, which `loadCoverPixels` already
-/// treats as a cover miss.
+/// the encoded body as an exact, gpa-owned slice (the caller frees it). Fetch and
+/// non-200 failures return `error.CoverFetchFailed`; allocation failures propagate
+/// as `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
+/// `error.Timeout` — to a cover miss at the `withDeadline` call site.
 fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();

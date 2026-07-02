@@ -68,8 +68,22 @@ pub fn withDeadline(
         return error.Timeout;
     };
     // await pulled the winner; cancel() requests + joins every loser (looped
-    // until null so each task's resources are reclaimed), so by return the
-    // canceled operation has fully unwound — no borrowed state outlives this frame.
+    // until null so each task's *frame* is reclaimed), so by return the canceled
+    // operation has fully unwound — no borrowed state outlives this frame.
+    //
+    // KNOWN RESIDUAL (ROD-265): cancel() hands back each drained loser's outcome so a
+    // caller can free any resource it *returned* — that is why std exposes this
+    // loop-returning variant alongside `cancelDiscard` (see Io.Select.cancel). We drop
+    // it with `|_|`. Harmless for the timer arm (`.timed_out` is void) and for an op
+    // interrupted at its `recv` (`.done` holds `error.Canceled` — no resource). But if
+    // the timer wins the await in the µs after the op clears its last cancel point and
+    // is in its return tail, cancel() drains a `.done` holding a *live* payload we then
+    // leak. Arena-backed callers (allanime, anilist) reclaim it at request scope; a
+    // gpa-backed caller (cover fetch) leaks it for the process lifetime. Left as-is: the
+    // window needs the op to *succeed* within µs of the deadline, it leaks one payload
+    // per hit, and freeing it generically would need a caller-supplied finalizer or a
+    // "return the late success" contract change — more machinery than a sub-µs leak of
+    // one payload earns.
     while (sel.cancel()) |_| {}
     return switch (first) {
         .done => |r| r,
