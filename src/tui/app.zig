@@ -2977,11 +2977,26 @@ pub const App = struct {
     /// row, matching pumpDiscoverCovers' fetch span so a filled grid also seeds the
     /// peek band. Returns true when the slot is short of that and a page should fire.
     /// Split from maybeFillDiscover so the geometry→target math is unit-testable with
-    /// no live fetch. A zero-cell grid (too-small terminal) never needs a fill.
+    /// no live fetch. A zero-row grid (too-small terminal) never needs a fill (cols is
+    /// `@max(1, …)`, never 0 — the cols guard is defensive parity with the cover pump).
     fn discoverNeedsFill(len: usize, geo: discover_view.Geometry) bool {
         if (geo.cols == 0 or geo.rows_visible == 0) return false;
         const target = (@as(usize, geo.rows_visible) + 1) * @as(usize, geo.cols);
         return len < target;
+    }
+
+    /// Whether the fill pass may fire for a slot in this state (ROD-272): an
+    /// established feed (page > 0 — page 1 is refreshDiscover's to own), idle (not
+    /// loading — the in-flight debounce), not exhausted (the short-page tail), and
+    /// not failed. The `failed` gate is load-bearing: a fill-fired page that errors
+    /// sets `slot.failed` and *wakes the loop* (.popular_error), so without it this
+    /// every-frame pass would re-fire as fast as the fetch can fail — no tick pacing,
+    /// and the pool cap never trips on near-instant failures (ROD-272 review). A later
+    /// successful page (a user scroll re-fires the prefetch, which clears `failed`)
+    /// resumes the fill; until then the grid degrades to under-filled — exactly the
+    /// pre-ROD-272 behaviour, i.e. the graceful-degradation floor, not a retry storm.
+    fn discoverFillEligible(loading: bool, exhausted: bool, failed: bool, page: u32) bool {
+        return page > 0 and !loading and !exhausted and !failed;
     }
 
     /// Top the active Discover window up to the visible grid (ROD-272). The feed
@@ -2991,14 +3006,14 @@ pub const App = struct {
     /// the cursor sits at 0. This fires the next page whenever the loaded set doesn't
     /// cover the visible rows (+ peek row), cascading page-by-page until the grid is
     /// full or the feed is exhausted. Called every frame from run() with the settled
-    /// geometry, so it also refills after a resize grows the viewport. Debounced by
-    /// `slot.loading`: only one page is ever in flight, so it can't spam the feed.
+    /// geometry, so it also refills after a resize grows the viewport. The state guard
+    /// (discoverFillEligible) keeps only one page in flight and — critically — backs
+    /// off on a failed page, so a flaky feed can't turn this every-frame pass into a
+    /// retry storm.
     fn maybeFillDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         if (self.active_view != .discover) return;
         const slot = self.discover.activeSlot();
-        // Only cascade an established feed: page 0 is the initial fetch refreshDiscover
-        // owns; loading/exhausted stop it (exhausted is the feed's short-page tail).
-        if (slot.loading or slot.exhausted or slot.page == 0) return;
+        if (!discoverFillEligible(slot.loading, slot.exhausted, slot.failed, slot.page)) return;
 
         const w = self.term_cols;
         const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
@@ -3736,4 +3751,17 @@ test "discoverNeedsFill: a short first page under-fills a wide grid, a full one 
     try testing.expectEqual(@as(u16, 0), tiny.rows_visible);
     try testing.expect(!App.discoverNeedsFill(0, tiny));
     try testing.expect(!App.discoverNeedsFill(30, tiny));
+}
+
+test "discoverFillEligible gates the fill on an established, idle, live feed (ROD-272)" {
+    // The stateful guard the every-frame fill pass rides — each blocker must veto
+    // on its own; only an all-clear slot fires. Pinned here (not just via the pure
+    // geometry math) because this guard is where a refactor regression would land.
+    try testing.expect(App.discoverFillEligible(false, false, false, 1)); // all clear → fire
+    try testing.expect(!App.discoverFillEligible(false, false, false, 0)); // page 0 is refreshDiscover's
+    try testing.expect(!App.discoverFillEligible(true, false, false, 1)); // in flight → debounce
+    try testing.expect(!App.discoverFillEligible(false, true, false, 1)); // feed exhausted
+    // The review blocker: a failed page must veto, else .popular_error wakes the loop
+    // and the fill re-fires as fast as the fetch can fail — an unbounded retry storm.
+    try testing.expect(!App.discoverFillEligible(false, false, true, 1));
 }
