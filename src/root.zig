@@ -103,4 +103,5 @@ test {
     _ = @import("tui/discover_covers.zig");
     _ = @import("tui/view/discover.zig");
     _ = @import("providers/allanime.zig");
+    _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
 }
