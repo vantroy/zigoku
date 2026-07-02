@@ -881,26 +881,39 @@ fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: [
 const cover_fetch_deadline_s = 20;
 
 /// The actual cover GET, run as a cancelable unit of concurrency by `withDeadline`
-/// (ROD-265). Owns its `std.http.Client` so a deadline cancel unwinds this frame —
-/// freeing the connection — instead of leaving a socket blocked in `recv`. Returns
-/// the encoded body as an exact, gpa-owned slice (the caller frees it). Fetch and
-/// non-200 failures return `error.CoverFetchFailed`; allocation failures propagate
-/// as `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
+/// (ROD-265). Takes a provider-resolved `CoverRequest` — an absolute URL plus any
+/// CDN headers (ROD-267): some cover CDNs (AllAnime's is Cloudflare-fronted) 403 a
+/// refererless GET, so Referer/UA ride along when the provider set them. Owns its
+/// `std.http.Client` so a deadline cancel unwinds this frame — freeing the
+/// connection — instead of leaving a socket blocked in `recv`. Returns the encoded
+/// body as an exact, gpa-owned slice (the caller frees it). Fetch and non-200
+/// failures return `error.CoverFetchFailed`; allocation failures propagate as
+/// `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
 /// `error.Timeout` — to a cover miss at the `withDeadline` call site.
-fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
+fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
     defer gpa.free(resp_buf);
     var resp_writer: std.Io.Writer = .fixed(resp_buf);
+    // Accept is ours; Referer/UA come from the provider only when its CDN needs
+    // them (AniList/MAL covers need none — the fields stay null).
+    var extra: [2]std.http.Header = .{
+        .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
+        undefined,
+    };
+    var extra_len: usize = 1;
+    if (req.referer) |r| {
+        extra[1] = .{ .name = "Referer", .value = r };
+        extra_len = 2;
+    }
     const res = client.fetch(.{
-        .location = .{ .url = url },
+        .location = .{ .url = req.url },
         .method = .GET,
         .response_writer = &resp_writer,
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
-        },
+        .headers = if (req.user_agent) |ua| .{ .user_agent = .{ .override = ua } } else .{},
+        .extra_headers = extra[0..extra_len],
     }) catch |e| {
         // Covers the deadline cancel (ReadFailed ← Canceled), oversize body (writer
         // full), and ordinary network errors.
@@ -923,7 +936,12 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
 /// Lock rule: every dupe of a slice that lives in (or was just inserted into) a
 /// cache happens while `caches.mu` is held; `decodeCoverBody` and `client.fetch`
 /// run *unlocked* so a slow decode/fetch never stalls another worker.
-pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
+///
+/// `url` is the raw stored cover ref and is the cache key at every layer (memory,
+/// disk). Only the network branch resolves it — via `provider.coverRequest` — into
+/// the absolute URL actually fetched, so a CDN-host rotation never invalidates the
+/// cache and the CDN host stays behind the provider seam (ROD-267).
+pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
     // 1) Decoded-cache hit: dupe the pixels out under the lock (get() promotes, so
     //    it mutates — even this read holds the lock).
     {
@@ -963,10 +981,14 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *Cov
     }
 
     // 4) Network fetch (unlocked, deadline-bounded), then warm both caches and
-    //    persist to disk. `withDeadline` races the fetch against a timer and cancels
-    //    a stalled host so a silent CDN can't hang this worker forever (ROD-265);
-    //    the returned body is a gpa-owned exact slice we free after decode.
-    const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, url }) catch |e| {
+    //    persist to disk. The provider resolves the (possibly relative) `url` into
+    //    an absolute URL + CDN headers behind the vtable (ROD-267). `withDeadline`
+    //    races the fetch against a timer and cancels a stalled host so a silent CDN
+    //    can't hang this worker forever (ROD-265); the returned body is a gpa-owned
+    //    exact slice we free after decode.
+    const req = provider.coverRequest(gpa, url) catch return error.CoverFetchFailed;
+    defer gpa.free(req.url);
+    const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, req }) catch |e| {
         if (e == error.Timeout)
             log.debug("cover fetch {s}: aborted past {d}s deadline", .{ url, cover_fetch_deadline_s });
         return error.CoverFetchFailed;
@@ -989,12 +1011,13 @@ pub fn coverTask(
     loop: *Loop,
     gpa: Allocator,
     io: std.Io,
+    provider: SourceProvider,
     url: []const u8,
     for_id: []const u8,
     caches: *CoverCaches,
 ) void {
     defer gpa.free(url);
-    const decoded = loadCoverPixels(gpa, io, url, caches) catch |e| {
+    const decoded = loadCoverPixels(gpa, io, provider, url, caches) catch |e| {
         log.debug("cover load failed: {s}", .{@errorName(e)});
         postCoverError(loop, gpa, for_id);
         return;
@@ -1019,12 +1042,13 @@ pub fn discoverCoverTask(
     loop: *Loop,
     gpa: Allocator,
     io: std.Io,
+    provider: SourceProvider,
     url: []const u8,
     caches: *CoverCaches,
     drain: *ThreadDrain,
 ) void {
     defer drain.finish();
-    if (loadCoverPixels(gpa, io, url, caches)) |px| {
+    if (loadCoverPixels(gpa, io, provider, url, caches)) |px| {
         loop.postEvent(.{ .discover_cover_done = .{
             .url = url,
             .rgba = px.rgba,

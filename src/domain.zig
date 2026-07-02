@@ -9,6 +9,14 @@
 
 const std = @import("std");
 
+/// True if `s` is an absolute http(s) URL (carries a scheme), as opposed to a
+/// provider-relative path a source must still resolve. The one axis the cover
+/// pipeline needs — a fetchable absolute URL vs a bare relative ref (ROD-267).
+/// Source-agnostic on purpose: no site knowledge, just the scheme.
+pub fn isAbsoluteUrl(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "https://") or std.mem.startsWith(u8, s, "http://");
+}
+
 /// Which track we want from the source. AllAnime keys sub/dub at every layer
 /// (search counts, episode lists, stream resolution), so it rides along
 /// everywhere.

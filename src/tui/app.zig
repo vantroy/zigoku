@@ -344,7 +344,7 @@ pub fn run(
         app.layout(win.height, win.width);
         // ROD-243: fetch the visible grid's covers off-thread once scroll is settled
         // (geometry known). No-op outside Discover / when nothing's missing.
-        app.pumpDiscoverCovers(&loop, io);
+        app.pumpDiscoverCovers(&loop, io, provider);
         try app.draw(&vx, writer);
     }
 
@@ -1332,12 +1332,13 @@ pub const App = struct {
     /// subsystem (CoverState never reaches into selection state itself — ROD-160).
     /// Called immediately for discrete nav (pane/view switch) and from the .tick
     /// settle for cursor-tracked scrolling (ROD-202).
-    fn syncCover(self: *App, loop: *Loop, io: std.Io) void {
+    fn syncCover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         const anime = self.detailSyncTarget();
         const started = self.cover.sync(
             self.gpa,
             loop,
             io,
+            provider,
             &self.cover_caches,
             self.now_ms,
             if (anime) |a| a.id else null,
@@ -2067,7 +2068,7 @@ pub const App = struct {
                 // target costs nothing.
                 if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
                     self.cover_sync_deadline_ms = 0;
-                    self.syncCover(loop, io);
+                    self.syncCover(loop, io, provider);
                 }
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |*t| {
@@ -2101,12 +2102,12 @@ pub const App = struct {
                 //    now and cancel any pending settle — the cover must never lag a
                 //    deliberate keystroke.
                 self.cover_sync_deadline_ms = 0;
-                self.syncCover(loop, io);
+                self.syncCover(loop, io, provider);
             } else {
                 // 3. Async completion / resize: refresh the cover, but don't stomp a
                 //    pending scroll settle — let the cursor settle drive it instead of
                 //    fetching the row we happen to be mid-scroll over.
-                if (self.cover_sync_deadline_ms == 0) self.syncCover(loop, io);
+                if (self.cover_sync_deadline_ms == 0) self.syncCover(loop, io, provider);
             }
         }
     }
@@ -2320,7 +2321,7 @@ pub const App = struct {
     /// the cap wait, scrolled-past cards are never fetched, and fast scrolling can't
     /// spawn unbounded requests. No-op outside Discover; the spawn is gated under
     /// test (the plan + the in-flight mark still run, so tests exercise both).
-    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io) void {
+    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         if (self.active_view != .discover) return;
 
         const w = self.term_cols;
@@ -2426,7 +2427,7 @@ pub const App = struct {
             // (nothing else would resolve this url, leaving it stranded `.loading`).
             self.discover_cover_drain.begin();
             const t = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
-                loop, self.gpa, io, owned_url, &self.cover_caches, &self.discover_cover_drain,
+                loop, self.gpa, io, provider, owned_url, &self.cover_caches, &self.discover_cover_drain,
             }) catch {
                 self.discover_cover_drain.finish();
                 self.resetLoadingSlot(url);

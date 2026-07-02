@@ -68,6 +68,10 @@ fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularO
     return &.{};
 }
 
+fn dummyCoverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
+    return .{ .url = try gpa.dupe(u8, ref) };
+}
+
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
@@ -75,6 +79,7 @@ const dummy_vtable: SourceProvider.VTable = .{
     .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
+    .coverRequest = dummyCoverRequestFn,
 };
 
 fn dummyProvider() SourceProvider {
@@ -110,6 +115,9 @@ const GateProvider = struct {
     fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
         return .{ .url = "" };
     }
+    fn coverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
+        return .{ .url = try gpa.dupe(u8, ref) };
+    }
 
     const vtable: SourceProvider.VTable = .{
         .name = nameFn,
@@ -118,6 +126,7 @@ const GateProvider = struct {
         .popular = popularFn,
         .episodes = episodesFn,
         .resolve = resolveFn,
+        .coverRequest = coverRequestFn,
     };
 
     fn provider(self: *GateProvider) SourceProvider {
@@ -785,16 +794,16 @@ test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping alrea
     // already marked loading so a wave never re-selects one. This proves the
     // per-frame half of the bound; the cap-minus-in-flight half (`busy` > 0) is
     // proved separately below, since `busy` stays 0 here (no worker decrements it).
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 3), countLoadingCovers(&app)); // wave 1
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 6), countLoadingCovers(&app)); // wave 2
     // Only 2 cards remain — the cap is an upper bound, not a quota.
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
     // Everything is now in flight → a further pump marks nothing new (never exceeds
     // the visible set regardless of how many pumps fire — fast scroll can't pile up).
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
 }
 
@@ -828,12 +837,12 @@ test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
     // tally). With cap 3 the pump may start only ONE more — `budget = cap - busy` —
     // which is the actual guard behind "never more than N downloads at once".
     app.discover_cover_drain.inflight.store(2, .release);
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Already at the cap → the pump starts nothing new this frame.
     app.discover_cover_drain.inflight.store(3, .release);
-    app.pumpDiscoverCovers(&loop, io);
+    app.pumpDiscoverCovers(&loop, io, dummyProvider());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Required before any drain(): no real workers exist to decrement the simulated
@@ -2968,6 +2977,7 @@ test "coverTask decoded-cache hit posts a cloned cover_done event" {
         &loop,
         testing.allocator,
         testing.io,
+        dummyProvider(),
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
         &caches,
@@ -2995,6 +3005,7 @@ test "coverTask raw-cache hit decodes once and warms decoded cache" {
         &loop,
         testing.allocator,
         testing.io,
+        dummyProvider(),
         try testing.allocator.dupe(u8, "https://img/anime.png"),
         try testing.allocator.dupe(u8, "anime1"),
         &caches,
@@ -3029,11 +3040,11 @@ test "CoverCaches survives concurrent loadCoverPixels under the lock (ROD-243)" 
     }
 
     const Worker = struct {
-        fn run(gpa: std.mem.Allocator, io: std.Io, c: *CoverCaches, keys: []const []const u8, tid: usize) void {
+        fn run(gpa: std.mem.Allocator, io: std.Io, provider: SourceProvider, c: *CoverCaches, keys: []const []const u8, tid: usize) void {
             var i: usize = 0;
             while (i < 64) : (i += 1) {
                 // Overlapping, deterministic key stride → contention + eviction churn.
-                const px = workers.loadCoverPixels(gpa, io, keys[(tid * 7 + i) % keys.len], c) catch continue;
+                const px = workers.loadCoverPixels(gpa, io, provider, keys[(tid * 7 + i) % keys.len], c) catch continue;
                 gpa.free(px.rgba); // independent copy — owned by us, never the cache's
             }
         }
@@ -3041,7 +3052,7 @@ test "CoverCaches survives concurrent loadCoverPixels under the lock (ROD-243)" 
 
     var threads: [8]?std.Thread = .{null} ** 8;
     for (&threads, 0..) |*t, tid| {
-        t.* = std.Thread.spawn(.{}, Worker.run, .{ testing.allocator, testing.io, &caches, &urls, tid }) catch null;
+        t.* = std.Thread.spawn(.{}, Worker.run, .{ testing.allocator, testing.io, dummyProvider(), &caches, &urls, tid }) catch null;
     }
     for (threads) |t| if (t) |th| th.join();
 }
@@ -3103,7 +3114,7 @@ test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-2
     }
 
     var loop = initTestLoop();
-    app.pumpDiscoverCovers(&loop, std.testing.io);
+    app.pumpDiscoverCovers(&loop, std.testing.io, dummyProvider());
 
     // Every visible card's slot is now in-flight, marked from the borrowed thumb.
     for (thumbs) |t| {
