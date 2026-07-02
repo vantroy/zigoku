@@ -322,7 +322,12 @@ pub const Store = struct {
     /// `cover_url` breaks the plain COALESCE "new-if-present" rule to prefer a
     /// fetchable absolute url over a relative ref (ROD-267): a stored AniList/MAL
     /// cover is never clobbered by a later `mcovers/…` re-search, so an enriched
-    /// cover stays put on surfaces that never re-enrich (History).
+    /// cover stays put on surfaces that never re-enrich (History). "Absolute" is a
+    /// case-sensitive `http(s)://` GLOB — it mirrors `domain.isAbsoluteUrl` so the
+    /// two layers can't drift; a looser `LIKE 'http%'` let non-URL "http…" garbage
+    /// stick or clobber a good cover (ROD-267 review). Note a new absolute *does*
+    /// replace a stored absolute here (unlike the in-memory merge, which never
+    /// churns absolute→absolute) — benign, the re-persisted URL is ~always the same.
     /// `scratch` joins the genres list into a '\n' blob for binding (only touched
     /// when `a.genres` is non-empty); pass an arena — like `putCachedEpisodes`,
     /// the join isn't freed here, it rides the caller's arena to teardown. It is
@@ -341,8 +346,8 @@ pub const Store = struct {
             \\    mal_id         = COALESCE(excluded.mal_id, anime.mal_id),
             \\    anilist_id     = COALESCE(excluded.anilist_id, anime.anilist_id),
             \\    cover_url      = CASE
-            \\        WHEN excluded.cover_url LIKE 'http%' THEN excluded.cover_url
-            \\        WHEN anime.cover_url LIKE 'http%' THEN anime.cover_url
+            \\        WHEN excluded.cover_url GLOB 'http://*' OR excluded.cover_url GLOB 'https://*' THEN excluded.cover_url
+            \\        WHEN anime.cover_url GLOB 'http://*' OR anime.cover_url GLOB 'https://*' THEN anime.cover_url
             \\        ELSE COALESCE(excluded.cover_url, anime.cover_url)
             \\    END,
             \\    year           = COALESCE(excluded.year, anime.year),
@@ -1766,4 +1771,24 @@ test "recomputeProgress: gap-watch documents strategy-A under-count (ROD-193)" {
     const hw = try s.recomputeProgress(arena, T_SOURCE, "x", .sub);
     // Sorted rows: ["3", "5"]. Last fully-watched is index 1 (0-based) → 1-based = 2.
     try testing.expectEqual(@as(i64, 2), hw);
+}
+
+test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor clobbers (ROD-267 review)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Garbage the old loose `LIKE 'http%'` matched but which is NOT an absolute URL
+    // (no `://`). It must not become sticky — a later real relative cover still lands.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "g", .title = "G", .cover_url = "httpzzz-not-a-url" }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "g", .title = "G", .cover_url = "mcovers/real.webp" }, 1001, arena);
+    try testing.expectEqualStrings("mcovers/real.webp", (try s.getAnime(arena, T_SOURCE, "g")).?.cover_url.?);
+
+    // Case-variant garbage ("HTTPFOO…") must not clobber a stored absolute cover —
+    // GLOB is case-sensitive, so an uppercase-scheme string is not "absolute".
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "https://s4.anilist.co/real.jpg" }, 1002, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "HTTPFOO-GARBAGE" }, 1003, arena);
+    try testing.expectEqualStrings("https://s4.anilist.co/real.jpg", (try s.getAnime(arena, T_SOURCE, "h")).?.cover_url.?);
 }
