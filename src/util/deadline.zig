@@ -49,13 +49,13 @@ pub fn withDeadline(
         return @call(.auto, func, args);
     };
     sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
-        // Timer didn't arm (OOM — the fetch arm already proved concurrency is
-        // available). Awaiting the lone fetch here would reintroduce the very
-        // unbounded hang this race exists to kill, so cancel it and fall back
-        // to the inline, unbounded run instead — same contract as the .done arm.
-        log.warn("deadline timer unavailable — re-running operation inline with no deadline", .{});
-        while (sel.cancel()) |_| {}
-        return @call(.auto, func, args);
+        // Timer didn't arm (OOM — the fetch arm above already proved concurrency
+        // is available, so the operation is *already in flight*). The old code
+        // cancelled it and re-invoked `func` — a SECOND network request for one
+        // logical call (ROD-264 #2). Instead fall through to the shared await
+        // below and wait out the in-flight op: unbounded (no timer), but that's
+        // the same ceiling loss as the .done fallback, minus the double-fetch.
+        log.warn("deadline timer unavailable — awaiting in-flight operation with no deadline", .{});
     };
     const first = sel.await() catch {
         while (sel.cancel()) |_| {}

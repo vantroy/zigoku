@@ -45,7 +45,10 @@ const Loop = event_mod.Loop;
 /// Intentionally does NOT cap the worker count: the episode-prefetch debounce
 /// (ROD-156) keeps superseding fires rare and each fetch is deadline-bounded
 /// (ROD-153), so the outstanding set stays small in practice. A hard cap would
-/// be backpressure policy, not a safety requirement.
+/// be backpressure policy, not a safety requirement — so where a caller *does*
+/// want one (the Discover fan-out, which can storm), it reads `inflight` against
+/// its own soft cap at the spawn site and drops past it (`discoverPoolSaturated`,
+/// ROD-264 #3), rather than this shared primitive imposing a single global limit.
 ///
 /// `drain()` assumes the event queue keeps draining: a worker's final
 /// `postEvent` blocks if the bounded queue is full, and during teardown the main
