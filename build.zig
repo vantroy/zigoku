@@ -5,6 +5,10 @@ const std = @import("std");
 // files on disk — see the addCSourceFiles call in build().
 const webp_decoder = @import("src/c/webp/decoder_srcs.zig");
 
+// Decoder-level image-dimension backstop, shared with cover.zig so the stb and
+// libwebp decode-bomb caps can't drift. Injected into the stb shim below.
+const decode_limits = @import("src/decode_limits.zig");
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -50,7 +54,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addIncludePath(b.path("src/c"));
-    mod.addCSourceFile(.{ .file = b.path("src/c/stb_image_impl.c") });
+    // STBI_MAX_DIMENSIONS is injected from src/decode_limits.zig so the stb and
+    // libwebp decode-bomb backstops share one value (see cover.zig).
+    mod.addCSourceFile(.{
+        .file = b.path("src/c/stb_image_impl.c"),
+        .flags = &.{b.fmt("-DSTBI_MAX_DIMENSIONS={d}", .{decode_limits.max_dimension})},
+    });
 
     // libwebp decoder subset (ROD-244) — AllAnime's cover CDN serves WebP no
     // matter the file extension, which stb_image cannot decode. We vendor the

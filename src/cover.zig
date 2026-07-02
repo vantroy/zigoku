@@ -1,5 +1,6 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
+const limits = @import("decode_limits.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -67,8 +68,9 @@ pub fn isWebp(encoded: []const u8) bool {
 /// 16383×16383 → ~1 GiB). This is a decoder-level backstop; callers that know
 /// their domain (cover art is far smaller) still apply a tighter policy cap on
 /// top (see src/tui/workers.zig). Kept generous so it never rejects a real
-/// image. stb enforces the same ceiling internally via STBI_MAX_DIMENSIONS.
-pub const max_decode_dimension = 8192;
+/// image. The stb path enforces the same ceiling via STBI_MAX_DIMENSIONS, which
+/// build.zig derives from this same value (src/decode_limits.zig).
+pub const max_decode_dimension = limits.max_dimension;
 
 fn withinDecodeBounds(dims: Dimensions) bool {
     return dims.w <= max_decode_dimension and dims.h <= max_decode_dimension;
