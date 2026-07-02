@@ -39,6 +39,17 @@ const GCM_SEED = "Xot36i3lK3:v1";
 // Site origin: base for deciphered provider GETs (ROD-92) and the CDN referer.
 const SITE = "https://allanime.day";
 
+// AllAnime serves some covers as a bare, provider-relative `mcovers/…` path with no
+// host (others are absolute AniList/MAL urls). This is the image CDN its own
+// frontend resolves those against — a pass-through cache, Cloudflare-fronted, that
+// 403s a refererless GET. Kept here so the host lives behind the vtable and never
+// leaks upstream; a host rotation is a one-line change (ROD-267).
+const COVER_CDN_BASE = "https://wp.youtube-anime.com/aln.youtube-anime.com/";
+
+// Sanity cap on a cover ref before it's spliced into a fetch URL — real refs (a
+// relative `mcovers/…` path or an absolute cover URL) are far shorter (ROD-267).
+const max_cover_ref_len = 2048;
+
 // Referers the API / CDN gate on, per operation.
 const REFERER_API = "https://allmanga.to/"; // search + episodes + deciphered clock GET
 const REFERER_VIDEO = "https://youtu-chan.com/"; // get_video
@@ -82,6 +93,7 @@ pub const AllAnime = struct {
         .popular = popularErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
+        .coverRequest = coverRequestErased,
     };
 
     // ── vtable trampolines: recover the typed self from the erased ptr ──────────
@@ -108,6 +120,27 @@ pub const AllAnime = struct {
     fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
         return self.resolve(arena, io, show_id, ep, tt, quality);
+    }
+    /// Resolve a stored cover ref into a fetchable request (ROD-267). Absolute refs
+    /// (AniList/MAL covers) fetch as-is, no CDN referer needed. A bare relative
+    /// `mcovers/…` gets the cover CDN prepended and carries the site referer + our
+    /// UA, which the Cloudflare-fronted CDN gates on. `url` is `gpa`-owned.
+    fn coverRequestErased(ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source.CoverRequest {
+        _ = ptr;
+        // `ref` is untrusted provider data (AllAnime's `thumbnail`) about to be
+        // spliced into a URL we fetch. Reject anything that isn't bounded, non-empty,
+        // printable-ASCII URL material: a CR/LF or space would let a hostile thumb
+        // smuggle a header or a second request onto the wire (ROD-267 review).
+        // `cleanArg` is the same printable-ASCII allowlist the mpv-argv path uses.
+        // (Host-allowlist / SSRF is a separate layer — ROD-266.)
+        if (ref.len == 0 or ref.len > max_cover_ref_len or !cleanArg(ref))
+            return error.InvalidCoverRef;
+        if (domain.isAbsoluteUrl(ref)) return .{ .url = try gpa.dupe(u8, ref) };
+        return .{
+            .url = try std.fmt.allocPrint(gpa, "{s}{s}", .{ COVER_CDN_BASE, ref }),
+            .referer = SITE,
+            .user_agent = UA,
+        };
     }
 
     // ── search ─────────────────────────────────────────────────────────────────
@@ -1543,4 +1576,49 @@ test "mapTransportError: connectivity failures become NetworkDown, rest pass thr
     // network — it propagates unchanged.
     try std.testing.expectEqual(error.OutOfMemory, AllAnime.mapTransportError(error.OutOfMemory, "t"));
     try std.testing.expectEqual(error.WriteFailed, AllAnime.mapTransportError(error.WriteFailed, "t"));
+}
+
+test "coverRequest: absolute refs pass through; relative mcovers get the CDN + referer (ROD-267)" {
+    var aa: AllAnime = .{};
+    const p = aa.provider();
+    const gpa = std.testing.allocator;
+
+    // Absolute AniList/MAL covers fetch as-is — no CDN referer/UA needed.
+    {
+        const req = try p.coverRequest(gpa, "https://s4.anilist.co/file/x/bx1-abc.jpg");
+        defer gpa.free(req.url);
+        try std.testing.expectEqualStrings("https://s4.anilist.co/file/x/bx1-abc.jpg", req.url);
+        try std.testing.expect(req.referer == null);
+        try std.testing.expect(req.user_agent == null);
+    }
+    // A bare relative `mcovers/…` gets the cover CDN prepended and carries the site
+    // referer + our UA, which the Cloudflare-fronted CDN gates on.
+    {
+        const req = try p.coverRequest(gpa, "mcovers/a_tbs/dhw/B6AMhLy6EQHDgYgBF.webp");
+        defer gpa.free(req.url);
+        try std.testing.expectEqualStrings(COVER_CDN_BASE ++ "mcovers/a_tbs/dhw/B6AMhLy6EQHDgYgBF.webp", req.url);
+        try std.testing.expectEqualStrings(SITE, req.referer.?);
+        try std.testing.expectEqualStrings(UA, req.user_agent.?);
+    }
+}
+
+test "coverRequest rejects control-char / whitespace / empty / oversize refs (ROD-267 review)" {
+    var aa: AllAnime = .{};
+    const p = aa.provider();
+    const gpa = std.testing.allocator;
+
+    // CR/LF header-splitting payload — the core hazard: untrusted thumb bytes must
+    // never reach the socket as a smuggled header or second request.
+    try std.testing.expectError(error.InvalidCoverRef, p.coverRequest(gpa, "mcovers/x.webp\r\nX-Injected: 1"));
+    // An absolute-looking ref with a control char is rejected on that branch too.
+    try std.testing.expectError(error.InvalidCoverRef, p.coverRequest(gpa, "https://evil/\r\nHost: x"));
+    // Embedded space, empty, and oversize are all junk.
+    try std.testing.expectError(error.InvalidCoverRef, p.coverRequest(gpa, "mcovers/a b.webp"));
+    try std.testing.expectError(error.InvalidCoverRef, p.coverRequest(gpa, ""));
+    try std.testing.expectError(error.InvalidCoverRef, p.coverRequest(gpa, "mcovers/" ++ ("a" ** (max_cover_ref_len + 1))));
+
+    // A clean relative ref still resolves (regression guard).
+    const req = try p.coverRequest(gpa, "mcovers/ok.webp");
+    defer gpa.free(req.url);
+    try std.testing.expect(std.mem.endsWith(u8, req.url, "mcovers/ok.webp"));
 }

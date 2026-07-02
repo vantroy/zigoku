@@ -50,6 +50,20 @@ pub const PopularOptions = struct {
     page: u32 = 1,
 };
 
+/// A resolved, fetchable cover request (ROD-267). A provider turns a stored cover
+/// ref — which may be a provider-relative path, since some sources serve covers as
+/// a bare `mcovers/…` with no host — into an absolute URL plus whatever headers its
+/// cover CDN gates on. `url` is owned by the allocator passed to `coverRequest`
+/// (the caller frees it); `referer`/`user_agent` are static or null and must NOT be
+/// freed. A null header means "don't send it". This is the seam that keeps the
+/// cover-CDN host behind the provider: the app fetches an opaque URL and never
+/// learns which host served it.
+pub const CoverRequest = struct {
+    url: []const u8,
+    referer: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
+};
+
 pub const SourceProvider = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -75,6 +89,12 @@ pub const SourceProvider = struct {
         /// `quality` is the user's preference (ROD-152); a source with no variants
         /// is free to ignore it.
         resolve: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink,
+        /// Resolve a stored cover ref into a fetchable request (absolute URL + any
+        /// headers this source's cover CDN requires). Absolute refs pass through
+        /// unchanged (e.g. AniList/MAL covers); a provider-relative ref gets the
+        /// site's cover CDN prepended. `CoverRequest.url` is owned by `gpa`. Keeps
+        /// the cover-CDN host behind the seam — no copy upstream names it (ROD-267).
+        coverRequest: *const fn (ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!CoverRequest,
     };
 
     pub fn name(self: SourceProvider) []const u8 {
@@ -94,5 +114,8 @@ pub const SourceProvider = struct {
     }
     pub fn resolve(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
         return self.vtable.resolve(self.ptr, arena, io, show_id, episode, tt, quality);
+    }
+    pub fn coverRequest(self: SourceProvider, gpa: Allocator, ref: []const u8) anyerror!CoverRequest {
+        return self.vtable.coverRequest(self.ptr, gpa, ref);
     }
 };

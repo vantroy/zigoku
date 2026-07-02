@@ -253,7 +253,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
 pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
     mergeOptText(&live.english_name, &incoming.english_name);
     mergeOptText(&live.native_name, &incoming.native_name);
-    mergeOptText(&live.thumb, &incoming.thumb);
+    mergeCoverPreferAbsolute(gpa, &live.thumb, &incoming.thumb);
     mergeOptText(&live.banner, &incoming.banner);
     mergeOptText(&live.status, &incoming.status);
     mergeOptText(&live.description, &incoming.description);
@@ -277,6 +277,27 @@ fn mergeOptText(live: *?[]const u8, incoming: *?[]const u8) void {
         live.* = incoming.*;
         incoming.* = null;
     }
+}
+
+/// Whether to replace a card's current cover `cur` with an enriched `inc`: adopt
+/// when there's no cover yet, or when `cur` is only a relative ref and `inc` is a
+/// fetchable absolute url (ROD-267). Never downgrades an absolute url to a relative
+/// one, and never swaps one absolute for another (no churn for equal quality).
+fn preferCover(cur: ?[]const u8, inc: ?[]const u8) bool {
+    const incoming = inc orelse return false;
+    const current = cur orelse return true;
+    return !domain.isAbsoluteUrl(current) and domain.isAbsoluteUrl(incoming);
+}
+
+/// Cover-thumb variant of `mergeOptText` that prefers an absolute url over a
+/// relative ref (ROD-267): when `preferCover` says so, adopt `incoming` (transfer
+/// ownership, null the source) and free `live`'s old relative thumb. Otherwise
+/// `live` keeps its thumb and the caller's `freeOwnedAnime` reclaims `incoming`'s.
+fn mergeCoverPreferAbsolute(gpa: Allocator, live: *?[]const u8, incoming: *?[]const u8) void {
+    if (!preferCover(live.*, incoming.*)) return;
+    if (live.*) |old| gpa.free(old);
+    live.* = incoming.*;
+    incoming.* = null;
 }
 
 /// List variant of mergeOptText: adopt only when live's list is empty; `&.{}` (len 0)
@@ -408,7 +429,15 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
-    if (a.thumb == null) a.thumb = dupeOptText(gpa, meta.thumb) catch a.thumb;
+    // Prefer a fetchable absolute cover over a relative source ref (ROD-267): an
+    // AniList/MAL url beats a bare `mcovers/…` that only resolves behind the
+    // provider. Free the old relative ref before adopting; a failed dup keeps it.
+    if (preferCover(a.thumb, meta.thumb)) {
+        if (dupeOptText(gpa, meta.thumb) catch null) |t| {
+            if (a.thumb) |old| gpa.free(old);
+            a.thumb = t;
+        }
+    }
     if (a.status == null) a.status = dupeOptText(gpa, meta.status) catch a.status;
     if (a.kind == null) a.kind = dupeOptText(gpa, meta.kind) catch a.kind;
     if (a.description == null) a.description = dupeOptText(gpa, meta.description) catch a.description;
@@ -881,26 +910,39 @@ fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: [
 const cover_fetch_deadline_s = 20;
 
 /// The actual cover GET, run as a cancelable unit of concurrency by `withDeadline`
-/// (ROD-265). Owns its `std.http.Client` so a deadline cancel unwinds this frame —
-/// freeing the connection — instead of leaving a socket blocked in `recv`. Returns
-/// the encoded body as an exact, gpa-owned slice (the caller frees it). Fetch and
-/// non-200 failures return `error.CoverFetchFailed`; allocation failures propagate
-/// as `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
+/// (ROD-265). Takes a provider-resolved `CoverRequest` — an absolute URL plus any
+/// CDN headers (ROD-267): some cover CDNs (AllAnime's is Cloudflare-fronted) 403 a
+/// refererless GET, so Referer/UA ride along when the provider set them. Owns its
+/// `std.http.Client` so a deadline cancel unwinds this frame — freeing the
+/// connection — instead of leaving a socket blocked in `recv`. Returns the encoded
+/// body as an exact, gpa-owned slice (the caller frees it). Fetch and non-200
+/// failures return `error.CoverFetchFailed`; allocation failures propagate as
+/// `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
 /// `error.Timeout` — to a cover miss at the `withDeadline` call site.
-fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
+fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
     const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
     defer gpa.free(resp_buf);
     var resp_writer: std.Io.Writer = .fixed(resp_buf);
+    // Accept is ours; Referer/UA come from the provider only when its CDN needs
+    // them (AniList/MAL covers need none — the fields stay null).
+    var extra: [2]std.http.Header = .{
+        .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
+        undefined,
+    };
+    var extra_len: usize = 1;
+    if (req.referer) |r| {
+        extra[1] = .{ .name = "Referer", .value = r };
+        extra_len = 2;
+    }
     const res = client.fetch(.{
-        .location = .{ .url = url },
+        .location = .{ .url = req.url },
         .method = .GET,
         .response_writer = &resp_writer,
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
-        },
+        .headers = if (req.user_agent) |ua| .{ .user_agent = .{ .override = ua } } else .{},
+        .extra_headers = extra[0..extra_len],
     }) catch |e| {
         // Covers the deadline cancel (ReadFailed ← Canceled), oversize body (writer
         // full), and ordinary network errors.
@@ -923,7 +965,12 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
 /// Lock rule: every dupe of a slice that lives in (or was just inserted into) a
 /// cache happens while `caches.mu` is held; `decodeCoverBody` and `client.fetch`
 /// run *unlocked* so a slow decode/fetch never stalls another worker.
-pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
+///
+/// `url` is the raw stored cover ref and is the cache key at every layer (memory,
+/// disk). Only the network branch resolves it — via `provider.coverRequest` — into
+/// the absolute URL actually fetched, so a CDN-host rotation never invalidates the
+/// cache and the CDN host stays behind the provider seam (ROD-267).
+pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
     // 1) Decoded-cache hit: dupe the pixels out under the lock (get() promotes, so
     //    it mutates — even this read holds the lock).
     {
@@ -963,10 +1010,17 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *Cov
     }
 
     // 4) Network fetch (unlocked, deadline-bounded), then warm both caches and
-    //    persist to disk. `withDeadline` races the fetch against a timer and cancels
-    //    a stalled host so a silent CDN can't hang this worker forever (ROD-265);
-    //    the returned body is a gpa-owned exact slice we free after decode.
-    const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, url }) catch |e| {
+    //    persist to disk. The provider resolves the (possibly relative) `url` into
+    //    an absolute URL + CDN headers behind the vtable (ROD-267). `withDeadline`
+    //    races the fetch against a timer and cancels a stalled host so a silent CDN
+    //    can't hang this worker forever (ROD-265); the returned body is a gpa-owned
+    //    exact slice we free after decode.
+    const req = provider.coverRequest(gpa, url) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.CoverFetchFailed, // bad/blocked ref → cover miss
+    };
+    defer gpa.free(req.url);
+    const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, req }) catch |e| {
         if (e == error.Timeout)
             log.debug("cover fetch {s}: aborted past {d}s deadline", .{ url, cover_fetch_deadline_s });
         return error.CoverFetchFailed;
@@ -989,12 +1043,13 @@ pub fn coverTask(
     loop: *Loop,
     gpa: Allocator,
     io: std.Io,
+    provider: SourceProvider,
     url: []const u8,
     for_id: []const u8,
     caches: *CoverCaches,
 ) void {
     defer gpa.free(url);
-    const decoded = loadCoverPixels(gpa, io, url, caches) catch |e| {
+    const decoded = loadCoverPixels(gpa, io, provider, url, caches) catch |e| {
         log.debug("cover load failed: {s}", .{@errorName(e)});
         postCoverError(loop, gpa, for_id);
         return;
@@ -1019,12 +1074,13 @@ pub fn discoverCoverTask(
     loop: *Loop,
     gpa: Allocator,
     io: std.Io,
+    provider: SourceProvider,
     url: []const u8,
     caches: *CoverCaches,
     drain: *ThreadDrain,
 ) void {
     defer drain.finish();
-    if (loadCoverPixels(gpa, io, url, caches)) |px| {
+    if (loadCoverPixels(gpa, io, provider, url, caches)) |px| {
         loop.postEvent(.{ .discover_cover_done = .{
             .url = url,
             .rgba = px.rgba,
@@ -1176,4 +1232,46 @@ test "ThreadDrain.drain blocks until every begun worker has finished (ROD-179)" 
     // precedes the deferred finish) is visible via finish's release / drain's acquire.
     try std.testing.expectEqual(spawned, completed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), drain.inflight.load(.acquire));
+}
+
+test "preferCover: absolute beats relative, never downgrades or churns (ROD-267)" {
+    // Nothing held yet → adopt whatever's present.
+    try std.testing.expect(preferCover(null, "mcovers/x.webp"));
+    try std.testing.expect(preferCover(null, "https://s4.anilist.co/x.jpg"));
+    // Relative held + absolute incoming → upgrade.
+    try std.testing.expect(preferCover("mcovers/x.webp", "https://s4.anilist.co/x.jpg"));
+    // Absolute held → never downgrade to relative, never swap absolute for absolute.
+    try std.testing.expect(!preferCover("https://s4.anilist.co/x.jpg", "mcovers/x.webp"));
+    try std.testing.expect(!preferCover("https://a/x.jpg", "https://b/y.jpg"));
+    // Relative held + relative incoming → no change (neither is fetchable as-is).
+    try std.testing.expect(!preferCover("mcovers/x.webp", "mcovers/y.png"));
+    // Nothing incoming → nothing to adopt.
+    try std.testing.expect(!preferCover("mcovers/x.webp", null));
+    try std.testing.expect(!preferCover(null, null));
+}
+
+test "mergeCoverPreferAbsolute: upgrade frees the old relative thumb, keeps absolute otherwise (ROD-267)" {
+    const gpa = std.testing.allocator; // flags a leak or double-free
+
+    // Upgrade: relative → absolute. The old relative thumb must be freed (else the
+    // testing allocator reports a leak); the absolute's ownership transfers to live.
+    {
+        var live: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
+        var incoming: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
+        mergeCoverPreferAbsolute(gpa, &live, &incoming);
+        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
+        try std.testing.expect(incoming == null); // transferred out
+        gpa.free(live.?);
+    }
+    // No swap: absolute held, relative incoming. live is untouched; incoming stays
+    // owned by us (the real caller's freeOwnedAnime would reclaim it).
+    {
+        var live: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
+        var incoming: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
+        mergeCoverPreferAbsolute(gpa, &live, &incoming);
+        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
+        try std.testing.expect(incoming != null); // not transferred
+        gpa.free(live.?);
+        gpa.free(incoming.?);
+    }
 }
