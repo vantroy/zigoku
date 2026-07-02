@@ -10,6 +10,7 @@ const player_mod = @import("../player.zig");
 const aniskip = @import("../aniskip.zig");
 const paths = @import("../paths.zig");
 const lru_mod = @import("../util/lru.zig");
+const deadline = @import("../util/deadline.zig");
 const event_mod = @import("event.zig");
 const log = @import("../log.zig");
 
@@ -870,6 +871,49 @@ fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: [
     return .{ .rgba = rgba, .w = decoded.w, .h = decoded.h };
 }
 
+/// Wall-clock ceiling for one cover fetch — connect, headers, and body, end to
+/// end. Covers are the last app fetch that lacked a deadline (ROD-265): a
+/// reachable-but-silent image host would otherwise hang the cover worker forever,
+/// leaking its `discover_cover_drain` slot so teardown's `drain()` spin-waits on a
+/// counter that never falls (workers.zig `ThreadDrain`). A cover is a GET body of
+/// the same class as the AllAnime long-tail (ROD-153), so it shares that 20 s
+/// ceiling — far above any healthy image fetch, only tripping on a stalled host.
+const cover_fetch_deadline_s = 20;
+
+/// The actual cover GET, run as a cancelable unit of concurrency by `withDeadline`
+/// (ROD-265). Owns its `std.http.Client` so a deadline cancel unwinds this frame —
+/// freeing the connection — instead of leaving a socket blocked in `recv`. Returns
+/// the encoded body as an exact, gpa-owned slice (the caller frees it). Fetch and
+/// non-200 failures return `error.CoverFetchFailed`; allocation failures propagate
+/// as `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
+/// `error.Timeout` — to a cover miss at the `withDeadline` call site.
+fn fetchCoverBody(gpa: Allocator, io: std.Io, url: []const u8) ![]u8 {
+    var client: std.http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+
+    const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
+    defer gpa.free(resp_buf);
+    var resp_writer: std.Io.Writer = .fixed(resp_buf);
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .response_writer = &resp_writer,
+        .extra_headers = &.{
+            .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
+        },
+    }) catch |e| {
+        // Covers the deadline cancel (ReadFailed ← Canceled), oversize body (writer
+        // full), and ordinary network errors.
+        log.debug("cover fetch failed: {s}", .{@errorName(e)});
+        return error.CoverFetchFailed;
+    };
+    if (res.status != .ok) {
+        log.debug("cover fetch HTTP {d}", .{@intFromEnum(res.status)});
+        return error.CoverFetchFailed;
+    }
+    return gpa.dupe(u8, resp_writer.buffered());
+}
+
 /// Shared cover load (ROD-243): resolve `url` to gpa-owned, INDEPENDENT decoded
 /// pixels via cache → disk → network, or return an error. The returned `rgba` is
 /// never a cache-owned pointer, so it stays valid past any concurrent eviction —
@@ -918,30 +962,16 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, url: []const u8, caches: *Cov
         }
     }
 
-    // 4) Network fetch (unlocked), then warm both caches and persist to disk.
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
-    defer gpa.free(resp_buf);
-    var resp_writer: std.Io.Writer = .fixed(resp_buf);
-    const res = client.fetch(.{
-        .location = .{ .url = url },
-        .method = .GET,
-        .response_writer = &resp_writer,
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
-        },
-    }) catch |e| {
-        log.debug("cover fetch failed: {s}", .{@errorName(e)});
+    // 4) Network fetch (unlocked, deadline-bounded), then warm both caches and
+    //    persist to disk. `withDeadline` races the fetch against a timer and cancels
+    //    a stalled host so a silent CDN can't hang this worker forever (ROD-265);
+    //    the returned body is a gpa-owned exact slice we free after decode.
+    const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, url }) catch |e| {
+        if (e == error.Timeout)
+            log.debug("cover fetch {s}: aborted past {d}s deadline", .{ url, cover_fetch_deadline_s });
         return error.CoverFetchFailed;
     };
-    if (res.status != .ok) {
-        log.debug("cover fetch HTTP {d}", .{@intFromEnum(res.status)});
-        return error.CoverFetchFailed;
-    }
-
-    const body = resp_writer.buffered();
+    defer gpa.free(body);
     const decoded = try decodeCoverBody(gpa, body);
     writeCoverDisk(gpa, io, url, body); // ROD-171: persist for the next cold start
     if (gpa.dupe(u8, body)) |raw_copy| {
