@@ -241,9 +241,7 @@ pub fn run(
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
-    defer if (app.popular_thread) |t| t.join();
-    defer if (app.discover_enrich_thread) |t| t.join();
-    defer if (app.discover_batch_enrich_thread) |t| t.join();
+    defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
@@ -664,20 +662,19 @@ pub const App = struct {
     /// the UI.
     enrich_thread: ?std.Thread = null,
 
-    /// Handle for the most recent Popular-feed thread (ROD-239). Joined before a
-    /// new spawn (bounding concurrent feed threads to 1) and in run() teardown,
-    /// so an in-flight fetch can't dereference a torn-down loop/gpa on quit.
-    popular_thread: ?std.Thread = null,
-
-    /// Handle for the most recent Discover lazy zoom-enrich thread (ROD-239).
-    /// Bounded to 1 and joined on teardown, same contract as popular_thread.
-    discover_enrich_thread: ?std.Thread = null,
-
-    /// Handle for the most recent Discover page batch-enrich thread (ROD-247).
-    /// Separate from discover_enrich_thread so pressing Enter to zoom fires its own
-    /// enrich immediately instead of blocking on a ~500ms page batch. Bounded to 1
-    /// and joined on teardown, same contract as discover_enrich_thread.
-    discover_batch_enrich_thread: ?std.Thread = null,
+    /// Drain barrier for all three Discover async workers — the Popular feed fetch
+    /// (ROD-239), the lazy zoom-enrich (ROD-239), and the page batch-enrich (ROD-247).
+    /// Before ROD-251 each had its own `?std.Thread` handle joined *on the event
+    /// thread* before spawning the replacement, so cycling windows (1→2→3→4) on a
+    /// slow link froze the UI on the prior fetch's join. Now every worker is detached
+    /// and accounted here, exactly like `episode_drain`: a superseded fetch is never
+    /// joined, its stale result is keep-checked away on arrival (the popular_done
+    /// per-window slot and the merge-by-id in the enrich handlers), and teardown just
+    /// waits the in-flight set out. Concurrency is free here — unlike the cover caches
+    /// (ROD-243), these workers own their input copies and only `postEvent`, touching
+    /// no shared App state. One counter suffices: teardown only needs "none in flight",
+    /// and the three thread handles existed solely to enable the join we've removed.
+    discover_drain: workers.ThreadDrain = .{},
 
     /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
     /// fetched by its own detached `discoverCoverTask`; `pump` caps how many run at
@@ -1815,10 +1812,8 @@ pub const App = struct {
                 } else {
                     freeOwnedAnime(self.gpa, ev.result); // slot cleared/refetched — drop it
                 }
-                if (self.discover_enrich_thread) |t| {
-                    t.join();
-                    self.discover_enrich_thread = null;
-                }
+                // ROD-251: no join here — the worker is detached and self-accounts in
+                // discover_drain; it has already exited by the time this event lands.
             },
 
             .discover_batch_enriched => |ev| {
@@ -1851,10 +1846,8 @@ pub const App = struct {
                 if (merged_any) {
                     self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len);
                 }
-                if (self.discover_batch_enrich_thread) |t| {
-                    t.join();
-                    self.discover_batch_enrich_thread = null;
-                }
+                // ROD-251: no join here — the worker is detached and self-accounts in
+                // discover_drain; it has already exited by the time this event lands.
             },
             .search_enriched => |ev| {
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
@@ -2141,25 +2134,32 @@ pub const App = struct {
         };
     }
 
-    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Mirrors
-    /// fireSearch's 1-thread bound: join the prior feed thread before spawning.
+    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Detached and
+    /// accounted via `discover_drain` (ROD-251) — never joins a prior in-flight
+    /// fetch (that join on the event thread was the UI-freeze this ticket fixed).
     /// Sets the target slot's loading flag; the `.popular_done` arm clears it and
     /// lands the results in that slot (by window — not necessarily the active one).
     fn firePopular(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
-        if (self.popular_thread) |t| {
-            t.join();
-            self.popular_thread = null;
-        }
+        // ROD-251: detach, don't join a prior in-flight feed fetch — cycling windows
+        // (1→2→3→4) on a slow link would otherwise block the event thread on the old
+        // fetch's join. Each window writes its own slot (popular_done), so a superseded
+        // fetch is harmless; refreshDiscover's `slot.loading` guard already blocks a
+        // same-window double page-1 fire, and teardown waits the set out via
+        // discover_drain.
         const slot = &self.discover.slots[@intFromEnum(window)];
         slot.loading = true;
         self.async_start_ms = self.now_ms;
-        self.popular_thread = std.Thread.spawn(.{}, workers.popularTask, .{
-            loop, self.gpa, io, provider, window, page,
+        // Account before the spawn so teardown's drain can never observe a gap.
+        self.discover_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.popularTask, .{
+            loop, self.gpa, io, provider, window, page, &self.discover_drain,
         }) catch {
+            self.discover_drain.finish(); // no worker will run — rebalance the count
             slot.loading = false;
             self.async_start_ms = 0;
             return;
         };
+        t.detach();
     }
 
     /// Cache-or-fetch the active Discover window (ROD-239). Renders the cached slot
@@ -2176,29 +2176,34 @@ pub const App = struct {
 
     /// Lazily enrich one Discover show for its zoom (ROD-239): the feed has no
     /// synopsis, so opening a card fetches its AniList metadata off-thread and
-    /// merges it back into the slot (.discover_enriched). Bounds to one thread like
-    /// the feed fetch. No-op in tests (network) and when nothing's missing.
+    /// merges it back into the slot (.discover_enriched). Detached + accounted via
+    /// `discover_drain` (ROD-251), like the feed fetch — no join on the event thread.
+    /// No-op in tests (network) and when nothing's missing.
     fn fireDiscoverEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, anime: Anime) void {
         if (builtin.is_test) return;
-        if (self.discover_enrich_thread) |t| {
-            t.join();
-            self.discover_enrich_thread = null;
-        }
         const copy = dupeOwnedAnime(self.gpa, anime) catch return;
-        self.discover_enrich_thread = std.Thread.spawn(.{}, workers.discoverEnrichTask, .{
-            loop, self.gpa, io, copy, window,
+        // ROD-251: detach + account, don't join. The discover_enriched handler merges
+        // this back by id and frees an orphan whose card the slot no longer holds, so
+        // a superseded zoom-enrich is keep-checked away without blocking the event
+        // thread.
+        self.discover_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.discoverEnrichTask, .{
+            loop, self.gpa, io, copy, window, &self.discover_drain,
         }) catch {
+            self.discover_drain.finish(); // no worker will run — rebalance the count
             freeOwnedAnime(self.gpa, copy);
             return;
         };
+        t.detach();
     }
 
     /// Batch-enrich the Discover page just appended (ROD-247): one AniList fetch
     /// hydrates score + genres + season for the [offset, offset+count) slice of
     /// `window`'s slot (.discover_batch_enriched). Only cards with a mineable
     /// anilist_id are sent — the worker joins AniList results by that id, and an
-    /// id-less card can't be enriched anyway (it stays [--]). Bounds to one thread,
-    /// separate from the zoom enrich so Enter never blocks on it. No-op in tests.
+    /// id-less card can't be enriched anyway (it stays [--]). Detached + accounted
+    /// via `discover_drain` (ROD-251), separate worker from the zoom enrich so Enter
+    /// never blocks on it and neither joins the other. No-op in tests.
     fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
         if (builtin.is_test) return;
         if (count == 0) return;
@@ -2228,17 +2233,19 @@ pub const App = struct {
             return;
         };
 
-        if (self.discover_batch_enrich_thread) |t| {
-            t.join();
-            self.discover_batch_enrich_thread = null;
-        }
-        self.discover_batch_enrich_thread = std.Thread.spawn(.{}, workers.discoverBatchEnrichTask, .{
-            loop, self.gpa, io, owned, window,
+        // ROD-251: detach + account, don't join. The discover_batch_enriched handler
+        // merges each card back by id and frees orphans whose slot moved on, so a
+        // superseded page batch is keep-checked away without blocking the event thread.
+        self.discover_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.discoverBatchEnrichTask, .{
+            loop, self.gpa, io, owned, window, &self.discover_drain,
         }) catch {
+            self.discover_drain.finish(); // no worker will run — rebalance the count
             for (owned) |stub| freeOwnedAnime(self.gpa, stub);
             self.gpa.free(owned);
             return;
         };
+        t.detach();
     }
 
     /// Pool cap for Discover-grid covers (ROD-243): retain roughly two large-tier
