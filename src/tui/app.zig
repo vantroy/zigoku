@@ -2134,8 +2134,9 @@ pub const App = struct {
         };
     }
 
-    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Mirrors
-    /// fireSearch's 1-thread bound: join the prior feed thread before spawning.
+    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Detached and
+    /// accounted via `discover_drain` (ROD-251) — never joins a prior in-flight
+    /// fetch (that join on the event thread was the UI-freeze this ticket fixed).
     /// Sets the target slot's loading flag; the `.popular_done` arm clears it and
     /// lands the results in that slot (by window — not necessarily the active one).
     fn firePopular(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
@@ -2175,8 +2176,9 @@ pub const App = struct {
 
     /// Lazily enrich one Discover show for its zoom (ROD-239): the feed has no
     /// synopsis, so opening a card fetches its AniList metadata off-thread and
-    /// merges it back into the slot (.discover_enriched). Bounds to one thread like
-    /// the feed fetch. No-op in tests (network) and when nothing's missing.
+    /// merges it back into the slot (.discover_enriched). Detached + accounted via
+    /// `discover_drain` (ROD-251), like the feed fetch — no join on the event thread.
+    /// No-op in tests (network) and when nothing's missing.
     fn fireDiscoverEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, anime: Anime) void {
         if (builtin.is_test) return;
         const copy = dupeOwnedAnime(self.gpa, anime) catch return;
@@ -2199,8 +2201,9 @@ pub const App = struct {
     /// hydrates score + genres + season for the [offset, offset+count) slice of
     /// `window`'s slot (.discover_batch_enriched). Only cards with a mineable
     /// anilist_id are sent — the worker joins AniList results by that id, and an
-    /// id-less card can't be enriched anyway (it stays [--]). Bounds to one thread,
-    /// separate from the zoom enrich so Enter never blocks on it. No-op in tests.
+    /// id-less card can't be enriched anyway (it stays [--]). Detached + accounted
+    /// via `discover_drain` (ROD-251), separate worker from the zoom enrich so Enter
+    /// never blocks on it and neither joins the other. No-op in tests.
     fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
         if (builtin.is_test) return;
         if (count == 0) return;
