@@ -11,6 +11,11 @@
 const std = @import("std");
 const Io = std.Io;
 
+// Routes through the app's `std_options.logFn` (log.zig) like every other call
+// site — TUI-safe. `warn`, not `debug`: hitting a fallback means the wall-clock
+// ceiling this module exists to enforce is gone, so it always emits.
+const log = std.log.scoped(.deadline);
+
 /// The success payload of a `!T`-returning operation — `withDeadline` returns this
 /// (or `error.Timeout`).
 pub fn DeadlinePayload(comptime Func: type) type {
@@ -35,12 +40,20 @@ pub fn withDeadline(
     const Outcome = union(enum) { done: Ret, timed_out: void };
     var buf: [2]Outcome = undefined;
     var sel: Io.Select(Outcome) = .init(io, &buf);
-    sel.concurrent(.done, func, args) catch return @call(.auto, func, args);
+    sel.concurrent(.done, func, args) catch {
+        // No unit of concurrency to spawn the op on (OOM, or the thread pool is at
+        // capacity and can't grow). Run it inline — correct, but with no deadline,
+        // so log it: this is the one door through which the unbounded hang can
+        // return (ROD-262).
+        log.warn("concurrency unavailable — running operation inline with no deadline", .{});
+        return @call(.auto, func, args);
+    };
     sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
         // Timer didn't arm (OOM — the fetch arm already proved concurrency is
         // available). Awaiting the lone fetch here would reintroduce the very
         // unbounded hang this race exists to kill, so cancel it and fall back
         // to the inline, unbounded run instead — same contract as the .done arm.
+        log.warn("deadline timer unavailable — re-running operation inline with no deadline", .{});
         while (sel.cancel()) |_| {}
         return @call(.auto, func, args);
     };

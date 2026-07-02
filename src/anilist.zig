@@ -186,7 +186,9 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
 /// join results back to cards by id — AniList does not guarantee response order
 /// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
 /// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
-/// `enrich` path's null-on-miss contract. Only allocation failures propagate.
+/// `enrich` path's null-on-miss contract. Only a failure building the query here
+/// propagates; a fetch miss — network, HTTP, over-cap, timeout, or the fetch's own
+/// OOM — degrades to empty like any other miss (postGql swallows it to null).
 pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
     if (ids.len == 0) return &.{};
 
