@@ -2191,36 +2191,60 @@ pub const App = struct {
         return false;
     }
 
+    /// The pure refresh-on-view decision, split from `maybeRefreshEnrichment` so it's
+    /// unit-testable without that function's `is_test` network guard. Refresh a
+    /// TRACKED, STALE show UNLESS a competing enrich path is already covering it:
+    ///   * `discover_inflight`    — a Discover feed/zoom enrich is running (discover_drain),
+    ///   * `search_enrich_active` — a live Browse search-page enrich is running (enrich_thread),
+    ///   * `refresh_inflight`     — another refresh-on-view is already in flight.
+    ///
+    /// Only tracked rows refresh here: a hidden Browse/Discover cache row (history_visible=0)
+    /// has its OWN enrich path, so refreshing it would just double-fetch.
+    ///
+    /// ROD-279: the three competing-path skips kill the residual double-fetch — post-ROD-280
+    /// the feed/search enrich paths persist AND freshness-stamp the row, so they heal
+    /// staleness too; letting refresh also fire would double-hit AniList for a tracked show
+    /// that's currently in the feed / a live search batch. Coarse by design (any competing
+    /// enrich, not per-id): a skipped refresh just heals on the next open — the same
+    /// rationale as the single-refresh-in-flight cap this generalizes.
+    fn shouldRefreshOnView(
+        rec: AnimeRecord,
+        now: i64,
+        discover_inflight: bool,
+        search_enrich_active: bool,
+        refresh_inflight: bool,
+    ) bool {
+        if (!rec.history_visible) return false;
+        if (!Store.enrichmentStale(rec.enrichment_fetched_at, rec.enrichment_fieldset_version, rec.status, now)) return false;
+        if (discover_inflight or search_enrich_active or refresh_inflight) return false;
+        return true;
+    }
+
     /// ROD-182: refresh-on-view gate. Re-enrich the just-opened show when its
     /// persisted enrichment is stale (`Store.enrichmentStale` — TTL lapsed, never
     /// enriched, or filled under an older field set). `rec` is the seed record
     /// `fireEpisodesForId` already resolved (History in-memory or the store); null
     /// means nothing is persisted yet, so the search/discover enrich path owns
-    /// freshness and there's nothing to refresh. The staleness gate keeps this rare
-    /// — a just-searched show carries a fresh stamp and never re-fetches here.
+    /// freshness and there's nothing to refresh. Delegates the yes/no to
+    /// `shouldRefreshOnView` (with the live competing-enrich state) and fires the
+    /// detached worker when it says go.
     fn maybeRefreshEnrichment(self: *App, loop: *Loop, io: std.Io, source: ?[]const u8, source_id: []const u8, rec: ?AnimeRecord) void {
         // Never fire a live network refresh under `zig build test` — this runs before
         // the episode cache-hit early-return in fireEpisodesForId, so without the
         // guard even a synchronous cache-hit test spawns a detached network thread
         // (leak + dangling thread). Same guard every sibling here carries (fireEnrich,
-        // fireDiscoverEnrich); tests exercise the handler by posting the event directly.
+        // fireDiscoverEnrich); tests exercise `shouldRefreshOnView` directly.
         if (builtin.is_test) return;
         if (self.store == null) return;
         const r = rec orelse return;
         const src = source orelse return;
-        // Only TRACKED shows refresh on view. History rows are always visible; a
-        // hidden Browse/Discover cache row (history_visible=0) is skipped — those
-        // surfaces have their own enrich paths (search-page enrich, fireDiscoverEnrich),
-        // so refreshing here would just double-fetch the same show (Discover-zoom
-        // fires both this and fireDiscoverEnrich). This also closes the old search-race
-        // window for free: a Browse search result is a hidden cache row, so it never
-        // refreshes here regardless of an in-flight enrich.
-        if (!r.history_visible) return;
-        if (!Store.enrichmentStale(r.enrichment_fetched_at, r.enrichment_fieldset_version, r.status, Store.nowSecs())) return;
-        // Light dedup: at most one refresh in flight. A stale show skipped here just
-        // refreshes on its next open — cheaper than tracking per-id in-flight state,
-        // and refreshes are TTL-gated and rare to begin with.
-        if (self.enrich_refresh_drain.inflight.load(.acquire) > 0) return;
+        if (!shouldRefreshOnView(
+            r,
+            Store.nowSecs(),
+            self.discover_drain.inflight.load(.acquire) > 0,
+            self.enrich_thread != null,
+            self.enrich_refresh_drain.inflight.load(.acquire) > 0,
+        )) return;
         self.fireRefreshEnrich(loop, io, src, source_id, r);
     }
 
@@ -2670,10 +2694,15 @@ pub const App = struct {
                 self.detail_origin = .discover;
                 self.active_view = .detail;
                 self.active_pane = .detail;
-                self.fireEpisodesForId(loop, io, provider, a.id);
                 // The feed payload has no synopsis — lazily enrich this one show so
                 // the zoom fills in (only when it's actually missing, ROD-239).
+                // ROD-279: fire this BEFORE fireEpisodesForId so its discover_drain.begin()
+                // is visible to the refresh-on-view dedup inside fireEpisodesForId — a
+                // tracked-and-in-feed show would otherwise double-fetch (refresh-on-view +
+                // this zoom enrich). This enrich already persists + freshness-stamps the
+                // row (ROD-280), so refresh-on-view is redundant for this open.
                 if (a.description == null) self.fireDiscoverEnrich(loop, io, self.discover.window, a);
+                self.fireEpisodesForId(loop, io, provider, a.id);
             }
             return;
         }
@@ -3528,6 +3557,36 @@ test "discoverNeedsFill: a short first page under-fills a wide grid, a full one 
     try testing.expectEqual(@as(u16, 0), tiny.rows_visible);
     try testing.expect(!App.discoverNeedsFill(0, tiny));
     try testing.expect(!App.discoverNeedsFill(30, tiny));
+}
+
+test "shouldRefreshOnView: tracked+stale refreshes unless a competing enrich is in flight (ROD-279)" {
+    const V = Store.ENRICHMENT_FIELDSET_VERSION;
+    // A tracked, never-enriched (→ stale) row with no competing enrich → refresh.
+    const stale_tracked: AnimeRecord = .{
+        .source = "s",
+        .source_id = "i",
+        .title = "T",
+        .history_visible = true,
+        .enrichment_fetched_at = null, // never enriched → stale
+    };
+    try testing.expect(App.shouldRefreshOnView(stale_tracked, 1000, false, false, false));
+
+    // A hidden (untracked) cache row never refreshes on view — its own enrich path owns it.
+    var hidden = stale_tracked;
+    hidden.history_visible = false;
+    try testing.expect(!App.shouldRefreshOnView(hidden, 1000, false, false, false));
+
+    // A freshly-stamped row (current fieldset, within the FINISHED TTL) isn't stale.
+    var fresh = stale_tracked;
+    fresh.enrichment_fetched_at = 1000;
+    fresh.enrichment_fieldset_version = V;
+    fresh.status = "FINISHED";
+    try testing.expect(!App.shouldRefreshOnView(fresh, 1000, false, false, false));
+
+    // ROD-279: any single competing enrich in flight suppresses the refresh.
+    try testing.expect(!App.shouldRefreshOnView(stale_tracked, 1000, true, false, false)); // discover feed/zoom enrich
+    try testing.expect(!App.shouldRefreshOnView(stale_tracked, 1000, false, true, false)); // live browse search enrich
+    try testing.expect(!App.shouldRefreshOnView(stale_tracked, 1000, false, false, true)); // another refresh in flight
 }
 
 test "discoverFillEligible gates the fill on an established, idle, live feed (ROD-272)" {
