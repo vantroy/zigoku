@@ -1899,6 +1899,13 @@ test "upsertEnriched gates the freshness stamp on stamp_fresh, honors visible (R
     try testing.expectEqual(@as(?i64, 9000), stamped.enrichment_fetched_at);
     try testing.expectEqual(@as(?i64, V), stamped.enrichment_fieldset_version);
     try testing.expect(stamped.history_visible);
+
+    // Independent variation (visible=false, stamp_fresh=true) on a fresh row pins the
+    // argument order — a swap between `visible` and `stamp_fresh` would flip both.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "v", .name = "V" }, .sub, false, true, 7000, arena);
+    const stamp_only = (try s.getAnime(arena, T_SOURCE, "v")).?;
+    try testing.expectEqual(@as(?i64, 7000), stamp_only.enrichment_fetched_at); // stamped...
+    try testing.expect(!stamp_only.history_visible); // ...but still hidden
 }
 
 test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {

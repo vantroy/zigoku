@@ -224,12 +224,9 @@ pub const SearchController = struct {
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            // ROD-280: history_visible + the ROD-278 freshness-stamp gate both live in
-            // Store.upsertEnriched now. `stamp_fresh` is false on the raw .search_done
-            // persist and on an enrich that hit a transport failure; true only when
-            // AniList actually answered — so a failed fetch caches content without
-            // burning the clock, and COALESCE preserves any stamp across a later raw
-            // re-persist.
+            // ROD-280: history_visible + the freshness-stamp gate live in
+            // Store.upsertEnriched (see its doc for the gate contract). `stamp_fresh`
+            // is false on the raw .search_done persist and on a failed enrich.
             st.upsertEnriched(source_name, self.results.items[i], translation, visible, stamp_fresh, now, arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }

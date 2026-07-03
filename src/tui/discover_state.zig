@@ -112,11 +112,9 @@ pub const DiscoverState = struct {
         const end = @min(items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            // ROD-280: a hidden cache row (history_visible=false, like a search result)
-            // + the ROD-278 freshness-stamp gate both live in Store.upsertEnriched.
-            // `stamp_fresh` is false on the raw popular_done feed dump and on an enrich
-            // that hit a transport failure; true only when AniList answered — so a
-            // failed fetch caches the slot without burning the clock.
+            // ROD-280: a hidden cache row (visible=false) + the freshness-stamp gate
+            // live in Store.upsertEnriched (see its doc for the gate contract).
+            // `stamp_fresh` is false on the raw popular_done dump and on a failed enrich.
             st.upsertEnriched(source_name, items[i], translation, false, stamp_fresh, now, arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
