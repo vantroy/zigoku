@@ -1788,6 +1788,40 @@ test "episode cache: hit, expiry, sub/dub separation" {
     try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "x", .sub, past)) == null);
 }
 
+test "episode cache: TTL is status-keyed and expiry is boundary-exact" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "r", .title = "R" }, 1000, arena); // FK parent
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "u", .title = "U" }, 1000, arena); // FK parent
+
+    const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "2" } };
+    const t0: i64 = 1000;
+    const six_h = 6 * 60 * 60; // RELEASING TTL
+    const day = 24 * 60 * 60; // unknown/null TTL
+
+    // Same clock, two shows — the only difference is airing status, so any
+    // divergence in expiry proves putCachedEpisodes keys the TTL off status
+    // (line: now + cacheTtl(status)) rather than baking in a constant.
+    try s.putCachedEpisodes(T_SOURCE, "r", .sub, &eps, "RELEASING", t0, arena);
+    try s.putCachedEpisodes(T_SOURCE, "u", .sub, &eps, null, t0, arena);
+
+    // Boundary-exact on getCachedEpisodes' `now >= expires_at`: a hit one second
+    // before expiry, a miss at the exact expiry second (not expiry+1).
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "r", .sub, t0 + six_h - 1)) != null);
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "r", .sub, t0 + six_h)) == null);
+
+    // At the RELEASING show's expiry, the null-status show cached at the SAME
+    // instant is still fresh — it was stamped with 24h, not 6h. This is the
+    // assertion the existing FINISHED-only test can't make.
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "u", .sub, t0 + six_h)) != null);
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "u", .sub, t0 + day - 1)) != null);
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "u", .sub, t0 + day)) == null);
+}
+
 test "cacheTtl by airing status" {
     try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), Store.cacheTtl("FINISHED"));
     try testing.expectEqual(@as(i64, 6 * 60 * 60), Store.cacheTtl("RELEASING"));
