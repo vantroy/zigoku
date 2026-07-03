@@ -1579,15 +1579,12 @@ pub const App = struct {
                         // history reload so the open detail/list reflect it.
                         // history_visible stays false: the MAX-merge preserves the row's
                         // stored visibility, so a Browse refresh of a hidden cache row
-                        // never reveals an untracked show.
+                        // never reveals an untracked show. ROD-280: stamp_fresh=true here
+                        // — we're inside `if (ev.answered)`, so this only runs on a
+                        // confirmed answer; Store.upsertEnriched owns the stamp gate.
                         var arena = std.heap.ArenaAllocator.init(self.gpa);
                         defer arena.deinit();
-                        const now = Store.nowSecs();
-                        var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
-                        rec.history_visible = false;
-                        rec.enrichment_fetched_at = now;
-                        rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
-                        st.upsertAnime(rec, now, arena.allocator()) catch |e|
+                        st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
                             log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
                         self.history_dirty = true; // reload so detail/list show fresh content
                     }

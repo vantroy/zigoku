@@ -438,6 +438,40 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
+    /// Canonical enrichment-persist path (ROD-280): map a freshly-fetched domain row
+    /// into the store, set `history_visible`, and — ONLY when `stamp_fresh` — advance
+    /// the enrichment freshness clock (`enrichment_fetched_at` +
+    /// `enrichment_fieldset_version`), then upsert.
+    ///
+    /// `stamp_fresh` must be true only when AniList returned a *confirmed* answer (a
+    /// match or a confirmed no-match), never on a transport/parse failure — see the
+    /// ROD-278 `EnrichError` contract. Folding the gate here means it lives in ONE
+    /// place: search (`persistResults`), Discover (`persistSlot`), and the
+    /// refresh-on-view handler all route through this, so a new caller can't
+    /// reintroduce an un-gated stamp (the class of bug ROD-278 fixed across 3 sites).
+    ///
+    /// `now` timestamps both the stamp and `upsertAnime`'s `added_at` default — pass
+    /// one value per page so a batch shares a timestamp. `scratch` is the genres-blob
+    /// arena, same contract as `upsertAnime`.
+    pub fn upsertEnriched(
+        self: *Store,
+        source: []const u8,
+        anime: domain.Anime,
+        tt: domain.Translation,
+        visible: bool,
+        stamp_fresh: bool,
+        now: i64,
+        scratch: Allocator,
+    ) Error!void {
+        var rec = AnimeRecord.fromDomain(source, anime, tt);
+        rec.history_visible = visible;
+        if (stamp_fresh) {
+            rec.enrichment_fetched_at = now;
+            rec.enrichment_fieldset_version = ENRICHMENT_FIELDSET_VERSION;
+        }
+        return self.upsertAnime(rec, now, scratch);
+    }
+
     /// All shows, most-recently-watched first (then most-recently-added). Every
     /// text field is duped into `arena`.
     pub fn loadHistory(self: *Store, arena: Allocator) Error![]AnimeRecord {
@@ -1837,6 +1871,34 @@ test "enrichment stamp (fetched_at + fieldset_version) round-trips and survives 
     const refreshed = (try s.getAnime(arena, T_SOURCE, "e")).?;
     try testing.expectEqual(@as(?i64, 9000), refreshed.enrichment_fetched_at);
     try testing.expectEqual(@as(?i64, V), refreshed.enrichment_fieldset_version);
+}
+
+test "upsertEnriched gates the freshness stamp on stamp_fresh, honors visible (ROD-280)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const V = Store.ENRICHMENT_FIELDSET_VERSION;
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const row: domain.Anime = .{ .id = "u", .name = "U", .status = "RELEASING" };
+
+    // stamp_fresh=false (a failed/transport-miss enrich): caches the row but leaves the
+    // freshness clock null — the single canonical gate ROD-278 needed at 3 call sites.
+    try s.upsertEnriched(T_SOURCE, row, .sub, false, false, 5000, arena);
+    const unstamped = (try s.getAnime(arena, T_SOURCE, "u")).?;
+    try testing.expectEqualStrings("U", unstamped.title); // content cached
+    try testing.expect(unstamped.enrichment_fetched_at == null); // NOT stamped
+    try testing.expect(unstamped.enrichment_fieldset_version == null);
+    try testing.expect(!unstamped.history_visible); // visible=false honored
+
+    // stamp_fresh=true (a confirmed answer): advances the clock to `now` at the current
+    // fieldset version; visible=true wins the MAX-merge over the stored false.
+    try s.upsertEnriched(T_SOURCE, row, .sub, true, true, 9000, arena);
+    const stamped = (try s.getAnime(arena, T_SOURCE, "u")).?;
+    try testing.expectEqual(@as(?i64, 9000), stamped.enrichment_fetched_at);
+    try testing.expectEqual(@as(?i64, V), stamped.enrichment_fieldset_version);
+    try testing.expect(stamped.history_visible);
 }
 
 test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {

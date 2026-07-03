@@ -21,7 +21,6 @@ const log = @import("../log.zig");
 const Allocator = std.mem.Allocator;
 const Anime = domain.Anime;
 const Store = store_mod.Store;
-const AnimeRecord = store_mod.AnimeRecord;
 const freeOwnedAnime = workers.freeOwnedAnime;
 
 /// One cached popularity window. Holds *that window's* fetched page(s), the
@@ -113,19 +112,12 @@ pub const DiscoverState = struct {
         const end = @min(items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            var rec = AnimeRecord.fromDomain(source_name, items[i], translation);
-            rec.history_visible = false; // a hidden cache row, like a search result
-            // ROD-182: stamp freshness only for the enriched persists (discover_enriched
-            // / discover_batch_enriched), not the raw popular_done feed dump, so
-            // refresh-on-view doesn't re-fetch a card AniList just enriched. ROD-278:
-            // the caller passes false when the enrich fetch failed (a transport miss),
-            // so a failed fetch persists the slot without burning the clock —
-            // `stamp_fresh` means "AniList answered", not just "the enriched persist".
-            if (stamp_fresh) {
-                rec.enrichment_fetched_at = now;
-                rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
-            }
-            st.upsertAnime(rec, now, arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
+            // ROD-280: a hidden cache row (history_visible=false, like a search result)
+            // + the ROD-278 freshness-stamp gate both live in Store.upsertEnriched.
+            // `stamp_fresh` is false on the raw popular_done feed dump and on an enrich
+            // that hit a transport failure; true only when AniList answered — so a
+            // failed fetch caches the slot without burning the clock.
+            st.upsertEnriched(source_name, items[i], translation, false, stamp_fresh, now, arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }
