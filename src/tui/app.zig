@@ -2189,6 +2189,12 @@ pub const App = struct {
     /// freshness and there's nothing to refresh. The staleness gate keeps this rare
     /// — a just-searched show carries a fresh stamp and never re-fetches here.
     fn maybeRefreshEnrichment(self: *App, loop: *Loop, io: std.Io, source: ?[]const u8, source_id: []const u8, rec: ?AnimeRecord) void {
+        // Never fire a live network refresh under `zig build test` — this runs before
+        // the episode cache-hit early-return in fireEpisodesForId, so without the
+        // guard even a synchronous cache-hit test spawns a detached network thread
+        // (leak + dangling thread). Same guard every sibling here carries (fireEnrich,
+        // fireDiscoverEnrich); tests exercise the handler by posting the event directly.
+        if (builtin.is_test) return;
         if (self.store == null) return;
         const r = rec orelse return;
         const src = source orelse return;

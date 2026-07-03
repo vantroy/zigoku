@@ -165,6 +165,11 @@ fn testTick(app: *App, event: Event) !void {
     // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
     // fan-out now, so it's a drain barrier rather than a single join (ROD-240).
     app.discover_cover_drain.drain();
+    // ROD-182: refresh-on-view workers. No-op today (the is_test gate in
+    // maybeRefreshEnrichment prevents them ever spawning in tests), but drained
+    // defensively — same contract as discover_cover_drain — so a future test that
+    // drives the firing path can't strand a worker on a torn-down loop.
+    app.enrich_refresh_drain.drain();
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -974,6 +979,15 @@ test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves 
     try testing.expect(rec.list_status == .watching);
     // ...and the view was flagged for a reload so the open detail reflects it.
     try testing.expect(app.history_dirty);
+    // ...and the tracked row stays visible. getAnime doesn't surface history_visible,
+    // so prove the MAX-merge held (the handler binds history_visible=false) via
+    // loadHistory, which returns only history_visible != 0 rows.
+    const visible = try st.loadHistory(arena);
+    var still_visible = false;
+    for (visible) |v| {
+        if (std.mem.eql(u8, v.source_id, "r1")) still_visible = true;
+    }
+    try testing.expect(still_visible);
 }
 
 test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {
