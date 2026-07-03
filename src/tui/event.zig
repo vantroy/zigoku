@@ -91,12 +91,16 @@ pub const Event = union(enum) {
     },
     /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned
     /// identity stub filled with fresh AniList metadata (or unchanged on a miss);
-    /// `source` is gpa-owned. The handler persists it (upsert stamps the freshness
-    /// columns + overwrites drift fields via COALESCE) and flags a history reload,
-    /// then frees both.
+    /// `source` is gpa-owned. `answered` (ROD-278) is true when AniList returned a
+    /// confirmed answer — a match or a confirmed no-match — and false on a transport
+    /// failure: the handler stamps the freshness columns + persists ONLY when
+    /// `answered`, so a failed fetch doesn't advance the freshness clock. On a
+    /// confirmed answer the handler persists (upsert stamps freshness + overwrites
+    /// drift fields via COALESCE) and flags a history reload. Both fields freed here.
     enrichment_refreshed: struct {
         result: Anime,
         source: []const u8,
+        answered: bool,
     },
     /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
     /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.

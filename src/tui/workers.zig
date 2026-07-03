@@ -498,9 +498,11 @@ pub fn enrichTask(
 /// values (keeping stored values where AniList returned null): a content refresh
 /// with no in-memory overwrite-merge. `stub` and `source` are gpa-owned; ownership
 /// transfers to the `enrichment_refreshed` event, or both are freed here on a post
-/// failure. A miss (no match / offline) posts `stub` UNCHANGED — the handler still
-/// stamps it fresh, a negative cache that stops re-hammering AniList until the TTL
-/// lapses, mirroring `discoverEnrichTask`'s miss contract.
+/// failure. Miss contract, split by ROD-278: a *confirmed* no-match posts `stub`
+/// UNCHANGED with `answered = true` — the handler stamps it fresh, a negative cache
+/// that stops re-hammering AniList until the TTL lapses. A transport failure (no
+/// answer reached) posts `stub` UNCHANGED with `answered = false` — the handler
+/// skips the stamp so the next view retries instead of burning the freshness clock.
 pub fn refreshEnrichTask(
     loop: *Loop,
     gpa: Allocator,
@@ -513,8 +515,17 @@ pub fn refreshEnrichTask(
     var a = stub;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    if (anilist.enrich(arena.allocator(), io, a) catch null) |meta| applyMetadata(gpa, &a, meta);
-    loop.postEvent(.{ .enrichment_refreshed = .{ .result = a, .source = source } }) catch |pe| {
+    // ROD-278: value (a match, or a confirmed no-match `null`) means AniList
+    // answered → stamp. The error arm (transport failure / OOM) means it didn't →
+    // leave the row un-stamped so the next view retries.
+    var answered = true;
+    if (anilist.enrich(arena.allocator(), io, a)) |maybe_meta| {
+        if (maybe_meta) |meta| applyMetadata(gpa, &a, meta);
+    } else |err| {
+        answered = false;
+        log.debug("refresh enrich got no answer: {s}", .{@errorName(err)});
+    }
+    loop.postEvent(.{ .enrichment_refreshed = .{ .result = a, .source = source, .answered = answered } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         freeOwnedAnime(gpa, a);
         gpa.free(source);

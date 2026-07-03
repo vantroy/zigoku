@@ -965,7 +965,7 @@ test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves 
         .description = "Now finished airing.",
     });
     const source = try testing.allocator.dupe(u8, "allanime");
-    try testTick(&app, .{ .enrichment_refreshed = .{ .result = result, .source = source } });
+    try testTick(&app, .{ .enrichment_refreshed = .{ .result = result, .source = source, .answered = true } });
 
     const rec = (try st.getAnime(arena, "allanime", "r1")).?;
     // Drift fields overwritten by the fresh pull (COALESCE-when-present)...
@@ -983,6 +983,52 @@ test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves 
     // and leans on the upsert's MAX-merge to keep a tracked row visible. getAnime
     // surfaces the column (ROD-182 refresh gate), so assert it on the row read above.
     try testing.expect(rec.history_visible);
+}
+
+test "enrichment_refreshed with answered=false skips the stamp and the persist (ROD-278)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+
+    // A tracked row with real content and NO freshness stamp — reads stale, exactly
+    // the state a refresh-on-view fires from.
+    try st.upsertAnime(.{
+        .source = "allanime",
+        .source_id = "r1",
+        .title = "Frieren",
+        .status = "RELEASING",
+        .score = 80,
+        .description = "Airing now.",
+        .history_visible = true,
+    }, 1000, arena);
+
+    // The refresh worker reached no answer (transport failure): it posts the blank
+    // identity stub UNCHANGED with answered=false. applyMetadata never ran, so the
+    // stub carries no fresh content to merge even if the handler did persist it.
+    const result = try workers.dupeOwnedAnime(testing.allocator, .{
+        .id = "r1",
+        .name = "Frieren",
+    });
+    const source = try testing.allocator.dupe(u8, "allanime");
+    try testTick(&app, .{ .enrichment_refreshed = .{ .result = result, .source = source, .answered = false } });
+
+    const rec = (try st.getAnime(arena, "allanime", "r1")).?;
+    // The fix: the freshness clock did NOT advance, so the row stays stale and the
+    // next view retries instead of waiting out the (up to 30d) TTL on a failed fetch.
+    try testing.expect(rec.enrichment_fetched_at == null);
+    try testing.expect(rec.enrichment_fieldset_version == null);
+    // Stored content is untouched — no upsert ran at all on a no-answer refresh.
+    try testing.expectEqualStrings("RELEASING", rec.status.?);
+    try testing.expectEqual(@as(?i64, 80), rec.score);
+    try testing.expectEqualStrings("Airing now.", rec.description.?);
+    // Nothing changed, so no history reload was flagged.
+    try testing.expect(!app.history_dirty);
 }
 
 test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {

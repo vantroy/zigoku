@@ -1559,25 +1559,32 @@ pub const App = struct {
                 }
             },
             .enrichment_refreshed => |ev| {
-                // ROD-182: a stale show was re-enriched on view. Persist the fresh
-                // content — upsert's COALESCE overwrites the drift fields (status/
-                // score/description/total_episodes), preserves the user columns, and
-                // keeps any field AniList returned null for — with a fresh freshness
-                // stamp, then flag a history reload so the open detail/list reflect it.
-                // history_visible stays false: the MAX-merge preserves the row's
-                // stored visibility, so a Browse refresh of a hidden cache row never
-                // reveals an untracked show.
-                if (self.store) |st| {
-                    var arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer arena.deinit();
-                    const now = Store.nowSecs();
-                    var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
-                    rec.history_visible = false;
-                    rec.enrichment_fetched_at = now;
-                    rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
-                    st.upsertAnime(rec, now, arena.allocator()) catch |e|
-                        log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
-                    self.history_dirty = true; // reload so detail/list show fresh content
+                // ROD-182: a stale show was re-enriched on view. ROD-278: only persist
+                // + stamp when AniList actually answered (a match or a confirmed
+                // no-match). A transport failure (`answered == false`) changed nothing
+                // and must NOT advance the freshness clock — skip the write entirely so
+                // the next view retries rather than waiting out the TTL on a failed fetch.
+                if (ev.answered) {
+                    if (self.store) |st| {
+                        // Persist the fresh content — upsert's COALESCE overwrites the
+                        // drift fields (status/score/description/total_episodes),
+                        // preserves the user columns, and keeps any field AniList
+                        // returned null for — with a fresh freshness stamp, then flag a
+                        // history reload so the open detail/list reflect it.
+                        // history_visible stays false: the MAX-merge preserves the row's
+                        // stored visibility, so a Browse refresh of a hidden cache row
+                        // never reveals an untracked show.
+                        var arena = std.heap.ArenaAllocator.init(self.gpa);
+                        defer arena.deinit();
+                        const now = Store.nowSecs();
+                        var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
+                        rec.history_visible = false;
+                        rec.enrichment_fetched_at = now;
+                        rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
+                        st.upsertAnime(rec, now, arena.allocator()) catch |e|
+                            log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
+                        self.history_dirty = true; // reload so detail/list show fresh content
+                    }
                 }
                 freeOwnedAnime(self.gpa, ev.result);
                 self.gpa.free(ev.source);
