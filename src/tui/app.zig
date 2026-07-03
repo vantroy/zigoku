@@ -1477,7 +1477,9 @@ pub const App = struct {
                     }
                 }
                 if (merged_at) |i| {
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1, true);
+                    // ROD-278: stamp freshness only if AniList answered — a transport
+                    // failure persists the merged card without advancing its clock.
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1, ev.answered);
                 } else {
                     freeOwnedAnime(self.gpa, ev.result); // slot cleared/refetched — drop it
                 }
@@ -1512,8 +1514,10 @@ pub const App = struct {
                 self.gpa.free(ev.results);
                 // Persist the whole slot once (idempotent upserts) rather than
                 // tracking each scattered merge position — N ≤ ~50 local rows.
+                // ROD-278: a transport-failed batch persists the slot without stamping
+                // freshness, so a failed page fetch doesn't burn the clock on [--] cards.
                 if (merged_any) {
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len, true);
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len, ev.answered);
                 }
                 // ROD-251: no join here — the worker is detached and self-accounts in
                 // discover_drain; it has already exited by the time this event lands.
@@ -1548,7 +1552,9 @@ pub const App = struct {
                 }
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
-                self.search.persistResults(self.gpa, self.store, source_name, self.translation, ev.offset, ev.results.len, false, true);
+                // ROD-278: stamp freshness only if every row in the page got an answer;
+                // a page with any transport failure persists content but stays un-stamped.
+                self.search.persistResults(self.gpa, self.store, source_name, self.translation, ev.offset, ev.results.len, false, ev.answered);
                 if (self.enrich_thread) |t| {
                     t.join();
                     self.enrich_thread = null;
@@ -1559,25 +1565,32 @@ pub const App = struct {
                 }
             },
             .enrichment_refreshed => |ev| {
-                // ROD-182: a stale show was re-enriched on view. Persist the fresh
-                // content — upsert's COALESCE overwrites the drift fields (status/
-                // score/description/total_episodes), preserves the user columns, and
-                // keeps any field AniList returned null for — with a fresh freshness
-                // stamp, then flag a history reload so the open detail/list reflect it.
-                // history_visible stays false: the MAX-merge preserves the row's
-                // stored visibility, so a Browse refresh of a hidden cache row never
-                // reveals an untracked show.
-                if (self.store) |st| {
-                    var arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer arena.deinit();
-                    const now = Store.nowSecs();
-                    var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
-                    rec.history_visible = false;
-                    rec.enrichment_fetched_at = now;
-                    rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
-                    st.upsertAnime(rec, now, arena.allocator()) catch |e|
-                        log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
-                    self.history_dirty = true; // reload so detail/list show fresh content
+                // ROD-182: a stale show was re-enriched on view. ROD-278: only persist
+                // + stamp when AniList actually answered (a match or a confirmed
+                // no-match). A transport failure (`answered == false`) changed nothing
+                // and must NOT advance the freshness clock — skip the write entirely so
+                // the next view retries rather than waiting out the TTL on a failed fetch.
+                if (ev.answered) {
+                    if (self.store) |st| {
+                        // Persist the fresh content — upsert's COALESCE overwrites the
+                        // drift fields (status/score/description/total_episodes),
+                        // preserves the user columns, and keeps any field AniList
+                        // returned null for — with a fresh freshness stamp, then flag a
+                        // history reload so the open detail/list reflect it.
+                        // history_visible stays false: the MAX-merge preserves the row's
+                        // stored visibility, so a Browse refresh of a hidden cache row
+                        // never reveals an untracked show.
+                        var arena = std.heap.ArenaAllocator.init(self.gpa);
+                        defer arena.deinit();
+                        const now = Store.nowSecs();
+                        var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
+                        rec.history_visible = false;
+                        rec.enrichment_fetched_at = now;
+                        rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
+                        st.upsertAnime(rec, now, arena.allocator()) catch |e|
+                            log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
+                        self.history_dirty = true; // reload so detail/list show fresh content
+                    }
                 }
                 freeOwnedAnime(self.gpa, ev.result);
                 self.gpa.free(ev.source);

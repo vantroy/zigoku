@@ -138,7 +138,20 @@ const MediaResp = struct {
 // standalone `apply(show, meta)` helper would hand back a struct pointing into
 // that soon-dead arena — a UAF trap — so there deliberately isn't one.
 
-pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
+/// The three-state enrich contract (ROD-278). Callers that stamp an enrichment
+/// freshness clock (the refresh-on-view path) MUST distinguish a confirmed answer
+/// from a failed fetch: only a confirmed answer may advance the clock.
+///   * `Metadata`        — a confirmed match.            → stamp fresh
+///   * `null`            — a *confirmed* no-match: AniList was reached and
+///                         definitively returned nothing (no such id, no search
+///                         hit, or nothing to look up). → stamp fresh (negative cache)
+///   * `error.NoAnswer`  — no confirmed answer: transport error, timeout, non-200,
+///                         over-cap body, a malformed 200, or a `{"data":null}`
+///                         GraphQL-level error. → DON'T stamp; retry on next view.
+/// Value (incl. `null`) means "AniList answered"; the error arm means "it didn't."
+pub const EnrichError = error{NoAnswer} || Allocator.Error;
+
+pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Metadata {
     // Deterministic path: AllAnime gave us the AniList id (mined from the cover
     // url, ROD-181). Look the media up by id — exact, no title matching, so the
     // "Nth Season" mismatch and sequel-ambiguity failures simply don't apply.
@@ -146,23 +159,37 @@ pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
     return enrichBySearch(arena, io, show);
 }
 
-fn enrichById(arena: Allocator, io: Io, id: u64) !?Metadata {
+fn enrichById(arena: Allocator, io: Io, id: u64) EnrichError!?Metadata {
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"id\":{d}}}}}",
         .{ GQL_BY_ID, id },
     );
-    const raw = postGql(arena, io, body) orelse return null;
+    // postGql returns null on any transport failure (network/timeout/non-200/
+    // over-cap) — that is "no answer", not a confirmed no-match, so it errors.
+    const raw = postGql(arena, io, body) orelse return error.NoAnswer;
+    return classifyById(arena, raw);
+}
+
+/// Map a by-id AniList response body to the three-state contract. Split from the
+/// POST so the null-vs-error classification is unit-testable without a live fetch.
+fn classifyById(arena: Allocator, raw: []const u8) EnrichError!?Metadata {
+    // A 200 we can't parse, or a `{"data":null}` GraphQL-level error, is a
+    // malformed/failed answer — not a no-match. Error so the row retries.
     const parsed = std.json.parseFromSlice(MediaResp, arena, raw, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
-    const data = parsed.value.data orelse return null;
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
+    // `{"data":{"Media":null}}` IS a confirmed answer: no anime carries that id.
     const media = data.Media orelse return null;
     return try mediaToMeta(arena, media);
 }
 
-fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
+fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Metadata {
     const search = show.english_name orelse show.name;
+    // Nothing to look up — a confirmed "no title, no possible match", not a fetch
+    // failure. Return null so the refresh path stamps it (negative cache) rather
+    // than re-attempting a doomed search on every view.
     if (search.len == 0) return null;
 
     const body = try std.fmt.allocPrint(
@@ -170,11 +197,19 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
         "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":8}}}}",
         .{ GQL_SEARCH, try jsonEscape(arena, search) },
     );
-    const raw = postGql(arena, io, body) orelse return null;
+    const raw = postGql(arena, io, body) orelse return error.NoAnswer;
+    return classifyBySearch(arena, show, raw);
+}
+
+/// Map a search AniList response body to the three-state contract. Split from the
+/// POST so the null-vs-error classification is unit-testable without a live fetch.
+fn classifyBySearch(arena: Allocator, show: domain.Anime, raw: []const u8) EnrichError!?Metadata {
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
-    const data = parsed.value.data orelse return null;
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
+    // Reached AniList and ran the match: an empty page or a page where nothing
+    // clears bestMatch's guard is a confirmed no-match, not a fetch failure.
     const best = bestMatch(show, data.Page.media) orelse return null;
     return try mediaToMeta(arena, best);
 }
@@ -184,12 +219,18 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) !?Metadata {
 /// one are filtered out upstream. Returns an arena-owned `Metadata` per returned
 /// media, each tagged with its `anilist_id` (via `mediaToMeta`) so the caller can
 /// join results back to cards by id — AniList does not guarantee response order
-/// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
-/// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
-/// `enrich` path's null-on-miss contract. Only a failure building the query here
-/// propagates; a fetch miss — network, HTTP, over-cap, timeout, or the fetch's own
-/// OOM — degrades to empty like any other miss (postGql swallows it to null).
-pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
+/// matches `ids`.
+///
+/// Same three-state contract as `enrich` (ROD-278), so the caller can gate a
+/// freshness stamp on whether AniList actually answered:
+///   * a non-empty (or empty) slice — AniList was REACHED: the page hydrates from
+///     the returned media; an empty slice is a confirmed "no matches for these ids"
+///     (or nothing to fetch — `ids.len == 0`). The caller may stamp fresh.
+///   * `error.NoAnswer` — a transport/HTTP/over-cap/timeout miss or a malformed 200
+///     (postGql returned null, or the body wouldn't parse). The whole page degrades
+///     to `[--]` AND the caller must NOT stamp — a failed batch fetch would otherwise
+///     burn the freshness clock on a page of un-enriched cards.
+pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]const Metadata {
     if (ids.len == 0) return &.{};
 
     // `id_in:[1,2,3]` — integers only, so the list is JSON-safe interpolated raw,
@@ -205,8 +246,8 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50:
     // the caller feeds at most one feed page (popular_page_size = 30 in source.zig), so
     // ids.len ≤ 50 holds today. If the feed page size is ever raised past 50, AniList
-    // 400s the whole query → postGql returns null → the page silently degrades to
-    // `[--]`. Chunk the ids (or clamp perPage) before crossing that line.
+    // 400s the whole query → postGql returns null → error.NoAnswer → the page degrades
+    // to `[--]` and stays un-stamped. Chunk the ids (or clamp perPage) before that line.
     //
     // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
     // string — it contains `startDate{year}`, whose braces the format parser would
@@ -219,18 +260,32 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     );
     const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
 
-    const raw = postGql(arena, io, body) orelse return &.{};
-    return pageToMetas(arena, raw) catch &.{};
+    // A transport miss (null response) is "no answer" — error so the caller leaves
+    // the page un-stamped. pageToMetas classifies the rest of the three-state contract
+    // (malformed 200 / {"data":null} → error.NoAnswer, empty page → &.{}) and returns
+    // the same EnrichError set, so it propagates directly — no re-wrap (which would
+    // relabel a genuine OutOfMemory as NoAnswer and lose the diagnostic).
+    const raw = postGql(arena, io, body) orelse return error.NoAnswer;
+    return pageToMetas(arena, raw);
 }
 
 /// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
 /// from `enrichBatch` so the mapping is unit-testable without a live POST (same
 /// seam as `mediaToMeta`). Arena-borrowed slices; the worker deep-copies to GPA.
-fn pageToMetas(arena: Allocator, raw: []const u8) ![]const Metadata {
-    const parsed = try std.json.parseFromSlice(Resp, arena, raw, .{
+///
+/// Classifies `data == null` the same way `classifyById`/`classifyBySearch` do
+/// (ROD-278): a `{"data":null}` body is a GraphQL-level execution error (a 200 with
+/// no data), NOT a confirmed-empty page — return `error.NoAnswer` so `enrichBatch`
+/// reports "no answer" and the caller leaves the page un-stamped. A parsed page with
+/// zero media IS a confirmed empty answer and returns an empty slice.
+fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
+    // A malformed 200 (unparseable body) is a failed answer, not an empty page —
+    // error, same as classifyById/classifyBySearch, so pageToMetas honors the
+    // three-state contract on its own (and is unit-testable for it).
+    const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
-    });
-    const data = parsed.value.data orelse return &.{};
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
     const media = data.Page.media;
     const out = try arena.alloc(Metadata, media.len);
     for (media, 0..) |m, i| out[i] = try mediaToMeta(arena, m);
@@ -710,6 +765,55 @@ test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
     try std.testing.expect(metas[1].season == null);
     try std.testing.expect(metas[1].start_date == null);
     try std.testing.expectEqual(@as(?u32, null), metas[1].year);
+}
+
+test "pageToMetas: {\"data\":null} is no-answer, an empty page is a confirmed empty answer (ROD-278)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `{"data":null}` body is a GraphQL-level execution error (200, no data), NOT a
+    // confirmed-empty page — it must error so `enrichBatch` reports no answer and the
+    // batch stays un-stamped. Mirrors classifyById/classifyBySearch on the same shape.
+    try std.testing.expectError(error.NoAnswer, pageToMetas(a, "{\"data\":null}"));
+
+    // A parsed page with zero media IS a confirmed empty answer → empty slice, no error.
+    const empty = try pageToMetas(a, "{\"data\":{\"Page\":{\"media\":[]}}}");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "classifyById: three-state map — match / confirmed no-match / no answer (ROD-278)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A real media → a match (Metadata), tagged by id for the caller's join-back.
+    const meta = (try classifyById(a, "{\"data\":{\"Media\":{\"id\":182255,\"episodes\":28}}}")).?;
+    try std.testing.expectEqual(@as(?u64, 182255), meta.anilist_id);
+
+    // `{"data":{"Media":null}}` — AniList answered: no anime carries that id. This is
+    // a CONFIRMED no-match (null), which the refresh path stamps as a negative cache.
+    try std.testing.expect((try classifyById(a, "{\"data\":{\"Media\":null}}")) == null);
+
+    // `{"data":null}` (a GraphQL-level error) and unparseable bytes are NOT answers —
+    // they must error so the refresh path leaves the row un-stamped and retries.
+    try std.testing.expectError(error.NoAnswer, classifyById(a, "{\"data\":null}"));
+    try std.testing.expectError(error.NoAnswer, classifyById(a, "not json at all"));
+}
+
+test "classifyBySearch: empty/no-match page is null, malformed is no-answer (ROD-278)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const show: domain.Anime = .{ .id = "x", .name = "Nonexistent Show" };
+
+    // Reached AniList, ran the match, page had nothing (or nothing cleared bestMatch's
+    // guard) → CONFIRMED no-match (null), stamped as a negative cache.
+    try std.testing.expect((try classifyBySearch(a, show, "{\"data\":{\"Page\":{\"media\":[]}}}")) == null);
+
+    // `{"data":null}` and unparseable bytes → no answer → error, so the row retries.
+    try std.testing.expectError(error.NoAnswer, classifyBySearch(a, show, "{\"data\":null}"));
+    try std.testing.expectError(error.NoAnswer, classifyBySearch(a, show, "}{"));
 }
 
 test "stripControls drops C0 + DEL bytes from AniList text (ROD-247)" {
