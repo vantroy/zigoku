@@ -260,10 +260,13 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     );
     const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
 
-    // A transport miss (null) or a malformed 200 (parse failure) is "no answer",
-    // not a confirmed empty page — error so the caller leaves the page un-stamped.
+    // A transport miss (null response) is "no answer" — error so the caller leaves
+    // the page un-stamped. pageToMetas classifies the rest of the three-state contract
+    // (malformed 200 / {"data":null} → error.NoAnswer, empty page → &.{}) and returns
+    // the same EnrichError set, so it propagates directly — no re-wrap (which would
+    // relabel a genuine OutOfMemory as NoAnswer and lose the diagnostic).
     const raw = postGql(arena, io, body) orelse return error.NoAnswer;
-    return pageToMetas(arena, raw) catch return error.NoAnswer;
+    return pageToMetas(arena, raw);
 }
 
 /// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
@@ -277,9 +280,8 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
 /// zero media IS a confirmed empty answer and returns an empty slice.
 fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
     // A malformed 200 (unparseable body) is a failed answer, not an empty page —
-    // error, same as classifyById/classifyBySearch. (enrichBatch also wraps this in
-    // its own `catch return error.NoAnswer`, but classifying here keeps pageToMetas
-    // unit-testable against the three-state contract on its own.)
+    // error, same as classifyById/classifyBySearch, so pageToMetas honors the
+    // three-state contract on its own (and is unit-testable for it).
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
     }) catch return error.NoAnswer;
