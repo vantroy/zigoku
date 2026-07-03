@@ -7,7 +7,10 @@
 //! is a pure read of App state plus at most one read-only `store.getAnime`; none
 //! spawn work, write the store, or touch toast/undo — that transport stays on
 //! App. The App methods that used to live here are now one-line forwards into
-//! this module, matching the CoverState/SettingsState re-export idiom.
+//! this module. Like the per-view passes (view/*.zig), the functions here thread
+//! `*App` rather than owning state — they are not App-independent the way the
+//! CoverState/SettingsState subsystem carves are; only the two type re-exports
+//! below (DetailRenderInfo, MetaField) match that re-export idiom.
 //!
 //! Lifetime note: the formatters write into `chip_buf` / `detail_meta_buf` /
 //! `detail_meta_fields`, which are App-owned precisely because vaxis cells hold a
@@ -391,7 +394,7 @@ pub fn currentDetailSourceName(self: *const App, provider: SourceProvider) []con
 /// null when the current nav state isn't history-origin detail. The episode
 /// subsystem never reads nav state (ROD-180); the controller hands it the
 /// record (or null) for both the cache-hit and fresh-fetch seed paths.
-pub fn historyDetailRecord(self: *App) ?AnimeRecord {
+fn historyDetailRecord(self: *App) ?AnimeRecord {
     if (historyDetailActive(self)) return self.selectedHistoryRecord();
     return null;
 }
