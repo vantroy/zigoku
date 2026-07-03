@@ -269,11 +269,21 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
 /// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
 /// from `enrichBatch` so the mapping is unit-testable without a live POST (same
 /// seam as `mediaToMeta`). Arena-borrowed slices; the worker deep-copies to GPA.
-fn pageToMetas(arena: Allocator, raw: []const u8) ![]const Metadata {
-    const parsed = try std.json.parseFromSlice(Resp, arena, raw, .{
+///
+/// Classifies `data == null` the same way `classifyById`/`classifyBySearch` do
+/// (ROD-278): a `{"data":null}` body is a GraphQL-level execution error (a 200 with
+/// no data), NOT a confirmed-empty page — return `error.NoAnswer` so `enrichBatch`
+/// reports "no answer" and the caller leaves the page un-stamped. A parsed page with
+/// zero media IS a confirmed empty answer and returns an empty slice.
+fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
+    // A malformed 200 (unparseable body) is a failed answer, not an empty page —
+    // error, same as classifyById/classifyBySearch. (enrichBatch also wraps this in
+    // its own `catch return error.NoAnswer`, but classifying here keeps pageToMetas
+    // unit-testable against the three-state contract on its own.)
+    const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
-    });
-    const data = parsed.value.data orelse return &.{};
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
     const media = data.Page.media;
     const out = try arena.alloc(Metadata, media.len);
     for (media, 0..) |m, i| out[i] = try mediaToMeta(arena, m);
@@ -753,6 +763,21 @@ test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
     try std.testing.expect(metas[1].season == null);
     try std.testing.expect(metas[1].start_date == null);
     try std.testing.expectEqual(@as(?u32, null), metas[1].year);
+}
+
+test "pageToMetas: {\"data\":null} is no-answer, an empty page is a confirmed empty answer (ROD-278)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A `{"data":null}` body is a GraphQL-level execution error (200, no data), NOT a
+    // confirmed-empty page — it must error so `enrichBatch` reports no answer and the
+    // batch stays un-stamped. Mirrors classifyById/classifyBySearch on the same shape.
+    try std.testing.expectError(error.NoAnswer, pageToMetas(a, "{\"data\":null}"));
+
+    // A parsed page with zero media IS a confirmed empty answer → empty slice, no error.
+    const empty = try pageToMetas(a, "{\"data\":{\"Page\":{\"media\":[]}}}");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "classifyById: three-state map — match / confirmed no-match / no answer (ROD-278)" {
