@@ -224,21 +224,10 @@ pub const SearchController = struct {
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], translation);
-            rec.history_visible = visible;
-            // ROD-182: stamp the freshness clock only when these rows actually came
-            // from an AniList enrich (the .search_enriched persist, not the raw
-            // .search_done one), so refresh-on-view doesn't immediately re-fetch a
-            // just-enriched show. COALESCE preserves the stamp across a later raw
-            // re-persist. ROD-278: the caller passes false when the enrich fetch failed
-            // (a transport miss), so a failed page fetch persists content without
-            // burning the clock — `stamp_fresh` means "AniList answered", not just
-            // "this is the enriched persist".
-            if (stamp_fresh) {
-                rec.enrichment_fetched_at = now;
-                rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
-            }
-            st.upsertAnime(rec, now, arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
+            // ROD-280: history_visible + the freshness-stamp gate live in
+            // Store.upsertEnriched (see its doc for the gate contract). `stamp_fresh`
+            // is false on the raw .search_done persist and on a failed enrich.
+            st.upsertEnriched(source_name, self.results.items[i], translation, visible, stamp_fresh, now, arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }
