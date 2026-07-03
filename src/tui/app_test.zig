@@ -165,6 +165,11 @@ fn testTick(app: *App, event: Event) !void {
     // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
     // fan-out now, so it's a drain barrier rather than a single join (ROD-240).
     app.discover_cover_drain.drain();
+    // ROD-182: refresh-on-view workers. No-op today (the is_test gate in
+    // maybeRefreshEnrichment prevents them ever spawning in tests), but drained
+    // defensively — same contract as discover_cover_drain — so a future test that
+    // drives the firing path can't strand a worker on a torn-down loop.
+    app.enrich_refresh_drain.drain();
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -210,6 +215,10 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
         },
         .cover_error => |id| alloc.free(id),
         .episodes_error => |e| alloc.free(e.for_id),
+        .enrichment_refreshed => |d| {
+            freeOwnedAnime(alloc, d.result);
+            alloc.free(d.source);
+        },
         // task_error and most other events carry no owned heap payloads.
         else => {},
     }
@@ -922,6 +931,58 @@ test "popular_done persists feed rows to the store (persist like search, ROD-239
     const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "f1")).?;
     try testing.expectEqualStrings("Feed Show", rec.title);
     try testing.expectEqual(@as(?i64, null), rec.year); // no year in the feed payload row
+}
+
+test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves user state (ROD-182)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+
+    // A tracked row enriched long ago: RELEASING, no freshness stamp → stale.
+    try st.upsertAnime(.{
+        .source = "allanime",
+        .source_id = "r1",
+        .title = "Frieren",
+        .status = "RELEASING",
+        .score = 80,
+        .history_visible = true,
+    }, 1000, arena);
+    try st.setListStatus("allanime", "r1", .watching); // user state must survive a refresh
+
+    // The refresh worker's result: fresh content for the same id (gpa-owned, freed
+    // by the handler — the test allocator fails the test on a leak).
+    const result = try workers.dupeOwnedAnime(testing.allocator, .{
+        .id = "r1",
+        .name = "Frieren",
+        .status = "FINISHED",
+        .score = 90,
+        .description = "Now finished airing.",
+    });
+    const source = try testing.allocator.dupe(u8, "allanime");
+    try testTick(&app, .{ .enrichment_refreshed = .{ .result = result, .source = source } });
+
+    const rec = (try st.getAnime(arena, "allanime", "r1")).?;
+    // Drift fields overwritten by the fresh pull (COALESCE-when-present)...
+    try testing.expectEqualStrings("FINISHED", rec.status.?);
+    try testing.expectEqual(@as(?i64, 90), rec.score);
+    try testing.expectEqualStrings("Now finished airing.", rec.description.?);
+    // ...stamped fresh so a re-open won't immediately re-fetch...
+    try testing.expect(rec.enrichment_fetched_at != null);
+    try testing.expectEqual(@as(?i64, store_mod.Store.ENRICHMENT_FIELDSET_VERSION), rec.enrichment_fieldset_version);
+    // ...user state untouched (ON CONFLICT never writes list_status)...
+    try testing.expect(rec.list_status == .watching);
+    // ...and the view was flagged for a reload so the open detail reflects it.
+    try testing.expect(app.history_dirty);
+    // ...and the tracked row stays visible: the handler binds history_visible=false
+    // and leans on the upsert's MAX-merge to keep a tracked row visible. getAnime
+    // surfaces the column (ROD-182 refresh gate), so assert it on the row read above.
+    try testing.expect(rec.history_visible);
 }
 
 test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {

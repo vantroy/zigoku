@@ -89,6 +89,15 @@ pub const Event = union(enum) {
         for_query: []const u8,
         offset: usize,
     },
+    /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned
+    /// identity stub filled with fresh AniList metadata (or unchanged on a miss);
+    /// `source` is gpa-owned. The handler persists it (upsert stamps the freshness
+    /// columns + overwrites drift fields via COALESCE) and flags a history reload,
+    /// then frees both.
+    enrichment_refreshed: struct {
+        result: Anime,
+        source: []const u8,
+    },
     /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
     /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.
     episodes_done: struct {

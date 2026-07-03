@@ -249,6 +249,7 @@ pub fn run(
     defer if (app.enrich_thread) |t| t.join();
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
+    defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view workers
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
     defer app.cover.joinThread();
@@ -702,6 +703,10 @@ pub const App = struct {
     /// this accounts for the in-flight set so teardown can wait them all out
     /// before loop/gpa/io die. The episode record/cache lives in `episodes`.
     episode_drain: workers.ThreadDrain = .{},
+    /// ROD-182: drain barrier for refresh-on-view enrichment workers. Detached and
+    /// accounted like `episode_drain` so teardown waits them out before loop/gpa/io
+    /// die; a duplicate refresh (same show re-opened mid-flight) is never joined.
+    enrich_refresh_drain: workers.ThreadDrain = .{},
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
     /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
@@ -1379,7 +1384,7 @@ pub const App = struct {
                 const added = self.search.results.items.len - offset;
                 const source_name = provider.name();
                 self.search.hydrateResultsFromStore(self.gpa, self.store, source_name, offset, added);
-                self.search.persistResults(self.gpa, self.store, source_name, self.translation, offset, added, false);
+                self.search.persistResults(self.gpa, self.store, source_name, self.translation, offset, added, false, false);
                 self.fireEnrich(loop, io, offset, added);
             },
 
@@ -1424,7 +1429,7 @@ pub const App = struct {
                 // (window-agnostic facts only; the per-window view_count never
                 // persists — there is no such store column).
                 const added = slot.results.items.len - offset;
-                self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added);
+                self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added, false);
                 // A short page (incl. the server's ~500 ceiling) means no more —
                 // stops the load-more prefetch and flips the footer to "all loaded".
                 slot.exhausted = added < source_mod.popular_page_size;
@@ -1472,7 +1477,7 @@ pub const App = struct {
                     }
                 }
                 if (merged_at) |i| {
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1);
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1, true);
                 } else {
                     freeOwnedAnime(self.gpa, ev.result); // slot cleared/refetched — drop it
                 }
@@ -1508,7 +1513,7 @@ pub const App = struct {
                 // Persist the whole slot once (idempotent upserts) rather than
                 // tracking each scattered merge position — N ≤ ~50 local rows.
                 if (merged_any) {
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len);
+                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len, true);
                 }
                 // ROD-251: no join here — the worker is detached and self-accounts in
                 // discover_drain; it has already exited by the time this event lands.
@@ -1543,7 +1548,7 @@ pub const App = struct {
                 }
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
-                self.search.persistResults(self.gpa, self.store, source_name, self.translation, ev.offset, ev.results.len, false);
+                self.search.persistResults(self.gpa, self.store, source_name, self.translation, ev.offset, ev.results.len, false, true);
                 if (self.enrich_thread) |t| {
                     t.join();
                     self.enrich_thread = null;
@@ -1552,6 +1557,31 @@ pub const App = struct {
                     self.search.pending_enrich = null;
                     self.fireEnrich(loop, io, p.offset, p.count);
                 }
+            },
+            .enrichment_refreshed => |ev| {
+                // ROD-182: a stale show was re-enriched on view. Persist the fresh
+                // content — upsert's COALESCE overwrites the drift fields (status/
+                // score/description/total_episodes), preserves the user columns, and
+                // keeps any field AniList returned null for — with a fresh freshness
+                // stamp, then flag a history reload so the open detail/list reflect it.
+                // history_visible stays false: the MAX-merge preserves the row's
+                // stored visibility, so a Browse refresh of a hidden cache row never
+                // reveals an untracked show.
+                if (self.store) |st| {
+                    var arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer arena.deinit();
+                    const now = Store.nowSecs();
+                    var rec = AnimeRecord.fromDomain(ev.source, ev.result, self.translation);
+                    rec.history_visible = false;
+                    rec.enrichment_fetched_at = now;
+                    rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
+                    st.upsertAnime(rec, now, arena.allocator()) catch |e|
+                        log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
+                    self.history_dirty = true; // reload so detail/list show fresh content
+                }
+                freeOwnedAnime(self.gpa, ev.result);
+                self.gpa.free(ev.source);
+                // Detached worker (enrich_refresh_drain) — already exited; no join here.
             },
             .episodes_done => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -2151,6 +2181,79 @@ pub const App = struct {
         return false;
     }
 
+    /// ROD-182: refresh-on-view gate. Re-enrich the just-opened show when its
+    /// persisted enrichment is stale (`Store.enrichmentStale` — TTL lapsed, never
+    /// enriched, or filled under an older field set). `rec` is the seed record
+    /// `fireEpisodesForId` already resolved (History in-memory or the store); null
+    /// means nothing is persisted yet, so the search/discover enrich path owns
+    /// freshness and there's nothing to refresh. The staleness gate keeps this rare
+    /// — a just-searched show carries a fresh stamp and never re-fetches here.
+    fn maybeRefreshEnrichment(self: *App, loop: *Loop, io: std.Io, source: ?[]const u8, source_id: []const u8, rec: ?AnimeRecord) void {
+        // Never fire a live network refresh under `zig build test` — this runs before
+        // the episode cache-hit early-return in fireEpisodesForId, so without the
+        // guard even a synchronous cache-hit test spawns a detached network thread
+        // (leak + dangling thread). Same guard every sibling here carries (fireEnrich,
+        // fireDiscoverEnrich); tests exercise the handler by posting the event directly.
+        if (builtin.is_test) return;
+        if (self.store == null) return;
+        const r = rec orelse return;
+        const src = source orelse return;
+        // Only TRACKED shows refresh on view. History rows are always visible; a
+        // hidden Browse/Discover cache row (history_visible=0) is skipped — those
+        // surfaces have their own enrich paths (search-page enrich, fireDiscoverEnrich),
+        // so refreshing here would just double-fetch the same show (Discover-zoom
+        // fires both this and fireDiscoverEnrich). This also closes the old search-race
+        // window for free: a Browse search result is a hidden cache row, so it never
+        // refreshes here regardless of an in-flight enrich.
+        if (!r.history_visible) return;
+        if (!Store.enrichmentStale(r.enrichment_fetched_at, r.enrichment_fieldset_version, r.status, Store.nowSecs())) return;
+        // Light dedup: at most one refresh in flight. A stale show skipped here just
+        // refreshes on its next open — cheaper than tracking per-id in-flight state,
+        // and refreshes are TTL-gated and rare to begin with.
+        if (self.enrich_refresh_drain.inflight.load(.acquire) > 0) return;
+        self.fireRefreshEnrich(loop, io, src, source_id, r);
+    }
+
+    /// Spawn the detached refresh worker for `rec`. Builds a gpa-owned identity stub
+    /// (id/name/english_name/anilist_id — all `anilist.enrich` needs to take the
+    /// exact `enrichById` path or fall back to a title search) plus a gpa-owned
+    /// source; both transfer to `refreshEnrichTask` → the `enrichment_refreshed`
+    /// event. Accounted through `enrich_refresh_drain` (ROD-179 shape). Best effort:
+    /// a failed dupe or spawn just skips the refresh.
+    fn fireRefreshEnrich(self: *App, loop: *Loop, io: std.Io, source: []const u8, source_id: []const u8, rec: AnimeRecord) void {
+        const gpa = self.gpa;
+        // seed_rec's strings are arena-owned and die when fireEpisodesForId returns,
+        // so the stub gets its own GPA copies (freed by freeOwnedAnime on the event).
+        const id = gpa.dupe(u8, source_id) catch return;
+        const name = gpa.dupe(u8, rec.title) catch {
+            gpa.free(id);
+            return;
+        };
+        const src = gpa.dupe(u8, source) catch {
+            gpa.free(id);
+            gpa.free(name);
+            return;
+        };
+        const english: ?[]const u8 = if (rec.title_english) |e| (gpa.dupe(u8, e) catch null) else null;
+        const stub: Anime = .{
+            .id = id,
+            .name = name,
+            .english_name = english,
+            .anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null,
+        };
+
+        self.enrich_refresh_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.refreshEnrichTask, .{
+            loop, gpa, io, stub, src, &self.enrich_refresh_drain,
+        }) catch {
+            self.enrich_refresh_drain.finish(); // no worker will run — rebalance
+            freeOwnedAnime(gpa, stub);
+            gpa.free(src);
+            return;
+        };
+        t.detach();
+    }
+
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
         // ROD-179: do NOT join a prior in-flight episode fetch here — that would
         // block the main loop on a slow network when a settled-then-resumed scroll
@@ -2178,6 +2281,10 @@ pub const App = struct {
         var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer seed_arena.deinit();
         const seed_rec = selection.detailSeedRecord(self, seed_arena.allocator(), source, source_id);
+        // ROD-182: opening a show is the refresh-on-view trigger — re-enrich it when
+        // its persisted metadata is stale. Independent of the episode cache hit
+        // below, so it runs whether or not the grid is already cached.
+        self.maybeRefreshEnrichment(loop, io, source, source_id, seed_rec);
         if (self.episodes.tryCacheHit(self.gpa, self.store, source, source_id, self.translation, status, seed_rec)) {
             self.async_start_ms = 0;
             return;

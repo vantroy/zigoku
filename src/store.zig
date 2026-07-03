@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 5;
+const SCHEMA_VERSION: c_int = 6;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -137,6 +137,26 @@ const MIGRATION_V5 =
     \\ALTER TABLE anime ADD COLUMN genres       TEXT;    -- '\n'-joined; see note above
 ;
 
+// ROD-182: enrichment content (status/score/description/…) rode alongside the
+// immutable `anilist_id` with no clock, so a show enriched once kept month-old
+// status/score forever. This column stamps the last successful AniList pull so a
+// status-aware TTL (`enrichmentTtl`) can drive refresh-on-view. NULL = never
+// enriched, or a row predating v6 — both read as stale (`enrichmentStale`), which
+// is also the backfill predicate for pre-ROD-181 rows that never got an id join.
+// It rides `anime` (not a side table like episode_cache) because the freshness
+// key IS the row's own `status`, so the TTL is computed at read from live columns.
+//
+// `enrichment_fieldset_version` records WHICH set of enriched columns a row was
+// last filled under (see `ENRICHMENT_FIELDSET_VERSION`). Widening the persisted
+// enrichment (e.g. ROD-261 adds studios/source/duration) leaves old rows fresh by
+// the clock but missing the new columns — a 30d-finished row would never backfill
+// them. Bumping the constant marks every older-fieldset row stale regardless of
+// clock, so the new columns heal on next view instead of waiting out the TTL.
+const MIGRATION_V6 =
+    \\ALTER TABLE anime ADD COLUMN enrichment_fetched_at       INTEGER;
+    \\ALTER TABLE anime ADD COLUMN enrichment_fieldset_version INTEGER;
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -164,6 +184,14 @@ pub const AnimeRecord = struct {
     start_month: ?i64 = null,
     start_day: ?i64 = null,
     genres: []const []const u8 = &.{},
+    /// ROD-182: unix seconds of the last successful AniList enrichment pull, or
+    /// null if never enriched (also null for rows written before the v6 column).
+    /// Drives `enrichmentStale` → refresh-on-view; never touched by user edits.
+    enrichment_fetched_at: ?i64 = null,
+    /// ROD-182: the `ENRICHMENT_FIELDSET_VERSION` this row was last enriched under;
+    /// null = never enriched / pre-v6. Lets a field-set widening (ROD-261) mark old
+    /// rows stale by version, not just by clock. Stamped alongside `fetched_at`.
+    enrichment_fieldset_version: ?i64 = null,
     list_status: domain.ListStatus = .planning,
     user_rating: ?f64 = null,
     notes: ?[]const u8 = null,
@@ -338,8 +366,9 @@ pub const Store = struct {
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
             \\    cover_url, year, status, description, score, total_episodes,
             \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible,
-            \\    season, native_name, kind, start_year, start_month, start_day, genres)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    season, native_name, kind, start_year, start_month, start_day, genres,
+            \\    enrichment_fetched_at, enrichment_fieldset_version)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -362,7 +391,9 @@ pub const Store = struct {
             \\    start_month    = COALESCE(excluded.start_month, anime.start_month),
             \\    start_day      = COALESCE(excluded.start_day, anime.start_day),
             \\    genres         = COALESCE(excluded.genres, anime.genres),
-            \\    history_visible = MAX(excluded.history_visible, anime.history_visible)
+            \\    history_visible = MAX(excluded.history_visible, anime.history_visible),
+            \\    enrichment_fetched_at = COALESCE(excluded.enrichment_fetched_at, anime.enrichment_fetched_at),
+            \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, anime.enrichment_fieldset_version)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -401,6 +432,8 @@ pub const Store = struct {
         } else {
             try bindText(stmt, 27, try joinGenres(scratch, a.genres));
         }
+        try bindOptI64(stmt, 28, a.enrichment_fetched_at);
+        try bindOptI64(stmt, 29, a.enrichment_fieldset_version);
 
         try self.stepDone(stmt);
     }
@@ -412,7 +445,8 @@ pub const Store = struct {
             \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
-            \\    season, native_name, kind, start_year, start_month, start_day, genres
+            \\    season, native_name, kind, start_year, start_month, start_day, genres,
+            \\    enrichment_fetched_at, enrichment_fieldset_version
             \\FROM anime
             \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
@@ -449,6 +483,8 @@ pub const Store = struct {
                 .start_month = colOptI64(stmt, 23),
                 .start_day = colOptI64(stmt, 24),
                 .genres = try dupeGenres(arena, stmt, 25),
+                .enrichment_fetched_at = colOptI64(stmt, 26),
+                .enrichment_fieldset_version = colOptI64(stmt, 27),
                 .history_visible = true,
             });
         }
@@ -461,7 +497,8 @@ pub const Store = struct {
             \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
-            \\    season, native_name, kind, start_year, start_month, start_day, genres
+            \\    season, native_name, kind, start_year, start_month, start_day, genres,
+            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -497,6 +534,11 @@ pub const Store = struct {
             .start_month = colOptI64(stmt, 23),
             .start_day = colOptI64(stmt, 24),
             .genres = try dupeGenres(arena, stmt, 25),
+            .enrichment_fetched_at = colOptI64(stmt, 26),
+            .enrichment_fieldset_version = colOptI64(stmt, 27),
+            // ROD-182: surface real visibility (loadHistory hardcodes true since it
+            // only returns visible rows) so refresh-on-view can gate on "tracked".
+            .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
         };
     }
 
@@ -772,6 +814,48 @@ pub const Store = struct {
         return 24 * 60 * 60;
     }
 
+    // ── ROD-182: enrichment-content TTL (status/score/description drift) ────────
+
+    /// The current version of the *persisted enrichment field set* — the columns an
+    /// enrich pull fills (`anilist.GQL_FIELDS` → `upsertAnime`). BUMP THIS whenever a
+    /// migration adds enrichment columns that a fresh enrich would populate (ROD-261:
+    /// studios/source/duration → 2). A row stamped below this reads stale in
+    /// `enrichmentStale` no matter its clock, so widened columns heal on next view
+    /// rather than waiting out the TTL. Not a schema knob — `SCHEMA_VERSION` gates
+    /// migrations; this gates enrichment freshness, and the two move independently.
+    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 1;
+
+    /// TTL in seconds for cached *enrichment metadata* on the `anime` row, keyed
+    /// off airing status. A deliberately longer curve than `cacheTtl` (which
+    /// governs the episode LIST): a score, synopsis, or status flips far slower
+    /// than a weekly episode drop, so we refresh conservatively — a finished show
+    /// is all but frozen (30d), an airing one can flip RELEASING→FINISHED and gain
+    /// votes (1d), an unknown/unmodelled status splits the difference (7d). The
+    /// "never enriched" case is NOT modelled here — that's `fetched_at == null` in
+    /// `enrichmentStale`, so a fetched-but-status-null row still gets 7d of grace
+    /// instead of re-fetching on every single view.
+    pub fn enrichmentTtl(airing_status: ?[]const u8) i64 {
+        const s = airing_status orelse return 7 * 24 * 60 * 60;
+        if (eqIgnoreCase(s, "FINISHED")) return 30 * 24 * 60 * 60;
+        if (eqIgnoreCase(s, "RELEASING") or eqIgnoreCase(s, "ongoing")) return 24 * 60 * 60;
+        return 7 * 24 * 60 * 60;
+    }
+
+    /// Whether a row's persisted enrichment is stale enough to refresh on view.
+    /// Stale when ANY of:
+    ///   * `fetched_at` is null — never enriched, or a row predating the v6 column;
+    ///     also the backfill predicate for pre-ROD-181 rows with no `anilist_id`.
+    ///   * `fieldset_version` predates `ENRICHMENT_FIELDSET_VERSION` — the row was
+    ///     filled under a narrower column set, so widened columns are missing (null
+    ///     version → treated as 0, i.e. older than any real field set).
+    ///   * the clock has passed `fetched_at + enrichmentTtl(status)`.
+    /// Pure — unit-tested without a DB.
+    pub fn enrichmentStale(fetched_at: ?i64, fieldset_version: ?i64, airing_status: ?[]const u8, now: i64) bool {
+        const t = fetched_at orelse return true;
+        if ((fieldset_version orelse 0) < ENRICHMENT_FIELDSET_VERSION) return true;
+        return now >= t + enrichmentTtl(airing_status);
+    }
+
     pub fn putCachedEpisodes(
         self: *Store,
         source: []const u8,
@@ -874,6 +958,11 @@ pub const Store = struct {
             try self.exec(MIGRATION_V5);
             try self.exec("PRAGMA user_version = 5;");
             v = 5;
+        }
+        if (v < 6) {
+            try self.exec(MIGRATION_V6);
+            try self.exec("PRAGMA user_version = 6;");
+            v = 6;
         }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
@@ -1670,6 +1759,100 @@ test "cacheTtl by airing status" {
     try testing.expectEqual(@as(i64, 6 * 60 * 60), Store.cacheTtl("RELEASING"));
     try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.cacheTtl(null));
     try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.cacheTtl("WEIRD"));
+}
+
+test "enrichmentTtl by airing status" {
+    // Longer curve than cacheTtl: metadata drifts slower than the episode list.
+    try testing.expectEqual(@as(i64, 30 * 24 * 60 * 60), Store.enrichmentTtl("FINISHED"));
+    try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.enrichmentTtl("RELEASING"));
+    try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.enrichmentTtl("ongoing"));
+    // Unknown/unmodelled status still gets grace (7d), NOT always-stale — that
+    // case belongs to a null fetched_at, not a null status.
+    try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), Store.enrichmentTtl(null));
+    try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), Store.enrichmentTtl("WEIRD"));
+}
+
+test "enrichmentStale: missing/old-fieldset always stale, else TTL-gated by status" {
+    const V = Store.ENRICHMENT_FIELDSET_VERSION;
+
+    // Never enriched (or a pre-v6 row) → always stale, regardless of status/now/version.
+    try testing.expect(Store.enrichmentStale(null, V, "FINISHED", 0));
+    try testing.expect(Store.enrichmentStale(null, null, null, 1_000_000));
+
+    // Enriched under an OLDER field set → stale even with a fresh clock, so a ROD-261
+    // widening heals old rows on view instead of waiting out the 30d TTL. A null
+    // stored version reads as 0 — older than any real field set.
+    try testing.expect(Store.enrichmentStale(1000, V - 1, "FINISHED", 1001));
+    try testing.expect(Store.enrichmentStale(1000, null, "FINISHED", 1001));
+
+    // Current field set + FINISHED, fetched at t=1000: fresh inside 30d, stale at the boundary.
+    const finished_ttl = 30 * 24 * 60 * 60;
+    try testing.expect(!Store.enrichmentStale(1000, V, "FINISHED", 1000 + finished_ttl - 1));
+    try testing.expect(Store.enrichmentStale(1000, V, "FINISHED", 1000 + finished_ttl));
+
+    // RELEASING refreshes on a 1d clock — stale a day after the fetch.
+    const day = 24 * 60 * 60;
+    try testing.expect(!Store.enrichmentStale(1000, V, "RELEASING", 1000 + day - 1));
+    try testing.expect(Store.enrichmentStale(1000, V, "RELEASING", 1000 + day));
+}
+
+test "enrichment stamp (fetched_at + fieldset_version) round-trips and survives a non-enriching upsert" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    const V = Store.ENRICHMENT_FIELDSET_VERSION;
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // First enrich stamps fetch time + field-set version together.
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "e",
+        .title = "E",
+        .status = "RELEASING",
+        .enrichment_fetched_at = 5000,
+        .enrichment_fieldset_version = V,
+    }, 5000, arena);
+    const first = (try s.getAnime(arena, T_SOURCE, "e")).?;
+    try testing.expectEqual(@as(?i64, 5000), first.enrichment_fetched_at);
+    try testing.expectEqual(@as(?i64, V), first.enrichment_fieldset_version);
+
+    // A plain re-search (no stamp) must NOT wipe either field — COALESCE keeps them,
+    // same "re-search never wipes enrichment" rule the content fields lean on.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "e", .title = "E" }, 6000, arena);
+    const kept = (try s.getAnime(arena, T_SOURCE, "e")).?;
+    try testing.expectEqual(@as(?i64, 5000), kept.enrichment_fetched_at);
+    try testing.expectEqual(@as(?i64, V), kept.enrichment_fieldset_version);
+
+    // A later refresh (fresh stamp) overwrites both.
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "e",
+        .title = "E",
+        .status = "FINISHED",
+        .enrichment_fetched_at = 9000,
+        .enrichment_fieldset_version = V,
+    }, 9000, arena);
+    const refreshed = (try s.getAnime(arena, T_SOURCE, "e")).?;
+    try testing.expectEqual(@as(?i64, 9000), refreshed.enrichment_fetched_at);
+    try testing.expectEqual(@as(?i64, V), refreshed.enrichment_fieldset_version);
+}
+
+test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A hidden search/discover cache row vs a tracked (visible) row — the refresh
+    // gate skips the former (its own enrich path owns freshness) and fires the latter.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "H", .history_visible = false }, 1, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "S", .history_visible = true }, 1, arena);
+
+    try testing.expect(!(try s.getAnime(arena, T_SOURCE, "hidden")).?.history_visible);
+    try testing.expect((try s.getAnime(arena, T_SOURCE, "shown")).?.history_visible);
 }
 
 test "foreign key cascade deletes progress and cache with its anime" {
