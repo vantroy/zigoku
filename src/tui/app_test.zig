@@ -979,15 +979,10 @@ test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves 
     try testing.expect(rec.list_status == .watching);
     // ...and the view was flagged for a reload so the open detail reflects it.
     try testing.expect(app.history_dirty);
-    // ...and the tracked row stays visible. getAnime doesn't surface history_visible,
-    // so prove the MAX-merge held (the handler binds history_visible=false) via
-    // loadHistory, which returns only history_visible != 0 rows.
-    const visible = try st.loadHistory(arena);
-    var still_visible = false;
-    for (visible) |v| {
-        if (std.mem.eql(u8, v.source_id, "r1")) still_visible = true;
-    }
-    try testing.expect(still_visible);
+    // ...and the tracked row stays visible: the handler binds history_visible=false
+    // and leans on the upsert's MAX-merge to keep a tracked row visible. getAnime
+    // surfaces the column (ROD-182 refresh gate), so assert it on the row read above.
+    try testing.expect(rec.history_visible);
 }
 
 test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {

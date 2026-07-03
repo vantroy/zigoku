@@ -498,7 +498,7 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version
+            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -536,6 +536,9 @@ pub const Store = struct {
             .genres = try dupeGenres(arena, stmt, 25),
             .enrichment_fetched_at = colOptI64(stmt, 26),
             .enrichment_fieldset_version = colOptI64(stmt, 27),
+            // ROD-182: surface real visibility (loadHistory hardcodes true since it
+            // only returns visible rows) so refresh-on-view can gate on "tracked".
+            .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
         };
     }
 
@@ -1834,6 +1837,22 @@ test "enrichment stamp (fetched_at + fieldset_version) round-trips and survives 
     const refreshed = (try s.getAnime(arena, T_SOURCE, "e")).?;
     try testing.expectEqual(@as(?i64, 9000), refreshed.enrichment_fetched_at);
     try testing.expectEqual(@as(?i64, V), refreshed.enrichment_fieldset_version);
+}
+
+test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A hidden search/discover cache row vs a tracked (visible) row — the refresh
+    // gate skips the former (its own enrich path owns freshness) and fires the latter.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "H", .history_visible = false }, 1, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "S", .history_visible = true }, 1, arena);
+
+    try testing.expect(!(try s.getAnime(arena, T_SOURCE, "hidden")).?.history_visible);
+    try testing.expect((try s.getAnime(arena, T_SOURCE, "shown")).?.history_visible);
 }
 
 test "foreign key cascade deletes progress and cache with its anime" {

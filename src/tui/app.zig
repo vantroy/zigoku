@@ -2198,12 +2198,14 @@ pub const App = struct {
         if (self.store == null) return;
         const r = rec orelse return;
         const src = source orelse return;
-        // A search-page enrich is in flight: it re-enriches the Browse results and
-        // re-persists them with a fresh stamp (search_enriched). Opening one of those
-        // still-unstamped rows mid-enrich would fire a duplicate fetch, so defer to
-        // it. A genuinely-stale History show opened during that window is skipped too
-        // — it just refreshes on its next open (rare, self-healing).
-        if (self.enrich_thread != null) return;
+        // Only TRACKED shows refresh on view. History rows are always visible; a
+        // hidden Browse/Discover cache row (history_visible=0) is skipped — those
+        // surfaces have their own enrich paths (search-page enrich, fireDiscoverEnrich),
+        // so refreshing here would just double-fetch the same show (Discover-zoom
+        // fires both this and fireDiscoverEnrich). This also closes the old search-race
+        // window for free: a Browse search result is a hidden cache row, so it never
+        // refreshes here regardless of an in-flight enrich.
+        if (!r.history_visible) return;
         if (!Store.enrichmentStale(r.enrichment_fetched_at, r.enrichment_fieldset_version, r.status, Store.nowSecs())) return;
         // Light dedup: at most one refresh in flight. A stale show skipped here just
         // refreshes on its next open — cheaper than tracking per-id in-flight state,
