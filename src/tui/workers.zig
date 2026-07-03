@@ -477,12 +477,23 @@ pub fn enrichTask(
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
+    // ROD-278: page-level answered signal — the handler stamps the freshness clock
+    // only if EVERY row got an answer (a match or a confirmed no-match). If any row's
+    // enrich hit a transport failure (error.NoAnswer / OOM), leave the whole page
+    // un-stamped so those rows retry on next view instead of burning the clock on a
+    // failed fetch. Conservative: a partial-failure page also re-enriches its answered
+    // rows next view (harmless waste), but never stamps a row AniList never reached.
+    var all_answered = true;
     for (results) |*a| {
-        const meta = anilist.enrich(arena.allocator(), io, a.*) catch null orelse continue;
-        applyMetadata(gpa, a, meta);
+        if (anilist.enrich(arena.allocator(), io, a.*)) |maybe_meta| {
+            if (maybe_meta) |meta| applyMetadata(gpa, a, meta);
+        } else |err| {
+            all_answered = false;
+            log.debug("search enrich got no answer: {s}", .{@errorName(err)});
+        }
     }
 
-    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset } }) catch |pe| {
+    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset, .answered = all_answered } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return; // `posted` stays false → the defer frees results/query
     };
@@ -543,10 +554,18 @@ pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime,
     var a = anime;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    // A miss (no AniList match / offline) still posts `a` unchanged — the merge is
-    // then a harmless self-replace and the zoom shows no synopsis (none exists).
-    if (anilist.enrich(arena.allocator(), io, a) catch null) |meta| applyMetadata(gpa, &a, meta);
-    loop.postEvent(.{ .discover_enriched = .{ .result = a, .window = window } }) catch {
+    // A confirmed no-match still posts `a` unchanged — the merge is then a harmless
+    // self-replace and the zoom shows no synopsis (none exists). ROD-278: stamp
+    // freshness only when AniList answered; a transport failure leaves this card
+    // un-stamped so it retries on next view.
+    var answered = true;
+    if (anilist.enrich(arena.allocator(), io, a)) |maybe_meta| {
+        if (maybe_meta) |meta| applyMetadata(gpa, &a, meta);
+    } else |err| {
+        answered = false;
+        log.debug("discover enrich got no answer: {s}", .{@errorName(err)});
+    }
+    loop.postEvent(.{ .discover_enriched = .{ .result = a, .window = window, .answered = answered } }) catch {
         freeOwnedAnime(gpa, a);
     };
 }
@@ -588,10 +607,17 @@ pub fn discoverBatchEnrichTask(
         if (a.anilist_id) |id| ids.append(arena.allocator(), id) catch {};
     }
 
-    // One round trip for the whole page. An empty return (offline / no matches)
-    // leaves every stub unchanged — the merge is then a harmless self-replace and
-    // the page stays at [--], mirroring discoverEnrichTask's miss behavior.
-    const metas = anilist.enrichBatch(arena.allocator(), io, ids.items) catch &.{};
+    // One round trip for the whole page. ROD-278: enrichBatch errors on a transport
+    // miss (vs an empty slice for a reached-but-no-matches page), so a failed page
+    // fetch sets answered=false and the handler leaves the slot un-stamped instead of
+    // burning the freshness clock on ~30 un-enriched cards. A reached-but-empty page
+    // still stamps (answered stays true) — the stubs stay at [--], the same as before.
+    var answered = true;
+    const metas = anilist.enrichBatch(arena.allocator(), io, ids.items) catch |err| blk: {
+        answered = false;
+        log.debug("discover batch enrich got no answer: {s}", .{@errorName(err)});
+        break :blk &.{};
+    };
     for (stubs) |*a| {
         const id = a.anilist_id orelse continue;
         for (metas) |meta| {
@@ -602,7 +628,7 @@ pub fn discoverBatchEnrichTask(
         }
     }
 
-    loop.postEvent(.{ .discover_batch_enriched = .{ .results = stubs, .window = window } }) catch |pe| {
+    loop.postEvent(.{ .discover_batch_enriched = .{ .results = stubs, .window = window, .answered = answered } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return; // `posted` stays false → the defer frees stubs
     };

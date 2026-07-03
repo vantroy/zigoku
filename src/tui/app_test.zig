@@ -1031,6 +1031,77 @@ test "enrichment_refreshed with answered=false skips the stamp and the persist (
     try testing.expect(!app.history_dirty);
 }
 
+test "search_enriched with answered=false caches content but skips the freshness stamp (ROD-278)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.search.len = 7;
+    @memcpy(app.search.query[0..7], "frieren");
+
+    // A live search result the enrich persist will cache.
+    try app.search.results.ensureTotalCapacity(testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try testing.allocator.dupe(u8, "id1"),
+        .name = try testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+    });
+
+    // The enrich worker reached no answer (transport failure): the page comes back
+    // unchanged and the event carries answered=false.
+    const query_copy = try testing.allocator.dupe(u8, "frieren");
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = .{
+        .id = try testing.allocator.dupe(u8, "id1"),
+        .name = try testing.allocator.dupe(u8, "Frieren"),
+        .eps_sub = 28,
+    };
+    try testTick(&app, .{ .search_enriched = .{ .results = results, .for_query = query_copy, .offset = 0, .answered = false } });
+
+    // The row was cached (persistResults ran) but NOT stamped fresh — the fix: a
+    // failed enrich leaves the row stale so refresh-on-view retries.
+    const rec = (try st.getAnime(arena, "allanime", "id1")).?;
+    try testing.expect(rec.enrichment_fetched_at == null);
+    try testing.expect(rec.enrichment_fieldset_version == null);
+
+    for (app.search.results.items) |r| freeOwnedAnime(testing.allocator, r);
+    app.search.results.deinit(testing.allocator);
+}
+
+test "discover_batch_enriched with answered=false caches the slot but skips the freshness stamp (ROD-278)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 }));
+
+    // The batch fetch hit a transport failure: enrichBatch errored, so the worker
+    // posts the stubs unchanged with answered=false (one card matching the slot).
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 });
+    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = false } });
+
+    // The slot card is cached (persistSlot ran) but NOT stamped fresh — a failed page
+    // fetch must not burn the freshness clock on an un-enriched card.
+    const rec = (try st.getAnime(arena, "allanime", "a")).?;
+    try testing.expect(rec.enrichment_fetched_at == null);
+    try testing.expect(rec.enrichment_fieldset_version == null);
+}
+
 test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -1043,7 +1114,7 @@ test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" 
 
     // The lazily-enriched copy arrives (same id, now with a synopsis).
     const enriched = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me", .description = "A grand tale." });
-    try testTick(&app, .{ .discover_enriched = .{ .result = enriched, .window = .daily } });
+    try testTick(&app, .{ .discover_enriched = .{ .result = enriched, .window = .daily, .answered = true } });
 
     // Merged in place — the zoom now has its synopsis.
     try testing.expectEqualStrings("A grand tale.", daily.results.items[0].description.?);
@@ -1058,7 +1129,7 @@ test "discover_enriched drops the result when the show is gone from the slot (RO
     // the show id no longer matches. The enriched result must be FREED, not leaked
     // — the test allocator fails the test if the else-branch drops the free.
     const orphan = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "gone", .name = "Gone", .description = "x" });
-    try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily } });
+    try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily, .answered = true } });
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
 }
 
@@ -1080,7 +1151,7 @@ test "discover_batch_enriched merges N cards into the slot by id, drops stale (R
     results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1, .score = 88, .genres = &.{ "Action", "Comedy" }, .season = .fall, .year = 2023 });
     results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "b", .name = "B", .anilist_id = 2, .score = 75 });
     results[2] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "stale", .name = "Stale", .anilist_id = 9, .score = 50 });
-    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily } });
+    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = true } });
 
     // Cards a + b enriched in place; card c untouched; the stale result dropped.
     try testing.expectEqual(@as(?u32, 88), daily.results.items[0].score);
@@ -1100,7 +1171,7 @@ test "discover_batch_enriched drops every result when the slot is cleared (ROD-2
     const results = try testing.allocator.alloc(Anime, 2);
     results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "X", .anilist_id = 1, .score = 60 });
     results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "y", .name = "Y", .anilist_id = 2, .score = 70 });
-    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily } });
+    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = true } });
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
 }
 
@@ -2818,7 +2889,7 @@ test "search_enriched merges metadata into matching live result" {
         .status = try std.testing.allocator.dupe(u8, "FINISHED"),
     };
 
-    try testTick(&app, .{ .search_enriched = .{ .results = enriched, .for_query = query_copy, .offset = 0 } });
+    try testTick(&app, .{ .search_enriched = .{ .results = enriched, .for_query = query_copy, .offset = 0, .answered = true } });
     try testing.expectEqual(@as(?u64, 154587), app.search.results.items[0].anilist_id);
     try testing.expectEqual(@as(?u32, 91), app.search.results.items[0].score);
     try testing.expectEqualStrings("Elf mage grief hour", app.search.results.items[0].description orelse "");

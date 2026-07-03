@@ -104,7 +104,7 @@ pub const DiscoverState = struct {
     /// column, so the per-window count never persists (the invariant). Best effort —
     /// a write failure never disrupts the feed. `store`/`source_name`/`translation`
     /// are resolved by App and passed in; this never reads App.
-    pub fn persistSlot(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, translation: domain.Translation, idx: usize, offset: usize, count: usize, enriched: bool) void {
+    pub fn persistSlot(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, translation: domain.Translation, idx: usize, offset: usize, count: usize, stamp_fresh: bool) void {
         const st = store orelse return;
         const items = self.slots[idx].results.items;
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -117,8 +117,11 @@ pub const DiscoverState = struct {
             rec.history_visible = false; // a hidden cache row, like a search result
             // ROD-182: stamp freshness only for the enriched persists (discover_enriched
             // / discover_batch_enriched), not the raw popular_done feed dump, so
-            // refresh-on-view doesn't re-fetch a card AniList just enriched.
-            if (enriched) {
+            // refresh-on-view doesn't re-fetch a card AniList just enriched. ROD-278:
+            // the caller passes false when the enrich fetch failed (a transport miss),
+            // so a failed fetch persists the slot without burning the clock —
+            // `stamp_fresh` means "AniList answered", not just "the enriched persist".
+            if (stamp_fresh) {
                 rec.enrichment_fetched_at = now;
                 rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
             }

@@ -212,7 +212,7 @@ pub const SearchController = struct {
         offset: usize,
         count: usize,
         visible: bool,
-        enriched: bool,
+        stamp_fresh: bool,
     ) void {
         const st = store orelse return;
         // Scratch arena for the per-row genres-blob join (reset each iteration so
@@ -230,8 +230,11 @@ pub const SearchController = struct {
             // from an AniList enrich (the .search_enriched persist, not the raw
             // .search_done one), so refresh-on-view doesn't immediately re-fetch a
             // just-enriched show. COALESCE preserves the stamp across a later raw
-            // re-persist.
-            if (enriched) {
+            // re-persist. ROD-278: the caller passes false when the enrich fetch failed
+            // (a transport miss), so a failed page fetch persists content without
+            // burning the clock — `stamp_fresh` means "AniList answered", not just
+            // "this is the enriched persist".
+            if (stamp_fresh) {
                 rec.enrichment_fetched_at = now;
                 rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
             }

@@ -219,12 +219,18 @@ fn classifyBySearch(arena: Allocator, show: domain.Anime, raw: []const u8) Enric
 /// one are filtered out upstream. Returns an arena-owned `Metadata` per returned
 /// media, each tagged with its `anilist_id` (via `mediaToMeta`) so the caller can
 /// join results back to cards by id — AniList does not guarantee response order
-/// matches `ids`. Empty slice on any transport/HTTP/parse miss: a flaky network
-/// degrades the whole page to `[--]` rather than erroring, mirroring the per-card
-/// `enrich` path's null-on-miss contract. Only a failure building the query here
-/// propagates; a fetch miss — network, HTTP, over-cap, timeout, or the fetch's own
-/// OOM — degrades to empty like any other miss (postGql swallows it to null).
-pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata {
+/// matches `ids`.
+///
+/// Same three-state contract as `enrich` (ROD-278), so the caller can gate a
+/// freshness stamp on whether AniList actually answered:
+///   * a non-empty (or empty) slice — AniList was REACHED: the page hydrates from
+///     the returned media; an empty slice is a confirmed "no matches for these ids"
+///     (or nothing to fetch — `ids.len == 0`). The caller may stamp fresh.
+///   * `error.NoAnswer` — a transport/HTTP/over-cap/timeout miss or a malformed 200
+///     (postGql returned null, or the body wouldn't parse). The whole page degrades
+///     to `[--]` AND the caller must NOT stamp — a failed batch fetch would otherwise
+///     burn the freshness clock on a page of un-enriched cards.
+pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]const Metadata {
     if (ids.len == 0) return &.{};
 
     // `id_in:[1,2,3]` — integers only, so the list is JSON-safe interpolated raw,
@@ -240,8 +246,8 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50:
     // the caller feeds at most one feed page (popular_page_size = 30 in source.zig), so
     // ids.len ≤ 50 holds today. If the feed page size is ever raised past 50, AniList
-    // 400s the whole query → postGql returns null → the page silently degrades to
-    // `[--]`. Chunk the ids (or clamp perPage) before crossing that line.
+    // 400s the whole query → postGql returns null → error.NoAnswer → the page degrades
+    // to `[--]` and stays un-stamped. Chunk the ids (or clamp perPage) before that line.
     //
     // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
     // string — it contains `startDate{year}`, whose braces the format parser would
@@ -254,8 +260,10 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) ![]const Metadata
     );
     const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
 
-    const raw = postGql(arena, io, body) orelse return &.{};
-    return pageToMetas(arena, raw) catch &.{};
+    // A transport miss (null) or a malformed 200 (parse failure) is "no answer",
+    // not a confirmed empty page — error so the caller leaves the page un-stamped.
+    const raw = postGql(arena, io, body) orelse return error.NoAnswer;
+    return pageToMetas(arena, raw) catch return error.NoAnswer;
 }
 
 /// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split

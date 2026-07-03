@@ -68,26 +68,38 @@ pub const Event = union(enum) {
     /// One Discover card lazily enriched from AniList for its zoom (ROD-239). The
     /// feed has no synopsis, so opening a card fetches it. `result` is gpa-owned;
     /// App merges it into `window`'s slot (matched by id) and takes ownership.
+    /// `answered` (ROD-278): true if AniList returned a confirmed answer; false on a
+    /// transport failure — the handler stamps the persisted card's freshness clock
+    /// only when `answered`, so a failed fetch doesn't advance it.
     discover_enriched: struct {
         result: Anime,
         window: source_mod.PopularWindow,
+        answered: bool,
     },
     /// A whole Discover feed page batch-enriched from AniList in one fetch
     /// (ROD-247) — score + genres + season, the card signals the popular feed
     /// nulls. `results` is gpa-allocated (each Anime's strings owned); App merges
     /// each into `window`'s slot by id and takes ownership (orphans freed). Distinct
     /// from `discover_enriched` (the per-card zoom path) so the page batch and a
-    /// zoom enrich never share a thread handle or block each other.
+    /// zoom enrich never share a thread handle or block each other. `answered`
+    /// (ROD-278): false when the batch fetch hit a transport failure — the handler
+    /// then persists the slot WITHOUT stamping freshness, so a failed page fetch
+    /// doesn't burn the clock on un-enriched cards. A reached-but-empty page is true.
     discover_batch_enriched: struct {
         results: []Anime,
         window: source_mod.PopularWindow,
+        answered: bool,
     },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.
+    /// `answered` (ROD-278): true only if EVERY row in the page got an answer; false
+    /// if any row's enrich hit a transport failure — the handler stamps the page's
+    /// freshness clock only when `answered`, so a failed fetch doesn't advance it.
     search_enriched: struct {
         results: []Anime,
         for_query: []const u8,
         offset: usize,
+        answered: bool,
     },
     /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned
     /// identity stub filled with fresh AniList metadata (or unchanged on a miss);
