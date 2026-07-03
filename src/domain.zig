@@ -168,7 +168,7 @@ pub const Season = enum {
     /// boundaries so the top-bar "current season" fallback (ROD-186) agrees with
     /// the show chips it sits beside: 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov.
     /// Note December belongs to the *next* year's Winter cour on AniList — that
-    /// year roll is the caller's concern (see App.currentCour); this is month→season
+    /// year roll is the caller's concern (see selection.currentCour); this is month→season
     /// only. Out-of-range months can't occur (std clock yields 1–12) but default to
     /// winter rather than trap.
     pub fn fromMonth(month: u4) Season {
