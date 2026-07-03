@@ -212,6 +212,7 @@ pub const SearchController = struct {
         offset: usize,
         count: usize,
         visible: bool,
+        enriched: bool,
     ) void {
         const st = store orelse return;
         // Scratch arena for the per-row genres-blob join (reset each iteration so
@@ -219,12 +220,22 @@ pub const SearchController = struct {
         // backing capacity, so it's one alloc amortized over the page.
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
+        const now = Store.nowSecs();
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
             var rec = AnimeRecord.fromDomain(source_name, self.results.items[i], translation);
             rec.history_visible = visible;
-            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
+            // ROD-182: stamp the freshness clock only when these rows actually came
+            // from an AniList enrich (the .search_enriched persist, not the raw
+            // .search_done one), so refresh-on-view doesn't immediately re-fetch a
+            // just-enriched show. COALESCE preserves the stamp across a later raw
+            // re-persist.
+            if (enriched) {
+                rec.enrichment_fetched_at = now;
+                rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
+            }
+            st.upsertAnime(rec, now, arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }

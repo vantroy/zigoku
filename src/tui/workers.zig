@@ -489,6 +489,38 @@ pub fn enrichTask(
     posted = true;
 }
 
+/// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read
+/// stale (`Store.enrichmentStale`), so re-pull AniList metadata and post it for the
+/// UI thread to persist + reload. `stub` is a gpa-owned identity record
+/// (id/name/english_name/anilist_id) the caller built from the stored row — blank
+/// beyond identity, so `applyMetadata`'s fill-if-null fills every field from `meta`
+/// and the store's upsert COALESCE then overwrites stored content with the fresh
+/// values (keeping stored values where AniList returned null): a content refresh
+/// with no in-memory overwrite-merge. `stub` and `source` are gpa-owned; ownership
+/// transfers to the `enrichment_refreshed` event, or both are freed here on a post
+/// failure. A miss (no match / offline) posts `stub` UNCHANGED — the handler still
+/// stamps it fresh, a negative cache that stops re-hammering AniList until the TTL
+/// lapses, mirroring `discoverEnrichTask`'s miss contract.
+pub fn refreshEnrichTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    stub: Anime,
+    source: []const u8,
+    drain: *ThreadDrain,
+) void {
+    defer drain.finish(); // detached; account so teardown can drain us
+    var a = stub;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    if (anilist.enrich(arena.allocator(), io, a) catch null) |meta| applyMetadata(gpa, &a, meta);
+    loop.postEvent(.{ .enrichment_refreshed = .{ .result = a, .source = source } }) catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        freeOwnedAnime(gpa, a);
+        gpa.free(source);
+    };
+}
+
 /// Lazy single-show enrich for the Discover zoom (ROD-239): the feed payload has
 /// no synopsis (anyCard has no description), so opening a card enriches just that
 /// show from AniList — far cheaper than enriching all ~30 grid cards proactively.

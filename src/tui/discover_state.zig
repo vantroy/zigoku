@@ -104,17 +104,25 @@ pub const DiscoverState = struct {
     /// column, so the per-window count never persists (the invariant). Best effort —
     /// a write failure never disrupts the feed. `store`/`source_name`/`translation`
     /// are resolved by App and passed in; this never reads App.
-    pub fn persistSlot(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, translation: domain.Translation, idx: usize, offset: usize, count: usize) void {
+    pub fn persistSlot(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, translation: domain.Translation, idx: usize, offset: usize, count: usize, enriched: bool) void {
         const st = store orelse return;
         const items = self.slots[idx].results.items;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
+        const now = Store.nowSecs();
         const end = @min(items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
             var rec = AnimeRecord.fromDomain(source_name, items[i], translation);
             rec.history_visible = false; // a hidden cache row, like a search result
-            st.upsertAnime(rec, Store.nowSecs(), arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
+            // ROD-182: stamp freshness only for the enriched persists (discover_enriched
+            // / discover_batch_enriched), not the raw popular_done feed dump, so
+            // refresh-on-view doesn't re-fetch a card AniList just enriched.
+            if (enriched) {
+                rec.enrichment_fetched_at = now;
+                rec.enrichment_fieldset_version = Store.ENRICHMENT_FIELDSET_VERSION;
+            }
+            st.upsertAnime(rec, now, arena.allocator()) catch |e| log.debug("discover upsertAnime failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }
