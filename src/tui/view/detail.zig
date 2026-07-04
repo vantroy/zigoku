@@ -1125,3 +1125,36 @@ test "ROD-231: animeFromHistoryRecord carries english + native title to the rend
     try t.expectEqualStrings("Demon Slayer: Kimetsu no Yaiba", a.english_name.?);
     try t.expectEqualStrings("鬼滅の刃", a.native_name.?);
 }
+
+test "ROD-261: animeFromHistoryRecord carries the enrichment-expansion fields" {
+    const t = std.testing;
+    // History detail builds its Anime from a store row, so every ROD-261 field the
+    // rail/chips render must survive this mapping (a duration gap here was caught
+    // mid-branch; this locks the full set so it can't silently regress).
+    const studios = [_][]const u8{"Madhouse"};
+    const rec: AnimeRecord = .{
+        .source = "allanime",
+        .source_id = "fr",
+        .title = "Frieren",
+        .studios = &studios,
+        .duration = 24,
+        .source_material = "MANGA",
+        .rank = 1,
+        .rank_type = "RATED",
+        .rank_year = 2023,
+        .next_airing_at = 1_700_000_000,
+        .next_airing_episode = 15,
+        .country = "JP",
+    };
+    const a = App.animeFromHistoryRecord(rec);
+    try t.expectEqual(@as(usize, 1), a.studios.len);
+    try t.expectEqualStrings("Madhouse", a.studios[0]);
+    try t.expectEqual(@as(?u32, 24), a.duration);
+    try t.expectEqualStrings("MANGA", a.source_material.?);
+    try t.expectEqual(@as(?u32, 1), a.rank);
+    try t.expectEqualStrings("RATED", a.rank_type.?);
+    try t.expectEqual(@as(?u32, 2023), a.rank_year);
+    try t.expectEqual(@as(?i64, 1_700_000_000), a.next_airing_at);
+    try t.expectEqual(@as(?u32, 15), a.next_airing_episode);
+    try t.expectEqualStrings("JP", a.country.?);
+}

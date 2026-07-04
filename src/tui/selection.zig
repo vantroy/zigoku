@@ -419,9 +419,8 @@ pub fn detailMetaFields(self: *App) []const MetaField {
     }
 
     // Studios (ROD-261) — main animation studios, collapse-formatted A / A, B /
-    // A, B +N. Rail tail (lowest visible priority for now), so a height-starved
-    // rail sheds it first; omitted outright when the list is empty (§9.1). Source
-    // will later slot between Format and Duration per §5.3a.
+    // A, B +N. Second-to-last in priority (only rail-only Rank follows), so a
+    // height-starved rail sheds it early; omitted outright when empty (§9.1).
     if (a.studios.len > 0) {
         const v = formatStudios(&self.detail_studios_buf, a.studios);
         if (v.len > 0) {

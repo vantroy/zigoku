@@ -1200,6 +1200,56 @@ test "mergeEnrichedFillNull fills gaps without clobbering either side (ROD-247)"
     try testing.expectEqual(@as(usize, 1), live2.genres.len); // gained
 }
 
+test "mergeEnrichedFillNull carries the ROD-261 enrichment fields, fill-if-null (ROD-261)" {
+    const gpa = testing.allocator;
+    // A Discover-origin merge must fold the enrichment-expansion fields too, or they
+    // silently vanish while the row is stamped fresh (the convergence gap review caught).
+    var live = try workers.dupeOwnedAnime(gpa, .{
+        .id = "a",
+        .name = "A",
+        .duration = 24,
+        .source_material = "MANGA",
+        .rank = 3,
+    });
+    defer workers.freeOwnedAnime(gpa, live);
+    var incoming = try workers.dupeOwnedAnime(gpa, .{
+        .id = "a",
+        .name = "A",
+        .duration = 99, // must NOT clobber live's 24
+        .rank_type = "RATED",
+        .rank_year = 2016,
+        .country = "CN",
+        .next_airing_at = 1_700_000_000,
+        .next_airing_episode = 14,
+    });
+    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
+    // Live wins where it already had a value.
+    try testing.expectEqual(@as(?u32, 24), live.duration);
+    try testing.expectEqualStrings("MANGA", live.source_material.?);
+    try testing.expectEqual(@as(?u32, 3), live.rank);
+    // Gaps gained from incoming — heap strings transferred, scalars copied.
+    try testing.expectEqualStrings("RATED", live.rank_type.?);
+    try testing.expectEqual(@as(?u32, 2016), live.rank_year);
+    try testing.expectEqualStrings("CN", live.country.?);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), live.next_airing_at);
+    try testing.expectEqual(@as(?u32, 14), live.next_airing_episode);
+
+    // Reverse arrival order: incoming carries what live lacks; live's country wins.
+    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .country = "KR" });
+    defer workers.freeOwnedAnime(gpa, live2);
+    var incoming2 = try workers.dupeOwnedAnime(gpa, .{
+        .id = "b",
+        .name = "B",
+        .duration = 22,
+        .source_material = "LIGHT_NOVEL",
+        .country = "JP", // must NOT clobber live2's KR
+    });
+    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
+    try testing.expectEqualStrings("KR", live2.country.?); // kept
+    try testing.expectEqual(@as(?u32, 22), live2.duration); // gained
+    try testing.expectEqualStrings("LIGHT_NOVEL", live2.source_material.?); // gained
+}
+
 test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
     var app: App = .{};
     app.gpa = testing.allocator;

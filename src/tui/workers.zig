@@ -271,13 +271,28 @@ pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) voi
     mergeOptText(&live.kind, &incoming.kind);
     mergeStrList(&live.genres, &incoming.genres);
     mergeStrList(&live.studios, &incoming.studios);
+    // ROD-261: the enrichment-expansion fields ride this merge too, or a
+    // Discover-origin enrich (zoom/batch) silently drops them while persistSlot
+    // still stamps the row fresh at ENRICHMENT_FIELDSET_VERSION — a false "healed"
+    // that enrichmentStale then trusts until the TTL lapses (the convergence gap
+    // review caught). Same fill-if-null rule: heap strings transfer via
+    // mergeOptText (nulled so they aren't freed below), scalars copy when the
+    // live card lacks them.
+    mergeOptText(&live.source_material, &incoming.source_material);
+    mergeOptText(&live.rank_type, &incoming.rank_type);
+    mergeOptText(&live.country, &incoming.country);
     if (live.mal_id == null) live.mal_id = incoming.mal_id;
     if (live.anilist_id == null) live.anilist_id = incoming.anilist_id;
     if (live.total_episodes == null) live.total_episodes = incoming.total_episodes;
+    if (live.duration == null) live.duration = incoming.duration;
     if (live.year == null) live.year = incoming.year;
     if (live.season == null) live.season = incoming.season;
     if (live.start_date == null) live.start_date = incoming.start_date;
     if (live.score == null) live.score = incoming.score;
+    if (live.rank == null) live.rank = incoming.rank;
+    if (live.rank_year == null) live.rank_year = incoming.rank_year;
+    if (live.next_airing_at == null) live.next_airing_at = incoming.next_airing_at;
+    if (live.next_airing_episode == null) live.next_airing_episode = incoming.next_airing_episode;
     freeOwnedAnime(gpa, incoming.*); // frees id/name + every field not transferred above
 }
 
