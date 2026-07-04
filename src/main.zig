@@ -100,6 +100,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ROD-283: `zigoku login` connects an AniList account (OAuth Implicit Grant)
+    // and writes auth.zon, then exits. A subcommand, not a flag — intercepted
+    // before the positional is read as a search query.
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "login")) {
+        try zigoku.login.run(arena, io, out);
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;

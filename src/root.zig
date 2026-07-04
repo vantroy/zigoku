@@ -18,6 +18,7 @@ pub const jikan = @import("providers/jikan.zig");
 pub const aniskip = @import("aniskip.zig");
 pub const config = @import("config.zig");
 pub const auth = @import("auth.zig");
+pub const login = @import("login.zig");
 pub const paths = @import("paths.zig");
 pub const log = @import("log.zig");
 // NB: the log handler is installed via `std_options` in `main.zig` (the exe's
@@ -98,6 +99,7 @@ test {
     _ = aniskip;
     _ = config;
     _ = auth;
+    _ = login;
     _ = paths;
     _ = log;
     _ = tui;
