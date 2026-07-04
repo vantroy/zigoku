@@ -13,3 +13,6 @@ zig-pkg/
 
 # local agent config (skills, worktrees) — personal dev setup, not part of the project
 /.claude/
+
+# pln CLI context binding (workspace/project/module) — personal, per-machine
+/.plane.json
