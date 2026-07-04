@@ -456,6 +456,34 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.score == null) a.score = meta.score;
 }
 
+/// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`,
+/// taking gpa-owned copies so they ride `freeOwnedAnime`. The record→Anime
+/// sibling of `applyMetadata` (meta→Anime): both back-fill only nulls, so a
+/// stored value never clobbers a fresher one already on the row. Pure — operates
+/// on the passed row + record and touches no controller state. Shared by the
+/// search-page hydrate (`SearchController.hydrateResultsFromStore`) and the
+/// Discover-feed hydrate (`DiscoverState.hydrateSlotFromStore`, ROD-268), so a
+/// card whose provider thumb carries no mineable AniList id still enriches
+/// deterministically by the id a past match already stored.
+pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRecord) void {
+    if (a.english_name == null) a.english_name = dupeOptText(gpa, rec.title_english) catch a.english_name;
+    if (a.native_name == null) a.native_name = dupeOptText(gpa, rec.native_name) catch a.native_name;
+    if (a.thumb == null) a.thumb = dupeOptText(gpa, rec.cover_url) catch a.thumb;
+    if (a.status == null) a.status = dupeOptText(gpa, rec.status) catch a.status;
+    if (a.description == null) a.description = dupeOptText(gpa, rec.description) catch a.description;
+    if (a.kind == null) a.kind = dupeOptText(gpa, rec.kind) catch a.kind;
+    if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
+    if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
+    if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
+    if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
+    if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
+    // Season/start_date are pure values (no heap); genres is deep-copied into
+    // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
+    if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
+    if (a.start_date == null) a.start_date = rec.startDate();
+    if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
+}
+
 /// Background task: enrich one page of search results from AniList. `results` and
 /// `query` are GPA-owned by this task and transferred to the `.search_enriched`
 /// event on success (freed here on failure). Fills each row via `applyMetadata`.

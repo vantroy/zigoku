@@ -100,6 +100,7 @@ test {
     _ = log;
     _ = tui;
     _ = @import("tui/app_test.zig");
+    _ = @import("tui/discover_state.zig"); // ROD-268: pull the slot-hydrate test
     _ = @import("tui/discover_covers.zig");
     _ = @import("tui/view/discover.zig");
     _ = @import("providers/allanime.zig");
