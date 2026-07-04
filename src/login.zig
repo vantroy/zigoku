@@ -21,7 +21,11 @@ const c = @cImport({
 });
 
 pub const CLIENT_ID = "43536";
-pub const REDIRECT = "http://localhost:8765";
+/// The loopback port — the single source of truth. `REDIRECT` is derived from it,
+/// and `login_loopback` binds it via `login.PORT`; changing it here moves both so
+/// the listener can't drift off the URL AniList redirects to.
+pub const PORT: u16 = 8765;
+pub const REDIRECT = std.fmt.comptimePrint("http://localhost:{d}", .{PORT});
 const ENDPOINT = "https://graphql.anilist.co";
 // redirect_uri is omitted: the app has a single registered redirect (REDIRECT),
 // so AniList uses it automatically. Adding it here would need URL-encoding for no gain.
@@ -115,12 +119,23 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
 
 /// Pull the JWT out of a pasted redirect URL (`…#access_token=<jwt>&…`) or a bare
 /// token. Cuts at the first URL/whitespace delimiter so trailing `&token_type=…`
-/// never rides along.
+/// never rides along. Returns `""` when there's nothing token-shaped, so a denial
+/// redirect (`?error=access_denied…`) or a bare `?state=…` isn't mistaken for a
+/// token and fired at AniList as a bogus Bearer.
 pub fn extractToken(raw: []const u8) []const u8 {
     const needle = "access_token=";
-    const start = if (std.mem.indexOf(u8, raw, needle)) |i| raw[i + needle.len ..] else raw;
-    const end = std.mem.indexOfAny(u8, start, "&\r\n\t \"'") orelse start.len;
-    return std.mem.trim(u8, start[0..end], " \t\r\n\"'");
+    if (std.mem.indexOf(u8, raw, needle)) |i| {
+        const start = raw[i + needle.len ..];
+        const end = std.mem.indexOfAny(u8, start, "&\r\n\t \"'") orelse start.len;
+        return std.mem.trim(u8, start[0..end], " \t\r\n\"'");
+    }
+    // No `access_token=` — only accept a bare paste that actually looks like a JWT.
+    // Every AniList JWT starts `eyJ` (base64 of `{"typ"…`); anything else is not a
+    // token we should try.
+    const bare = std.mem.trim(u8, raw, " \t\r\n\"'");
+    if (!std.mem.startsWith(u8, bare, "eyJ")) return "";
+    const end = std.mem.indexOfAny(u8, bare, "&\r\n\t \"'") orelse bare.len;
+    return bare[0..end];
 }
 
 /// Read `expires_in=<secs>` from the fragment, 0 if absent. A bare-token paste has
@@ -188,6 +203,15 @@ test "extractToken accepts a bare token unchanged" {
 
 test "extractToken trims stray quotes and whitespace" {
     try testing.expectEqualStrings("eyJhbc.def.ghi", extractToken("  '#access_token=eyJhbc.def.ghi' \n"));
+}
+
+test "extractToken returns empty for non-token queries (deny redirect, bare state)" {
+    // A denial redirect or a bare state param must not be fired at AniList as a token.
+    try testing.expectEqualStrings("", extractToken("error=access_denied&error_description=denied"));
+    try testing.expectEqualStrings("", extractToken("state=6269b8e26c3de42af04f6a4c6e948f8f"));
+    try testing.expectEqualStrings("", extractToken("a long string that is not token-shaped at all"));
+    // …but an access_token= anywhere still wins.
+    try testing.expectEqualStrings("eyJreal.tok.en", extractToken("error=x&access_token=eyJreal.tok.en"));
 }
 
 test "extractExpiresIn reads the lifetime, 0 when absent" {
