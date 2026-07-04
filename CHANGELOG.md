@@ -14,6 +14,22 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-07-04
+
+### Added
+
+- **More detail on every show**: studio, per-episode runtime, and source material (Manga, Light novel, Original, and more) now show alongside episode count and format — across Browse, History, the History preview pane, and the full-screen zoom. Open a show from History with room to spread out, and you'll also see a rating or popularity rank (e.g. `#1 rated 2023`).
+
+- **Live airing countdown and origin marker**: a currently-airing show now carries a countdown to its next episode (`Ep14 · 3d`) next to its airing status, and shows from outside Japan (donghua, aeni) get a small origin marker.
+
+### Changed
+
+- **Watchlist shows refresh their details automatically**: opening a show you're tracking now checks whether its stored info is stale — for example, a show that finished airing months ago but was still shown as currently airing — and pulls fresh data in the background instead of leaving the old snapshot in place.
+
+### Fixed
+
+- **Shows you've already matched now show correctly in Discover**: if the app had already linked a show to its AniList entry — via Browse or an earlier view — that link now carries over into the Discover feed. Previously, each session re-matched by title instead, which occasionally missed and left a card without cover art or details.
+
 ## [0.2.2] - 2026-07-03
 
 ### Changed
@@ -174,7 +190,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/vantroy/zigoku/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/vantroy/zigoku/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/vantroy/zigoku/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/vantroy/zigoku/compare/v0.1.5...v0.2.0
