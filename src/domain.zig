@@ -219,6 +219,9 @@ pub const Anime = struct {
     /// Total episode count from enrichment when the provider-side per-track count
     /// is missing or partial.
     total_episodes: ?u32 = null,
+    /// Per-episode runtime in minutes, from AniList enrichment (ROD-261). Renders
+    /// as "N min" on the detail metadata rail between Format and Studios.
+    duration: ?u32 = null,
     year: ?u32 = null,
     /// Broadcast season (the cours of `year`). Sourced AllAnime-first from
     /// `season.quarter`, backfilled by AniList enrichment. Pairs with `year` for

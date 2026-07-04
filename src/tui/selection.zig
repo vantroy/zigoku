@@ -381,10 +381,23 @@ pub fn detailMetaFields(self: *App) []const MetaField {
         }
     }
 
+    // Duration (ROD-261) — per-episode runtime as "N min", slotted between Format
+    // and Studios per §5.3a. Omitted when null or zero (a 0-minute runtime is a
+    // missing value, not a fact). Source will later slot before this.
+    if (a.duration) |dur| {
+        if (dur > 0) {
+            const v = std.fmt.bufPrint(&self.detail_duration_buf, "{d} min", .{dur}) catch "";
+            if (v.len > 0) {
+                self.detail_meta_fields[n] = .{ .label = "Duration", .value = v };
+                n += 1;
+            }
+        }
+    }
+
     // Studios (ROD-261) — main animation studios, collapse-formatted A / A, B /
     // A, B +N. Rail tail (lowest visible priority for now), so a height-starved
     // rail sheds it first; omitted outright when the list is empty (§9.1). Source
-    // and Duration will later slot between Format and this per §5.3a.
+    // will later slot between Format and Duration per §5.3a.
     if (a.studios.len > 0) {
         const v = formatStudios(&self.detail_studios_buf, a.studios);
         if (v.len > 0) {

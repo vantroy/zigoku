@@ -2048,7 +2048,7 @@ test "detail meta fields carry episodes then format in priority order (ROD-260)"
     app.search.results.deinit(std.testing.allocator);
 }
 
-test "detail meta fields append collapse-formatted studios after format (ROD-261)" {
+test "detail meta fields order Episodes/Format/Duration/Studios with collapse + 'N min' (ROD-261)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
@@ -2066,14 +2066,19 @@ test "detail meta fields append collapse-formatted studios after format (ROD-261
         .name = try std.testing.allocator.dupe(u8, "X"),
         .eps_sub = 28,
         .kind = try std.testing.allocator.dupe(u8, "TV"),
+        .duration = 24,
         .studios = studios,
     });
 
     const fields = app.detailMetaFields();
-    // Episodes, Format, then Studios — the rail tail, so it emits last of the three.
-    try testing.expectEqual(@as(usize, 3), fields.len);
-    try testing.expectEqualStrings("Studios", fields[2].label);
-    try testing.expectEqualStrings("Madhouse, Bones +1", fields[2].value);
+    // Priority order per §5.3a: Episodes, Format, Duration, then Studios (the tail).
+    try testing.expectEqual(@as(usize, 4), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("Format", fields[1].label);
+    try testing.expectEqualStrings("Duration", fields[2].label);
+    try testing.expectEqualStrings("24 min", fields[2].value);
+    try testing.expectEqualStrings("Studios", fields[3].label);
+    try testing.expectEqualStrings("Madhouse, Bones +1", fields[3].value);
 
     for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.search.results.deinit(std.testing.allocator);

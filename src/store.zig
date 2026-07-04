@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 7;
+const SCHEMA_VERSION: c_int = 8;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -167,6 +167,13 @@ const MIGRATION_V7 =
     \\ALTER TABLE anime ADD COLUMN studios TEXT;    -- '\n'-joined; same shape as genres
 ;
 
+// ROD-261: per-episode runtime in minutes, the second field of the AniList
+// widening. A plain nullable scalar (mirrors total_episodes); the fieldset bump
+// alongside heals rows enriched before the column existed.
+const MIGRATION_V8 =
+    \\ALTER TABLE anime ADD COLUMN duration INTEGER;
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -184,6 +191,8 @@ pub const AnimeRecord = struct {
     description: ?[]const u8 = null,
     score: ?i64 = null,
     total_episodes: ?i64 = null,
+    /// ROD-261: per-episode runtime in minutes (AniList `duration`).
+    duration: ?i64 = null,
     // ROD-185 enrichment. `season` is the canonical lowercase tag; `genres` is
     // the split list (arena-owned on read, borrowed from domain on construct) —
     // the '\n' blob lives only in the column, joined at upsert / split at load.
@@ -236,6 +245,7 @@ pub const AnimeRecord = struct {
             .description = a.description,
             .score = if (a.score) |s| std.math.cast(i64, s) else null,
             .total_episodes = if (a.total_episodes) |n| @intCast(n) else if (eps > 0) @intCast(eps) else null,
+            .duration = if (a.duration) |d| @intCast(d) else null,
             // Store the canonical tag ("winter"…) so it round-trips through
             // domain.Season.fromString on the way back out.
             .season = if (a.season) |s| @tagName(s) else null,
@@ -382,8 +392,8 @@ pub const Store = struct {
             \\    cover_url, year, status, description, score, total_episodes,
             \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, studios)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -409,7 +419,8 @@ pub const Store = struct {
             \\    history_visible = MAX(excluded.history_visible, anime.history_visible),
             \\    enrichment_fetched_at = COALESCE(excluded.enrichment_fetched_at, anime.enrichment_fetched_at),
             \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, anime.enrichment_fieldset_version),
-            \\    studios        = COALESCE(excluded.studios, anime.studios)
+            \\    studios        = COALESCE(excluded.studios, anime.studios),
+            \\    duration       = COALESCE(excluded.duration, anime.duration)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -457,6 +468,7 @@ pub const Store = struct {
         } else {
             try bindText(stmt, 30, try joinStrBlob(scratch, a.studios));
         }
+        try bindOptI64(stmt, 31, a.duration);
 
         try self.stepDone(stmt);
     }
@@ -503,7 +515,7 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, studios
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration
             \\FROM anime
             \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
@@ -543,6 +555,7 @@ pub const Store = struct {
                 .enrichment_fetched_at = colOptI64(stmt, 26),
                 .enrichment_fieldset_version = colOptI64(stmt, 27),
                 .studios = try dupeStrBlob(arena, stmt, 28),
+                .duration = colOptI64(stmt, 29),
                 .history_visible = true,
             });
         }
@@ -556,7 +569,7 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios
+            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios, duration
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -598,6 +611,7 @@ pub const Store = struct {
             // only returns visible rows) so refresh-on-view can gate on "tracked".
             .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
             .studios = try dupeStrBlob(arena, stmt, 29),
+            .duration = colOptI64(stmt, 30),
         };
     }
 
@@ -882,7 +896,7 @@ pub const Store = struct {
     /// `enrichmentStale` no matter its clock, so widened columns heal on next view
     /// rather than waiting out the TTL. Not a schema knob — `SCHEMA_VERSION` gates
     /// migrations; this gates enrichment freshness, and the two move independently.
-    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 2; // ROD-261: +studios column
+    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 3; // ROD-261: +studios, +duration
 
     /// TTL in seconds for cached *enrichment metadata* on the `anime` row, keyed
     /// off airing status. A deliberately longer curve than `cacheTtl` (which
@@ -1027,6 +1041,11 @@ pub const Store = struct {
             try self.exec(MIGRATION_V7);
             try self.exec("PRAGMA user_version = 7;");
             v = 7;
+        }
+        if (v < 8) {
+            try self.exec(MIGRATION_V8);
+            try self.exec("PRAGMA user_version = 8;");
+            v = 8;
         }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
@@ -1343,7 +1362,7 @@ test "getAnime returns persisted enrichment" {
     try testing.expectEqualStrings("Elf mage grief hour", rec.description orelse "");
 }
 
-test "enrichment fields (season/native/kind/start_date/genres/studios) round-trip" {
+test "enrichment fields (season/native/kind/start_date/genres/studios/duration) round-trip" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -1364,6 +1383,7 @@ test "enrichment fields (season/native/kind/start_date/genres/studios) round-tri
         .kind = "TV",
         .genres = &genres,
         .studios = &studios,
+        .duration = 24,
     }, .sub);
     try s.upsertAnime(rec, 1000, arena);
 
@@ -1380,6 +1400,7 @@ test "enrichment fields (season/native/kind/start_date/genres/studios) round-tri
     try testing.expectEqualStrings("Fantasy", got.genres[2]);
     try testing.expectEqual(@as(usize, 1), got.studios.len);
     try testing.expectEqualStrings("Madhouse", got.studios[0]);
+    try testing.expectEqual(@as(?i64, 24), got.duration);
 
     // loadHistory path sees the same blob split back into a list.
     const rows = try s.loadHistory(arena);
@@ -1389,6 +1410,7 @@ test "enrichment fields (season/native/kind/start_date/genres/studios) round-tri
     try testing.expectEqualStrings("Adventure", rows[0].genres[1]);
     try testing.expectEqual(@as(usize, 1), rows[0].studios.len);
     try testing.expectEqualStrings("Madhouse", rows[0].studios[0]);
+    try testing.expectEqual(@as(?i64, 24), rows[0].duration);
 }
 
 test "a later search without genres/studios preserves the persisted lists" {

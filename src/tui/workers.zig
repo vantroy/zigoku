@@ -199,6 +199,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .eps_sub = a.eps_sub,
         .eps_dub = a.eps_dub,
         .total_episodes = a.total_episodes,
+        .duration = a.duration,
         .year = a.year,
         .season = a.season,
         .start_date = a.start_date,
@@ -450,6 +451,7 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
     if (a.mal_id == null) a.mal_id = meta.mal_id;
     if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
+    if (a.duration == null) a.duration = meta.duration;
     if (a.year == null) a.year = meta.year;
     if (a.season == null) a.season = meta.season;
     if (a.start_date == null) a.start_date = meta.start_date;
@@ -475,6 +477,7 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
     if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
     if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
+    if (a.duration == null) a.duration = if (rec.duration) |x| std.math.cast(u32, x) else null;
     if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
     if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
     // Season/start_date are pure values (no heap); genres/studios are deep-copied

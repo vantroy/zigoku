@@ -783,6 +783,9 @@ pub const App = struct {
     /// collapse-formatted `A, B +N` string; 64 bytes covers two studio names plus
     /// the overflow marker.
     detail_studios_buf: [64]u8 = undefined,
+    /// Duration rail value (ROD-261), "N min" — its own buffer for the same
+    /// reason: every emitted field needs a value slice that outlives the frame.
+    detail_duration_buf: [16]u8 = undefined,
     detail_meta_fields: [6]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack

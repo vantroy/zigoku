@@ -22,7 +22,7 @@ const ENDPOINT = "https://graphql.anilist.co";
 // one GraphQL POST (even a 50-id batch) is a single round trip.
 const ANILIST_DEADLINE_S = 10;
 // Shared selection set so the search and by-id queries can never drift apart.
-const GQL_FIELDS = "id idMal title{romaji english native} episodes averageScore status season seasonYear startDate{year month day} format genres studios(isMain:true){nodes{name}} description(asHtml:false) coverImage{large}";
+const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format genres studios(isMain:true){nodes{name}} description(asHtml:false) coverImage{large}";
 const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
@@ -54,6 +54,8 @@ pub const Metadata = struct {
     title_native: ?[]const u8 = null,
     thumb: ?[]const u8 = null,
     total_episodes: ?u32 = null,
+    /// Per-episode runtime in minutes (ROD-261).
+    duration: ?u32 = null,
     year: ?u32 = null,
     season: ?domain.Season = null,
     start_date: ?domain.Date = null,
@@ -99,6 +101,7 @@ const Media = struct {
     idMal: ?u64 = null,
     title: Title = .{},
     episodes: ?u32 = null,
+    duration: ?u32 = null,
     averageScore: ?u32 = null,
     status: ?[]const u8 = null,
     season: ?[]const u8 = null,
@@ -347,6 +350,7 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
         .title_native = try stripControlsOpt(arena, m.title.native),
         .thumb = m.coverImage.large,
         .total_episodes = m.episodes,
+        .duration = m.duration,
         .year = m.seasonYear,
         .season = if (m.season) |s| domain.Season.fromString(s) else null,
         .start_date = startDate(m.startDate),
