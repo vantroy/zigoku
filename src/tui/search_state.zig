@@ -34,11 +34,12 @@ const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
 const Anime = domain.Anime;
-const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
 
-const dupeOptText = workers.dupeOptText;
-const dupeOwnedStrList = workers.dupeOwnedStrList;
+// ROD-268: the record→Anime back-fill moved to workers.zig so the Discover feed
+// hydrate can share it verbatim (both back-fill a stored anilist_id so an
+// id-less thumb still enriches deterministically). Same call, one home.
+const hydrateAnimeFromRecord = workers.hydrateAnimeFromRecord;
 const freeOwnedAnime = workers.freeOwnedAnime;
 
 /// The catalogue-search controller (ROD-219). Holds the query buffer, the
@@ -149,29 +150,6 @@ pub const SearchController = struct {
         self.clearResults(gpa);
         self.results.deinit(gpa);
         self.results = .empty;
-    }
-
-    /// Fill the null fields of a result row from a stored `AnimeRecord`, taking
-    /// gpa-owned copies so they ride `freeOwnedAnime`. Pure: operates on the
-    /// passed row + record and touches no controller state, so it stays a free
-    /// helper rather than a method.
-    fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: AnimeRecord) void {
-        if (a.english_name == null) a.english_name = dupeOptText(gpa, rec.title_english) catch a.english_name;
-        if (a.native_name == null) a.native_name = dupeOptText(gpa, rec.native_name) catch a.native_name;
-        if (a.thumb == null) a.thumb = dupeOptText(gpa, rec.cover_url) catch a.thumb;
-        if (a.status == null) a.status = dupeOptText(gpa, rec.status) catch a.status;
-        if (a.description == null) a.description = dupeOptText(gpa, rec.description) catch a.description;
-        if (a.kind == null) a.kind = dupeOptText(gpa, rec.kind) catch a.kind;
-        if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
-        if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
-        if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
-        if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
-        if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
-        // Season/start_date are pure values (no heap); genres is deep-copied into
-        // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
-        if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
-        if (a.start_date == null) a.start_date = rec.startDate();
-        if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
     }
 
     /// Backfill the [offset, offset+count) result rows from the local store, so a

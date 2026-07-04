@@ -96,6 +96,31 @@ pub const DiscoverState = struct {
         slot.exhausted = false;
     }
 
+    /// Backfill a window slot's [offset, offset+count) cards from the local store
+    /// before enrichment fires (ROD-268), the mirror of
+    /// `SearchController.hydrateResultsFromStore`. The popular feed's thumbs are
+    /// provider-relative `mcovers/…` paths with no mineable AniList id, so an
+    /// id-less card would take the flaky title-match path — or, in the batch path,
+    /// be dropped entirely. Feeding the `anilist_id` a past match already stored
+    /// (keyed by `(source, source_id)`) makes that card enrich deterministically
+    /// by id instead. Back-fills nulls only, so a fresher in-memory value from the
+    /// feed is never clobbered. `store`/`source_name` are resolved by App and
+    /// passed in; this never reads App.
+    pub fn hydrateSlotFromStore(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, idx: usize, offset: usize, count: usize) void {
+        const st = store orelse return;
+        const items = self.slots[idx].results.items;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const end = @min(items.len, offset + count);
+        var i = offset;
+        while (i < end) : (i += 1) {
+            const source_id = items[i].id;
+            const rec = st.getAnime(arena.allocator(), source_name, source_id) catch null orelse continue;
+            workers.hydrateAnimeFromRecord(gpa, &items[i], rec);
+            _ = arena.reset(.retain_capacity);
+        }
+    }
+
     /// Mirror a window slot's [offset, offset+count) rows into the store as hidden
     /// catalogue-cache records (history_visible=false), exactly as search caches its
     /// results — so a Discover-seen show enriches a later Browse hit and seeds the
@@ -131,3 +156,43 @@ pub const DiscoverState = struct {
         }
     }
 };
+
+test "hydrateSlotFromStore feeds a stored anilist_id into an id-less popular card (ROD-268)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var arena_inst = std.heap.ArenaAllocator.init(alloc);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try Store.openMemory();
+    defer st.close();
+
+    // A past match already stored this show's AniList id under (source, source_id).
+    try st.upsertAnime(.{
+        .source = "allanime",
+        .source_id = "lc1",
+        .title = "Lovely Complex",
+        .anilist_id = 2034,
+    }, 1000, arena);
+
+    var ds: DiscoverState = .{};
+    defer ds.deinit(alloc);
+
+    // The feed hands the same (source, source_id) back with a provider-relative
+    // mcovers thumb and no mineable id — the exact card that would otherwise be
+    // dropped from the batch enrich or fall to flaky title-match.
+    try ds.slots[0].results.append(alloc, .{
+        .id = try alloc.dupe(u8, "lc1"),
+        .name = try alloc.dupe(u8, "Lovely Complex"),
+        .thumb = try alloc.dupe(u8, "mcovers/lc.png"),
+        .anilist_id = null,
+    });
+
+    try testing.expectEqual(@as(?u64, null), ds.slots[0].results.items[0].anilist_id);
+    ds.hydrateSlotFromStore(alloc, &st, "allanime", 0, 0, 1);
+    // The stored id is recovered, so enrichment can now go deterministic-by-id.
+    try testing.expectEqual(@as(?u64, 2034), ds.slots[0].results.items[0].anilist_id);
+    // Back-fill touches nulls only: the card's own thumb is left as-is.
+    try testing.expectEqualStrings("mcovers/lc.png", ds.slots[0].results.items[0].thumb.?);
+}

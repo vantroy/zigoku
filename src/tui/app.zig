@@ -1429,6 +1429,12 @@ pub const App = struct {
                 // (window-agnostic facts only; the per-window view_count never
                 // persists — there is no such store column).
                 const added = slot.results.items.len - offset;
+                // ROD-268: back-fill each card's stored anilist_id BEFORE persist +
+                // batch enrich (mirrors search's hydrate→persist→enrich order). A
+                // popular card's thumb is a provider-relative mcovers path with no
+                // mineable id, so without this an already-mapped show would be
+                // dropped from the batch (id-less) or fall to flaky title-match.
+                self.discover.hydrateSlotFromStore(self.gpa, self.store, provider.name(), idx, offset, added);
                 self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added, false);
                 // A short page (incl. the server's ~500 ceiling) means no more —
                 // stops the load-more prefetch and flips the footer to "all loaded".
@@ -2275,6 +2281,13 @@ pub const App = struct {
             .english_name = english,
             .anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null,
         };
+        // ROD-268 known residual (accepted, not fixed): a row with a stored
+        // anilist_id takes the exact enrichById path above. A row WITHOUT one still
+        // title-matches on refresh, and this stub carries eps_sub/eps_dub=0 — so
+        // bestMatch's episode-count disambiguation guard (anilist.zig candidateScore)
+        // is skipped, weakening the match for precisely the id-less rows. Carrying
+        // stored episode counts into the stub would restore the guard; deferred as a
+        // follow-up since it only bites the shrinking set of never-matched rows.
 
         self.enrich_refresh_drain.begin();
         const t = std.Thread.spawn(.{}, workers.refreshEnrichTask, .{
