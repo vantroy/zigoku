@@ -734,27 +734,26 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
     // drawAltTitles self-guards; rows with no alternates are unchanged (ROD-231).
     if (row < h) row = drawAltTitles(self, win, w, h, anime, row);
 
+    // Kanji chips (ROD-141): status + season, then the ROD-261 airing countdown +
+    // origin. Placed ABOVE the score and hairline to match drawHeader's canonical
+    // §4.4 header order (title → alt-titles → chips → score → hairline), so the
+    // chips row doesn't jump position when the preview is focused into the full
+    // detail (ROD-261 review). Fallback: if no chip resolves (status null/unknown),
+    // show list_status so the pane is never entirely silent about state.
+    if (row < h) {
+        const chips_row = row;
+        row = drawChips(self, win, h, anime, row);
+        if (row == chips_row) {
+            putClipped(win, chips_row, 0, w, rec.list_status.str(), self.s(self.palette.fg2, .{}));
+            row = chips_row + 1;
+        }
+    }
+
     if (row < h) row = drawScore(self, win, w, anime, row);
 
     if (row < h) {
         drawHairline(self, win, w, row);
         row += 1;
-    }
-
-    // Kanji chips (ROD-141): status chip then season/year chip. The history
-    // row itself shows progress + list_status, so the airing-status kanji is
-    // the complementary fact here (§5.4a "History preview — detail stack").
-    // Fallback: if no chip resolves (status null/unknown), show list_status in
-    // text.muted as a last resort so the pane is never entirely silent.
-    if (row < h) {
-        const chips_row = row;
-        row = drawChips(self, win, h, anime, row);
-        if (row == chips_row) {
-            // No chip was emitted (status absent/unknown) — fall back to the
-            // watchlist status label so the preview isn't silent about state.
-            putClipped(win, chips_row, 0, w, rec.list_status.str(), self.s(self.palette.fg2, .{}));
-            row = chips_row + 1;
-        }
     }
 
     // Metadata line — the same Episodes · Format · Source · Duration · Studios the
