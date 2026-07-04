@@ -2048,7 +2048,7 @@ test "detail meta fields carry episodes then format in priority order (ROD-260)"
     app.search.results.deinit(std.testing.allocator);
 }
 
-test "detail meta fields order Episodes/Format/Duration/Studios with collapse + 'N min' (ROD-261)" {
+test "detail meta fields order Episodes/Format/Source/Duration/Studios/Rank per §5.3a (ROD-261)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
@@ -2066,19 +2066,31 @@ test "detail meta fields order Episodes/Format/Duration/Studios with collapse + 
         .name = try std.testing.allocator.dupe(u8, "X"),
         .eps_sub = 28,
         .kind = try std.testing.allocator.dupe(u8, "TV"),
+        .source_material = try std.testing.allocator.dupe(u8, "LIGHT_NOVEL"),
         .duration = 24,
         .studios = studios,
+        .rank = 3,
+        .rank_type = try std.testing.allocator.dupe(u8, "RATED"),
+        .rank_year = 2016,
     });
 
     const fields = app.detailMetaFields();
-    // Priority order per §5.3a: Episodes, Format, Duration, then Studios (the tail).
-    try testing.expectEqual(@as(usize, 4), fields.len);
+    // Full §5.3a priority order: Episodes, Format, Source, Duration, Studios, Rank.
+    try testing.expectEqual(@as(usize, 6), fields.len);
     try testing.expectEqualStrings("Episodes", fields[0].label);
     try testing.expectEqualStrings("Format", fields[1].label);
-    try testing.expectEqualStrings("Duration", fields[2].label);
-    try testing.expectEqualStrings("24 min", fields[2].value);
-    try testing.expectEqualStrings("Studios", fields[3].label);
-    try testing.expectEqualStrings("Madhouse, Bones +1", fields[3].value);
+    try testing.expectEqualStrings("Source", fields[2].label);
+    try testing.expectEqualStrings("Light novel", fields[2].value); // enum prettified
+    try testing.expectEqualStrings("Duration", fields[3].label);
+    try testing.expectEqualStrings("24 min", fields[3].value);
+    try testing.expectEqualStrings("Studios", fields[4].label);
+    try testing.expectEqualStrings("Madhouse, Bones +1", fields[4].value);
+    // Rank is rail-only and carries its contextual year.
+    try testing.expectEqualStrings("Rank", fields[5].label);
+    try testing.expectEqualStrings("#3 rated 2016", fields[5].value);
+    try testing.expect(fields[5].rail_only);
+    // Only Rank is rail-only — the rest show on the compact line too.
+    for (fields[0..5]) |f| try testing.expect(!f.rail_only);
 
     for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.search.results.deinit(std.testing.allocator);

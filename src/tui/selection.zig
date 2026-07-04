@@ -188,6 +188,11 @@ pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
         .studios = rec.studios,
         .score = if (rec.score) |x| std.math.cast(u32, x) else null,
         .kind = rec.kind,
+        .duration = if (rec.duration) |x| std.math.cast(u32, x) else null,
+        .source_material = rec.source_material,
+        .rank = if (rec.rank) |x| std.math.cast(u32, x) else null,
+        .rank_type = rec.rank_type,
+        .rank_year = if (rec.rank_year) |x| std.math.cast(u32, x) else null,
     };
 }
 
@@ -342,6 +347,11 @@ pub const MetaField = struct {
     /// Render `value` in `fg3` (dim) rather than `fg2` — the "? eps" count
     /// degrade only; present enrichment is always `fg2`.
     dim: bool = false,
+    /// ROD-261: this field appears ONLY in the labeled rail, never on the compact
+    /// line — `drawMetaLine` skips it. Rank is the sole rail-only field (verbose,
+    /// lowest priority); it still rides the one ordered list, so the two forms
+    /// stay in sync everywhere else.
+    rail_only: bool = false,
 };
 
 /// The ordered detail-metadata fields (ROD-260), highest-priority first so a
@@ -381,9 +391,20 @@ pub fn detailMetaFields(self: *App) []const MetaField {
         }
     }
 
-    // Duration (ROD-261) — per-episode runtime as "N min", slotted between Format
+    // Source (ROD-261) — adaptation origin, prettified from the raw AniList enum
+    // (LIGHT_NOVEL → "Light novel"). Slotted between Format and Duration per §5.3a;
+    // omitted when absent.
+    if (a.source_material) |src| {
+        const v = formatSource(&self.detail_source_buf, src);
+        if (v.len > 0) {
+            self.detail_meta_fields[n] = .{ .label = "Source", .value = v };
+            n += 1;
+        }
+    }
+
+    // Duration (ROD-261) — per-episode runtime as "N min", slotted between Source
     // and Studios per §5.3a. Omitted when null or zero (a 0-minute runtime is a
-    // missing value, not a fact). Source will later slot before this.
+    // missing value, not a fact).
     if (a.duration) |dur| {
         if (dur > 0) {
             const v = std.fmt.bufPrint(&self.detail_duration_buf, "{d} min", .{dur}) catch "";
@@ -406,7 +427,54 @@ pub fn detailMetaFields(self: *App) []const MetaField {
         }
     }
 
+    // Rank (ROD-261) — rail-only (never on the compact line), the verbose standing
+    // last in priority order. Emits only with both a position and a type; a
+    // contextual pick carries its year, an all-time one doesn't (§5.3a).
+    if (a.rank) |rank| {
+        if (a.rank_type) |rtype| {
+            const v = formatRank(&self.detail_rank_buf, rank, rtype, a.rank_year);
+            if (v.len > 0) {
+                self.detail_meta_fields[n] = .{ .label = "Rank", .value = v, .rail_only = true };
+                n += 1;
+            }
+        }
+    }
+
     return self.detail_meta_fields[0..n];
+}
+
+/// Prettify the raw AniList `source` enum for the rail (ROD-261): underscores to
+/// spaces, everything lowercased, first letter capitalized — `LIGHT_NOVEL` →
+/// `Light novel`, `ORIGINAL` → `Original`. Writes into the App-owned `buf`.
+fn formatSource(buf: []u8, raw: []const u8) []const u8 {
+    if (raw.len == 0) return "";
+    var n: usize = 0;
+    for (raw) |ch| {
+        if (n >= buf.len) break;
+        buf[n] = if (ch == '_') ' ' else std.ascii.toLower(ch);
+        n += 1;
+    }
+    if (n > 0) buf[0] = std.ascii.toUpper(buf[0]);
+    return buf[0..n];
+}
+
+/// Compose the rail-only Rank value (ROD-261): `#{rank} {type} {year}` for a
+/// contextual pick, `#{rank} {type}` for an all-time one. The type is lowercased
+/// (`RATED` → `rated`); the season name is deliberately dropped — the header's
+/// season/year chip already carries that context (§5.3a).
+fn formatRank(buf: []u8, rank: u32, rank_type: []const u8, rank_year: ?u32) []const u8 {
+    var tbuf: [16]u8 = undefined;
+    var tn: usize = 0;
+    for (rank_type) |ch| {
+        if (tn >= tbuf.len) break;
+        tbuf[tn] = std.ascii.toLower(ch);
+        tn += 1;
+    }
+    const tl = tbuf[0..tn];
+    return if (rank_year) |y|
+        std.fmt.bufPrint(buf, "#{d} {s} {d}", .{ rank, tl, y }) catch ""
+    else
+        std.fmt.bufPrint(buf, "#{d} {s}", .{ rank, tl }) catch "";
 }
 
 /// Collapse a studio list to the rail form: `A`, `A, B`, or `A, B +N` (ROD-261,

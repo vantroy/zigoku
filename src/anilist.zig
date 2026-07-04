@@ -22,7 +22,7 @@ const ENDPOINT = "https://graphql.anilist.co";
 // one GraphQL POST (even a 50-id batch) is a single round trip.
 const ANILIST_DEADLINE_S = 10;
 // Shared selection set so the search and by-id queries can never drift apart.
-const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format genres studios(isMain:true){nodes{name}} description(asHtml:false) coverImage{large}";
+const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} description(asHtml:false) coverImage{large}";
 const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
@@ -68,6 +68,16 @@ pub const Metadata = struct {
     studios: []const []const u8 = &.{},
     description: ?[]const u8 = null,
     score: ?u32 = null,
+    /// AniList `source` enum (MANGA/LIGHT_NOVEL/ORIGINAL…), stored raw and
+    /// prettified at render (ROD-261). Named `source_material` to avoid clashing
+    /// with the provider `source` key used across the store.
+    source_material: ?[]const u8 = null,
+    /// The single ranking selected from AniList's `rankings` array by `selectRank`
+    /// (ROD-261): rank position, type ("RATED"/"POPULAR"), and year — null year
+    /// means an all-time ranking. Rendered rail-only as `#{rank} {type} {year}`.
+    rank: ?u32 = null,
+    rank_type: ?[]const u8 = null,
+    rank_year: ?u32 = null,
 };
 
 const Title = struct {
@@ -96,6 +106,16 @@ const Studios = struct {
     nodes: []const Studio = &.{},
 };
 
+// One entry of AniList's `rankings` array (ROD-261). `type` is RATED or POPULAR;
+// `allTime` distinguishes an all-time ranking from a year/season-scoped one. We
+// keep only what `selectRank` needs to pick and render the best one.
+const Ranking = struct {
+    rank: u32 = 0,
+    type: ?[]const u8 = null,
+    year: ?u32 = null,
+    allTime: bool = false,
+};
+
 const Media = struct {
     id: u64,
     idMal: ?u64 = null,
@@ -108,8 +128,10 @@ const Media = struct {
     seasonYear: ?u32 = null,
     startDate: StartDate = .{},
     format: ?[]const u8 = null,
+    source: ?[]const u8 = null,
     genres: []const []const u8 = &.{},
     studios: Studios = .{},
+    rankings: []const Ranking = &.{},
     description: ?[]const u8 = null,
     coverImage: Cover = .{},
 };
@@ -343,6 +365,7 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
     // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
     // that render straight to terminal cells; see stripControls. thumb is a URL
     // (validated separately on fetch), season is an enum, the rest are scalars.
+    const sel = selectRank(m.rankings);
     return .{
         .anilist_id = m.id,
         .mal_id = m.idMal,
@@ -360,7 +383,38 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
         .studios = try studioNames(arena, m.studios),
         .description = if (m.description) |d| try stripControls(arena, try sanitizeDescription(arena, d)) else null,
         .score = m.averageScore,
+        .source_material = try stripControlsOpt(arena, m.source),
+        .rank = if (sel) |r| r.rank else null,
+        .rank_type = if (sel) |r| try stripControlsOpt(arena, r.type) else null,
+        .rank_year = if (sel) |r| r.year else null,
     };
+}
+
+const SelectedRank = struct { rank: u32, type: ?[]const u8, year: ?u32 };
+
+/// Pick the single most meaningful ranking from AniList's `rankings` array
+/// (ROD-261, §5.3a): a *contextual* (year/season-scoped) ranking beats an
+/// all-time one, and within a tier RATED beats POPULAR. `year` is carried only
+/// for a contextual pick — an all-time ranking renders without one. Null when the
+/// array is empty.
+fn selectRank(rankings: []const Ranking) ?SelectedRank {
+    var best: ?Ranking = null;
+    for (rankings) |r| {
+        if (best == null or rankScore(r) > rankScore(best.?)) best = r;
+    }
+    const b = best orelse return null;
+    return .{ .rank = b.rank, .type = b.type, .year = if (b.allTime) null else b.year };
+}
+
+/// Preference score: contextual (+2) dominates type (RATED +1), so a contextual
+/// POPULAR still outranks an all-time RATED — the tier ordering §5.3a specifies.
+fn rankScore(r: Ranking) i32 {
+    var s: i32 = 0;
+    if (!r.allTime) s += 2;
+    if (r.type) |t| {
+        if (std.mem.eql(u8, t, "RATED")) s += 1;
+    }
+    return s;
 }
 
 /// Lift AniList's `startDate` into a `domain.Date`. The year anchors the date —
@@ -693,6 +747,45 @@ test "titleScore reconciles 'Season N' vs 'Nth Season' (ROD-181)" {
     try std.testing.expectEqual(@as(i32, 1600), titleScore("Sousou no Frieren Season 2", "Sousou no Frieren 2nd Season"));
     // A base title must still not score as an exact match for its sequel.
     try std.testing.expect(titleScore("Frieren Season 2", "Frieren") < 1600);
+}
+
+test "selectRank prefers contextual over all-time, RATED over POPULAR (ROD-261)" {
+    // Empty → no pick.
+    try std.testing.expect(selectRank(&.{}) == null);
+
+    // Contextual RATED beats an all-time RATED — and carries its year.
+    {
+        const rankings = [_]Ranking{
+            .{ .rank = 42, .type = "RATED", .allTime = true },
+            .{ .rank = 3, .type = "RATED", .year = 2016, .allTime = false },
+        };
+        const sel = selectRank(&rankings) orelse return error.TestExpectationFailed;
+        try std.testing.expectEqual(@as(u32, 3), sel.rank);
+        try std.testing.expectEqual(@as(?u32, 2016), sel.year);
+    }
+
+    // Tier dominates type: a contextual POPULAR still beats an all-time RATED.
+    {
+        const rankings = [_]Ranking{
+            .{ .rank = 5, .type = "RATED", .allTime = true },
+            .{ .rank = 1, .type = "POPULAR", .year = 2016, .allTime = false },
+        };
+        const sel = selectRank(&rankings) orelse return error.TestExpectationFailed;
+        try std.testing.expectEqual(@as(u32, 1), sel.rank);
+        try std.testing.expectEqualStrings("POPULAR", sel.type.?);
+    }
+
+    // Within the all-time tier, RATED wins the tie-break; year is dropped.
+    {
+        const rankings = [_]Ranking{
+            .{ .rank = 88, .type = "POPULAR", .allTime = true },
+            .{ .rank = 42, .type = "RATED", .allTime = true },
+        };
+        const sel = selectRank(&rankings) orelse return error.TestExpectationFailed;
+        try std.testing.expectEqual(@as(u32, 42), sel.rank);
+        try std.testing.expectEqualStrings("RATED", sel.type.?);
+        try std.testing.expectEqual(@as(?u32, null), sel.year);
+    }
 }
 
 test "bestMatch rejects ambiguous close titles" {

@@ -474,9 +474,13 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
 /// no orphan `·` when a field is absent (§9.1). Returns the next free row.
 fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaField, start_row: u16) u16 {
     var col: u16 = 0;
-    for (fields, 0..) |f, i| {
+    // `printed`, not the loop index, drives the separator — a rail-only field
+    // (Rank, ROD-261) is skipped here without leaving an orphan ` · ` behind it.
+    var printed: usize = 0;
+    for (fields) |f| {
+        if (f.rail_only) continue;
         if (col >= w) break;
-        if (i > 0) {
+        if (printed > 0) {
             col = win.print(
                 &.{.{ .text = " · ", .style = self.s(self.palette.fg3, .{}) }},
                 .{ .row_offset = start_row, .col_offset = col, .wrap = .none },
@@ -488,6 +492,7 @@ fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaF
             .{ .text = f.value, .style = val_style },
             .{ .text = f.unit, .style = val_style },
         }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none }).col;
+        printed += 1;
     }
     return start_row + 1;
 }

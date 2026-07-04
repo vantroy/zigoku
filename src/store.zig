@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 8;
+const SCHEMA_VERSION: c_int = 9;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -174,6 +174,18 @@ const MIGRATION_V8 =
     \\ALTER TABLE anime ADD COLUMN duration INTEGER;
 ;
 
+// ROD-261: adaptation source + the pre-selected AniList ranking. `source` is the
+// raw enum (prettified at render). The ranking is stored pre-selected (selectRank
+// chose the best row at enrich time) as three scalars — position, type, and year
+// (null year = an all-time ranking) — rather than a raw blob, so render just
+// composes them. The fieldset bump alongside heals rows enriched before these.
+const MIGRATION_V9 =
+    \\ALTER TABLE anime ADD COLUMN source_material TEXT;
+    \\ALTER TABLE anime ADD COLUMN rank            INTEGER;
+    \\ALTER TABLE anime ADD COLUMN rank_type       TEXT;
+    \\ALTER TABLE anime ADD COLUMN rank_year       INTEGER;
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -193,6 +205,14 @@ pub const AnimeRecord = struct {
     total_episodes: ?i64 = null,
     /// ROD-261: per-episode runtime in minutes (AniList `duration`).
     duration: ?i64 = null,
+    /// ROD-261: raw AniList adaptation source enum (prettified at render). Named
+    /// `source_material`, not `source` — `source` is the provider PK key above.
+    source_material: ?[]const u8 = null,
+    /// ROD-261: the pre-selected ranking — position, type ("RATED"/"POPULAR"),
+    /// and year (null = all-time). Composed into `#{rank} {type} {year}` at render.
+    rank: ?i64 = null,
+    rank_type: ?[]const u8 = null,
+    rank_year: ?i64 = null,
     // ROD-185 enrichment. `season` is the canonical lowercase tag; `genres` is
     // the split list (arena-owned on read, borrowed from domain on construct) —
     // the '\n' blob lives only in the column, joined at upsert / split at load.
@@ -246,6 +266,10 @@ pub const AnimeRecord = struct {
             .score = if (a.score) |s| std.math.cast(i64, s) else null,
             .total_episodes = if (a.total_episodes) |n| @intCast(n) else if (eps > 0) @intCast(eps) else null,
             .duration = if (a.duration) |d| @intCast(d) else null,
+            .source_material = a.source_material,
+            .rank = if (a.rank) |r| @intCast(r) else null,
+            .rank_type = a.rank_type,
+            .rank_year = if (a.rank_year) |y| @intCast(y) else null,
             // Store the canonical tag ("winter"…) so it round-trips through
             // domain.Season.fromString on the way back out.
             .season = if (a.season) |s| @tagName(s) else null,
@@ -392,8 +416,9 @@ pub const Store = struct {
             \\    cover_url, year, status, description, score, total_episodes,
             \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
+            \\    source_material, rank, rank_type, rank_year)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -420,7 +445,11 @@ pub const Store = struct {
             \\    enrichment_fetched_at = COALESCE(excluded.enrichment_fetched_at, anime.enrichment_fetched_at),
             \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, anime.enrichment_fieldset_version),
             \\    studios        = COALESCE(excluded.studios, anime.studios),
-            \\    duration       = COALESCE(excluded.duration, anime.duration)
+            \\    duration       = COALESCE(excluded.duration, anime.duration),
+            \\    source_material = COALESCE(excluded.source_material, anime.source_material),
+            \\    rank           = COALESCE(excluded.rank, anime.rank),
+            \\    rank_type      = COALESCE(excluded.rank_type, anime.rank_type),
+            \\    rank_year      = COALESCE(excluded.rank_year, anime.rank_year)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -469,6 +498,10 @@ pub const Store = struct {
             try bindText(stmt, 30, try joinStrBlob(scratch, a.studios));
         }
         try bindOptI64(stmt, 31, a.duration);
+        try bindOptText(stmt, 32, a.source_material);
+        try bindOptI64(stmt, 33, a.rank);
+        try bindOptText(stmt, 34, a.rank_type);
+        try bindOptI64(stmt, 35, a.rank_year);
 
         try self.stepDone(stmt);
     }
@@ -515,7 +548,8 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
+            \\    source_material, rank, rank_type, rank_year
             \\FROM anime
             \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
@@ -556,6 +590,10 @@ pub const Store = struct {
                 .enrichment_fieldset_version = colOptI64(stmt, 27),
                 .studios = try dupeStrBlob(arena, stmt, 28),
                 .duration = colOptI64(stmt, 29),
+                .source_material = try dupeText(arena, stmt, 30),
+                .rank = colOptI64(stmt, 31),
+                .rank_type = try dupeText(arena, stmt, 32),
+                .rank_year = colOptI64(stmt, 33),
                 .history_visible = true,
             });
         }
@@ -569,7 +607,8 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios, duration
+            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios, duration,
+            \\    source_material, rank, rank_type, rank_year
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -612,6 +651,10 @@ pub const Store = struct {
             .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
             .studios = try dupeStrBlob(arena, stmt, 29),
             .duration = colOptI64(stmt, 30),
+            .source_material = try dupeText(arena, stmt, 31),
+            .rank = colOptI64(stmt, 32),
+            .rank_type = try dupeText(arena, stmt, 33),
+            .rank_year = colOptI64(stmt, 34),
         };
     }
 
@@ -896,7 +939,7 @@ pub const Store = struct {
     /// `enrichmentStale` no matter its clock, so widened columns heal on next view
     /// rather than waiting out the TTL. Not a schema knob — `SCHEMA_VERSION` gates
     /// migrations; this gates enrichment freshness, and the two move independently.
-    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 3; // ROD-261: +studios, +duration
+    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 4; // ROD-261: +studios, +duration, +source, +rank
 
     /// TTL in seconds for cached *enrichment metadata* on the `anime` row, keyed
     /// off airing status. A deliberately longer curve than `cacheTtl` (which
@@ -1046,6 +1089,11 @@ pub const Store = struct {
             try self.exec(MIGRATION_V8);
             try self.exec("PRAGMA user_version = 8;");
             v = 8;
+        }
+        if (v < 9) {
+            try self.exec(MIGRATION_V9);
+            try self.exec("PRAGMA user_version = 9;");
+            v = 9;
         }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
@@ -1362,7 +1410,7 @@ test "getAnime returns persisted enrichment" {
     try testing.expectEqualStrings("Elf mage grief hour", rec.description orelse "");
 }
 
-test "enrichment fields (season/native/kind/start_date/genres/studios/duration) round-trip" {
+test "enrichment fields (season/native/kind/start_date/genres/studios/duration/source/rank) round-trip" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -1384,6 +1432,10 @@ test "enrichment fields (season/native/kind/start_date/genres/studios/duration) 
         .genres = &genres,
         .studios = &studios,
         .duration = 24,
+        .source_material = "MANGA",
+        .rank = 3,
+        .rank_type = "RATED",
+        .rank_year = 2016,
     }, .sub);
     try s.upsertAnime(rec, 1000, arena);
 
@@ -1401,6 +1453,10 @@ test "enrichment fields (season/native/kind/start_date/genres/studios/duration) 
     try testing.expectEqual(@as(usize, 1), got.studios.len);
     try testing.expectEqualStrings("Madhouse", got.studios[0]);
     try testing.expectEqual(@as(?i64, 24), got.duration);
+    try testing.expectEqualStrings("MANGA", got.source_material orelse "");
+    try testing.expectEqual(@as(?i64, 3), got.rank);
+    try testing.expectEqualStrings("RATED", got.rank_type orelse "");
+    try testing.expectEqual(@as(?i64, 2016), got.rank_year);
 
     // loadHistory path sees the same blob split back into a list.
     const rows = try s.loadHistory(arena);
@@ -1411,6 +1467,10 @@ test "enrichment fields (season/native/kind/start_date/genres/studios/duration) 
     try testing.expectEqual(@as(usize, 1), rows[0].studios.len);
     try testing.expectEqualStrings("Madhouse", rows[0].studios[0]);
     try testing.expectEqual(@as(?i64, 24), rows[0].duration);
+    try testing.expectEqualStrings("MANGA", rows[0].source_material orelse "");
+    try testing.expectEqual(@as(?i64, 3), rows[0].rank);
+    try testing.expectEqualStrings("RATED", rows[0].rank_type orelse "");
+    try testing.expectEqual(@as(?i64, 2016), rows[0].rank_year);
 }
 
 test "a later search without genres/studios preserves the persisted lists" {

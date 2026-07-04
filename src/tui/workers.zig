@@ -204,6 +204,8 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .season = a.season,
         .start_date = a.start_date,
         .score = a.score,
+        .rank = a.rank,
+        .rank_year = a.rank_year,
         .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
@@ -216,6 +218,8 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
     out.status = try dupeOptText(alloc, a.status);
     out.description = try dupeOptText(alloc, a.description);
     out.kind = try dupeOptText(alloc, a.kind);
+    out.source_material = try dupeOptText(alloc, a.source_material);
+    out.rank_type = try dupeOptText(alloc, a.rank_type);
     out.genres = try dupeOwnedStrList(alloc, a.genres);
     out.studios = try dupeOwnedStrList(alloc, a.studios);
     return out;
@@ -231,6 +235,8 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     if (a.status) |x| alloc.free(x);
     if (a.description) |x| alloc.free(x);
     if (a.kind) |x| alloc.free(x);
+    if (a.source_material) |x| alloc.free(x);
+    if (a.rank_type) |x| alloc.free(x);
     if (a.genres.len > 0) {
         for (a.genres) |g| alloc.free(g);
         alloc.free(a.genres);
@@ -456,6 +462,10 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.season == null) a.season = meta.season;
     if (a.start_date == null) a.start_date = meta.start_date;
     if (a.score == null) a.score = meta.score;
+    if (a.source_material == null) a.source_material = dupeOptText(gpa, meta.source_material) catch a.source_material;
+    if (a.rank == null) a.rank = meta.rank;
+    if (a.rank_type == null) a.rank_type = dupeOptText(gpa, meta.rank_type) catch a.rank_type;
+    if (a.rank_year == null) a.rank_year = meta.rank_year;
 }
 
 /// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`,
@@ -486,6 +496,10 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.start_date == null) a.start_date = rec.startDate();
     if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
     if (a.studios.len == 0) a.studios = dupeOwnedStrList(gpa, rec.studios) catch a.studios;
+    if (a.source_material == null) a.source_material = dupeOptText(gpa, rec.source_material) catch a.source_material;
+    if (a.rank == null) a.rank = if (rec.rank) |x| std.math.cast(u32, x) else null;
+    if (a.rank_type == null) a.rank_type = dupeOptText(gpa, rec.rank_type) catch a.rank_type;
+    if (a.rank_year == null) a.rank_year = if (rec.rank_year) |x| std.math.cast(u32, x) else null;
 }
 
 /// Background task: enrich one page of search results from AniList. `results` and

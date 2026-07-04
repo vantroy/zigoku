@@ -235,6 +235,15 @@ pub const Anime = struct {
     genres: []const []const u8 = &.{},
     score: ?u32 = null,
     studios: []const []const u8 = &.{},
+    /// AniList adaptation source (MANGA/LIGHT_NOVEL/ORIGINAL…), stored raw and
+    /// prettified at render (ROD-261). Named `source_material` — NOT `source` —
+    /// because `source` is already the provider key elsewhere (AnimeRecord's PK).
+    source_material: ?[]const u8 = null,
+    /// The single ranking picked by AniList `selectRank` (ROD-261): position,
+    /// type ("RATED"/"POPULAR"), and year (null = all-time). Rail-only render.
+    rank: ?u32 = null,
+    rank_type: ?[]const u8 = null,
+    rank_year: ?u32 = null,
     /// Show kind ("TV", "Movie", "OVA"…). `type` is too close to a keyword to
     /// read well, so: `kind`.
     kind: ?[]const u8 = null,
