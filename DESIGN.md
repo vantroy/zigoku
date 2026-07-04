@@ -737,7 +737,7 @@ consistent header rhythm. Each segment is omitted entirely when its field is
 absent (no empty span); the row itself is skipped only when every segment is
 absent.
 
-**Airing countdown (ROD-261, not yet implemented).** A third segment, releasing
+**Airing countdown (ROD-261, shipped).** A third segment, releasing
 shows only, sourced from AniList `nextAiringEpisode{episode airingAt
 timeUntilAiring}`:
 
@@ -759,7 +759,7 @@ window between the real airing and the next enrichment pull — the segment is
 omitted rather than rendered negative or as a bare "airing": a wrong countdown is
 worse than no countdown (§8 logs this call).
 
-**Non-JP origin marker (ROD-261, not yet implemented).** A quiet trailing
+**Non-JP origin marker (ROD-261, shipped).** A quiet trailing
 segment surfacing AniList `countryOfOrigin` whenever it is **not** `JP` — a
 donghua/aeni show like *Mo Tian Ji* (CN) earns a marker; the common
 Japanese-origin case shows nothing:
@@ -1166,11 +1166,11 @@ Notes:
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
 - The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
-  ROD-260 rail form — see §5.3a for the full grammar, including why it only
-  blooms for a History-origin zoom. Only Episodes and Format ship today; Source,
-  Duration, Studios, and a rail-only Rank are spec'd for ROD-261 (§5.3a/§5.3b) but
-  not yet implemented. The `nextAiringEpisode` countdown lands on the chips row
-  (§4.4), not here — also ROD-261, not yet implemented.
+  ROD-260/261 rail form — see §5.3a for the full six-field grammar (Episodes,
+  Format, Source, Duration, Studios, and a rail-only Rank), all shipped; this
+  mock keeps the two-row ROD-260 baseline for brevity rather than redrawing the
+  full rail. The `nextAiringEpisode` countdown lands on the chips row (§4.4), not
+  here — also shipped (ROD-261).
 
 ### 5.3a Detail Metadata — Compact Line vs. Labeled Rail (ROD-260)
 
@@ -1223,15 +1223,16 @@ because the rail only claims the ~38%-width left column, not the full pane.
 **Phase 1 (shipped, ROD-260): Episodes and Format** — the enrichment that already
 survives to the store, no network call or schema change needed.
 
-**Phase 2 (ROD-261 — spec'd below, not yet implemented): Source, Duration,
-Studios, and a rail-only Rank.** Formatting for each:
+**Phase 2 (shipped, ROD-261): Source, Duration, Studios, and a rail-only
+Rank.** Formatting for each:
 
 - **Source** — AniList `source` enum (`MANGA`, `LIGHT_NOVEL`, `ORIGINAL`,
   `VISUAL_NOVEL`, `GAME`, `WEB_NOVEL`, …), rendered title-case with underscores
   turned to spaces: `LIGHT_NOVEL` → `Light novel`, `ORIGINAL` → `Original`. Rail
   label `Source`. New nullable column, mirrors `kind`.
 - **Duration** — AniList `duration` (per-episode runtime, minutes), rendered
-  `{n} min` (e.g. `24 min`). Rail label `Duration`. New nullable column, mirrors
+  `{n} min` (e.g. `24 min`); omitted when null or zero — a 0-minute runtime is a
+  missing value, not a fact. Rail label `Duration`. New nullable column, mirrors
   `kind`/`total_episodes`. Rod's confirmed must-have field for this pass.
 - **Studios** — AniList `studios{nodes{name}}`, already fetched and carried on
   `domain.Anime` but never persisted — the actual gap is the store, not the API
@@ -1241,10 +1242,9 @@ Studios, and a rail-only Rank.** Formatting for each:
   here, not just this one). Collapse-format: `A` for one studio, `A, B` for two,
   `A, B +N` beyond two — capped at 2 named studios so a long co-production credit
   list can't blow out the rail's 8-col gutter (§8 logs this cap as a deliberate
-  call). The fetch itself also needs narrowing to *main* animation studios
-  (AniList's `isMain` flag) — today's `studios{nodes{name}}` in `GQL_FIELDS`
-  pulls every credited studio with no such filter; this doc doesn't pin the
-  exact GQL shape, only the requirement. Rail label `Studios`.
+  call). The fetch narrows to *main* animation studios via AniList's `isMain`
+  flag — `GQL_FIELDS` queries `studios(isMain:true){nodes{name}}`, shipped
+  alongside this column. Rail label `Studios`.
 - **Rank** — AniList `rankings{rank type context year season allTime}`, the one
   **rail-only** field: it never appears on the compact line even though it rides
   the same ordered list, because `MetaField.rail_only` suppresses it there.
@@ -1255,9 +1255,10 @@ Studios, and a rail-only Rank.** Formatting for each:
   for a season-scoped ranking, since the header's own season/year chip (§4.4)
   already carries that context on the same screen. When both a contextual RATED
   and a contextual POPULAR ranking exist, RATED wins the tie-break (§8 logs the
-  reasoning). Rail label `Rank`. Persisting the underlying ranking data needs an
-  additive column too, but its exact shape (raw blob vs. pre-selected row) is an
-  implementation detail this doc leaves open.
+  reasoning). Rail label `Rank`. Persisted as three pre-selected scalar columns
+  — `rank`, `rank_type`, `rank_year` — rather than a raw blob: `selectRank`
+  picks the best ranking once at enrich time, so render just composes the
+  stored values.
 
 The `nextAiringEpisode` countdown is a fifth ROD-261 field but does **not** join
 this list — it renders on the **chips row** (`state.now`, §4.4) instead, because
@@ -1462,12 +1463,13 @@ Notes:
 - Null-degrade rules from §9.1 apply in full: `no art yet` in [d]+italic when
   `cover_url` is null; `[--/100]` in [d] when score is null; `no synopsis yet`
   in [m]+italic when synopsis is null; chips omitted when null.
-- The `28 eps · TV` row is the ROD-260 metadata grammar's compact-line form
+- The `28 eps · TV` row is the ROD-260/261 metadata grammar's compact-line form
   (§5.3a) — `detail_w ≈ 70` at 120 cols is below `detail_two_col_min` (100), so
   the rail doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`,
-  below). Only Episodes and Format ship; Source/Duration/Studios/Rank and the
-  airing countdown are spec'd for ROD-261 (§5.3a/§5.3b/§4.4) but not yet
-  implemented.
+  below). Source, Duration, Studios, and a rail-only Rank have shipped alongside
+  Episodes/Format (ROD-261, §5.3a/§5.3b), as has the chips-row airing countdown
+  (§4.4); this mock keeps the two-field ROD-260 baseline for brevity rather than
+  redrawing a fully-enriched compact line.
 
 ---
 
@@ -1505,13 +1507,14 @@ pane, so that surface needs `term ≥ 168` to engage. At 160-col, right_w ≈ 96
 19 grid columns. At 120-col zoom, right_w ≈ 72 gives 14 columns. This is where the
 zoom earns its keep over the pane's ≈8 columns at 120 cols.
 
-Clearing `detail_two_col_min` also blooms the `Episodes` / `Format` rail above
-(§5.3a, ROD-260) — but only because this is a **History-origin** zoom, which is
-the one surface that sets `two_col = true` unconditionally; a Browse-origin zoom
-at the same 160 cols still renders the compact `28 eps · TV` line. Source,
-Duration, Studios, and a rail-only Rank are spec'd for the same rail (§5.3a/§5.3b,
-ROD-261); the airing countdown is spec'd for the chips row instead (§4.4). None
-of the ROD-261 fields render yet — this mock still shows the ROD-260 baseline.
+Clearing `detail_two_col_min` also blooms the metadata rail above (§5.3a,
+ROD-260/261) — but only because this is a **History-origin** zoom, which is the
+one surface that sets `two_col = true` unconditionally; a Browse-origin zoom at
+the same 160 cols still renders the compact `28 eps · TV` line. Source, Duration,
+Studios, and a rail-only Rank have shipped in the same rail (§5.3a/§5.3b,
+ROD-261), and the airing countdown has shipped on the chips row instead (§4.4);
+this mock keeps the `Episodes` / `Format` two-row ROD-260 baseline for brevity
+rather than redrawing the full six-row rail.
 
 ### 5.5 Settings
 
@@ -1987,7 +1990,7 @@ aliases.
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, spec'd — not yet implemented) | `App.detailMetaFields()` (§5.3a, ROD-260/261) emits an ordered field list — Episodes, Format, Source, Duration, Studios, then a rail-only Rank — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank excluded) or the `Label  Value` rail (two-column surfaces, all six) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). The `nextAiringEpisode` countdown ships under the same ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
+| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, shipped) | `App.detailMetaFields()` (§5.3a, ROD-260/261) emits an ordered field list — Episodes, Format, Source, Duration, Studios, then a rail-only Rank — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank excluded) or the `Label  Value` rail (two-column surfaces, all six) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). The `nextAiringEpisode` countdown ships under the same ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
