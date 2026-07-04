@@ -1200,6 +1200,56 @@ test "mergeEnrichedFillNull fills gaps without clobbering either side (ROD-247)"
     try testing.expectEqual(@as(usize, 1), live2.genres.len); // gained
 }
 
+test "mergeEnrichedFillNull carries the ROD-261 enrichment fields, fill-if-null (ROD-261)" {
+    const gpa = testing.allocator;
+    // A Discover-origin merge must fold the enrichment-expansion fields too, or they
+    // silently vanish while the row is stamped fresh (the convergence gap review caught).
+    var live = try workers.dupeOwnedAnime(gpa, .{
+        .id = "a",
+        .name = "A",
+        .duration = 24,
+        .source_material = "MANGA",
+        .rank = 3,
+    });
+    defer workers.freeOwnedAnime(gpa, live);
+    var incoming = try workers.dupeOwnedAnime(gpa, .{
+        .id = "a",
+        .name = "A",
+        .duration = 99, // must NOT clobber live's 24
+        .rank_type = "RATED",
+        .rank_year = 2016,
+        .country = "CN",
+        .next_airing_at = 1_700_000_000,
+        .next_airing_episode = 14,
+    });
+    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
+    // Live wins where it already had a value.
+    try testing.expectEqual(@as(?u32, 24), live.duration);
+    try testing.expectEqualStrings("MANGA", live.source_material.?);
+    try testing.expectEqual(@as(?u32, 3), live.rank);
+    // Gaps gained from incoming — heap strings transferred, scalars copied.
+    try testing.expectEqualStrings("RATED", live.rank_type.?);
+    try testing.expectEqual(@as(?u32, 2016), live.rank_year);
+    try testing.expectEqualStrings("CN", live.country.?);
+    try testing.expectEqual(@as(?i64, 1_700_000_000), live.next_airing_at);
+    try testing.expectEqual(@as(?u32, 14), live.next_airing_episode);
+
+    // Reverse arrival order: incoming carries what live lacks; live's country wins.
+    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .country = "KR" });
+    defer workers.freeOwnedAnime(gpa, live2);
+    var incoming2 = try workers.dupeOwnedAnime(gpa, .{
+        .id = "b",
+        .name = "B",
+        .duration = 22,
+        .source_material = "LIGHT_NOVEL",
+        .country = "JP", // must NOT clobber live2's KR
+    });
+    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
+    try testing.expectEqualStrings("KR", live2.country.?); // kept
+    try testing.expectEqual(@as(?u32, 22), live2.duration); // gained
+    try testing.expectEqualStrings("LIGHT_NOVEL", live2.source_material.?); // gained
+}
+
 test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
     var app: App = .{};
     app.gpa = testing.allocator;
@@ -2046,6 +2096,92 @@ test "detail meta fields carry episodes then format in priority order (ROD-260)"
 
     for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.search.results.deinit(std.testing.allocator);
+}
+
+test "detail meta fields order Episodes/Format/Source/Duration/Studios/Rank per §5.3a (ROD-261)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+
+    // Three studios → the rail caps at two named plus a "+N" overflow marker.
+    const studios = try std.testing.allocator.alloc([]const u8, 3);
+    studios[0] = try std.testing.allocator.dupe(u8, "Madhouse");
+    studios[1] = try std.testing.allocator.dupe(u8, "Bones");
+    studios[2] = try std.testing.allocator.dupe(u8, "Ufotable");
+
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+        .eps_sub = 28,
+        .kind = try std.testing.allocator.dupe(u8, "TV"),
+        .source_material = try std.testing.allocator.dupe(u8, "LIGHT_NOVEL"),
+        .duration = 24,
+        .studios = studios,
+        .rank = 3,
+        .rank_type = try std.testing.allocator.dupe(u8, "RATED"),
+        .rank_year = 2016,
+    });
+
+    const fields = app.detailMetaFields();
+    // Full §5.3a priority order: Episodes, Format, Source, Duration, Studios, Rank.
+    try testing.expectEqual(@as(usize, 6), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("Format", fields[1].label);
+    try testing.expectEqualStrings("Source", fields[2].label);
+    try testing.expectEqualStrings("Light novel", fields[2].value); // enum prettified
+    try testing.expectEqualStrings("Duration", fields[3].label);
+    try testing.expectEqualStrings("24 min", fields[3].value);
+    try testing.expectEqualStrings("Studios", fields[4].label);
+    try testing.expectEqualStrings("Madhouse, Bones +1", fields[4].value);
+    // Rank is rail-only and carries its contextual year.
+    try testing.expectEqualStrings("Rank", fields[5].label);
+    try testing.expectEqualStrings("#3 rated 2016", fields[5].value);
+    try testing.expect(fields[5].rail_only);
+    // Only Rank is rail-only — the rest show on the compact line too.
+    for (fields[0..5]) |f| try testing.expect(!f.rail_only);
+
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
+}
+
+test "detailMetaFieldsFor builds the rail from an explicit anime, independent of nav state (ROD-261)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    // History list view: renderedDetailAnime resolves nothing without a focused
+    // record, so detailMetaFields() would floor to "?". The preview feeds an
+    // explicit anime instead — detailMetaFieldsFor must build the full list from it
+    // (the path drawHistoryPreview uses; a string-literal anime, nothing to free).
+    app.active_view = .history;
+    const studios = [_][]const u8{"Madhouse"};
+    const a: domain.Anime = .{
+        .id = "x",
+        .name = "X",
+        .eps_sub = 28,
+        .kind = "TV",
+        .source_material = "MANGA",
+        .duration = 24,
+        .studios = &studios,
+        .rank = 1,
+        .rank_type = "RATED",
+        .rank_year = 2023,
+    };
+    const fields = app.detailMetaFieldsFor(a);
+    try testing.expectEqual(@as(usize, 6), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("Format", fields[1].label);
+    try testing.expectEqualStrings("Source", fields[2].label);
+    try testing.expectEqualStrings("Manga", fields[2].value); // MANGA enum prettified
+    try testing.expectEqualStrings("Duration", fields[3].label);
+    try testing.expectEqualStrings("Studios", fields[4].label);
+    try testing.expectEqualStrings("Rank", fields[5].label);
+    try testing.expect(fields[5].rail_only);
+
+    // Null anime → the dim "?" floor (the empty-preview case), never a crash.
+    const floor = app.detailMetaFieldsFor(null);
+    try testing.expectEqual(@as(usize, 1), floor.len);
+    try testing.expect(floor[0].dim);
 }
 
 test "detail meta fields floor to a dim '?' when no show is focused (ROD-260)" {

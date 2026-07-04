@@ -199,10 +199,15 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .eps_sub = a.eps_sub,
         .eps_dub = a.eps_dub,
         .total_episodes = a.total_episodes,
+        .duration = a.duration,
         .year = a.year,
         .season = a.season,
         .start_date = a.start_date,
         .score = a.score,
+        .rank = a.rank,
+        .rank_year = a.rank_year,
+        .next_airing_at = a.next_airing_at,
+        .next_airing_episode = a.next_airing_episode,
         .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
@@ -215,6 +220,9 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
     out.status = try dupeOptText(alloc, a.status);
     out.description = try dupeOptText(alloc, a.description);
     out.kind = try dupeOptText(alloc, a.kind);
+    out.source_material = try dupeOptText(alloc, a.source_material);
+    out.rank_type = try dupeOptText(alloc, a.rank_type);
+    out.country = try dupeOptText(alloc, a.country);
     out.genres = try dupeOwnedStrList(alloc, a.genres);
     out.studios = try dupeOwnedStrList(alloc, a.studios);
     return out;
@@ -230,6 +238,9 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     if (a.status) |x| alloc.free(x);
     if (a.description) |x| alloc.free(x);
     if (a.kind) |x| alloc.free(x);
+    if (a.source_material) |x| alloc.free(x);
+    if (a.rank_type) |x| alloc.free(x);
+    if (a.country) |x| alloc.free(x);
     if (a.genres.len > 0) {
         for (a.genres) |g| alloc.free(g);
         alloc.free(a.genres);
@@ -260,13 +271,28 @@ pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) voi
     mergeOptText(&live.kind, &incoming.kind);
     mergeStrList(&live.genres, &incoming.genres);
     mergeStrList(&live.studios, &incoming.studios);
+    // ROD-261: the enrichment-expansion fields ride this merge too, or a
+    // Discover-origin enrich (zoom/batch) silently drops them while persistSlot
+    // still stamps the row fresh at ENRICHMENT_FIELDSET_VERSION — a false "healed"
+    // that enrichmentStale then trusts until the TTL lapses (the convergence gap
+    // review caught). Same fill-if-null rule: heap strings transfer via
+    // mergeOptText (nulled so they aren't freed below), scalars copy when the
+    // live card lacks them.
+    mergeOptText(&live.source_material, &incoming.source_material);
+    mergeOptText(&live.rank_type, &incoming.rank_type);
+    mergeOptText(&live.country, &incoming.country);
     if (live.mal_id == null) live.mal_id = incoming.mal_id;
     if (live.anilist_id == null) live.anilist_id = incoming.anilist_id;
     if (live.total_episodes == null) live.total_episodes = incoming.total_episodes;
+    if (live.duration == null) live.duration = incoming.duration;
     if (live.year == null) live.year = incoming.year;
     if (live.season == null) live.season = incoming.season;
     if (live.start_date == null) live.start_date = incoming.start_date;
     if (live.score == null) live.score = incoming.score;
+    if (live.rank == null) live.rank = incoming.rank;
+    if (live.rank_year == null) live.rank_year = incoming.rank_year;
+    if (live.next_airing_at == null) live.next_airing_at = incoming.next_airing_at;
+    if (live.next_airing_episode == null) live.next_airing_episode = incoming.next_airing_episode;
     freeOwnedAnime(gpa, incoming.*); // frees id/name + every field not transferred above
 }
 
@@ -450,10 +476,18 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.anilist_id == null) a.anilist_id = meta.anilist_id;
     if (a.mal_id == null) a.mal_id = meta.mal_id;
     if (a.total_episodes == null) a.total_episodes = meta.total_episodes;
+    if (a.duration == null) a.duration = meta.duration;
     if (a.year == null) a.year = meta.year;
     if (a.season == null) a.season = meta.season;
     if (a.start_date == null) a.start_date = meta.start_date;
     if (a.score == null) a.score = meta.score;
+    if (a.source_material == null) a.source_material = dupeOptText(gpa, meta.source_material) catch a.source_material;
+    if (a.rank == null) a.rank = meta.rank;
+    if (a.rank_type == null) a.rank_type = dupeOptText(gpa, meta.rank_type) catch a.rank_type;
+    if (a.rank_year == null) a.rank_year = meta.rank_year;
+    if (a.next_airing_at == null) a.next_airing_at = meta.next_airing_at;
+    if (a.next_airing_episode == null) a.next_airing_episode = meta.next_airing_episode;
+    if (a.country == null) a.country = dupeOptText(gpa, meta.country) catch a.country;
 }
 
 /// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`,
@@ -475,13 +509,22 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.anilist_id == null) a.anilist_id = if (rec.anilist_id) |x| std.math.cast(u64, x) else null;
     if (a.mal_id == null) a.mal_id = if (rec.mal_id) |x| std.math.cast(u64, x) else null;
     if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
+    if (a.duration == null) a.duration = if (rec.duration) |x| std.math.cast(u32, x) else null;
     if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
     if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
-    // Season/start_date are pure values (no heap); genres is deep-copied into
-    // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
+    // Season/start_date are pure values (no heap); genres/studios are deep-copied
+    // into gpa so they outlive the caller's scratch arena and ride freeOwnedAnime.
     if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
     if (a.start_date == null) a.start_date = rec.startDate();
     if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
+    if (a.studios.len == 0) a.studios = dupeOwnedStrList(gpa, rec.studios) catch a.studios;
+    if (a.source_material == null) a.source_material = dupeOptText(gpa, rec.source_material) catch a.source_material;
+    if (a.rank == null) a.rank = if (rec.rank) |x| std.math.cast(u32, x) else null;
+    if (a.rank_type == null) a.rank_type = dupeOptText(gpa, rec.rank_type) catch a.rank_type;
+    if (a.rank_year == null) a.rank_year = if (rec.rank_year) |x| std.math.cast(u32, x) else null;
+    if (a.next_airing_at == null) a.next_airing_at = rec.next_airing_at;
+    if (a.next_airing_episode == null) a.next_airing_episode = if (rec.next_airing_episode) |x| std.math.cast(u32, x) else null;
+    if (a.country == null) a.country = dupeOptText(gpa, rec.country) catch a.country;
 }
 
 /// Background task: enrich one page of search results from AniList. `results` and

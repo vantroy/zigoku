@@ -219,6 +219,9 @@ pub const Anime = struct {
     /// Total episode count from enrichment when the provider-side per-track count
     /// is missing or partial.
     total_episodes: ?u32 = null,
+    /// Per-episode runtime in minutes, from AniList enrichment (ROD-261). Renders
+    /// as "N min" on the detail metadata rail between Format and Studios.
+    duration: ?u32 = null,
     year: ?u32 = null,
     /// Broadcast season (the cours of `year`). Sourced AllAnime-first from
     /// `season.quarter`, backfilled by AniList enrichment. Pairs with `year` for
@@ -232,6 +235,22 @@ pub const Anime = struct {
     genres: []const []const u8 = &.{},
     score: ?u32 = null,
     studios: []const []const u8 = &.{},
+    /// AniList adaptation source (MANGA/LIGHT_NOVEL/ORIGINAL…), stored raw and
+    /// prettified at render (ROD-261). Named `source_material` — NOT `source` —
+    /// because `source` is already the provider key elsewhere (AnimeRecord's PK).
+    source_material: ?[]const u8 = null,
+    /// The single ranking picked by AniList `selectRank` (ROD-261): position,
+    /// type ("RATED"/"POPULAR"), and year (null = all-time). Rail-only render.
+    rank: ?u32 = null,
+    rank_type: ?[]const u8 = null,
+    rank_year: ?u32 = null,
+    /// Next-episode airing (ROD-261): absolute `airingAt` unix timestamp + episode
+    /// number, from AniList. The chips row recomputes a live countdown from these
+    /// against `state.now` — see DESIGN §4.4. Present only for airing shows.
+    next_airing_at: ?i64 = null,
+    next_airing_episode: ?u32 = null,
+    /// AniList `countryOfOrigin` (JP/CN/KR…), surfaced only when not JP (ROD-261).
+    country: ?[]const u8 = null,
     /// Show kind ("TV", "Movie", "OVA"…). `type` is too close to a keyword to
     /// read well, so: `kind`.
     kind: ?[]const u8 = null,
