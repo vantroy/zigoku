@@ -1140,6 +1140,10 @@ pub const App = struct {
         return selection.detailMetaFields(self);
     }
 
+    pub fn detailMetaFieldsFor(self: *App, a: ?Anime) []const MetaField {
+        return selection.detailMetaFieldsFor(self, a);
+    }
+
     /// Controller glue for the playback-event handlers (ROD-162): hand the final
     /// state to the session for persistence + clear, then reset the App-owned
     /// transport. The session owns the record; the shell owns playing/current_*.

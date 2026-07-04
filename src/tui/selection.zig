@@ -368,8 +368,18 @@ pub const MetaField = struct {
 /// it has a value (§9.1: no empty segment, no orphan `·`, no bare rail row);
 /// Episodes is the floor, degrading to a dim "?" so neither form renders empty.
 pub fn detailMetaFields(self: *App) []const MetaField {
+    return detailMetaFieldsFor(self, renderedDetailAnime(self));
+}
+
+/// Same ordered field list, but for an explicitly-supplied anime rather than the
+/// one `renderedDetailAnime` resolves from nav state. The History list preview
+/// (`drawHistoryPreview`) is fed a record directly and can't read
+/// `renderedDetailAnime` (it resolves null in the History list view), so it routes
+/// through here to render the SAME metadata as the focused detail — otherwise the
+/// preview silently omits the whole rail (even Format). Writes App-owned buffers.
+pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
     var n: usize = 0;
-    const a = renderedDetailAnime(self) orelse {
+    const a = maybe_a orelse {
         self.detail_meta_fields[0] = .{ .label = "Episodes", .value = "?", .unit = " eps", .dim = true };
         return self.detail_meta_fields[0..1];
     };

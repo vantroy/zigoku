@@ -757,6 +757,12 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
         }
     }
 
+    // Metadata line — the same Episodes · Format · Source · Duration · Studios the
+    // focused detail carries, in the compact one-row form (the preview is a lean
+    // vertical stack, so no rail bloom; rail-only Rank stays out by design). Fed
+    // the preview's own `anime` since `detailMetaFields` can't read nav state here.
+    if (row < h) row = drawMetaLine(self, win, w, self.detailMetaFieldsFor(anime), row);
+
     _ = drawSynopsis(self, win, w, h, anime, row);
 }
 
