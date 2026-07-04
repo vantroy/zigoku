@@ -2146,6 +2146,44 @@ test "detail meta fields order Episodes/Format/Source/Duration/Studios/Rank per 
     app.search.results.deinit(std.testing.allocator);
 }
 
+test "detailMetaFieldsFor builds the rail from an explicit anime, independent of nav state (ROD-261)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    // History list view: renderedDetailAnime resolves nothing without a focused
+    // record, so detailMetaFields() would floor to "?". The preview feeds an
+    // explicit anime instead — detailMetaFieldsFor must build the full list from it
+    // (the path drawHistoryPreview uses; a string-literal anime, nothing to free).
+    app.active_view = .history;
+    const studios = [_][]const u8{"Madhouse"};
+    const a: domain.Anime = .{
+        .id = "x",
+        .name = "X",
+        .eps_sub = 28,
+        .kind = "TV",
+        .source_material = "MANGA",
+        .duration = 24,
+        .studios = &studios,
+        .rank = 1,
+        .rank_type = "RATED",
+        .rank_year = 2023,
+    };
+    const fields = app.detailMetaFieldsFor(a);
+    try testing.expectEqual(@as(usize, 6), fields.len);
+    try testing.expectEqualStrings("Episodes", fields[0].label);
+    try testing.expectEqualStrings("Format", fields[1].label);
+    try testing.expectEqualStrings("Source", fields[2].label);
+    try testing.expectEqualStrings("Manga", fields[2].value); // MANGA enum prettified
+    try testing.expectEqualStrings("Duration", fields[3].label);
+    try testing.expectEqualStrings("Studios", fields[4].label);
+    try testing.expectEqualStrings("Rank", fields[5].label);
+    try testing.expect(fields[5].rail_only);
+
+    // Null anime → the dim "?" floor (the empty-preview case), never a crash.
+    const floor = app.detailMetaFieldsFor(null);
+    try testing.expectEqual(@as(usize, 1), floor.len);
+    try testing.expect(floor[0].dim);
+}
+
 test "detail meta fields floor to a dim '?' when no show is focused (ROD-260)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
