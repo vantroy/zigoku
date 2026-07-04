@@ -254,6 +254,21 @@ pub fn build(b: *std.Build) void {
     const spike_oauth_step = b.step("spike-oauth", "ROD-282: AniList Implicit Grant OAuth spike");
     spike_oauth_step.dependOn(&run_spike_oauth.step);
 
+    // spike-loopback: std.http.Server loopback listener for the OAuth redirect
+    // capture + fragment relay (ROD-283 2b decision gate).
+    const spike_loopback = b.addExecutable(.{
+        .name = "spike-loopback",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/loopback.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_loopback = b.addRunArtifact(spike_loopback);
+    if (b.args) |args| run_spike_loopback.addArgs(args);
+    const spike_loopback_step = b.step("spike-loopback", "ROD-283: std.http.Server loopback listener spike");
+    spike_loopback_step.dependOn(&run_spike_loopback.step);
+
     // `zig build run [-- args]` — run from the install dir, not the cache.
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
