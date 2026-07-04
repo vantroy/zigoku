@@ -18,9 +18,6 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const paths = @import("paths.zig");
-const c = @cImport({
-    @cInclude("sys/stat.h"); // chmod — lock the token file to 0600 after writing
-});
 
 /// A JWT is ~1KB; a token file an order of magnitude larger isn't ours — refuse it
 /// and fall back to signed-out rather than slurp an arbitrary blob into memory.
@@ -77,34 +74,21 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) Auth {
     return parse(gpa, source);
 }
 
-/// Serialize `auth` to `path` as ZON, creating the parent directory if needed and
-/// restricting the file to `0600` (owner-only) since it carries a bearer token.
-/// The Io create API can't set a mode, so we `chmod` after writing — the same
-/// libc route `paths.ensureDir` uses for `mkdir`. Unlike `load`, this surfaces
-/// errors.
+/// Serialize `auth` to `path` as ZON, creating the parent directory if needed.
+/// The file is created **owner-only (0600) atomically** — it carries a bearer
+/// token, so it must never exist group/world-readable, not even for the span of
+/// the write (the parent `~/.config/zigoku` is 0755/world-traversable). Unlike
+/// `load`, this surfaces errors.
 pub fn save(io: Io, auth: Auth, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
 
-    var file = try std.Io.Dir.createFileAbsolute(io, path, .{});
+    var file = try std.Io.Dir.createFileAbsolute(io, path, .{ .permissions = .fromMode(0o600) });
     defer file.close(io);
 
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io, &buf);
     try std.zon.stringify.serialize(auth, .{}, &writer.interface);
     try writer.interface.flush();
-
-    chmod0600(path);
-}
-
-/// Best-effort `chmod 0600 path`. A token file has no business being group- or
-/// world-readable; a failure here isn't worth failing the save over (the write
-/// already succeeded), so the result is ignored — same stance as `ensureDir`.
-fn chmod0600(path: []const u8) void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len == 0 or path.len >= buf.len) return;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    _ = c.chmod(&buf, 0o600);
 }
 
 /// `{configDir}/auth.zon` (see `paths.configDir`).
