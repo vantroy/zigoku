@@ -239,6 +239,21 @@ pub fn build(b: *std.Build) void {
     const spike_tui_step = b.step("spike-tui", "ROD-71: libvaxis boot spike");
     spike_tui_step.dependOn(&run_spike_tui.step);
 
+    // spike-oauth: AniList Implicit Grant end-to-end — token → auth → pull → push
+    // round-trip against the live API (ROD-282 decision gate for ROD-129 sync).
+    const spike_oauth = b.addExecutable(.{
+        .name = "spike-oauth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/anilist_oauth.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_spike_oauth = b.addRunArtifact(spike_oauth);
+    if (b.args) |args| run_spike_oauth.addArgs(args);
+    const spike_oauth_step = b.step("spike-oauth", "ROD-282: AniList Implicit Grant OAuth spike");
+    spike_oauth_step.dependOn(&run_spike_oauth.step);
+
     // `zig build run [-- args]` — run from the install dir, not the cache.
     const run_step = b.step("run", "Run the app");
     const run_cmd = b.addRunArtifact(exe);
