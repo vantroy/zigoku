@@ -719,8 +719,10 @@ header stacks romaji title → english → native (italic) → **chips row** →
 genres, so the chips render on their own row beneath the alt-title lines rather
 than trailing the title inline (the alt-titles claim the title's row). On that
 dedicated row the chips sit **flush at column 0**, aligned with the title stack —
-no leading indent. The status chip comes first, then the season+year chip
-(Section 2.3), separated by two spaces (ROD-141).
+no leading indent. Up to four segments share the row, in fixed order, each pair
+separated by two spaces (ROD-141): **status** chip, **season+year** chip
+(Section 2.3), an **airing countdown** (ROD-261 — releasing shows only), and a
+**non-JP origin marker** (ROD-261 — non-JP shows only) trailing last.
 
 ```
 Sousou no Frieren
@@ -731,8 +733,49 @@ Frieren: Beyond Journey's End
 ```
 
 When a title carries no alt-title lines, the chips still take their own row for a
-consistent header rhythm. Each chip is omitted entirely when its field is absent
-(no empty span); a row with neither status nor season is skipped.
+consistent header rhythm. Each segment is omitted entirely when its field is
+absent (no empty span); the row itself is skipped only when every segment is
+absent.
+
+**Airing countdown (ROD-261, not yet implemented).** A third segment, releasing
+shows only, sourced from AniList `nextAiringEpisode{episode airingAt
+timeUntilAiring}`:
+
+```
+放映中  春 2026  Ep14 · 3d
+```
+
+Format: `Ep{episode} · {countdown}`, rendered in `state.now` — it shares the
+airing chip's own register, since both mark "this matters right now." The
+countdown collapses to a single coarsest unit, never combined (`3d`, not
+`3d 4h`): `≥ 1 day` renders `Nd`, `< 1 day` renders `Nh`, `< 1 hour` renders `Nm`.
+**Persist the absolute, not the relative:** store `airingAt` (unix seconds) plus
+the episode number, and recompute the countdown from `state.now` at render time.
+`timeUntilAiring` is only correct at fetch time and drifts the instant the
+process keeps running, so persisting it verbatim would go stale; the absolute
+timestamp survives a restart and stays correct indefinitely (Rod's ruling). If
+the recomputed countdown has already lapsed — a stale `nextAiringEpisode` in the
+window between the real airing and the next enrichment pull — the segment is
+omitted rather than rendered negative or as a bare "airing": a wrong countdown is
+worse than no countdown (§8 logs this call).
+
+**Non-JP origin marker (ROD-261, not yet implemented).** A quiet trailing
+segment surfacing AniList `countryOfOrigin` whenever it is **not** `JP` — a
+donghua/aeni show like *Mo Tian Ji* (CN) earns a marker; the common
+Japanese-origin case shows nothing:
+
+```
+完結  夏 2016  CN
+```
+
+Rendered as the bare two-letter AniList country code in `text.dim` — the
+dimmest tier on the row, deliberately, and last in segment order: it's the least
+time-sensitive fact here, so it reads after the live status/season/countdown
+information rather than competing with it. No flag glyph: an actual flag emoji is
+a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall
+inside the BMP" contract, so a plain text country code is the only form that
+renders deterministically across every terminal this app targets (§8 logs this
+call).
 
 ### 4.5 Progress Bar
 
@@ -1124,23 +1167,27 @@ Notes:
   density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
 - The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
   ROD-260 rail form — see §5.3a for the full grammar, including why it only
-  blooms for a History-origin zoom. Only Episodes and Format ship today; studios,
-  source, duration, a rail-only rank, and the `nextAiringEpisode` countdown (which
-  lands on the chips row, not here) are deferred to ROD-261.
+  blooms for a History-origin zoom. Only Episodes and Format ship today; Source,
+  Duration, Studios, and a rail-only Rank are spec'd for ROD-261 (§5.3a/§5.3b) but
+  not yet implemented. The `nextAiringEpisode` countdown lands on the chips row
+  (§4.4), not here — also ROD-261, not yet implemented.
 
 ### 5.3a Detail Metadata — Compact Line vs. Labeled Rail (ROD-260)
 
 One ordered field list, two render densities. `App.detailMetaFields()` (`app.zig`)
-returns `[]const MetaField` — `{label, value, unit, dim}` — highest-priority field
-first: **Episodes**, then **Format**. `drawHeader` (`view/detail.zig`) renders that
-list through one of two functions, selected by a `bloom: bool` parameter, so the
-two forms can't drift apart — same source, same order, same value strings:
+returns `[]const MetaField` — `{label, value, unit, dim, rail_only}` —
+highest-priority field first: **Episodes**, **Format**, **Source**, **Duration**,
+**Studios**, then a rail-only **Rank** (ROD-261 widens the list; see below).
+`drawHeader` (`view/detail.zig`) renders that list through one of two functions,
+selected by a `bloom: bool` parameter, so the two forms can't drift apart — same
+source, same order, same value strings:
 
 - **`drawMetaLine`** — the compact form: values joined with ` · ` on one row
   (separator `fg3`, values `fg2`, `fg3` when a value's `dim` flag is set). A unit
   suffix renders only here (`13 eps`; Format carries no unit). A separator sits
   only *between* two emitted fields — an absent field never leaves an orphan `·`
-  (§9.1).
+  (§9.1). It also skips any field flagged `rail_only` (Rank) outright — the one
+  shared conditional the ROD-261 widening adds, not a per-field branch.
 - **`drawMetaRail`** — the roomy form: `Label  Value` stacked one field per row,
   an 8-col label gutter (`fg3`) with values aligned at column 10 (`fg2`, `fg3`
   when `dim`). The rail walks the same priority order top-down, so a pane too
@@ -1150,9 +1197,10 @@ two forms can't drift apart — same source, same order, same value strings:
 **Episodes is the floor.** It always renders, never omitted: when neither the
 per-track count (`eps_sub`/`eps_dub`) nor `total_episodes` is known — no show
 focused, or a show AniList hasn't enriched yet — it degrades to a dim `?` (`fg3`,
-the `dim` flag) instead of disappearing, so neither form is ever empty. Format
-(`kind`, e.g. `TV`) is the one field that *can* be omitted outright: it simply
-isn't emitted when `kind` is null.
+the `dim` flag) instead of disappearing, so neither form is ever empty. Every
+other field — Format, Source, Duration, Studios, Rank — *can* be omitted
+outright: each simply isn't emitted when its underlying value is null (§9.1: no
+orphan separator, no bare rail row).
 
 **The rail needs two conditions, not one.** `drawHeader`'s `bloom` argument is
 `two_col and isTwoColumn(w)` — the caller's `two_col` flag **and** the pane
@@ -1172,14 +1220,75 @@ checked (mirrors the pre-existing ROD-113 origin gate on the cover/content split
 itself). History's in-pane split needs a genuinely wide terminal (168 cols)
 because the rail only claims the ~38%-width left column, not the full pane.
 
-**Phase 1 (shipped) fields: Episodes and Format only** — the enrichment that
-already survives to the store, no network call or schema change needed.
-**Deferred to ROD-261:** studios, source, duration, and a rail-only rank slot,
-once an AniList-enrichment pass fetches and persists them (the store has no
-`studios` column yet); and the `nextAiringEpisode` countdown, which lands on the
-**chips row** (`state.now`) rather than this metadata list. Both renderers
-iterate the field list generically, so each addition is a `detailMetaFields`
-data change only — no renderer edits.
+**Phase 1 (shipped, ROD-260): Episodes and Format** — the enrichment that already
+survives to the store, no network call or schema change needed.
+
+**Phase 2 (ROD-261 — spec'd below, not yet implemented): Source, Duration,
+Studios, and a rail-only Rank.** Formatting for each:
+
+- **Source** — AniList `source` enum (`MANGA`, `LIGHT_NOVEL`, `ORIGINAL`,
+  `VISUAL_NOVEL`, `GAME`, `WEB_NOVEL`, …), rendered title-case with underscores
+  turned to spaces: `LIGHT_NOVEL` → `Light novel`, `ORIGINAL` → `Original`. Rail
+  label `Source`. New nullable column, mirrors `kind`.
+- **Duration** — AniList `duration` (per-episode runtime, minutes), rendered
+  `{n} min` (e.g. `24 min`). Rail label `Duration`. New nullable column, mirrors
+  `kind`/`total_episodes`. Rod's confirmed must-have field for this pass.
+- **Studios** — AniList `studios{nodes{name}}`, already fetched and carried on
+  `domain.Anime` but never persisted — the actual gap is the store, not the API
+  call. Needs its own `studios` column, migrated line-for-line like `genres`
+  ('\n'-joined blob, split on read, `COALESCE` on upsert so a null re-enrich never
+  clobbers a stored list — the §9 DB-safety rule applies to every new column
+  here, not just this one). Collapse-format: `A` for one studio, `A, B` for two,
+  `A, B +N` beyond two — capped at 2 named studios so a long co-production credit
+  list can't blow out the rail's 8-col gutter (§8 logs this cap as a deliberate
+  call). The fetch itself also needs narrowing to *main* animation studios
+  (AniList's `isMain` flag) — today's `studios{nodes{name}}` in `GQL_FIELDS`
+  pulls every credited studio with no such filter; this doc doesn't pin the
+  exact GQL shape, only the requirement. Rail label `Studios`.
+- **Rank** — AniList `rankings{rank type context year season allTime}`, the one
+  **rail-only** field: it never appears on the compact line even though it rides
+  the same ordered list, because `MetaField.rail_only` suppresses it there.
+  Selection prefers a **contextual** ranking (`allTime: false`, season- or
+  year-scoped) over an all-time one when both exist; render `#{rank} rated
+  {year}` / `#{rank} popular {year}` for a contextual hit, or `#{rank} rated` /
+  `#{rank} popular` for the all-time fallback — the season name is dropped even
+  for a season-scoped ranking, since the header's own season/year chip (§4.4)
+  already carries that context on the same screen. When both a contextual RATED
+  and a contextual POPULAR ranking exist, RATED wins the tie-break (§8 logs the
+  reasoning). Rail label `Rank`. Persisting the underlying ranking data needs an
+  additive column too, but its exact shape (raw blob vs. pre-selected row) is an
+  implementation detail this doc leaves open.
+
+The `nextAiringEpisode` countdown is a fifth ROD-261 field but does **not** join
+this list — it renders on the **chips row** (`state.now`, §4.4) instead, because
+it's a live, clock-relative signal, not a stored snapshot the rail's static model
+fits. Same ticket, different grammar. Both renderers still iterate the field list
+generically (plus the one shared `rail_only` skip in `drawMetaLine`), so every
+field above is a `detailMetaFields` data change only — no further renderer edits.
+Full survey of what was considered and rejected: §5.3b.
+
+### 5.3b ROD-261 — The AniList Shopping Trip
+
+The reflection pass behind ROD-261: survey what AniList's `Media` type offers
+beyond the ROD-260 floor, and rule signal vs. noise for a terminal watchlist
+before writing a line of fetch/persist/render code. Verdict, one line each:
+
+| Field | Verdict | Lands | Why |
+|---|---|---|---|
+| `source` | Ship | Rail — Source | Cheap, unambiguous signal; no formatting risk |
+| `duration` | Ship | Rail — Duration | Rod's confirmed must-have — per-episode runtime is genuinely useful on a watchlist |
+| `studios{nodes{name}}` | Ship | Rail — Studios | Already fetched and carried — the gap was the store, not the API call |
+| `rankings{…}` | Ship, rail-only | Rail — Rank | Verbose but a contextual rank is a sharper signal than a raw count (contrast the rejected `popularity` row below) |
+| `nextAiringEpisode{…}` | Ship | Chips row, 3rd segment | Live and clock-relative — doesn't fit the rail's static-snapshot model (§4.4) |
+| `countryOfOrigin` | Ship, quiet | Chips row, trailing marker | Non-JP-only surfacing (donghua/aeni); JP is the default and shows nothing (§4.4, §8) |
+| `popularity` | Skip | — | A bare user count — Rank already conveys standing, better |
+| `tags` | Skip | — | Dozens per show, often spoiler-laden; genres already categorize |
+| `trailer` / `externalLinks` / `hashtag` / `siteUrl` | Skip | — | Not terminal-actionable without a browser handoff |
+| `isAdult` | Skip | — | A future *filter* input, not a rail fact |
+| `relations` | Defer → v0.4 | — | A connection graph needs its own UI, already parked per ROD-257 |
+
+Every "Ship" row still obeys the §9.1 no-empty rule: a field with no value emits
+nothing — no placeholder, no orphan separator, no bare rail row.
 
 ### 5.4 History / Watchlist — Narrow (w < 60) or No Records
 
@@ -1356,8 +1465,9 @@ Notes:
 - The `28 eps · TV` row is the ROD-260 metadata grammar's compact-line form
   (§5.3a) — `detail_w ≈ 70` at 120 cols is below `detail_two_col_min` (100), so
   the rail doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`,
-  below). Only Episodes and Format ship; studios/source/duration/rank and the
-  airing countdown are deferred to ROD-261.
+  below). Only Episodes and Format ship; Source/Duration/Studios/Rank and the
+  airing countdown are spec'd for ROD-261 (§5.3a/§5.3b/§4.4) but not yet
+  implemented.
 
 ---
 
@@ -1398,9 +1508,10 @@ zoom earns its keep over the pane's ≈8 columns at 120 cols.
 Clearing `detail_two_col_min` also blooms the `Episodes` / `Format` rail above
 (§5.3a, ROD-260) — but only because this is a **History-origin** zoom, which is
 the one surface that sets `two_col = true` unconditionally; a Browse-origin zoom
-at the same 160 cols still renders the compact `28 eps · TV` line. Studios,
-source, duration, a rail-only rank, and the airing countdown are deferred to
-ROD-261 — they don't render yet in either form.
+at the same 160 cols still renders the compact `28 eps · TV` line. Source,
+Duration, Studios, and a rail-only Rank are spec'd for the same rail (§5.3a/§5.3b,
+ROD-261); the airing countdown is spec'd for the chips row instead (§4.4). None
+of the ROD-261 fields render yet — this mock still shows the ROD-260 baseline.
 
 ### 5.5 Settings
 
@@ -1824,6 +1935,10 @@ revisited without archaeology.
 | `r` (not `:reset`) for progress recompute in History (ROD-193) | The keybind ships now rather than being deferred to `:` command mode because single-level undo (`u`) goes stale after any subsequent key — the recovery window is one action. `r` is non-adjacent to `c` on Colemak-DH, so it can't be mis-keyed in the same motion. Recompute uses strategy A (sorted-index, translation-scoped): `progress` = 1-based ordinal of the last fully-watched row among the `episode_progress` rows present, sorted by `EpisodeNumber.sortKey`. Intentionally under-counts gap-watching (only rows that were started are present). `Store.recomputeProgress` is the single source of truth for these semantics. | If users want a "reset to 0" shortcut independently of strategy-A, note that a show with no fully_watched rows already recomputes to 0 — suggest deleting episode_progress rows via a future `:clear progress` command. |
 | Genre glyphs stay `text.dim` (`fg3`), single-space separated (ROD-247) | The glyphs are ambient texture, not a label — `text.dim` is the register for "present but not asking to be read." The real legibility problem was the two glyphs smushing into one shape, not brightness: a single space between them fixed that. `text.muted` (`fg2`) was tried and reverted — brighter made the glyphs compete with the view-count for attention, which owns that row as the popularity-ranking signal. The spatial split (count left-anchored, glyphs right-anchored at the cover edge) plus the dim tier keeps each in its lane. | If the glyphs prove invisible in practice, widen the inter-glyph gap or drop to one before re-dimming. |
 | Nord `focus` stays hue-shift, **not** a luminance lift (ROD-184: ratified B over A) | ROD-183 flagged that Nord violates the §1.1 focus-clears-`fg`-luminance rule — `focus` (nord8 frost, L 0.475) reads dimmer than `fg` (nord4 snow, L 0.727). Option A was to overdrive `focus` to a snow-storm value (nord6, L≈0.83) so the rule stays universal. Rejected: Nord's `fg` already sits the brightest of the four dark palettes, and lifting `focus` past it would push Nord toward a light-theme read — fighting §0's dark-only constraint. The nord8 hue-shift + bold carries focus distinction without adding luminance, faithful to Nord's own palette relationships. So the focus-clears-`fg`-luminance rule stays non-universal (§1.4): Terminal Ghost / Phosphor / TokyoNight honour it; Nord trades it for hue. This ratifies the ROD-183 doc state as a deliberate call, not a deferred fix — `src/tui/colors.zig` `nord.focus` is unchanged. | If user testing shows the Nord focused row is genuinely hard to locate (hue-shift + bold insufficient), revisit A — but bound any lift so Nord's `focus` does not cross into light-theme luminance. |
+| Studios collapse-format caps at 2 named studios, `+N` beyond (ROD-261) | Mirrors the §3.8a genre-glyph cap (≤2, ambient rather than exhaustive) and keeps the rail's 8-col gutter from being blown out by a multi-studio co-production credit list. The full list still lives in the persisted column for any future full-detail surface — this only caps the rail's render. | If a 3-studio credit is the common case rather than the outlier, raise the cap to 3 before reaching for a wrap. |
+| Rank prefers a contextual RATED ranking over POPULAR when both exist, and drops the season name even for a season-scoped rank (ROD-261) | RATED reads closer to Rank's quality-signal intent — `popularity`'s raw count was rejected as noise (§5.3b), and a contextual *rank* needs to read as a different, sharper signal than that rejected field, not a rebrand of it. The season name is dropped from the render even when AniList scoped the ranking to a season, because the header's own season/year chip (§4.4) already carries that context on the same screen — repeating it would waste space Rank's 8-col gutter doesn't have. | If a season-scoped rank without the season name reads ambiguous in testing (e.g. a show that spans two cours), reconsider a compact season glyph. |
+| Airing countdown collapses to one coarsest unit and omits itself once stale, rather than showing a negative/zero value (ROD-261) | A combined `Nd Nh` value doesn't fit the chips row's terse register, and a countdown that has silently lapsed (a stale `nextAiringEpisode` in the window between the real airing time and the next enrichment refresh) would read as a bug if shown as `-2h` or `0d`. Omitting it instead degrades to the same "no countdown" state a not-yet-enriched show already renders — a known-good degrade (§9.1), not a new one. | If users want confirmation an episode aired without waiting for refresh, consider a distinct "just aired" state instead of silent omission. |
+| Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row — not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information — honoring Rod's "low-noise, JP shows nothing" ruling. | If CN/KR-origin shows are common enough in a user's library that the marker starts feeling load-bearing rather than incidental, promote it to `text.muted` or a small dedicated icon. |
 
 ---
 
@@ -1872,7 +1987,7 @@ aliases.
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null | `App.detailMetaFields()` (§5.3a, ROD-260) emits an ordered field list — Episodes then Format — rendered as the compact `N eps · kind` line (single-column surfaces) or the `Label  Value` rail (two-column surfaces) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format omits outright when `kind` is null. Studios, source, duration, a rail-only rank, and the `nextAiringEpisode` countdown (which lands on the chips row) are deferred — ROD-261 |
+| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, spec'd — not yet implemented) | `App.detailMetaFields()` (§5.3a, ROD-260/261) emits an ordered field list — Episodes, Format, Source, Duration, Studios, then a rail-only Rank — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank excluded) or the `Label  Value` rail (two-column surfaces, all six) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). The `nextAiringEpisode` countdown ships under the same ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
