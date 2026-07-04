@@ -193,6 +193,9 @@ pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
         .rank = if (rec.rank) |x| std.math.cast(u32, x) else null,
         .rank_type = rec.rank_type,
         .rank_year = if (rec.rank_year) |x| std.math.cast(u32, x) else null,
+        .next_airing_at = rec.next_airing_at,
+        .next_airing_episode = if (rec.next_airing_episode) |x| std.math.cast(u32, x) else null,
+        .country = rec.country,
     };
 }
 

@@ -331,17 +331,7 @@ fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16
     // Season chip: "冬 2026" etc. Only when both season and year are present.
     const has_season = anime.season != null and anime.year != null;
 
-    if (status_chip == null and !has_season) return start_row; // nothing to emit
-
-    // Render the whole row as one `win.print` of styled segments so vaxis
-    // advances wide-glyph (kanji) cell widths in a single consistent pass while
-    // each span keeps its own color (§2.3). Two spaces separate the two chips.
-    // Chips sit flush at col 0, aligning with the title/alt-title stack above —
-    // §4.4's "leading space" is for the chip rendered *inline after the title*;
-    // here it lives on its own row, so a leading indent would only misalign it
-    // (design review).
-    //
-    // CRITICAL: the season text must live in App-owned storage, not a stack
+    // CRITICAL: every chip's text must live in App-owned storage, not a stack
     // local. vaxis cells hold a *slice* into the segment text (not a copy), and
     // the frame isn't emitted until `render()` — well after this function
     // returns. A stack buffer would dangle and render as garbage (ROD-141).
@@ -351,19 +341,57 @@ fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16
     else
         "";
 
-    var segs: [3]vaxis.Segment = undefined;
+    // Airing countdown (ROD-261, §4.4): a live `state.now` segment recomputed from
+    // the wall clock (`now_ms` is `Clock.real`), so it survives a restart and lapses
+    // cleanly. Empty when the show isn't airing or the countdown already passed.
+    const now_secs = @divFloor(self.now_ms, 1000);
+    const airing_text: []const u8 = airingChipText(&self.detail_airing_buf, anime, now_secs) orelse "";
+
+    // Non-JP origin marker (ROD-261, §4.4): the bare AniList country code, dimmest
+    // tier, trailing last — JP is the default and shows nothing. Borrows the
+    // gpa-owned `anime.country` slice (frame-lived), so it needs no buffer.
+    const origin_text: []const u8 = if (anime.country) |cc|
+        (if (cc.len > 0 and !std.mem.eql(u8, cc, "JP")) cc else "")
+    else
+        "";
+
+    if (status_chip == null and !has_season and airing_text.len == 0 and origin_text.len == 0)
+        return start_row; // nothing to emit
+
+    // Render the whole row as one `win.print` of styled segments so vaxis advances
+    // wide-glyph (kanji) cell widths in a single consistent pass while each span
+    // keeps its own color (§2.3). Chips sit flush at col 0, aligning with the
+    // title/alt-title stack above; two spaces separate adjacent chips. Up to four
+    // segments (status · season · countdown · origin) → 7 slots with the gaps.
+    var segs: [7]vaxis.Segment = undefined;
     var n: usize = 0;
     if (status_chip) |chip| {
         segs[n] = .{ .text = chip.kanji, .style = self.s(chipColor(self, chip), .{}) };
         n += 1;
     }
     if (season_text.len > 0) {
-        // Two-space gap before the season chip when a status chip precedes it.
-        if (status_chip != null) {
+        if (n > 0) {
             segs[n] = .{ .text = "  ", .style = fg3 };
             n += 1;
         }
         segs[n] = .{ .text = season_text, .style = self.s(self.palette.focus, .{}) };
+        n += 1;
+    }
+    if (airing_text.len > 0) {
+        if (n > 0) {
+            segs[n] = .{ .text = "  ", .style = fg3 };
+            n += 1;
+        }
+        // Shares the airing status chip's `state.now` register — both mark "now".
+        segs[n] = .{ .text = airing_text, .style = self.s(self.palette.hot, .{}) };
+        n += 1;
+    }
+    if (origin_text.len > 0) {
+        if (n > 0) {
+            segs[n] = .{ .text = "  ", .style = fg3 };
+            n += 1;
+        }
+        segs[n] = .{ .text = origin_text, .style = fg3 }; // dimmest, least time-sensitive
         n += 1;
     }
     // wrap: .none — these prints target the multi-row pane window, so without it
@@ -371,6 +399,26 @@ fn drawChips(self: *App, win: vaxis.Window, h: u16, anime: Anime, start_row: u16
     _ = win.print(segs[0..n], .{ .row_offset = start_row, .col_offset = 0, .wrap = .none });
 
     return start_row + 1;
+}
+
+/// The airing-countdown chip text "Ep{episode} · {countdown}" (ROD-261, §4.4), or
+/// null when the show isn't airing, the episode number is missing, or the
+/// countdown has lapsed (`airingAt ≤ now` — a stale enrich between the real airing
+/// and the next re-pull; a wrong countdown is worse than none). The countdown
+/// collapses to a single coarsest unit — `Nd` ≥ 1 day, else `Nh` ≥ 1 hour, else
+/// `Nm` — recomputed from the live `now_secs` so it stays correct across a restart.
+fn airingChipText(buf: []u8, anime: Anime, now_secs: i64) ?[]const u8 {
+    const at = anime.next_airing_at orelse return null;
+    const ep = anime.next_airing_episode orelse return null;
+    const remaining = at - now_secs;
+    if (remaining <= 0) return null;
+    const day = 24 * 60 * 60;
+    const hour = 60 * 60;
+    if (remaining >= day)
+        return std.fmt.bufPrint(buf, "Ep{d} · {d}d", .{ ep, @divFloor(remaining, day) }) catch null;
+    if (remaining >= hour)
+        return std.fmt.bufPrint(buf, "Ep{d} · {d}h", .{ ep, @divFloor(remaining, hour) }) catch null;
+    return std.fmt.bufPrint(buf, "Ep{d} · {d}m", .{ ep, @divFloor(remaining, 60) }) catch null;
 }
 
 /// Score line — "[--/100]" until AniList enrichment fills `a.score`, then tiered
@@ -889,6 +937,38 @@ test "statusChipFor: null on unknown/empty" {
     try t.expect(statusChipFor("") == null);
     try t.expect(statusChipFor("unknown") == null);
     try t.expect(statusChipFor("AIRING") == null); // not a valid vocab word
+}
+
+test "airingChipText: coarsest unit, lapse, and missing data (ROD-261)" {
+    const t = std.testing;
+    var buf: [24]u8 = undefined;
+    const base: Anime = .{ .id = "x", .name = "X", .next_airing_episode = 14 };
+
+    // >= 1 day → Nd (never combines units, so 3d 5h renders just "3d").
+    var d = base;
+    d.next_airing_at = 1000 + 3 * 24 * 60 * 60 + 5 * 60 * 60;
+    try t.expectEqualStrings("Ep14 · 3d", airingChipText(&buf, d, 1000).?);
+
+    // < 1 day → Nh.
+    var h = base;
+    h.next_airing_at = 1000 + 5 * 60 * 60;
+    try t.expectEqualStrings("Ep14 · 5h", airingChipText(&buf, h, 1000).?);
+
+    // < 1 hour → Nm.
+    var m = base;
+    m.next_airing_at = 1000 + 20 * 60;
+    try t.expectEqualStrings("Ep14 · 20m", airingChipText(&buf, m, 1000).?);
+
+    // Lapsed (airingAt <= now) → null: a wrong countdown is worse than none.
+    var lapsed = base;
+    lapsed.next_airing_at = 900;
+    try t.expect(airingChipText(&buf, lapsed, 1000) == null);
+
+    // No airing data → null; airing but no episode → null.
+    try t.expect(airingChipText(&buf, base, 1000) == null);
+    var no_ep: Anime = .{ .id = "x", .name = "X" };
+    no_ep.next_airing_at = 1000 + 24 * 60 * 60;
+    try t.expect(airingChipText(&buf, no_ep, 1000) == null);
 }
 
 test "coverWidthFor: tiers off the pane width, capped at 20 (ROD-170 §3.3)" {

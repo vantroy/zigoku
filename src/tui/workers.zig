@@ -206,6 +206,8 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .score = a.score,
         .rank = a.rank,
         .rank_year = a.rank_year,
+        .next_airing_at = a.next_airing_at,
+        .next_airing_episode = a.next_airing_episode,
         .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
@@ -220,6 +222,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
     out.kind = try dupeOptText(alloc, a.kind);
     out.source_material = try dupeOptText(alloc, a.source_material);
     out.rank_type = try dupeOptText(alloc, a.rank_type);
+    out.country = try dupeOptText(alloc, a.country);
     out.genres = try dupeOwnedStrList(alloc, a.genres);
     out.studios = try dupeOwnedStrList(alloc, a.studios);
     return out;
@@ -237,6 +240,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     if (a.kind) |x| alloc.free(x);
     if (a.source_material) |x| alloc.free(x);
     if (a.rank_type) |x| alloc.free(x);
+    if (a.country) |x| alloc.free(x);
     if (a.genres.len > 0) {
         for (a.genres) |g| alloc.free(g);
         alloc.free(a.genres);
@@ -466,6 +470,9 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.rank == null) a.rank = meta.rank;
     if (a.rank_type == null) a.rank_type = dupeOptText(gpa, meta.rank_type) catch a.rank_type;
     if (a.rank_year == null) a.rank_year = meta.rank_year;
+    if (a.next_airing_at == null) a.next_airing_at = meta.next_airing_at;
+    if (a.next_airing_episode == null) a.next_airing_episode = meta.next_airing_episode;
+    if (a.country == null) a.country = dupeOptText(gpa, meta.country) catch a.country;
 }
 
 /// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`,
@@ -500,6 +507,9 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.rank == null) a.rank = if (rec.rank) |x| std.math.cast(u32, x) else null;
     if (a.rank_type == null) a.rank_type = dupeOptText(gpa, rec.rank_type) catch a.rank_type;
     if (a.rank_year == null) a.rank_year = if (rec.rank_year) |x| std.math.cast(u32, x) else null;
+    if (a.next_airing_at == null) a.next_airing_at = rec.next_airing_at;
+    if (a.next_airing_episode == null) a.next_airing_episode = if (rec.next_airing_episode) |x| std.math.cast(u32, x) else null;
+    if (a.country == null) a.country = dupeOptText(gpa, rec.country) catch a.country;
 }
 
 /// Background task: enrich one page of search results from AniList. `results` and

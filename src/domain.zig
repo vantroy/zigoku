@@ -244,6 +244,13 @@ pub const Anime = struct {
     rank: ?u32 = null,
     rank_type: ?[]const u8 = null,
     rank_year: ?u32 = null,
+    /// Next-episode airing (ROD-261): absolute `airingAt` unix timestamp + episode
+    /// number, from AniList. The chips row recomputes a live countdown from these
+    /// against `state.now` — see DESIGN §4.4. Present only for airing shows.
+    next_airing_at: ?i64 = null,
+    next_airing_episode: ?u32 = null,
+    /// AniList `countryOfOrigin` (JP/CN/KR…), surfaced only when not JP (ROD-261).
+    country: ?[]const u8 = null,
     /// Show kind ("TV", "Movie", "OVA"…). `type` is too close to a keyword to
     /// read well, so: `kind`.
     kind: ?[]const u8 = null,

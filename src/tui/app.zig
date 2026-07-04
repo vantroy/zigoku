@@ -791,6 +791,9 @@ pub const App = struct {
     detail_source_buf: [24]u8 = undefined,
     /// Rank rail value (ROD-261), rail-only "#N rated YYYY". Own buffer.
     detail_rank_buf: [24]u8 = undefined,
+    /// Airing-countdown chip value (ROD-261), "Ep14 · 3d" — its own frame-lived
+    /// buffer alongside the season chip's `detail_season_buf`.
+    detail_airing_buf: [24]u8 = undefined,
     detail_meta_fields: [6]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack

@@ -22,7 +22,7 @@ const ENDPOINT = "https://graphql.anilist.co";
 // one GraphQL POST (even a 50-id batch) is a single round trip.
 const ANILIST_DEADLINE_S = 10;
 // Shared selection set so the search and by-id queries can never drift apart.
-const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} description(asHtml:false) coverImage{large}";
+const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source countryOfOrigin genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} nextAiringEpisode{episode airingAt} description(asHtml:false) coverImage{large}";
 const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
@@ -78,6 +78,14 @@ pub const Metadata = struct {
     rank: ?u32 = null,
     rank_type: ?[]const u8 = null,
     rank_year: ?u32 = null,
+    /// Next-episode airing (ROD-261): the absolute `airingAt` unix timestamp and
+    /// the episode number. Persisted absolute so the countdown recomputes from the
+    /// live clock at render, surviving restarts (the relative `timeUntilAiring`
+    /// would go stale). Present only for currently-airing shows.
+    next_airing_at: ?i64 = null,
+    next_airing_episode: ?u32 = null,
+    /// AniList `countryOfOrigin` (JP/CN/KR…) — surfaced only when not JP (ROD-261).
+    country: ?[]const u8 = null,
 };
 
 const Title = struct {
@@ -116,6 +124,13 @@ const Ranking = struct {
     allTime: bool = false,
 };
 
+// AniList `nextAiringEpisode` (ROD-261) — the next episode's absolute airing
+// timestamp. Null on the media entirely for a finished/unscheduled show.
+const NextAiring = struct {
+    episode: ?u32 = null,
+    airingAt: ?i64 = null,
+};
+
 const Media = struct {
     id: u64,
     idMal: ?u64 = null,
@@ -129,9 +144,11 @@ const Media = struct {
     startDate: StartDate = .{},
     format: ?[]const u8 = null,
     source: ?[]const u8 = null,
+    countryOfOrigin: ?[]const u8 = null,
     genres: []const []const u8 = &.{},
     studios: Studios = .{},
     rankings: []const Ranking = &.{},
+    nextAiringEpisode: ?NextAiring = null,
     description: ?[]const u8 = null,
     coverImage: Cover = .{},
 };
@@ -387,6 +404,9 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
         .rank = if (sel) |r| r.rank else null,
         .rank_type = if (sel) |r| try stripControlsOpt(arena, r.type) else null,
         .rank_year = if (sel) |r| r.year else null,
+        .next_airing_at = if (m.nextAiringEpisode) |na| na.airingAt else null,
+        .next_airing_episode = if (m.nextAiringEpisode) |na| na.episode else null,
+        .country = try stripControlsOpt(arena, m.countryOfOrigin),
     };
 }
 
