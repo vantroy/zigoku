@@ -477,11 +477,12 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.total_episodes == null) a.total_episodes = if (rec.total_episodes) |x| std.math.cast(u32, x) else null;
     if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
     if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
-    // Season/start_date are pure values (no heap); genres is deep-copied into
-    // gpa so it outlives the caller's scratch arena and rides freeOwnedAnime.
+    // Season/start_date are pure values (no heap); genres/studios are deep-copied
+    // into gpa so they outlive the caller's scratch arena and ride freeOwnedAnime.
     if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
     if (a.start_date == null) a.start_date = rec.startDate();
     if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
+    if (a.studios.len == 0) a.studios = dupeOwnedStrList(gpa, rec.studios) catch a.studios;
 }
 
 /// Background task: enrich one page of search results from AniList. `results` and

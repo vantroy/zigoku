@@ -2048,6 +2048,37 @@ test "detail meta fields carry episodes then format in priority order (ROD-260)"
     app.search.results.deinit(std.testing.allocator);
 }
 
+test "detail meta fields append collapse-formatted studios after format (ROD-261)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+
+    // Three studios → the rail caps at two named plus a "+N" overflow marker.
+    const studios = try std.testing.allocator.alloc([]const u8, 3);
+    studios[0] = try std.testing.allocator.dupe(u8, "Madhouse");
+    studios[1] = try std.testing.allocator.dupe(u8, "Bones");
+    studios[2] = try std.testing.allocator.dupe(u8, "Ufotable");
+
+    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try std.testing.allocator.dupe(u8, "x"),
+        .name = try std.testing.allocator.dupe(u8, "X"),
+        .eps_sub = 28,
+        .kind = try std.testing.allocator.dupe(u8, "TV"),
+        .studios = studios,
+    });
+
+    const fields = app.detailMetaFields();
+    // Episodes, Format, then Studios — the rail tail, so it emits last of the three.
+    try testing.expectEqual(@as(usize, 3), fields.len);
+    try testing.expectEqualStrings("Studios", fields[2].label);
+    try testing.expectEqualStrings("Madhouse, Bones +1", fields[2].value);
+
+    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
+    app.search.results.deinit(std.testing.allocator);
+}
+
 test "detail meta fields floor to a dim '?' when no show is focused (ROD-260)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;

@@ -778,6 +778,11 @@ pub const App = struct {
     /// lesson). Sized for the eventual field union (the AniList-enrichment
     /// follow-up adds studios/source/duration/rank between Format and the tail).
     detail_meta_buf: [32]u8 = undefined,
+    /// Studios rail value (ROD-261), its own buffer so it can't collide with the
+    /// episode-count value in `detail_meta_buf` when both fields emit. Holds the
+    /// collapse-formatted `A, B +N` string; 64 bytes covers two studio names plus
+    /// the overflow marker.
+    detail_studios_buf: [64]u8 = undefined,
     detail_meta_fields: [6]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack

@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 6;
+const SCHEMA_VERSION: c_int = 7;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -157,6 +157,16 @@ const MIGRATION_V6 =
     \\ALTER TABLE anime ADD COLUMN enrichment_fieldset_version INTEGER;
 ;
 
+// ROD-261: the first field of the AniList "shopping trip" widening to land in the
+// store. `studios` was already fetched (`GQL_FIELDS`) and carried on domain.Anime,
+// but never persisted — so History (which never re-enriches in place) always
+// rendered an empty studios list. Same '\n'-joined-blob shape as `genres`; the
+// ENRICHMENT_FIELDSET_VERSION bump alongside this heals rows enriched before the
+// column existed (see the note above MIGRATION_V6).
+const MIGRATION_V7 =
+    \\ALTER TABLE anime ADD COLUMN studios TEXT;    -- '\n'-joined; same shape as genres
+;
+
 // ── Records ─────────────────────────────────────────────────────────────────
 
 /// A library/history row. Text fields returned from `loadHistory` are owned by
@@ -184,6 +194,9 @@ pub const AnimeRecord = struct {
     start_month: ?i64 = null,
     start_day: ?i64 = null,
     genres: []const []const u8 = &.{},
+    /// ROD-261: main animation studios, same '\n'-blob shape and borrowed/owned
+    /// contract as `genres` — the column joins at upsert, splits at load.
+    studios: []const []const u8 = &.{},
     /// ROD-182: unix seconds of the last successful AniList enrichment pull, or
     /// null if never enriched (also null for rows written before the v6 column).
     /// Drives `enrichmentStale` → refresh-on-view; never touched by user edits.
@@ -232,6 +245,7 @@ pub const AnimeRecord = struct {
             .start_month = if (a.start_date) |d| if (d.month) |m| @intCast(m) else null else null,
             .start_day = if (a.start_date) |d| if (d.day) |dd| @intCast(dd) else null else null,
             .genres = a.genres,
+            .studios = a.studios,
         };
     }
 
@@ -356,19 +370,20 @@ pub const Store = struct {
     /// stick or clobber a good cover (ROD-267 review). Note a new absolute *does*
     /// replace a stored absolute here (unlike the in-memory merge, which never
     /// churns absolute→absolute) — benign, the re-persisted URL is ~always the same.
-    /// `scratch` joins the genres list into a '\n' blob for binding (only touched
-    /// when `a.genres` is non-empty); pass an arena — like `putCachedEpisodes`,
-    /// the join isn't freed here, it rides the caller's arena to teardown. It is
-    /// safe to pass a non-arena (e.g. `testing.allocator`) ONLY when `a.genres` is
-    /// empty — then nothing is allocated and the lifetime contract is moot.
+    /// `scratch` joins the genres and studios lists into '\n' blobs for binding
+    /// (only touched when the respective list is non-empty); pass an arena — like
+    /// `putCachedEpisodes`, the joins aren't freed here, they ride the caller's
+    /// arena to teardown. It is safe to pass a non-arena (e.g. `testing.allocator`)
+    /// ONLY when both `a.genres` and `a.studios` are empty — then nothing is
+    /// allocated and the lifetime contract is moot.
     pub fn upsertAnime(self: *Store, a: AnimeRecord, now: i64, scratch: Allocator) Error!void {
         const sql =
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
             \\    cover_url, year, status, description, score, total_episodes,
             \\    list_status, user_rating, notes, play_count, progress, added_at, last_watched_at, history_visible,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -393,7 +408,8 @@ pub const Store = struct {
             \\    genres         = COALESCE(excluded.genres, anime.genres),
             \\    history_visible = MAX(excluded.history_visible, anime.history_visible),
             \\    enrichment_fetched_at = COALESCE(excluded.enrichment_fetched_at, anime.enrichment_fetched_at),
-            \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, anime.enrichment_fieldset_version)
+            \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, anime.enrichment_fieldset_version),
+            \\    studios        = COALESCE(excluded.studios, anime.studios)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -430,10 +446,17 @@ pub const Store = struct {
         if (a.genres.len == 0) {
             try checkBind(stmt, c.sqlite3_bind_null(stmt, 27));
         } else {
-            try bindText(stmt, 27, try joinGenres(scratch, a.genres));
+            try bindText(stmt, 27, try joinStrBlob(scratch, a.genres));
         }
         try bindOptI64(stmt, 28, a.enrichment_fetched_at);
         try bindOptI64(stmt, 29, a.enrichment_fieldset_version);
+        // Same empty→NULL rule as genres, so a re-search that carries no studios
+        // never wipes a list an earlier enrichment persisted (ROD-261).
+        if (a.studios.len == 0) {
+            try checkBind(stmt, c.sqlite3_bind_null(stmt, 30));
+        } else {
+            try bindText(stmt, 30, try joinStrBlob(scratch, a.studios));
+        }
 
         try self.stepDone(stmt);
     }
@@ -480,7 +503,7 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios
             \\FROM anime
             \\WHERE history_visible != 0
             \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
@@ -516,9 +539,10 @@ pub const Store = struct {
                 .start_year = colOptI64(stmt, 22),
                 .start_month = colOptI64(stmt, 23),
                 .start_day = colOptI64(stmt, 24),
-                .genres = try dupeGenres(arena, stmt, 25),
+                .genres = try dupeStrBlob(arena, stmt, 25),
                 .enrichment_fetched_at = colOptI64(stmt, 26),
                 .enrichment_fieldset_version = colOptI64(stmt, 27),
+                .studios = try dupeStrBlob(arena, stmt, 28),
                 .history_visible = true,
             });
         }
@@ -532,7 +556,7 @@ pub const Store = struct {
             \\    year, status, description, score, total_episodes, list_status,
             \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible
+            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios
             \\FROM anime
             \\WHERE source = ? AND source_id = ?
         ;
@@ -567,12 +591,13 @@ pub const Store = struct {
             .start_year = colOptI64(stmt, 22),
             .start_month = colOptI64(stmt, 23),
             .start_day = colOptI64(stmt, 24),
-            .genres = try dupeGenres(arena, stmt, 25),
+            .genres = try dupeStrBlob(arena, stmt, 25),
             .enrichment_fetched_at = colOptI64(stmt, 26),
             .enrichment_fieldset_version = colOptI64(stmt, 27),
             // ROD-182: surface real visibility (loadHistory hardcodes true since it
             // only returns visible rows) so refresh-on-view can gate on "tracked".
             .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
+            .studios = try dupeStrBlob(arena, stmt, 29),
         };
     }
 
@@ -857,7 +882,7 @@ pub const Store = struct {
     /// `enrichmentStale` no matter its clock, so widened columns heal on next view
     /// rather than waiting out the TTL. Not a schema knob — `SCHEMA_VERSION` gates
     /// migrations; this gates enrichment freshness, and the two move independently.
-    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 1;
+    pub const ENRICHMENT_FIELDSET_VERSION: i64 = 2; // ROD-261: +studios column
 
     /// TTL in seconds for cached *enrichment metadata* on the `anime` row, keyed
     /// off airing status. A deliberately longer curve than `cacheTtl` (which
@@ -998,6 +1023,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 6;");
             v = 6;
         }
+        if (v < 7) {
+            try self.exec(MIGRATION_V7);
+            try self.exec("PRAGMA user_version = 7;");
+            v = 7;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -1123,21 +1153,22 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-// Genres persist as a single '\n'-joined blob (display-only — never queried by
-// genre, so a column beats a side table). Genre names never contain newlines,
-// the same guarantee episode labels lean on in episode_cache.
-fn joinGenres(scratch: Allocator, genres: []const []const u8) Error![]const u8 {
+// A string list persists as a single '\n'-joined blob (display-only — never
+// queried by element, so a column beats a side table). Genre and studio names
+// never contain newlines, the same guarantee episode labels lean on in
+// episode_cache. Shared by both `genres` and `studios` (ROD-261).
+fn joinStrBlob(scratch: Allocator, items: []const []const u8) Error![]const u8 {
     var blob: std.ArrayList(u8) = .empty;
-    for (genres, 0..) |g, i| {
+    for (items, 0..) |g, i| {
         if (i != 0) try blob.append(scratch, '\n');
         try blob.appendSlice(scratch, g);
     }
     return blob.items;
 }
 
-/// Split the stored genres blob back into an arena-owned list. A NULL/empty
+/// Split a stored '\n'-blob column back into an arena-owned list. A NULL/empty
 /// column is an empty list, never a one-element list of "".
-fn dupeGenres(arena: Allocator, stmt: Stmt, idx: c_int) Error![]const []const u8 {
+fn dupeStrBlob(arena: Allocator, stmt: Stmt, idx: c_int) Error![]const []const u8 {
     const blob = (try dupeText(arena, stmt, idx)) orelse return &.{};
     if (blob.len == 0) return &.{};
     var list: std.ArrayList([]const u8) = .empty;
@@ -1312,7 +1343,7 @@ test "getAnime returns persisted enrichment" {
     try testing.expectEqualStrings("Elf mage grief hour", rec.description orelse "");
 }
 
-test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
+test "enrichment fields (season/native/kind/start_date/genres/studios) round-trip" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -1320,9 +1351,10 @@ test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
     var s = try Store.openMemory();
     defer s.close();
 
-    // Persist via the real domain→record path so the @tagName / Date / genres
-    // mapping in fromDomain is exercised, not hand-rolled record literals.
+    // Persist via the real domain→record path so the @tagName / Date / genres /
+    // studios mapping in fromDomain is exercised, not hand-rolled record literals.
     const genres = [_][]const u8{ "Action", "Adventure", "Fantasy" };
+    const studios = [_][]const u8{"Madhouse"};
     const rec = AnimeRecord.fromDomain(T_SOURCE, .{
         .id = "frieren",
         .name = "Sousou no Frieren",
@@ -1331,6 +1363,7 @@ test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
         .start_date = .{ .year = 2023, .month = 9, .day = 29 },
         .kind = "TV",
         .genres = &genres,
+        .studios = &studios,
     }, .sub);
     try s.upsertAnime(rec, 1000, arena);
 
@@ -1345,6 +1378,8 @@ test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
     try testing.expectEqual(@as(usize, 3), got.genres.len);
     try testing.expectEqualStrings("Action", got.genres[0]);
     try testing.expectEqualStrings("Fantasy", got.genres[2]);
+    try testing.expectEqual(@as(usize, 1), got.studios.len);
+    try testing.expectEqualStrings("Madhouse", got.studios[0]);
 
     // loadHistory path sees the same blob split back into a list.
     const rows = try s.loadHistory(arena);
@@ -1352,9 +1387,11 @@ test "enrichment fields (season/native/kind/start_date/genres) round-trip" {
     try testing.expectEqualStrings("fall", rows[0].season orelse "");
     try testing.expectEqual(@as(usize, 3), rows[0].genres.len);
     try testing.expectEqualStrings("Adventure", rows[0].genres[1]);
+    try testing.expectEqual(@as(usize, 1), rows[0].studios.len);
+    try testing.expectEqualStrings("Madhouse", rows[0].studios[0]);
 }
 
-test "a later search without genres preserves the persisted genres list" {
+test "a later search without genres/studios preserves the persisted lists" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -1363,14 +1400,19 @@ test "a later search without genres preserves the persisted genres list" {
     defer s.close();
 
     const genres = [_][]const u8{ "Action", "Fantasy" };
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .genres = &genres }, 1000, arena);
-    // A plain re-search carries no genres (empty list → NULL bind → COALESCE keeps
-    // the stored blob, same rule the scalar enrichment fields lean on).
+    const studios = [_][]const u8{ "Madhouse", "Bones" };
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .genres = &genres, .studios = &studios }, 1000, arena);
+    // A plain re-search carries neither genres nor studios (empty list → NULL bind
+    // → COALESCE keeps the stored blob, same rule the scalar enrichment fields lean
+    // on). Studios must survive it exactly as genres does (ROD-261).
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X" }, 2000, arena);
 
     const got = (try s.getAnime(arena, T_SOURCE, "x")) orelse return error.TestExpectationFailed;
     try testing.expectEqual(@as(usize, 2), got.genres.len);
     try testing.expectEqualStrings("Action", got.genres[0]);
+    try testing.expectEqual(@as(usize, 2), got.studios.len);
+    try testing.expectEqualStrings("Madhouse", got.studios[0]);
+    try testing.expectEqualStrings("Bones", got.studios[1]);
 }
 
 test "empty genres reads back as an empty list, never [\"\"]" {

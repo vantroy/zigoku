@@ -185,6 +185,7 @@ pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
         .status = rec.status,
         .description = rec.description,
         .genres = rec.genres,
+        .studios = rec.studios,
         .score = if (rec.score) |x| std.math.cast(u32, x) else null,
         .kind = rec.kind,
     };
@@ -380,7 +381,34 @@ pub fn detailMetaFields(self: *App) []const MetaField {
         }
     }
 
+    // Studios (ROD-261) — main animation studios, collapse-formatted A / A, B /
+    // A, B +N. Rail tail (lowest visible priority for now), so a height-starved
+    // rail sheds it first; omitted outright when the list is empty (§9.1). Source
+    // and Duration will later slot between Format and this per §5.3a.
+    if (a.studios.len > 0) {
+        const v = formatStudios(&self.detail_studios_buf, a.studios);
+        if (v.len > 0) {
+            self.detail_meta_fields[n] = .{ .label = "Studios", .value = v };
+            n += 1;
+        }
+    }
+
     return self.detail_meta_fields[0..n];
+}
+
+/// Collapse a studio list to the rail form: `A`, `A, B`, or `A, B +N` (ROD-261,
+/// §5.3a). Caps at two named studios — mirroring the §3.8a genre-glyph cap — so a
+/// long co-production credit can't blow the rail's 8-col gutter; the overflow
+/// rides a `+N` suffix. Writes into the App-owned `buf` (slice must outlive the
+/// frame); a name too long for `buf` degrades to the borrowed first name, whose
+/// lifetime matches the field's `a` exactly as Format's borrowed `kind` does.
+fn formatStudios(buf: []u8, studios: []const []const u8) []const u8 {
+    return switch (studios.len) {
+        0 => "",
+        1 => std.fmt.bufPrint(buf, "{s}", .{studios[0]}) catch studios[0],
+        2 => std.fmt.bufPrint(buf, "{s}, {s}", .{ studios[0], studios[1] }) catch studios[0],
+        else => std.fmt.bufPrint(buf, "{s}, {s} +{d}", .{ studios[0], studios[1], studios.len - 2 }) catch studios[0],
+    };
 }
 
 pub fn currentDetailSourceName(self: *const App, provider: SourceProvider) []const u8 {
