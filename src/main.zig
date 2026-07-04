@@ -102,9 +102,19 @@ pub fn main(init: std.process.Init) !void {
 
     // ROD-283: `zigoku login` connects an AniList account (OAuth Implicit Grant)
     // and writes auth.zon, then exits. A subcommand, not a flag — intercepted
-    // before the positional is read as a search query.
+    // before the positional is read as a search query. Defaults to the loopback
+    // listener (auto-captures the browser redirect); `--paste`, or a loopback that
+    // can't start, uses the SSH-safe manual paste flow.
     if (isLoginCommand(args)) {
-        try zigoku.login.run(arena, io, out);
+        if (hasFlag(args, "--paste")) {
+            try zigoku.login.run(arena, io, out);
+        } else zigoku.login_loopback.run(arena, io, out) catch |err| switch (err) {
+            error.LoopbackUnavailable => {
+                try out.print("  (couldn't start the loopback listener — falling back to paste)\n\n", .{});
+                try zigoku.login.run(arena, io, out);
+            },
+            else => return err,
+        };
         try out.flush();
         return;
     }
