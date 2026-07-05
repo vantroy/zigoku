@@ -221,6 +221,10 @@ pub const PullSummary = struct {
     unmatched: usize = 0,
     /// Rows whose `applyPulled` write errored; logged per row, the run continues.
     failed: usize = 0,
+    /// Rows a concurrent local edit (the TUI) moved between our read and our write —
+    /// the optimistic guard skipped them to avoid clobbering the edit; they reconcile
+    /// next run. Reported so the skip isn't silent.
+    contended: usize = 0,
     /// No AniList token on file — nothing attempted; run `zigoku login`.
     signed_out: bool = false,
     /// Token past its expiry — nothing attempted; re-auth needed.
@@ -281,10 +285,12 @@ fn reconcile(base: ?Pair, local: Pair, remote: Pair) Merged {
 /// dates the expiry check. Fetches the whole collection in one round trip, then
 /// hands the entries to the network-free `reconcileAll` core.
 pub fn pullAll(gpa: Allocator, io: Io, st: *Store, credentials: auth.Auth, now_unix: i64) PullSummary {
-    // Same gate as the push, plus the user-id the pull query needs.
+    // Same gate as the push, plus the user-id the pull query needs. `<= 0`, not `== 0`:
+    // a negative id is as unusable as a zero one (a corrupt/hand-edited auth.zon) and
+    // must not ride onto the wire as a GraphQL Int.
     if (!credentials.hasAniList()) return .{ .signed_out = true };
     if (credentials.anilist.isExpired(now_unix)) return .{ .expired = true };
-    if (credentials.anilist.user_id == 0) return .{ .no_user_id = true };
+    if (credentials.anilist.user_id <= 0) return .{ .no_user_id = true };
 
     // The fetched entry slice lives in this arena for the whole reconcile —
     // `PulledEntry` is all scalars (no borrowed slices), so nothing outlives it.
@@ -296,15 +302,21 @@ pub fn pullAll(gpa: Allocator, io: Io, st: *Store, credentials: auth.Auth, now_u
         io,
         credentials.anilist.access_token,
         credentials.anilist.user_id,
-    ) catch |e| return switch (e) {
+    ) catch |e| return classifyPullOutcome(e);
+    return reconcileAll(gpa, st, entries);
+}
+
+/// Map a fetch-side `PullError` to the summary bucket that reports it — split out of
+/// `pullAll` so the mapping has runtime coverage without an injectable transport
+/// (pull has no per-row `Effects` seam like the push loop). A failed fetch and an
+/// OOM'd fetch both mean "no list to reconcile", one report line; the exhaustive
+/// switch means a future `PullError` arm can't be silently dropped.
+fn classifyPullOutcome(e: anilist.PullError) PullSummary {
+    return switch (e) {
         error.RateLimited => .{ .rate_limited = true },
         error.Unauthorized => .{ .unauthorized = true },
-        // A failed fetch and an OOM'd fetch both mean "no list to reconcile" — one
-        // report line. (Pull is total; there's no per-row bucket to absorb an OOM
-        // into up here, unlike the push loop.)
         error.PullFailed, error.OutOfMemory => .{ .fetch_failed = true },
     };
-    return reconcileAll(gpa, st, entries);
 }
 
 /// The testable core of the pull: given the already-fetched remote `entries` and the
@@ -361,11 +373,18 @@ fn reconcileAll(gpa: Allocator, st: *Store, entries: []const anilist.PulledEntry
         const snap_changed = base == null or base.?.status != entry.status or base.?.progress != entry.progress;
         if (!local_changed and !snap_changed) continue; // already in sync — nothing to write
 
-        st.applyPulled(row.source, row.source_id, merged.status, merged.progress, entry.status, entry.progress) catch |e| {
+        // Guarded on the pre-merge local pair — if the TUI moved this row between the
+        // bulk read above and now, the write is skipped rather than clobbering it.
+        const applied = st.applyPulled(row.source, row.source_id, merged.status, merged.progress, entry.status, entry.progress, row.list_status, row.progress) catch |e| {
             summary.failed += 1;
             log.debug("pull: applyPulled failed for {s}/{s}: {s}", .{ row.source, row.source_id, @errorName(e) });
             continue;
         };
+        if (!applied) {
+            summary.contended += 1;
+            log.debug("pull: {s}/{s} changed under reconcile — skipped, retries next run", .{ row.source, row.source_id });
+            continue;
+        }
         if (local_changed) summary.updated += 1;
     }
 
@@ -570,6 +589,14 @@ test "reconcile: first contact (no ancestor) adopts remote onto planning, keeps 
         try testing.expectEqual(@as(i64, 4), m.progress);
         try testing.expect(!m.status_conflict);
     }
+    // Both sides already agree on a non-default status with no ancestor → keep it, no
+    // conflict (converged independently — the fourth branch, by name).
+    {
+        const m = reconcile(null, .{ .status = .completed, .progress = 12 }, .{ .status = .completed, .progress = 12 });
+        try testing.expectEqual(S.completed, m.status);
+        try testing.expectEqual(@as(i64, 12), m.progress);
+        try testing.expect(!m.status_conflict);
+    }
 }
 
 test "pullAll: signed-out / expired / no-user-id are no-ops before any fetch (ROD-285)" {
@@ -694,4 +721,108 @@ test "reconcileAll: first contact adopts an AniList status onto an unsynced plan
     try testing.expectEqual(@as(i64, 12), rec.progress);
     // Snapshot baselined to remote → clean (local == remote here).
     try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+}
+
+test "classifyPullOutcome: each fetch error maps to its own summary bucket (ROD-285)" {
+    // Runtime coverage for the pull's error→summary mapping (pull has no injectable
+    // transport seam like the push loop, so the switch is proven here in isolation).
+    try testing.expect(classifyPullOutcome(error.RateLimited).rate_limited);
+    try testing.expect(classifyPullOutcome(error.Unauthorized).unauthorized);
+    try testing.expect(classifyPullOutcome(error.PullFailed).fetch_failed);
+    try testing.expect(classifyPullOutcome(error.OutOfMemory).fetch_failed);
+}
+
+test "reconcileAll: a rewatch (REPEATING→watching) adopts watching but keeps progress via max (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // Local completed@12, synced there.
+    try seedReconcilable(&s, arena, "a", 42, .completed, 12);
+    try s.markSynced("allanime", "a", .completed, 12);
+
+    // classifyMediaList has already folded AniList's REPEATING → .watching; the rewatch
+    // reset remote progress to 2. Only remote moved (completed→watching) → adopt the
+    // watching status, but max keeps the completed episode count — the design-mandated
+    // outcome (you don't lose 12 episodes because a rewatch restarted the counter).
+    const entries = [_]anilist.PulledEntry{.{ .media_id = 42, .status = .watching, .progress = 2 }};
+    const sum = reconcileAll(testing.allocator, &s, &entries);
+
+    try testing.expectEqual(@as(usize, 1), sum.updated);
+    const rec = (try s.getAnime(arena, "allanime", "a")).?;
+    try testing.expectEqual(domain.ListStatus.watching, rec.list_status);
+    try testing.expectEqual(@as(i64, 12), rec.progress);
+}
+
+// A fake AniList list backing a `pushDirty` run: `save` writes the pushed value into
+// an in-memory map (AniList's server state), and `toEntries` reads it back as the
+// pull's input — so a test can drive push and pull against the SAME remote and prove
+// the *order* between them matters.
+const FakeAniList = struct {
+    entries: std.AutoHashMapUnmanaged(i64, anilist.PulledEntry) = .empty,
+    backing: Allocator,
+
+    fn save(ptr: *anyopaque, arena: Allocator, media_id: i64, status: domain.ListStatus, progress: i64) anilist.PushError!i64 {
+        _ = arena;
+        const self: *FakeAniList = @ptrCast(@alignCast(ptr));
+        // A push is a blind upsert — it overwrites whatever AniList held for this media.
+        self.entries.put(self.backing, media_id, .{ .media_id = media_id, .status = status, .progress = progress }) catch return error.OutOfMemory;
+        return media_id; // any non-null entry id counts as a landed push
+    }
+    fn sleepImpl(ptr: *anyopaque, dur: Io.Duration) void {
+        _ = ptr;
+        _ = dur;
+    }
+    fn effects(self: *FakeAniList) Effects {
+        return .{ .ptr = self, .saveFn = save, .sleepFn = sleepImpl };
+    }
+    fn toEntries(self: *FakeAniList, a: Allocator) ![]anilist.PulledEntry {
+        var list: std.ArrayList(anilist.PulledEntry) = .empty;
+        var it = self.entries.iterator();
+        while (it.next()) |kv| try list.append(a, kv.value_ptr.*);
+        return list.toOwnedSlice(a);
+    }
+};
+
+test "pull-before-push preserves AniList history a blind push-first would wipe (ROD-285 regression)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    // The reachable first-sync scenario: locally we've watched eps 1-3 (engaged, never
+    // synced); AniList already holds this show at watching@10 (watched on another
+    // device). AniList is the fake remote, pre-loaded with the richer history.
+
+    // ── The BUG (push-first): push blind-upserts local watching@3 over AniList's
+    //    watching@10, then pull reads back watching@3 — 7 episodes of real remote
+    //    history destroyed, and reported clean.
+    {
+        var s = try Store.openMemory();
+        defer s.close();
+        try seedReconcilable(&s, arena, "a", 42, .watching, 3);
+        var fake = FakeAniList{ .backing = arena };
+        try fake.entries.put(arena, 42, .{ .media_id = 42, .status = .watching, .progress = 10 });
+
+        _ = pushDirty(testing.allocator, &s, fake.effects());
+        try testing.expectEqual(@as(i64, 3), fake.entries.get(42).?.progress); // remote wiped 10 → 3
+        _ = reconcileAll(testing.allocator, &s, try fake.toEntries(arena));
+        try testing.expectEqual(@as(i64, 3), (try s.getAnime(arena, "allanime", "a")).?.progress); // unrecoverable
+    }
+
+    // ── The FIX (pull-first, the shipped order): pull sees watching@10 first, max
+    //    lifts local to 10, then push carries 10 back up. Nothing lost; both converge.
+    {
+        var s = try Store.openMemory();
+        defer s.close();
+        try seedReconcilable(&s, arena, "a", 42, .watching, 3);
+        var fake = FakeAniList{ .backing = arena };
+        try fake.entries.put(arena, 42, .{ .media_id = 42, .status = .watching, .progress = 10 });
+
+        _ = reconcileAll(testing.allocator, &s, try fake.toEntries(arena));
+        try testing.expectEqual(@as(i64, 10), (try s.getAnime(arena, "allanime", "a")).?.progress); // preserved
+        _ = pushDirty(testing.allocator, &s, fake.effects());
+        try testing.expectEqual(@as(i64, 10), fake.entries.get(42).?.progress); // remote stays at 10
+    }
 }

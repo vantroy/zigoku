@@ -816,14 +816,23 @@ pub const Store = struct {
         return rows.toOwnedSlice(arena);
     }
 
-    /// Apply a reconciled pull to one row (ROD-285): set the merged local
-    /// (list_status, progress) AND advance the sync snapshot to what AniList now
-    /// holds, in one UPDATE. The snapshot becomes the *remote* pair (server truth),
-    /// not the merged pair — so if the merge kept a locally-ahead value (a conflict
-    /// resolved local-authoritative, or a higher local progress), the row reads
-    /// dirty against the snapshot and the next push carries that delta back up. The
-    /// two directions compose: pull sets the baseline to the server, push closes any
-    /// remaining local→remote gap.
+    /// Apply a reconciled pull to one row (ROD-285) — but only if the row still holds
+    /// the `(expected_status, expected_progress)` pair the merge was computed from.
+    /// Sets the merged local (list_status, progress) AND advances the sync snapshot to
+    /// what AniList now holds, in one guarded UPDATE. Returns `true` when the write
+    /// landed, `false` when the guard matched zero rows — i.e. a concurrent writer (the
+    /// TUI's `recordPlay`/`setListStatus`) moved the row between the bulk
+    /// `loadReconcileRows` read and this write. `reconcileAll` computes the merge from a
+    /// point-in-time snapshot with no transaction spanning the loop, so without this
+    /// guard a mid-flight local edit would be silently clobbered (a lost update); the
+    /// guard turns that race into a skip that simply re-reconciles next run. This
+    /// matters more once ROD-286 runs sync in-process alongside the live TUI.
+    ///
+    /// The snapshot becomes the *remote* pair (server truth), not the merged pair — so
+    /// if the merge kept a locally-ahead value (a conflict resolved local-authoritative,
+    /// or a higher local progress), the row reads dirty against the snapshot and the
+    /// next push carries that delta back up. The two directions compose: pull sets the
+    /// baseline to the server, push closes any remaining local→remote gap.
     pub fn applyPulled(
         self: *Store,
         source: []const u8,
@@ -832,11 +841,14 @@ pub const Store = struct {
         progress: i64,
         synced_status: domain.ListStatus,
         synced_progress: i64,
-    ) Error!void {
+        expected_status: domain.ListStatus,
+        expected_progress: i64,
+    ) Error!bool {
         const sql =
             \\UPDATE anime
             \\SET list_status = ?, progress = ?, synced_status = ?, synced_progress = ?
             \\WHERE source = ? AND source_id = ?
+            \\  AND list_status = ? AND progress = ?
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -846,7 +858,12 @@ pub const Store = struct {
         try checkBind(stmt, c.sqlite3_bind_int64(stmt, 4, synced_progress));
         try bindText(stmt, 5, source);
         try bindText(stmt, 6, source_id);
+        try bindText(stmt, 7, expected_status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 8, expected_progress));
         try self.stepDone(stmt);
+        // sqlite3_changes counts rows the WHERE matched — 0 means the guard failed
+        // (the row changed underneath us), not an error.
+        return c.sqlite3_changes(self.db) > 0;
     }
 
     /// Full stored metadata for one show, or null if it was never persisted.
@@ -1802,8 +1819,9 @@ test "applyPulled: writes merged local pair + a server-truth snapshot; leaves a 
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .list_status = .watching, .progress = 3, .history_visible = true }, 1000, arena);
 
     // Reconcile kept a locally-ahead value (completed@12) while AniList still holds
-    // (watching, 8): local pair = merged, snapshot = remote (server truth).
-    try s.applyPulled(T_SOURCE, "a", .completed, 12, .watching, 8);
+    // (watching, 8): local pair = merged, snapshot = remote (server truth). The row
+    // still holds the (watching, 3) it was seeded with → the guard matches, so it lands.
+    try testing.expect(try s.applyPulled(T_SOURCE, "a", .completed, 12, .watching, 8, .watching, 3));
 
     // The merged local pair landed.
     const rec = (try s.getAnime(arena, T_SOURCE, "a")).?;
@@ -1817,9 +1835,32 @@ test "applyPulled: writes merged local pair + a server-truth snapshot; leaves a 
     try testing.expectEqual(domain.ListStatus.completed, dirty[0].list_status);
     try testing.expectEqual(@as(i64, 12), dirty[0].progress);
 
-    // A clean pull-in (merged == remote) instead leaves the row clean.
-    try s.applyPulled(T_SOURCE, "a", .completed, 12, .completed, 12);
+    // A clean pull-in (merged == remote) instead leaves the row clean. The row now
+    // holds (completed, 12), so that's the expected guard pair.
+    try testing.expect(try s.applyPulled(T_SOURCE, "a", .completed, 12, .completed, 12, .completed, 12));
     try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+}
+
+test "applyPulled: the optimistic guard skips a row that changed underneath (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .list_status = .watching, .progress = 5, .history_visible = true }, 1000, arena);
+
+    // Reconcile read the row as watching@5. Then a concurrent play (the TUI) advances
+    // it to 7 before this write lands — the exact read-then-write race.
+    try s.recordPlay(T_SOURCE, "a", 7, 2000, true);
+    try testing.expectEqual(@as(i64, 7), (try s.getAnime(arena, T_SOURCE, "a")).?.progress);
+
+    // applyPulled still carries the STALE expected pair (watching@5) from the bulk read.
+    // The guard matches zero rows → false, and the concurrent value (7) is left intact
+    // (no lost update); the row simply re-reconciles next run.
+    const applied = try s.applyPulled(T_SOURCE, "a", .completed, 12, .watching, 5, .watching, 5);
+    try testing.expect(!applied);
+    try testing.expectEqual(@as(i64, 7), (try s.getAnime(arena, T_SOURCE, "a")).?.progress);
 }
 
 test "upsertAnime cover_url: an absolute cover survives a later relative re-search (ROD-267)" {

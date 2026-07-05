@@ -529,6 +529,23 @@ pub fn fromAniListStatus(s: []const u8) ?domain.ListStatus {
 /// `PullFailed`.
 pub const PullError = error{ RateLimited, Unauthorized, PullFailed } || Allocator.Error;
 
+/// Upper bound on a pulled `progress` (ROD-285 hardening). AniList `progress` is an
+/// episode count — a few thousand at the extreme (One Piece is ~1100). But it's an
+/// UNTRUSTED external integer: a buggy/hostile API, a MITM, or the user's own
+/// devtools-edited account could return an absurd value that flows unchecked into the
+/// `progress` column and then into `render.drawProgressBar`'s `progress * bar_w`
+/// arithmetic, where a near-i64-max value overflows and panics (ReleaseSafe keeps the
+/// check on). Clamping at this ingestion boundary bounds the value before it can be
+/// persisted — generous enough (100k) that no real list is touched, small enough that
+/// `progress * bar_w` can never overflow. Negatives clamp to 0 (a negative episode
+/// count is meaningless). Belt to render.zig's suspenders — defend at the trust
+/// boundary AND at the use site.
+const MAX_SANE_PROGRESS: i64 = 100_000;
+
+fn clampProgress(p: i64) i64 {
+    return std.math.clamp(p, 0, MAX_SANE_PROGRESS);
+}
+
 // `userId` rides as a GraphQL variable (never interpolated into the query), so the
 // query is a constant with nothing to escape — comptime-guarded like the others.
 const MLC_QUERY = "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress}}}}";
@@ -593,7 +610,9 @@ fn classifyMediaList(arena: Allocator, r: HttpResult) PullError![]const PulledEn
             const media_id = e.mediaId orelse continue; // an entry with no media is unusable
             const status_str = e.status orelse continue; // no status → nothing to reconcile
             const status = fromAniListStatus(status_str) orelse continue; // unknown enum → skip
-            const entry: PulledEntry = .{ .media_id = media_id, .status = status, .progress = e.progress };
+            // Clamp progress at the trust boundary before it can reach a store write
+            // or downstream render arithmetic (see MAX_SANE_PROGRESS).
+            const entry: PulledEntry = .{ .media_id = media_id, .status = status, .progress = clampProgress(e.progress) };
             const gop = try seen.getOrPut(arena, media_id);
             if (gop.found_existing) {
                 out.items[gop.value_ptr.*] = entry; // dup across lists — last wins (identical anyway)
@@ -1079,6 +1098,28 @@ test "classifyMediaList: distinct errors for 429/401, failure on malformed/no-da
     // A reachable account with an empty list is a confirmed empty answer → empty slice.
     const empty = try classifyMediaList(a, .{ .status = .ok, .body = "{\"data\":{\"MediaListCollection\":{\"lists\":[]}}}" });
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "classifyMediaList: clamps an untrusted progress at the ingestion boundary (ROD-285)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A near-i64-max progress (hostile/MITM/devtools-edited) and a negative one — both
+    // must land bounded so they can never overflow render's `progress * bar_w` or
+    // persist as garbage. A normal value passes through untouched.
+    const body =
+        \\{"data":{"MediaListCollection":{"lists":[{"entries":[
+        \\{"mediaId":1,"status":"CURRENT","progress":9223372036854775807},
+        \\{"mediaId":2,"status":"CURRENT","progress":-42},
+        \\{"mediaId":3,"status":"CURRENT","progress":12}
+        \\]}]}}}
+    ;
+    const entries = try classifyMediaList(a, .{ .status = .ok, .body = body });
+    var byId = std.AutoHashMap(i64, PulledEntry).init(a);
+    for (entries) |e| try byId.put(e.media_id, e);
+    try std.testing.expectEqual(MAX_SANE_PROGRESS, byId.get(1).?.progress); // capped
+    try std.testing.expectEqual(@as(i64, 0), byId.get(2).?.progress); // negative floored
+    try std.testing.expectEqual(@as(i64, 12), byId.get(3).?.progress); // normal untouched
 }
 
 test "normalizeTitle folds ASCII punctuation and whitespace" {

@@ -202,8 +202,8 @@ fn describeOpenStoreError(err: anyerror) []const u8 {
     };
 }
 
-/// Drive one `zigoku sync`: open the store, load the AniList token, push local
-/// changes up (ROD-284) then pull remote changes down and reconcile (ROD-285),
+/// Drive one `zigoku sync`: open the store, load the AniList token, pull remote
+/// changes down and reconcile (ROD-285) then push local changes up (ROD-284),
 /// printing a one-shot report for each direction. Best-effort throughout — a missing
 /// store or token is a friendly line, never a crash. Both engines are total (return
 /// a summary, never error), so every real outcome is a printed line.
@@ -231,18 +231,32 @@ fn runSync(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
         try out.flush();
     }
 
-    // Push local changes up first (ROD-284), then pull remote changes down and
-    // reconcile (ROD-285). Push-before-pull is deliberate: a landed push advances the
-    // snapshot, so the pull's 3-way merge sees the freshest ancestor and won't re-flag
-    // a row we just reconciled outward as an inbound change.
-    const push = zigoku.sync.pushAll(arena, io, &store, credentials, now);
-    try printSyncSummary(out, push);
-
-    // Pull only when the token is usable AND the push didn't already hit a terminal
-    // token/limit wall — otherwise we'd duplicate its line (or re-hit the same 429).
-    if (usable and !push.unauthorized and !push.rate_limited) {
+    // Pull remote changes down and reconcile FIRST (ROD-285), then push local changes
+    // up (ROD-284). Pull-before-push is load-bearing on a first sync: `pushAll` is a
+    // blind upsert, and every never-synced row is push-dirty, so pushing first would
+    // overwrite AniList's real history with an untouched local default before the
+    // 3-way merge ever saw it (progress destroyed, reported "clean"). Pulling first
+    // lets that remote history land locally (progress = max, nothing lost); the push
+    // then carries the *merged* value up instead of clobbering the account.
+    var skip_push = false;
+    if (usable) {
         const pull = zigoku.sync.pullAll(arena, io, &store, credentials, now);
         try printPullSummary(out, pull);
+        // Skip the push if the pull already hit a wall the push would hit too: a
+        // rejected token or a rate limit apply to both, and an unreadable store means
+        // `loadDirtyForSync` will fail the same way — re-running push would only
+        // duplicate the line or, under lock contention, double the busy-timeout stall
+        // (ROD-287). A mere fetch miss (network flaked on the pull) doesn't gate push —
+        // it has its own transport and failure reporting.
+        skip_push = pull.unauthorized or pull.rate_limited or pull.store_error;
+    }
+
+    // Push second. When the token isn't usable, `printPullSummary` stays silent on the
+    // signed-out/expired arms, so this push+`printSyncSummary` is what surfaces that
+    // line (its lead arms own those messages).
+    if (!skip_push) {
+        const push = zigoku.sync.pushAll(arena, io, &store, credentials, now);
+        try printSyncSummary(out, push);
     }
 }
 
@@ -273,12 +287,16 @@ fn printPullSummary(out: *Io.Writer, s: zigoku.sync.PullSummary) !void {
         return;
     }
 
-    if (s.updated == 0) {
-        try out.print("  already in step with AniList — nothing to pull in.\n", .{});
-    } else {
-        try out.print("  pulled {d} update(s) in from AniList.\n", .{s.updated});
+    if (s.updated > 0) {
+        try out.print("  pulled {d} update(s) from AniList.\n", .{s.updated});
+    } else if (s.conflicts == 0) {
+        // Mirror the push side's idiom exactly (they print back-to-back). Suppressed
+        // when conflicts > 0 — the row isn't actually "up to date", it's dirty for the
+        // next push, and the conflicts footer below carries that.
+        try out.print("  already up to date — nothing to pull in.\n", .{});
     }
-    if (s.conflicts > 0) try out.print("  ({d} kept your local status over AniList's — they'll push back up next sync.)\n", .{s.conflicts});
+    if (s.conflicts > 0) try out.print("  ({d} show(s) kept your local status over AniList's — they'll push back up next sync.)\n", .{s.conflicts});
+    if (s.contended > 0) try out.print("  ({d} show(s) changed mid-sync — left as-is, will reconcile next run.)\n", .{s.contended});
     if (s.failed > 0) try out.print("  {d} local update(s) failed to save — re-run with --debug for details.\n", .{s.failed});
     if (s.unmatched > 0) try out.print("  ({d} AniList show(s) aren't in your local library yet — not imported.)\n", .{s.unmatched});
 }
@@ -702,7 +720,7 @@ test "printPullSummary: each mutually-exclusive lead line (ROD-285)" {
         .{ .s = .{ .rate_limited = true }, .needle = "rate limit" },
         .{ .s = .{ .fetch_failed = true }, .needle = "couldn't fetch" },
         .{ .s = .{ .store_error = true }, .needle = "couldn't read" },
-        .{ .s = .{ .updated = 0 }, .needle = "already in step" },
+        .{ .s = .{ .updated = 0 }, .needle = "already up to date" },
         .{ .s = .{ .reconciled = 3, .updated = 2 }, .needle = "pulled 2 update" },
     };
     for (cases) |c| {
@@ -715,16 +733,24 @@ test "printPullSummary: each mutually-exclusive lead line (ROD-285)" {
 test "printPullSummary: advisory footers stack; a lead line short-circuits (ROD-285)" {
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    const out = try renderPull(.{ .remote_entries = 9, .reconciled = 4, .updated = 2, .conflicts = 1, .failed = 1, .unmatched = 5 }, &aw);
+    const out = try renderPull(.{ .remote_entries = 9, .reconciled = 4, .updated = 2, .conflicts = 1, .contended = 1, .failed = 1, .unmatched = 5 }, &aw);
     try std.testing.expect(std.mem.indexOf(u8, out, "pulled 2 update") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "kept your local status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "changed mid-sync") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "failed to save") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "not imported") != null);
-    // A no-user-id lead line short-circuits — no tally, no footers.
+    // updated == 0 with conflicts > 0 must NOT print the contradictory "up to date"
+    // lead — the conflicts footer speaks instead.
     var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw2.deinit();
-    const out2 = try renderPull(.{ .no_user_id = true, .unmatched = 9 }, &aw2);
-    try std.testing.expect(std.mem.indexOf(u8, out2, "not imported") == null);
+    const out2 = try renderPull(.{ .reconciled = 2, .updated = 0, .conflicts = 2 }, &aw2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "already up to date") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "kept your local status") != null);
+    // A no-user-id lead line short-circuits — no tally, no footers.
+    var aw3 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw3.deinit();
+    const out3 = try renderPull(.{ .no_user_id = true, .unmatched = 9 }, &aw3);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "not imported") == null);
 }
 
 test "handleVersionFlag emits the version line and signals exit only on a version flag" {

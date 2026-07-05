@@ -40,6 +40,13 @@ pub fn barFracColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *
     return if (selected and list_focused and is_progressing) pal.fg2 else pal.fg3;
 }
 
+/// Ceiling on the `progress` operand of the fill multiply (`p * bar_w`) so it can't
+/// overflow i64 on a corrupt/hostile value. `bar_w` is a u16 (≤ 65535), so 1e9 keeps
+/// the product ≤ ~6.5e13, far under i64 max, while dwarfing any real episode count
+/// (One Piece ~1100). Only reached when `progress < total_episodes`; at/above total the
+/// bar is already full. See drawProgressBar and ROD-285's MAX_SANE_PROGRESS.
+const PROGRESS_MULT_CEILING: i64 = 1_000_000_000;
+
 /// §4.5 progress bar for a history row. `row_bg` is the row's background color
 /// (bg.surface for the focused entry while the list pane has focus, bg.base
 /// otherwise). `frac_buf` must be App-owned — vaxis holds a reference until the
@@ -48,18 +55,30 @@ pub fn barFracColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *
 /// list's right edge, accounting for the left margin) — the frac is clipped to it
 /// so it can't bleed into a neighbour. `selected`/`list_focused` gate the §4.1
 /// selection affordance into the fill (ROD-194).
+/// How many of `bar_w` cells to fill for `progress` of `total_episodes` watched.
+/// Pure + overflow-proof so it's testable without a vaxis window and can't panic on a
+/// corrupt/hostile `progress` (see PROGRESS_MULT_CEILING). `total_episodes` null or
+/// ≤ 0 → the "unknown length" heuristic (a third-full stub when any progress exists).
+fn progressFill(progress: i64, total_episodes: ?i64, bar_w: u16) u16 {
+    const total = total_episodes orelse return if (progress > 0) bar_w / 3 else 0;
+    if (total <= 0) return if (progress > 0) bar_w / 3 else 0;
+    const p = @max(0, progress);
+    // Full bar once watched ≥ the episode count. Deciding this BEFORE the multiply
+    // below means `p * bw` only runs with p < total, and capping p at
+    // PROGRESS_MULT_CEILING keeps that product from overflowing i64 on a corrupt or
+    // hostile progress/total (belt to ROD-285's ingestion clamp — ReleaseSafe turns an
+    // overflow here into a render-loop panic, so guard it at the use site too, not only
+    // at the trust boundary).
+    if (p >= total) return bar_w;
+    const bw: i64 = @intCast(bar_w);
+    const f = @divTrunc(@min(p, PROGRESS_MULT_CEILING) * bw, total);
+    return @intCast(@min(bw, f));
+}
+
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette, selected: bool, list_focused: bool) void {
     const is_paused = rec.list_status == .paused;
 
-    const filled: u16 = blk: {
-        if (rec.total_episodes) |total| {
-            if (total <= 0) break :blk if (rec.progress > 0) bar_w / 3 else 0;
-            const bw: i64 = @intCast(bar_w);
-            const f = @divTrunc(@max(0, rec.progress) * bw, total);
-            break :blk @intCast(@min(bw, f));
-        }
-        break :blk if (rec.progress > 0) bar_w / 3 else 0;
-    };
+    const filled: u16 = progressFill(rec.progress, rec.total_episodes, bar_w);
 
     const fill_color = barFillColor(rec, selected, list_focused, pal);
     const frac_color = barFracColor(rec, selected, list_focused, pal);
@@ -220,6 +239,27 @@ const testing = std.testing;
 
 fn mkRec(status: domain.ListStatus) AnimeRecord {
     return .{ .source = "s", .source_id = "i", .title = "t", .list_status = status };
+}
+
+test "progressFill: proportional, clamped, and overflow-proof on a hostile progress (ROD-285)" {
+    // Normal proportional fill.
+    try std.testing.expectEqual(@as(u16, 12), progressFill(6, 12, 24)); // half of 24
+    try std.testing.expectEqual(@as(u16, 0), progressFill(0, 12, 24));
+    // At/over the episode count → full bar (never over-fills).
+    try std.testing.expectEqual(@as(u16, 24), progressFill(12, 12, 24));
+    try std.testing.expectEqual(@as(u16, 24), progressFill(99, 12, 24));
+    // Unknown/zero total → the third-full "some progress" stub.
+    try std.testing.expectEqual(@as(u16, 8), progressFill(3, null, 24));
+    try std.testing.expectEqual(@as(u16, 0), progressFill(0, null, 24));
+    try std.testing.expectEqual(@as(u16, 8), progressFill(3, 0, 24));
+    // Negative progress floors to empty, not a wrap.
+    try std.testing.expectEqual(@as(u16, 0), progressFill(-5, 12, 24));
+    // The overflow vector review flagged (ROD-285): a near-i64-max progress must NOT
+    // overflow `p * bar_w` (ReleaseSafe would panic the render loop) — it saturates.
+    try std.testing.expectEqual(@as(u16, 24), progressFill(std.math.maxInt(i64), 12, 24));
+    // And even with a corrupt-huge total (so p < total, forcing the multiply path),
+    // the capped operand keeps the product from overflowing.
+    _ = progressFill(std.math.maxInt(i64) - 1, std.math.maxInt(i64), 40); // must not panic
 }
 
 test "barFillColor: focus cyan is the cursor, and the cursor overrides status (ROD-194)" {
