@@ -23,6 +23,7 @@
 //! string because anime labels aren't integers ("1.5" recaps, "SP1" specials).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const domain = @import("domain.zig");
 const Allocator = std.mem.Allocator;
 
@@ -41,6 +42,16 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
 const SCHEMA_VERSION: c_int = 11;
+
+/// Milliseconds SQLite waits on a held lock before giving up with SQLITE_BUSY, set
+/// once per connection in `open` (ROD-287). Two processes now share one DB as a
+/// normal pattern — the TUI plus a standalone/cron'd `zigoku sync` — so a writer can
+/// find the write lock held by the other. This bounds the wait: long enough to sit
+/// out the other side's one-time migration or a single short UPDATE (the `markSynced`
+/// vs. enrichment-upsert collision), short enough that a pathological pile-up can't
+/// freeze a foreground write for more than a beat. Reads never wait under WAL, so the
+/// render loop — which is all reads — is unaffected regardless of this value.
+const BUSY_TIMEOUT_MS: c_int = 3000;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -390,6 +401,10 @@ pub const Store = struct {
         }
         var self: Store = .{ .db = db };
         errdefer self.close();
+        // Bound lock-contention waits before the first statement runs so migrate()'s
+        // BEGIN IMMEDIATE — and every later writer — sits out a concurrent holder
+        // instead of erroring immediately (ROD-287). See BUSY_TIMEOUT_MS.
+        _ = c.sqlite3_busy_timeout(self.db, BUSY_TIMEOUT_MS);
         try self.exec("PRAGMA journal_mode = WAL;");
         try self.exec("PRAGMA foreign_keys = ON;");
         try self.migrate();
@@ -1185,67 +1200,86 @@ pub const Store = struct {
     // ── internals ────────────────────────────────────────────────────────────
 
     fn migrate(self: *Store) Error!void {
+        // Fast path: read the version WITHOUT a write lock (reads never block under
+        // WAL). The common case — an already-current DB — writes nothing, so routine
+        // opens (every launch, every `zigoku sync`) never contend for the write lock.
         var v = try self.userVersion();
         // A DB written by a newer Zigoku knows a schema we don't. Refuse it as a
-        // real error (the best-effort caller falls back to no persistence)
-        // rather than asserting our way into a panic.
+        // real error (the best-effort caller falls back to no persistence) rather
+        // than asserting our way into a panic — and before taking any write lock.
         if (v > SCHEMA_VERSION) return error.SchemaTooNew;
+        if (v == SCHEMA_VERSION) return; // nothing to migrate
+
+        // A migration is needed. Run the whole check-and-apply under ONE write
+        // transaction (ROD-287). BEGIN IMMEDIATE takes the write lock up front, and
+        // busy_timeout (set in open) makes a second opener racing the same schema
+        // window wait for us rather than erroring with 'duplicate column name'.
+        // Atomicity is the real prize: the ALTERs and the version bump commit
+        // together or roll back together, so an interrupted migrate can never leave
+        // the half-applied state (columns added, user_version un-bumped) that used to
+        // brick every future open. (This prevents NEW half-applied states; it does
+        // not heal one an older build already wrote — that needs idempotent ALTERs.)
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+
+        // Re-read under the lock: whoever we just waited out may have already migrated.
+        v = try self.userVersion();
+        if (v > SCHEMA_VERSION) return error.SchemaTooNew; // errdefer rolls back
+        if (v == SCHEMA_VERSION) {
+            try self.exec("COMMIT;"); // someone else finished the ladder; nothing to do
+            return;
+        }
+
         if (v < 1) {
             try self.exec(MIGRATION_V1);
-            try self.exec("PRAGMA user_version = 1;");
             v = 1;
         }
         if (v < 2) {
             try self.exec(MIGRATION_V2);
-            try self.exec("PRAGMA user_version = 2;");
             v = 2;
         }
         if (v < 3) {
             try self.exec(MIGRATION_V3);
-            try self.exec("PRAGMA user_version = 3;");
             v = 3;
         }
         if (v < 4) {
             try self.exec(MIGRATION_V4);
-            try self.exec("PRAGMA user_version = 4;");
             v = 4;
         }
         if (v < 5) {
             try self.exec(MIGRATION_V5);
-            try self.exec("PRAGMA user_version = 5;");
             v = 5;
         }
         if (v < 6) {
             try self.exec(MIGRATION_V6);
-            try self.exec("PRAGMA user_version = 6;");
             v = 6;
         }
         if (v < 7) {
             try self.exec(MIGRATION_V7);
-            try self.exec("PRAGMA user_version = 7;");
             v = 7;
         }
         if (v < 8) {
             try self.exec(MIGRATION_V8);
-            try self.exec("PRAGMA user_version = 8;");
             v = 8;
         }
         if (v < 9) {
             try self.exec(MIGRATION_V9);
-            try self.exec("PRAGMA user_version = 9;");
             v = 9;
         }
         if (v < 10) {
             try self.exec(MIGRATION_V10);
-            try self.exec("PRAGMA user_version = 10;");
             v = 10;
         }
         if (v < 11) {
             try self.exec(MIGRATION_V11);
-            try self.exec("PRAGMA user_version = 11;");
             v = 11;
         }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
+
+        // One bump at the end: the whole ladder commits atomically below, so per-step
+        // bumps would be redundant. Derived from SCHEMA_VERSION so it can't drift.
+        try self.exec(std.fmt.comptimePrint("PRAGMA user_version = {d};", .{SCHEMA_VERSION}));
+        try self.exec("COMMIT;");
     }
 
     fn userVersion(self: *Store) Error!c_int {
@@ -1403,6 +1437,98 @@ test "open + migrate sets user_version" {
     var s = try Store.openMemory();
     defer s.close();
     try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
+}
+
+/// Absolute, null-terminated path to a file inside a fresh test tmp dir. `:memory:`
+/// can't be shared between connections, so the concurrent-opener tests below need a
+/// real file. The caller owns `tmp_dir` — it must outlive the returned path.
+fn tmpDbPath(arena: Allocator, tmp_dir: *std.testing.TmpDir, name: []const u8) ![:0]const u8 {
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
+    const cwd_str = std.mem.sliceTo(&cwd_buf, 0);
+    return std.fmt.allocPrintSentinel(arena, "{s}/.zig-cache/tmp/{s}/{s}", .{ cwd_str, tmp_dir.sub_path, name }, 0);
+}
+
+test "concurrent open migrates atomically — no double-apply, no half-applied schema (ROD-287)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const db_path = try tmpDbPath(arena, &tmp_dir, "concurrent.db");
+
+    // Two independent connections open the same fresh (v0) file at once, both racing
+    // the full 0→N ladder. The BEGIN IMMEDIATE txn + busy_timeout must serialize them:
+    // exactly one applies the ALTERs, the other waits, re-reads the bumped version,
+    // and skips every step. Neither errors, and the schema lands consistent. Under the
+    // old two-exec migrate this raced to 'duplicate column name' or a half-applied brick.
+    const Worker = struct {
+        fn run(path: [:0]const u8, err_slot: *?anyerror) void {
+            var s = Store.open(path) catch |e| {
+                err_slot.* = e;
+                return;
+            };
+            s.close();
+        }
+    };
+
+    var err_a: ?anyerror = null;
+    var err_b: ?anyerror = null;
+    const t_a = try std.Thread.spawn(.{}, Worker.run, .{ db_path, &err_a });
+    const t_b = try std.Thread.spawn(.{}, Worker.run, .{ db_path, &err_b });
+    t_a.join();
+    t_b.join();
+
+    try testing.expectEqual(@as(?anyerror, null), err_a);
+    try testing.expectEqual(@as(?anyerror, null), err_b);
+
+    // A fresh open sees a fully-migrated, consistent schema after the race.
+    var s = try Store.open(db_path);
+    defer s.close();
+    try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
+}
+
+test "a second writer waits out a held write lock, then recovers (ROD-287)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const db_path = try tmpDbPath(arena, &tmp_dir, "contended.db");
+
+    var a = try Store.open(db_path);
+    defer a.close();
+    var b = try Store.open(db_path);
+    defer b.close();
+
+    // Shorten B's patience so the held-lock branch resolves fast instead of blocking
+    // the test for the full BUSY_TIMEOUT_MS.
+    _ = c.sqlite3_busy_timeout(b.db, 50);
+
+    // A holds the write lock. We drive B's contention at the C level so the expected
+    // SQLITE_BUSY doesn't route through the logging exec() wrapper — this test runner
+    // fails a test that logs at .err (see the "bind error" test). The property under
+    // test is busy_timeout's: a second writer (the markSynced-vs-enrichment-upsert
+    // collision) degrades to a clean BUSY, never a crash or a silent dropped write.
+    try a.exec("BEGIN IMMEDIATE;");
+    try testing.expectEqual(c.SQLITE_BUSY, c.sqlite3_exec(b.db, "BEGIN IMMEDIATE;", null, null, null));
+
+    // A releases; the same acquisition on B now succeeds — the collision was transient.
+    try a.exec("COMMIT;");
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(b.db, "BEGIN IMMEDIATE;", null, null, null));
+    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(b.db, "COMMIT;", null, null, null));
+
+    // A real write through B then lands and reads back — the handle is healthy, not
+    // wedged by the earlier contention.
+    const seed = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "z1", .name = "Zoro", .eps_sub = 12 }, .sub);
+    try b.upsertAnime(seed, 1000, arena);
+    const rows = try b.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("z1", rows[0].source_id);
 }
 
 test "bind error surfaces instead of writing a silent NULL" {
