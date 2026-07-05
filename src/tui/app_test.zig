@@ -2039,6 +2039,152 @@ test "cover settle arms in wide history and fires on .tick (ROD-202)" {
     try testing.expectEqual(@as(i64, 0), app.cover_sync_deadline_ms);
 }
 
+// ── action-triggered AniList push debounce (ROD-291) ─────────────────────────
+
+test "action-sync arms the push debounce on a status key, gated on connection (ROD-291)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12, .anilist_id = 100 }, 1000, arena);
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // Connected: a status key (`c` → completed) schedules a debounced push.
+    app.anilist_connected = true;
+    try testTick(&app, keyEv('c', .{}));
+    try testing.expect(app.sync_flush_deadline_ms > 0);
+
+    // Not connected: arming is a no-op — with no usable token the push side rail
+    // must never spin, so a mutation leaves the deadline untouched.
+    app.sync_flush_deadline_ms = 0;
+    app.anilist_connected = false;
+    try testTick(&app, keyEv('w', .{}));
+    try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
+}
+
+test "action-sync arms on undo (ROD-291)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "a", .title = "A", .total_episodes = 12, .anilist_id = 100 }, 1000, arena);
+    try st.recordPlay("s", "a", 5, 2000, true); // watching, progress 5
+
+    const recs = try st.loadHistory(arena);
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.history = recs;
+    app.list_cursor = 0;
+    app.anilist_connected = true;
+    defer if (app.undo) |u| u.free(testing.allocator);
+
+    // `c` arms (and records an undo entry); clear the deadline to isolate the undo.
+    try testTick(&app, keyEv('c', .{}));
+    app.sync_flush_deadline_ms = 0;
+
+    // `u` restores the prior pair — itself a mutation AniList must learn about, so it
+    // re-arms the debounce.
+    try testTick(&app, keyEv('u', .{}));
+    try testing.expect(app.sync_flush_deadline_ms > 0);
+}
+
+test "action-sync arms on a finished episode, gated on connection (ROD-291)" {
+    var store = try store_mod.Store.openMemory();
+    defer store.close();
+    try store.upsertAnime(.{ .source = "allanime", .source_id = "show1", .title = "Test Show", .anilist_id = 100 }, 1000, testing.allocator);
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &store;
+    app.anilist_connected = true;
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "3");
+    app.session.episode_index = 3;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
+
+    // Connected: a meaningful finish (past NATURAL_END_RATIO) moves progress via
+    // recordPlay and schedules a flush.
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
+    try testing.expect(app.sync_flush_deadline_ms > 0);
+
+    // Not connected: the same finish must NOT arm. Re-seed the session (finish cleared
+    // it) and disconnect, then drive another meaningful finish.
+    app.sync_flush_deadline_ms = 0;
+    app.anilist_connected = false;
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "4");
+    app.session.episode_index = 4;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
+    try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
+}
+
+test "action-sync debounce fires and clears on .tick (ROD-291)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.anilist_connected = true;
+
+    // A due deadline is consumed by the .tick that finds it (fireSyncFlush is a no-op
+    // under builtin.is_test, so the deadline-clear is the observable contract — the
+    // same shape as the cover-settle test above).
+    app.sync_flush_deadline_ms = 1; // due in the past
+    try testTick(&app, .tick);
+    try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
+}
+
+test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (ROD-291)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    // A push landed → a low-key info whisper.
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.info, t.kind);
+    try testing.expect(!t.persistent);
+
+    // A pull that changed local rows flags a history reload so the view refreshes.
+    var rel: App = .{};
+    rel.gpa = testing.allocator;
+    try testing.expect(!rel.history_dirty);
+    try testTick(&rel, .{ .sync_flushed = .{ .reconciled = 1 } });
+    try testing.expect(rel.history_dirty);
+
+    // Mid-session expiry drops the cached connected flag (stops the churn, seeds ROD-295).
+    var exp: App = .{};
+    exp.gpa = testing.allocator;
+    exp.anilist_connected = true;
+    try testTick(&exp, .{ .sync_flushed = .{ .expired = true } });
+    try testing.expect(!exp.anilist_connected);
+
+    // Nothing landed (a no-op flush, or a soft failure) → silence: no toast at all.
+    var quiet: App = .{};
+    quiet.gpa = testing.allocator;
+    try testTick(&quiet, .{ .sync_flushed = .{ .pushed = 0 } });
+    try testing.expect(quiet.toast_queue[0] == null);
+}
+
 test "browse list pane detail render info uses selected anime" {
     var app: App = .{};
     app.gpa = std.testing.allocator;

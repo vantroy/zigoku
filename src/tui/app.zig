@@ -28,6 +28,7 @@ const workers = @import("workers.zig");
 const config_mod = @import("../config.zig");
 const paths = @import("../paths.zig");
 const log = @import("../log.zig");
+const auth_mod = @import("../auth.zig");
 
 // Per-view render passes, extracted along the tick/draw seam (ROD-144).
 const chrome = @import("view/chrome.zig");
@@ -194,6 +195,34 @@ pub fn run(
     };
     defer app.deinitOwnedState(&vx, writer);
 
+    // ── AniList connection (ROD-291) ──────────────────────────────────────────
+    // Resolve the token once at boot into a session-lived arena so the action-sync
+    // coordinator can hand it to each background flush without re-reading the file.
+    // Best-effort, exactly like the CLI's runSync: an absent or unreadable token
+    // leaves `anilist_connected` false, and every armSyncFlush is then a no-op — the
+    // TUI runs identically, the sync side rail simply never fires. A mid-session expiry
+    // is deliberately NOT re-checked here (the flush's pull/push both return a no-op and
+    // the handler drops `anilist_connected`; the reconnect nudge is ROD-295). The arena
+    // outlives every flush thread on the error-unwind path — its deinit defer is
+    // registered before the sync-thread join below, so LIFO frees the token only after
+    // that join. (On the ordinary quit path both are skipped by `_exit`.)
+    var auth_arena = std.heap.ArenaAllocator.init(gpa);
+    defer auth_arena.deinit();
+    if (auth_mod.defaultPath(auth_arena.allocator())) |auth_path| {
+        app.anilist_auth = auth_mod.load(auth_arena.allocator(), io, auth_path);
+        app.anilist_connected = app.anilist_auth.hasAniList() and
+            !app.anilist_auth.anilist.isExpired(Store.nowSecs());
+    } else |e| {
+        log.debug("anilist: no config dir for token: {s}", .{@errorName(e)});
+    }
+
+    // Seed the tick clock now so a mutation landing before the first .tick (e.g. a
+    // scripted keypress at launch, as a capture/e2e harness fires) arms the sync
+    // debounce off a real timestamp instead of the 0 default — otherwise that first
+    // deadline would be ~3 s past the epoch and fire on the very next tick, collapsing
+    // the debounce window (ROD-291 review).
+    app.now_ms = nowMs(io);
+
     // History memory lives in a double-buffered pair of arenas owned here and
     // freed on exit (ROD-191), matching store.loadHistory's arena-in contract.
     // At any moment one arena backs the live `self.history` slice (`hist_live`);
@@ -247,6 +276,16 @@ pub fn run(
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
     defer if (app.enrich_thread) |t| t.join();
+    // ROD-291: join an in-flight AniList flush on the error-unwind / test teardown path
+    // so it can't touch a torn-down loop/store/gpa or the freed token arena. Like the
+    // search/enrich/cover joins above, this defer is SKIPPED on the ordinary quit path —
+    // `q`/Ctrl-C fall through to the ROD-232 fast-exit `_exit(0)`, which abandons every
+    // in-flight worker atomically. That's safe for this writer: the DB is WAL crash-safe
+    // and SaveMediaListEntry is idempotent, so a push abandoned before its markSynced
+    // leaves the row dirty and re-flushes next session. (ROD-294 will add a bounded quit
+    // wait if we want the flush to actually finish on quit — there's nothing to bound
+    // today, since quit never waits on it.)
+    defer if (app.sync_thread) |t| t.join();
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view workers
@@ -822,6 +861,31 @@ pub const App = struct {
     /// blocking the UI thread on the cover joinThread for — every row's art it
     /// scrolls past (ROD-202). 0 = no pending settle.
     cover_sync_deadline_ms: i64 = 0,
+
+    // ── action-triggered AniList push (ROD-291) ───────────────────────────────
+    /// The loaded AniList token, resolved once at boot in run() into a session-lived
+    /// arena. Passed by value to each background flush; a mid-session expiry just
+    /// makes `pushAll` return its no-op `.expired` arm (the reconnect nudge is ROD-295).
+    anilist_auth: auth_mod.Auth = .{},
+    /// Cached at boot: `hasAniList() and !isExpired`. The single gate `armSyncFlush`
+    /// checks — with no usable token, arming is a no-op and the push machinery never
+    /// spins. Deliberately a boot snapshot; ROD-295 owns re-evaluating it on expiry.
+    anilist_connected: bool = false,
+    /// Debounce deadline (ms) for the background push, mirroring
+    /// `cover_sync_deadline_ms`. A local mutation to a linked row arms it; a binge of
+    /// episode-marks coalesces into one flush. Serviced in .tick. 0 = nothing pending.
+    sync_flush_deadline_ms: i64 = 0,
+    /// One flush at a time. Set true when a `syncFlushTask` is spawned; cleared ONLY by
+    /// the worker's own teardown defer (`inflight.store(false)`), which runs on every
+    /// exit path — so a dropped `postEvent` can't latch it on. The `.sync_flushed`
+    /// handler does NOT clear it. A deadline that fires while this holds re-arms instead
+    /// of stacking a second flush onto the same dirty set.
+    sync_flush_inflight: std.atomic.Value(bool) = .init(false),
+    /// Handle for the in-flight flush thread; joined before spawning the next, and on the
+    /// error-unwind / test teardown path. The ordinary quit path (`_exit(0)`, ROD-232)
+    /// skips that join and abandons the thread — safe and self-healing (see the join
+    /// defer in run()).
+    sync_thread: ?std.Thread = null,
     /// Last-seen terminal width (columns). Seeded in layout() every frame from
     /// real geometry so onKey/tick can gate split-browse and wide-history
     /// behaviour without being passed the winsize event.
@@ -1029,6 +1093,11 @@ pub const App = struct {
                 // Sync EpisodeState when the detail pane is bound to this show.
                 syncEpisodeProgress(self, e.source, e.source_id, e.prev_progress);
 
+                // ROD-291: an undo restores a prior pair — itself a mutation AniList
+                // must learn about (the restored value may differ from what we last
+                // pushed), so schedule a push like any other local change.
+                self.armSyncFlush();
+
                 self.pushToast(.info, "undone", false);
             },
         }
@@ -1110,6 +1179,9 @@ pub const App = struct {
                 if (t > 0) rec.progress = t;
             }
         }
+
+        // ROD-291: the status key (p/x/c/w) moved this row's pair; schedule a push.
+        self.armSyncFlush();
     }
 
     pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
@@ -1188,6 +1260,57 @@ pub const App = struct {
         };
     }
 
+    /// Arm the debounced AniList sync (ROD-291). Called at each local mutation that can
+    /// move a linked row's (list_status, progress) pair — a finished episode, a status
+    /// key (p/x/c/w), an undo. Gated on a cached usable token so an unconnected session
+    /// never touches the machinery. Only sets the deadline; .tick fires the actual
+    /// off-thread flush once it elapses, coalescing a burst into one. Uses the last-tick
+    /// clock (`now_ms`, seeded once at boot so it is never the 0 default here) rather
+    /// than a fresh syscall — a ≤100 ms-stale timestamp is immaterial against a 3 s
+    /// settle, and it keeps every call site free of an `io` param.
+    fn armSyncFlush(self: *App) void {
+        if (!self.anilist_connected) return;
+        self.sync_flush_deadline_ms = self.now_ms + App.sync_flush_settle_ms;
+    }
+
+    /// Fire the debounced flush (ROD-291): spawn `syncFlushTask` (pull-then-push, off the
+    /// render thread) when `sync_flush_deadline_ms` elapses. Both engines are total, so
+    /// this is just "kick a worker" — no per-row plumbing, and a dropped run self-heals
+    /// (rows stay dirty for the next arm/launch). One flush at a time: if one is still
+    /// running, re-arm rather than stack a second onto the same dirty set.
+    ///
+    /// NOTE (tested-debt): the whole body short-circuits under `builtin.is_test` — it
+    /// spawns a real thread that hits the network, which a unit test can't have. So the
+    /// inflight gate, the reap-before-spawn, and the spawn-failure recovery below are
+    /// exercised only by hand / integration, not the suite. Accepted deliberately: the
+    /// tested logic lives in the pure engines (`sync.zig`'s `reconcile` + its `Effects`
+    /// seam); this function is orchestration around a thread spawn that has no
+    /// unit-testable seam worth the contortion. Keep it thin so that stays true.
+    fn fireSyncFlush(self: *App, loop: *Loop, io: std.Io) void {
+        if (builtin.is_test) return; // don't spawn a real network flush under test
+        const st = self.store orelse return;
+        if (!self.anilist_connected) return;
+        if (self.sync_flush_inflight.load(.acquire)) {
+            // Still flushing — retry shortly after it finishes; rows stay dirty.
+            self.sync_flush_deadline_ms = nowMs(io) + App.sync_flush_settle_ms;
+            return;
+        }
+        // Reap the previous (now-finished, since inflight is clear) handle before
+        // spawning the next, matching the search/enrich single-handle discipline.
+        if (self.sync_thread) |t| {
+            t.join();
+            self.sync_thread = null;
+        }
+        self.sync_flush_inflight.store(true, .release);
+        self.sync_thread = std.Thread.spawn(.{}, workers.syncFlushTask, .{
+            loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight,
+        }) catch |e| blk: {
+            log.debug("sync flush spawn failed: {s}", .{@errorName(e)});
+            self.sync_flush_inflight.store(false, .release);
+            break :blk null;
+        };
+    }
+
     fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, completed: bool) void {
         // Capture the session facts ROD-131 needs *before* finish() clears them:
         // the played episode (1-based) and whether the detail pane still shows
@@ -1204,7 +1327,13 @@ pub const App = struct {
         // brand-new show, so mark it dirty; run() reloads at a safe seam. A trivial
         // quit (no meaningful position) recorded nothing → no reload.
         if (final_update) |u| {
-            if (u.isMeaningful()) self.history_dirty = true;
+            if (u.isMeaningful()) {
+                self.history_dirty = true;
+                // ROD-291: a meaningful finish moved this row's progress (session.finish's
+                // recordPlay); schedule a debounced push. The isMeaningful gate is a
+                // superset of finish's recordPlay gate, so this can't miss a written row.
+                self.armSyncFlush();
+            }
         }
 
         self.session.finish(self.gpa, self.store, final_update, completed);
@@ -1363,6 +1492,26 @@ pub const App = struct {
                 self.cover_sync_deadline_ms = 0;
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
+            },
+            .sync_flushed => |outcome| {
+                // ROD-291: the pull-then-push flush settled. inflight was already cleared
+                // by the worker's defer — nothing to unlatch here.
+                // The pull reconciled remote changes into local rows: if any actually
+                // changed, the in-memory history slice is stale, so flag a reload at a
+                // safe seam (the same signal a playback write uses).
+                if (outcome.reconciled > 0) self.history_dirty = true;
+                // Token rejected mid-session: drop the cached connected flag so we stop
+                // spawning do-nothing flushes on every edit, and seed ROD-295's reconnect
+                // nudge (which re-evaluates connection). The user-facing surface is 295's.
+                if (outcome.expired) self.anilist_connected = false;
+                // Ambient feedback only: whisper a low-key toast when a push actually
+                // landed, stay silent on a no-op or soft failure (unpushed rows stay dirty
+                // and retry on the next flush).
+                if (outcome.pushed > 0) {
+                    var buf: [40]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "↑ synced {d} to AniList", .{outcome.pushed}) catch "↑ synced to AniList";
+                    self.pushToast(.info, msg, false);
+                }
             },
             .search_done => |ev| {
                 // Stale check: ignore if query has changed since this search was fired.
@@ -1798,6 +1947,13 @@ pub const App = struct {
                 if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
                     self.cover_sync_deadline_ms = 0;
                     selection.syncCover(self, loop, io, provider);
+                }
+                // The action-sync debounce settled (ROD-291): flush dirty local rows up
+                // to AniList off-thread. fireSyncFlush no-ops when unconnected or already
+                // flushing, so a settle that has nothing to do costs nothing.
+                if (self.sync_flush_deadline_ms > 0 and now >= self.sync_flush_deadline_ms) {
+                    self.sync_flush_deadline_ms = 0;
+                    self.fireSyncFlush(loop, io);
                 }
                 for (&self.toast_queue) |*slot| {
                     if (slot.*) |*t| {
@@ -3377,6 +3533,13 @@ pub const App = struct {
     /// (key repeat ~30 ms) into one fetch at the settle instead of one per row.
     /// The 100 ms tick is the real floor, so this lands ~150–250 ms after settle.
     pub const cover_settle_ms: i64 = 150;
+
+    /// Settle window (ms) before an action-triggered AniList push fires (ROD-291).
+    /// Long compared with the cover/search debounces on purpose: a push is a paced
+    /// network side-rail, not a preview, so coalescing a binge (finish ep 3→4→5 in
+    /// quick succession → one flush, not three) matters more than latency. The user
+    /// never waits on it, so a few seconds of settle is free.
+    pub const sync_flush_settle_ms: i64 = 3000;
 
     pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
 
