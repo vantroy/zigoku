@@ -100,6 +100,25 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ROD-283: `zigoku login` connects an AniList account (OAuth Implicit Grant)
+    // and writes auth.zon, then exits. A subcommand, not a flag — intercepted
+    // before the positional is read as a search query. Defaults to the loopback
+    // listener (auto-captures the browser redirect); `--paste`, or a loopback that
+    // can't start, uses the SSH-safe manual paste flow.
+    if (isLoginCommand(args)) {
+        if (hasFlag(args, "--paste")) {
+            try zigoku.login.run(arena, io, out);
+        } else zigoku.login_loopback.run(arena, io, out) catch |err| switch (err) {
+            error.LoopbackUnavailable => {
+                try out.print("  (couldn't start the loopback listener — falling back to paste)\n\n", .{});
+                try zigoku.login.run(arena, io, out);
+            },
+            else => return err,
+        };
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
@@ -423,6 +442,19 @@ fn hasVersionFlag(args: []const [:0]const u8) bool {
     return hasFlag(args, "--version") or hasFlag(args, "-V");
 }
 
+/// True if the first positional (non-flag) argument is `login`, regardless of any
+/// flags before it — so `zigoku --debug login` connects rather than searching for
+/// a show called "login". Same position-independence lesson as `hasVersionFlag`.
+/// A `login` appearing *after* a real query (`zigoku frieren login`) is a search
+/// word, not the subcommand.
+fn isLoginCommand(args: []const [:0]const u8) bool {
+    for (args[1..]) |a| {
+        if (std.mem.eql(u8, a, "login")) return true;
+        if (!std.mem.startsWith(u8, a, "-")) return false; // first positional wasn't login
+    }
+    return false;
+}
+
 /// ROD-221: the `--version`/`-V` fast-path, factored out of `main` so the
 /// flag-dispatch *and* the line emission can be unit-tested without standing up
 /// `main`'s full IO. Returns true when a version flag was present (and the
@@ -443,6 +475,16 @@ test "hasVersionFlag detects --version and -V anywhere, ignores others" {
     try std.testing.expect(hasVersionFlag(&v2));
     try std.testing.expect(!hasVersionFlag(&none));
     try std.testing.expect(!hasVersionFlag(&bare));
+}
+
+test "isLoginCommand accepts login behind flags, rejects it as a query word" {
+    // Bare and flag-prefixed forms both connect.
+    try std.testing.expect(isLoginCommand(&[_][:0]const u8{ "zigoku", "login" }));
+    try std.testing.expect(isLoginCommand(&[_][:0]const u8{ "zigoku", "--debug", "login" }));
+    // A real search, and `login` sitting after a query, must NOT be the subcommand.
+    try std.testing.expect(!isLoginCommand(&[_][:0]const u8{ "zigoku", "frieren" }));
+    try std.testing.expect(!isLoginCommand(&[_][:0]const u8{ "zigoku", "frieren", "login" }));
+    try std.testing.expect(!isLoginCommand(&[_][:0]const u8{"zigoku"}));
 }
 
 test "handleVersionFlag emits the version line and signals exit only on a version flag" {
