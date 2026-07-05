@@ -766,6 +766,26 @@ pub const Store = struct {
         return c.sqlite3_column_int64(stmt, 0);
     }
 
+    /// The titles behind `countEngagedWithoutAniListId` — the engaged shows that can't
+    /// be pushed for lack of an `anilist_id` — so `zigoku sync` can list *which* shows
+    /// have no AniList link yet (enrichment never resolved one), not just how many. The
+    /// actionable half: the user can re-open these to re-enrich. Most-recently-active
+    /// first (matches the push work-list ordering); titles duped into `arena`.
+    pub fn loadEngagedWithoutAniListId(self: *Store, arena: Allocator) Error![]const []const u8 {
+        const sql =
+            \\SELECT title FROM anime
+            \\WHERE history_visible != 0 AND anilist_id IS NULL
+            \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        var out: std.ArrayList([]const u8) = .empty;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try out.append(arena, try dupeText(arena, stmt, 0) orelse "");
+        }
+        return out.toOwnedSlice(arena);
+    }
+
     /// One local row eligible for pull/reconcile (ROD-285): the join key + PK to
     /// write back through, the current local (list_status, progress), and the
     /// last-synced snapshot — the 3-way-merge ancestor. `synced_status`/
@@ -1806,6 +1826,26 @@ test "loadReconcileRows: engaged id-bearing rows only, snapshot NULL until synce
     const synced = try s.loadReconcileRows(arena);
     try testing.expectEqual(domain.ListStatus.watching, synced[0].synced_status.?);
     try testing.expectEqual(@as(i64, 3), synced[0].synced_progress.?);
+}
+
+test "loadEngagedWithoutAniListId: names the engaged, unlinked shows, agreeing with the count (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // Engaged + linked → excluded (it can sync). Engaged + no id → listed. Browsed-only
+    // (hidden) + no id → excluded (not part of the push set).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "linked", .title = "Linked", .anilist_id = 100, .list_status = .watching, .progress = 1, .history_visible = true }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "unlinked", .title = "Unlinked Show", .list_status = .watching, .progress = 1, .history_visible = true }, 1001, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "browsed", .title = "Browsed", .history_visible = false }, 1002, arena);
+
+    const names = try s.loadEngagedWithoutAniListId(arena);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("Unlinked Show", names[0]);
+    // The list and the count must agree (same predicate).
+    try testing.expectEqual(@as(i64, 1), try s.countEngagedWithoutAniListId());
 }
 
 test "applyPulled: writes merged local pair + a server-truth snapshot; leaves a local-ahead row dirty (ROD-285)" {

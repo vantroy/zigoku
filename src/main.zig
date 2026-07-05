@@ -257,7 +257,27 @@ fn runSync(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
     if (!skip_push) {
         const push = zigoku.sync.pushAll(arena, io, &store, credentials, now);
         try printSyncSummary(out, push);
+        // List *which* engaged shows have no AniList link yet (the count is in the
+        // summary line above) — the actionable half, since the user can re-open them to
+        // re-enrich. Best-effort: a failed lookup just drops the list, never the run.
+        if (push.no_link > 0) {
+            const unlinked = store.loadEngagedWithoutAniListId(arena) catch &.{};
+            try printShowList(out, unlinked);
+        }
     }
+}
+
+/// Longest run of show titles `zigoku sync` lists inline before collapsing the rest
+/// to "… and N more" — enough to be useful, capped so a big unlinked library can't
+/// wall the terminal.
+const SHOW_LIST_CAP: usize = 12;
+
+/// Print an indented bullet list of show titles under a preceding count line, capped
+/// at `SHOW_LIST_CAP`. No-op on an empty slice.
+fn printShowList(out: *Io.Writer, titles: []const []const u8) !void {
+    const shown = @min(titles.len, SHOW_LIST_CAP);
+    for (titles[0..shown]) |t| try out.print("      · {s}\n", .{t});
+    if (titles.len > shown) try out.print("      … and {d} more\n", .{titles.len - shown});
 }
 
 /// Render a pull `PullSummary` (ROD-285) to human text — one early-stop line, or the
@@ -751,6 +771,25 @@ test "printPullSummary: advisory footers stack; a lead line short-circuits (ROD-
     defer aw3.deinit();
     const out3 = try renderPull(.{ .no_user_id = true, .unmatched = 9 }, &aw3);
     try std.testing.expect(std.mem.indexOf(u8, out3, "not imported") == null);
+}
+
+test "printShowList: bullets the titles, collapses past the cap (ROD-285)" {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    const three = [_][]const u8{ "Alpha", "Beta", "Gamma" };
+    try printShowList(&aw.writer, &three);
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "· Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "· Gamma") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more") == null); // under the cap, no collapse
+
+    // Over the cap → first SHOW_LIST_CAP shown, the remainder collapsed to a count.
+    var many: [SHOW_LIST_CAP + 3][]const u8 = undefined;
+    for (&many) |*m| m.* = "Show";
+    var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw2.deinit();
+    try printShowList(&aw2.writer, &many);
+    try std.testing.expect(std.mem.indexOf(u8, aw2.writer.buffered(), "… and 3 more") != null);
 }
 
 test "handleVersionFlag emits the version line and signals exit only on a version flag" {
