@@ -403,7 +403,15 @@ fn reconcileAll(gpa: Allocator, st: *Store, entries: []const anilist.PulledEntry
     for (entries) |e| {
         if (!matched.contains(e.media_id)) unmatched_ids.append(gpa, e.media_id) catch break;
     }
-    summary.unmatched_ids = unmatched_ids.items;
+    // Hand back an exact-fit slice (len == capacity), NOT `.items` — `.items` is a
+    // sub-slice of an over-allocated buffer, and a caller that frees it against a real
+    // (non-arena) gpa hits an allocation-length-mismatch panic (ROD-291's background
+    // flush is exactly such a caller). On an OOM shrink, drop the list rather than return
+    // a mismatched slice.
+    summary.unmatched_ids = unmatched_ids.toOwnedSlice(gpa) catch blk: {
+        unmatched_ids.deinit(gpa);
+        break :blk &.{};
+    };
     return summary;
 }
 
@@ -717,6 +725,32 @@ test "reconcileAll: unmatched remote counted, local-only row untouched (ROD-285)
     try testing.expectEqual(@as(i64, 99), sum.unmatched_ids[0]);
     // No phantom row was created for the unmatched remote entry.
     try testing.expectEqual(@as(usize, 1), (try s.loadReconcileRows(arena)).len);
+}
+
+test "reconcileAll: unmatched_ids is exact-fit, safe to free on a real gpa (ROD-291)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try seedReconcilable(&s, arena, "a", 42, .watching, 5);
+    try s.markSynced("allanime", "a", .watching, 5);
+
+    // One unmatched entry (media 99): unmatched_ids has len 1, but an i64 ArrayList
+    // over-allocates its backing buffer (first-growth capacity 8). ROD-291's background
+    // flush frees this slice against the real (non-arena) gpa — if reconcileAll handed
+    // back `.items` instead of an exact-fit slice, that free would panic on an
+    // allocation-length mismatch under the checked allocator. This test performs exactly
+    // that free with `testing.allocator`, so it reproduces the crash if the contract
+    // regresses (and passes silently when the slice is exact-fit).
+    const entries = [_]anilist.PulledEntry{
+        .{ .media_id = 42, .status = .watching, .progress = 5 },
+        .{ .media_id = 99, .status = .completed, .progress = 24 },
+    };
+    const sum = reconcileAll(testing.allocator, &s, &entries);
+    try testing.expectEqual(@as(usize, 1), sum.unmatched_ids.len);
+    testing.allocator.free(sum.unmatched_ids);
 }
 
 test "reconcileAll: first contact adopts an AniList status onto an unsynced planning row (ROD-285)" {
