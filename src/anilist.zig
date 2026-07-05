@@ -494,6 +494,128 @@ const SaveResp = struct { data: ?SaveData = null };
 const SaveData = struct { SaveMediaListEntry: ?SaveEntry = null };
 const SaveEntry = struct { id: ?i64 = null };
 
+// ── AniList pull: MediaListCollection (ROD-285) ──────────────────────────────
+
+/// One reconciled entry from the remote list: the AniList media id (== our
+/// `anilist_id`) plus the (status, progress) AniList currently holds. This is the
+/// remote leg of the ROD-285 3-way merge; the reconcile engine joins it to a local
+/// row by `media_id`. REPEATING has already been folded to `.watching` by
+/// `fromAniListStatus`, so `status` is always a local `domain.ListStatus`.
+pub const PulledEntry = struct {
+    media_id: i64,
+    status: domain.ListStatus,
+    progress: i64,
+};
+
+/// Map an AniList `MediaListStatus` to the local `domain.ListStatus`. AniList's
+/// REPEATING (a re-watch) has no local twin, so it folds to `.watching` — a
+/// re-watch is still "currently watching" locally. An unrecognized status (API/
+/// schema drift, a value we don't model) returns null so the reconcile engine
+/// skips that entry rather than guessing a status onto a local row.
+pub fn fromAniListStatus(s: []const u8) ?domain.ListStatus {
+    if (std.mem.eql(u8, s, "CURRENT")) return .watching;
+    if (std.mem.eql(u8, s, "PLANNING")) return .planning;
+    if (std.mem.eql(u8, s, "PAUSED")) return .paused;
+    if (std.mem.eql(u8, s, "COMPLETED")) return .completed;
+    if (std.mem.eql(u8, s, "DROPPED")) return .dropped;
+    if (std.mem.eql(u8, s, "REPEATING")) return .watching; // re-watch → watching (no local twin)
+    return null;
+}
+
+/// A pull either lands (the whole collection), hits a rate limit (429), finds the
+/// token rejected (401 — re-auth needed), or fails otherwise. Same arm shape as
+/// `PushError` so the ROD-285 engine reacts per case; distinct type because pull
+/// has no `PushFailed`-vs-success entry-id nuance — a failed fetch is just
+/// `PullFailed`.
+pub const PullError = error{ RateLimited, Unauthorized, PullFailed } || Allocator.Error;
+
+// `userId` rides as a GraphQL variable (never interpolated into the query), so the
+// query is a constant with nothing to escape — comptime-guarded like the others.
+const MLC_QUERY = "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress}}}}";
+
+comptime {
+    for (MLC_QUERY) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20)
+            @compileError("MLC_QUERY contains a character that needs JSON escaping; build the body with std.json instead of {s} interpolation");
+    }
+}
+
+/// Pull the user's whole anime list from AniList in one round trip (ROD-285).
+/// `MediaListCollection` is NOT paginated — it returns every list (status lists +
+/// any custom lists) in a single response — so one POST covers the account.
+/// `bearer` is the OAuth access token; `user_id` is the AniList id the token was
+/// minted for (cached in auth.zon at login — AniList doesn't infer it from the
+/// token). Entries are deduped by `media_id` (a show in a custom list appears under
+/// both its status list and the custom one, carrying identical entry data).
+///
+/// The response rides `fetchGql`'s 2 MB fixed cap. Each entry is three scalar fields
+/// (~45 bytes of JSON), so that holds tens of thousands of entries — well past any
+/// real list. A pathologically huge one overflows the cap → the fetch errors →
+/// `error.PullFailed`, which the engine reports as a failed pull, not a crash.
+pub fn mediaListCollection(arena: Allocator, io: Io, bearer: []const u8, user_id: i64) PullError![]const PulledEntry {
+    // `userId` is an integer, JSON-safe interpolated as a variable value on the same
+    // trust basis as saveMediaListEntry's `mediaId`.
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"query\":\"{s}\",\"variables\":{{\"userId\":{d}}}}}",
+        .{ MLC_QUERY, user_id },
+    );
+    const r = postGqlRaw(arena, io, body, bearer) orelse return error.PullFailed;
+    return classifyMediaList(arena, r);
+}
+
+/// Map the raw {status, body} of a MediaListCollection POST to the PullError
+/// contract, flattening + deduping the lists into one entry slice. Split from the
+/// POST so the branching and the flatten/dedup are unit-testable without a live
+/// query. A 200 whose body carries no `MediaListCollection` (a GraphQL-level error,
+/// or `{"data":null}`) is a failed pull, not an empty list.
+fn classifyMediaList(arena: Allocator, r: HttpResult) PullError![]const PulledEntry {
+    switch (r.status) {
+        .ok => {},
+        .too_many_requests => return error.RateLimited, // 429 — engine backs off
+        .unauthorized => return error.Unauthorized, // 401 — token re-auth
+        else => return error.PullFailed,
+    }
+
+    const parsed = std.json.parseFromSlice(MlcResp, arena, r.body, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.PullFailed;
+    const data = parsed.value.data orelse return error.PullFailed;
+    const mlc = data.MediaListCollection orelse return error.PullFailed;
+
+    // Dedupe by media_id: the same entry rides both its status list and any custom
+    // list it's in, with identical (status, progress) — collapse to one. `seen` maps
+    // media_id → index in `out` so a duplicate overwrites rather than double-counts.
+    var out: std.ArrayList(PulledEntry) = .empty;
+    var seen: std.AutoHashMapUnmanaged(i64, usize) = .empty;
+    for (mlc.lists) |list| {
+        for (list.entries) |e| {
+            const media_id = e.mediaId orelse continue; // an entry with no media is unusable
+            const status_str = e.status orelse continue; // no status → nothing to reconcile
+            const status = fromAniListStatus(status_str) orelse continue; // unknown enum → skip
+            const entry: PulledEntry = .{ .media_id = media_id, .status = status, .progress = e.progress };
+            const gop = try seen.getOrPut(arena, media_id);
+            if (gop.found_existing) {
+                out.items[gop.value_ptr.*] = entry; // dup across lists — last wins (identical anyway)
+            } else {
+                gop.value_ptr.* = out.items.len;
+                try out.append(arena, entry);
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+// MediaListCollection response shape: lists of entries, each carrying just the
+// three fields the reconcile needs. `progress` defaults to 0 (AniList sends 0, not
+// null, for an unstarted entry); `mediaId`/`status` are optional so a malformed
+// entry parses and is skipped rather than failing the whole pull.
+const MlcEntry = struct { mediaId: ?i64 = null, status: ?[]const u8 = null, progress: i64 = 0 };
+const MlcList = struct { entries: []const MlcEntry = &.{} };
+const MediaListCollectionT = struct { lists: []const MlcList = &.{} };
+const MlcData = struct { MediaListCollection: ?MediaListCollectionT = null };
+const MlcResp = struct { data: ?MlcData = null };
+
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
     // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
     // that render straight to terminal cells; see stripControls. thumb is a URL
@@ -884,6 +1006,79 @@ test "classifySave: id on 200, distinct errors for 429/401/failure (ROD-284)" {
     // 200 with the entry present but `id` omitted → "field present but empty" is a
     // failed push, not a landed one — the snapshot must not advance on it.
     try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = .ok, .body = "{\"data\":{\"SaveMediaListEntry\":{}}}" }));
+}
+
+test "fromAniListStatus maps every remote status, folding REPEATING (ROD-285)" {
+    try std.testing.expectEqual(domain.ListStatus.watching, fromAniListStatus("CURRENT").?);
+    try std.testing.expectEqual(domain.ListStatus.planning, fromAniListStatus("PLANNING").?);
+    try std.testing.expectEqual(domain.ListStatus.paused, fromAniListStatus("PAUSED").?);
+    try std.testing.expectEqual(domain.ListStatus.completed, fromAniListStatus("COMPLETED").?);
+    try std.testing.expectEqual(domain.ListStatus.dropped, fromAniListStatus("DROPPED").?);
+    // REPEATING has no local twin — a re-watch reads as "watching".
+    try std.testing.expectEqual(domain.ListStatus.watching, fromAniListStatus("REPEATING").?);
+    // An unknown enum is skipped by the caller, not guessed.
+    try std.testing.expect(fromAniListStatus("SOMETHING_NEW") == null);
+    try std.testing.expect(fromAniListStatus("") == null);
+}
+
+test "classifyMediaList: flattens lists, maps status, keeps progress (ROD-285)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Two lists (Watching + Completed), one entry each. REPEATING folds to watching;
+    // a null-status entry is skipped. mediaId tags each for the local join-back.
+    const body =
+        \\{"data":{"MediaListCollection":{"lists":[
+        \\{"entries":[{"mediaId":100,"status":"CURRENT","progress":5},{"mediaId":101,"status":"REPEATING","progress":2}]},
+        \\{"entries":[{"mediaId":200,"status":"COMPLETED","progress":12},{"mediaId":300,"status":null,"progress":0}]}
+        \\]}}}
+    ;
+    const entries = try classifyMediaList(a, .{ .status = .ok, .body = body });
+    try std.testing.expectEqual(@as(usize, 3), entries.len); // the null-status entry dropped
+
+    // Order is list-then-entry; assert by scanning (dedup uses insertion order).
+    var byId = std.AutoHashMap(i64, PulledEntry).init(a);
+    for (entries) |e| try byId.put(e.media_id, e);
+    try std.testing.expectEqual(domain.ListStatus.watching, byId.get(100).?.status);
+    try std.testing.expectEqual(@as(i64, 5), byId.get(100).?.progress);
+    try std.testing.expectEqual(domain.ListStatus.watching, byId.get(101).?.status); // REPEATING → watching
+    try std.testing.expectEqual(domain.ListStatus.completed, byId.get(200).?.status);
+    try std.testing.expectEqual(@as(i64, 12), byId.get(200).?.progress);
+}
+
+test "classifyMediaList: dedupes an entry shared across custom lists (ROD-285)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // media 100 appears in both its status list and a custom list — one entry out.
+    const body =
+        \\{"data":{"MediaListCollection":{"lists":[
+        \\{"entries":[{"mediaId":100,"status":"CURRENT","progress":5}]},
+        \\{"entries":[{"mediaId":100,"status":"CURRENT","progress":5}]}
+        \\]}}}
+    ;
+    const entries = try classifyMediaList(a, .{ .status = .ok, .body = body });
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(i64, 100), entries[0].media_id);
+}
+
+test "classifyMediaList: distinct errors for 429/401, failure on malformed/no-data (ROD-285)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 429 → RateLimited (engine backs off); 401 → Unauthorized (token re-auth).
+    try std.testing.expectError(error.RateLimited, classifyMediaList(a, .{ .status = @enumFromInt(429), .body = "" }));
+    try std.testing.expectError(error.Unauthorized, classifyMediaList(a, .{ .status = @enumFromInt(401), .body = "" }));
+    // A 200 with no data (GraphQL-level error) and a 5xx both → PullFailed, never an
+    // empty-list "success" that would strand the whole collection.
+    try std.testing.expectError(error.PullFailed, classifyMediaList(a, .{ .status = .ok, .body = "{\"data\":null}" }));
+    try std.testing.expectError(error.PullFailed, classifyMediaList(a, .{ .status = @enumFromInt(500), .body = "oops" }));
+    try std.testing.expectError(error.PullFailed, classifyMediaList(a, .{ .status = .ok, .body = "not json" }));
+    // A reachable account with an empty list is a confirmed empty answer → empty slice.
+    const empty = try classifyMediaList(a, .{ .status = .ok, .body = "{\"data\":{\"MediaListCollection\":{\"lists\":[]}}}" });
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }
 
 test "normalizeTitle folds ASCII punctuation and whitespace" {
