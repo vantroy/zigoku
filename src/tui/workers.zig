@@ -13,6 +13,8 @@ const lru_mod = @import("../util/lru.zig");
 const deadline = @import("../util/deadline.zig");
 const event_mod = @import("event.zig");
 const log = @import("../log.zig");
+const sync = @import("../sync.zig");
+const auth_mod = @import("../auth.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -717,6 +719,30 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
         return;
     };
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+}
+
+/// Background task: flush dirty local rows up to AniList (ROD-291). The action-sync
+/// coordinator arms a debounce on a local mutation; when it elapses, .tick spawns
+/// this to run the paced push off the render thread. `sync.pushAll` is total (every
+/// outcome lands in the returned `Summary`, never an error) and delta-only, so this
+/// is a thin wrapper: run it, post the summary for an ambient whisper. `credentials`
+/// is passed by value — its slices live in run()'s session auth arena, which outlives
+/// this thread (joined before teardown). `inflight` is cleared here in a defer so a
+/// failed `postEvent` (queue torn down at quit) can't latch the one-flush gate on.
+/// A dropped or failed push self-heals: unpushed rows stay dirty for the next flush.
+pub fn syncFlushTask(
+    loop: *Loop,
+    gpa: Allocator,
+    io: std.Io,
+    store: *Store,
+    credentials: auth_mod.Auth,
+    now_unix: i64,
+    inflight: *std.atomic.Value(bool),
+) void {
+    defer inflight.store(false, .release);
+    const summary = sync.pushAll(gpa, io, store, credentials, now_unix);
+    loop.postEvent(.{ .sync_flushed = summary }) catch |pe|
+        log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
 /// Like loadHistoryTask but for the post-playback refresh (ROD-191): posts

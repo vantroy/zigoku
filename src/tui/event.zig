@@ -6,6 +6,7 @@ const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
 const source_mod = @import("../source.zig");
+const sync = @import("../sync.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
@@ -39,6 +40,11 @@ pub const Event = union(enum) {
     /// A background BROWSE task (search/enrich) failed; payload is a human-readable
     /// reason. Surfaces as a toast only — never touches History state (ROD-234).
     task_error: []const u8,
+    /// An action-triggered AniList push finished (ROD-291). Payload is the push
+    /// `Summary` — a plain POD with no owned memory, so it ships across the worker→UI
+    /// seam by value. The handler whispers an ambient toast only when something landed;
+    /// soft failures stay silent (the rows stay dirty and retry on the next flush).
+    sync_flushed: sync.Summary,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
     /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
     /// `page` is the page number this result set belongs to.
