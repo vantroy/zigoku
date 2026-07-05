@@ -343,7 +343,7 @@ if [ "$NETWORK" = true ] && command -v sqlite3 >/dev/null 2>&1; then
         assert_file_nonempty "DB created at XDG path" "$DB_PATH"
 
         ver=$(sqlite3 "$DB_PATH" "PRAGMA user_version;" 2>/dev/null || echo "?")
-        [ "$ver" = "6" ] && pass "schema migrated to v6" || fail "schema user_version=$ver (expected 6)"
+        [ "$ver" = "11" ] && pass "schema migrated to v11" || fail "schema user_version=$ver (expected 11)"
 
         plays=$(sqlite3 "$DB_PATH" "SELECT play_count FROM anime LIMIT 1;" 2>/dev/null || echo 0)
         [ "${plays:-0}" -ge 1 ] && pass "play recorded (play_count=$plays)" || fail "play_count=$plays (expected >=1)"
