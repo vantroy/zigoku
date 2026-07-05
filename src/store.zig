@@ -1231,7 +1231,13 @@ pub const Store = struct {
         while (true) : (attempt += 1) {
             const rc = c.sqlite3_exec(self.db, "PRAGMA journal_mode = WAL;", null, null, null);
             if (rc == c.SQLITE_OK) return;
-            if ((rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED) and attempt < WAL_RETRY_LIMIT) {
+            // Match on the PRIMARY result code (low byte). If a future caller ever
+            // enables extended result codes on this connection, BUSY/LOCKED would
+            // arrive as SQLITE_BUSY_* / SQLITE_LOCKED_* and stop matching the bare
+            // constants — silently turning a normal contention wobble into a first-try
+            // error.Exec. Masking keeps the retry robust to that (ROD-287 re-review).
+            const primary = rc & 0xff;
+            if ((primary == c.SQLITE_BUSY or primary == c.SQLITE_LOCKED) and attempt < WAL_RETRY_LIMIT) {
                 _ = c.sqlite3_sleep(WAL_RETRY_BACKOFF_MS);
                 continue;
             }

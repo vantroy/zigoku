@@ -272,9 +272,14 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
 
     // Best-effort persistence. Unlike the CLI path, the TUI can't print to stderr (it's
     // the render surface), so a failure here would otherwise vanish — log the reason to
-    // the file sink instead of swallowing it silently (ROD-287, review follow-up).
+    // the file sink instead of swallowing it silently (ROD-287, review follow-up). Only
+    // when we actually HAVE that sink, though: with no data dir at all (no $HOME/
+    // $XDG_DATA_HOME) log.file_path stays null AND that's why openStore failed, and
+    // log.zig would then route the line to stderr — one stray print into the terminal
+    // the TUI is about to take over. Silence beats leaking on that degraded path.
     var store_opt: ?zigoku.Store = openStore(arena) catch |err| blk: {
-        std.log.warn("persistence off — {s}", .{describeOpenStoreError(err)});
+        if (zigoku.log.file_path != null)
+            std.log.warn("persistence off — {s}", .{describeOpenStoreError(err)});
         break :blk null;
     };
     defer if (store_opt) |*st| st.close();
