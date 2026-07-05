@@ -40,7 +40,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 10;
+const SCHEMA_VERSION: c_int = 11;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -195,6 +195,20 @@ const MIGRATION_V10 =
     \\ALTER TABLE anime ADD COLUMN next_airing_at      INTEGER;
     \\ALTER TABLE anime ADD COLUMN next_airing_episode INTEGER;
     \\ALTER TABLE anime ADD COLUMN country             TEXT;
+;
+
+// ROD-284: AniList push delta-tracking. `synced_status`/`synced_progress` snapshot
+// the (list_status, progress) pair last accepted by AniList (SaveMediaListEntry).
+// A row is dirty — needs pushing — when it has an `anilist_id` and its live pair
+// differs from this snapshot (or the snapshot is NULL: never synced). Snapshot-vs-
+// live, NOT a `synced_at` clock: `last_watched_at` only moves on playback, so a
+// wall-clock watermark would silently miss a manual drop/pause. Both NULL for
+// every pre-v11 row → the first push treats the whole engaged library as dirty and
+// backfills the snapshot. This pair is also the last-known-synced baseline the
+// ROD-285 pull/reconcile 3-way merge will read, so it isn't push-only scaffolding.
+const MIGRATION_V11 =
+    \\ALTER TABLE anime ADD COLUMN synced_status   TEXT;
+    \\ALTER TABLE anime ADD COLUMN synced_progress INTEGER;
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -412,8 +426,12 @@ pub const Store = struct {
 
     /// Insert a show, or refresh *source-derived* metadata if it already exists.
     /// Deliberately does NOT touch user state on conflict (play_count, progress,
-    /// list_status, user_rating, notes, added_at, last_watched_at) — re-running a
-    /// search must never wipe the viewer's history.
+    /// list_status, user_rating, notes, added_at, last_watched_at, and the ROD-284
+    /// sync snapshot synced_status/synced_progress) — re-running a search must never
+    /// wipe the viewer's history, nor reset the AniList sync snapshot (which would
+    /// make every re-viewed show spuriously, permanently dirty). The invariant is
+    /// simply that none of those columns appear in the `ON CONFLICT DO UPDATE SET`
+    /// clause below; keep it that way when adding columns.
     ///
     /// `cover_url` breaks the plain COALESCE "new-if-present" rule to prefer a
     /// fetchable absolute url over a relative ref (ROD-267): a stored AniList/MAL
@@ -629,6 +647,93 @@ pub const Store = struct {
             });
         }
         return rows.toOwnedSlice(arena);
+    }
+
+    // ── AniList sync (ROD-284) ────────────────────────────────────────────────
+
+    /// The minimal projection the AniList push needs for one dirty row: the PK to
+    /// stamp the snapshot back onto, the media id to target, and the (status,
+    /// progress) pair to send. `title` rides along only for the CLI's log line.
+    /// `anilist_id` is non-optional here — `loadDirtyForSync` filters out the rows
+    /// that lack one (no id → nothing to push them to).
+    pub const SyncRow = struct {
+        source: []const u8,
+        source_id: []const u8,
+        title: []const u8,
+        anilist_id: i64,
+        list_status: domain.ListStatus,
+        progress: i64,
+    };
+
+    /// Rows whose local (list_status, progress) differs from what AniList last
+    /// accepted — the push work-list (ROD-284). Scoped to the engaged library
+    /// (`history_visible`, the same gate as `loadHistory`) so a merely-browsed
+    /// search-cache row never floods the user's AniList planning list, and to rows
+    /// carrying an `anilist_id` (no id → no push target). A NULL snapshot
+    /// (`synced_status IS NULL`) reads as never-synced, so the first run returns the
+    /// whole engaged, id-bearing library. Text fields are duped into `arena`.
+    pub fn loadDirtyForSync(self: *Store, arena: Allocator) Error![]SyncRow {
+        const sql =
+            \\SELECT source, source_id, title, anilist_id, list_status, progress
+            \\FROM anime
+            \\WHERE history_visible != 0
+            \\  AND anilist_id IS NOT NULL
+            \\  AND (synced_status IS NULL
+            \\       OR synced_status <> list_status
+            \\       OR synced_progress IS NULL
+            \\       OR synced_progress <> progress)
+            \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var rows: std.ArrayList(SyncRow) = .empty;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try rows.append(arena, .{
+                .source = try dupeText(arena, stmt, 0) orelse "",
+                .source_id = try dupeText(arena, stmt, 1) orelse "",
+                .title = try dupeText(arena, stmt, 2) orelse "",
+                .anilist_id = c.sqlite3_column_int64(stmt, 3),
+                .list_status = colStatus(stmt, 4),
+                .progress = c.sqlite3_column_int64(stmt, 5),
+            });
+        }
+        return rows.toOwnedSlice(arena);
+    }
+
+    /// Record that AniList accepted `(status, progress)` for one show — advance the
+    /// sync snapshot so the row reads clean on `loadDirtyForSync` until it changes
+    /// again. Called once per successful `SaveMediaListEntry`.
+    pub fn markSynced(
+        self: *Store,
+        source: []const u8,
+        source_id: []const u8,
+        status: domain.ListStatus,
+        progress: i64,
+    ) Error!void {
+        const sql =
+            \\UPDATE anime
+            \\SET synced_status = ?, synced_progress = ?
+            \\WHERE source = ? AND source_id = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, progress));
+        try bindText(stmt, 3, source);
+        try bindText(stmt, 4, source_id);
+        try self.stepDone(stmt);
+    }
+
+    /// How many engaged rows can't be pushed for lack of an `anilist_id` (ROD-284).
+    /// The push's work-list (`loadDirtyForSync`) filters these out — there's no
+    /// media to target — so this count is how the CLI reports "the rest" it skipped:
+    /// shows with no AniList link yet (enrichment never resolved an id).
+    pub fn countEngagedWithoutAniListId(self: *Store) Error!i64 {
+        const stmt = try self.prepare("SELECT COUNT(*) FROM anime WHERE history_visible != 0 AND anilist_id IS NULL");
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        return c.sqlite3_column_int64(stmt, 0);
     }
 
     /// Full stored metadata for one show, or null if it was never persisted.
@@ -1135,6 +1240,11 @@ pub const Store = struct {
             try self.exec("PRAGMA user_version = 10;");
             v = 10;
         }
+        if (v < 11) {
+            try self.exec(MIGRATION_V11);
+            try self.exec("PRAGMA user_version = 11;");
+            v = 11;
+        }
         std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
     }
 
@@ -1338,6 +1448,67 @@ test "upsertAnime + loadHistory round-trips" {
     try testing.expectEqual(domain.ListStatus.planning, rows[0].list_status);
     try testing.expectEqual(@as(i64, 0), rows[0].play_count);
     try testing.expect(rows[0].history_visible);
+}
+
+test "loadDirtyForSync: only engaged, id-bearing rows; markSynced clears them (ROD-284)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Engaged + carries an AniList id → the one row the push should pick up.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "has-id", .title = "Frieren", .anilist_id = 100, .list_status = .watching, .progress = 3, .history_visible = true }, 1000, arena);
+    // Engaged but no AniList id → nothing to push to; excluded.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "no-id", .title = "No Id", .list_status = .watching, .progress = 5, .history_visible = true }, 1001, arena);
+    // Carries an id but is a merely-browsed search-cache row (not engaged) → excluded.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "Browsed", .anilist_id = 200, .history_visible = false }, 1002, arena);
+
+    {
+        const dirty = try s.loadDirtyForSync(arena);
+        try testing.expectEqual(@as(usize, 1), dirty.len);
+        try testing.expectEqualStrings("has-id", dirty[0].source_id);
+        try testing.expectEqual(@as(i64, 100), dirty[0].anilist_id);
+        try testing.expectEqual(domain.ListStatus.watching, dirty[0].list_status);
+        try testing.expectEqual(@as(i64, 3), dirty[0].progress);
+    }
+
+    // Stamp the snapshot at exactly what we read → the row reads clean next time.
+    try s.markSynced(T_SOURCE, "has-id", .watching, 3);
+    try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+}
+
+test "loadDirtyForSync re-flags a row after a status or progress change (ROD-284)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .total_episodes = 12, .list_status = .watching, .progress = 4, .history_visible = true }, 1000, arena);
+    try s.markSynced(T_SOURCE, "a", .watching, 4);
+    try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len); // clean baseline
+
+    // A manual status change with progress unchanged must re-flag the row — the
+    // exact case a `last_watched_at` clock would miss, since no play occurred.
+    try s.setListStatus(T_SOURCE, "a", .paused);
+    {
+        const dirty = try s.loadDirtyForSync(arena);
+        try testing.expectEqual(@as(usize, 1), dirty.len);
+        try testing.expectEqual(domain.ListStatus.paused, dirty[0].list_status);
+    }
+    try s.markSynced(T_SOURCE, "a", .paused, 4);
+    try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+
+    // A progress change (via a play) must re-flag it too.
+    try s.recordPlay(T_SOURCE, "a", 5, 2000, true);
+    {
+        const dirty = try s.loadDirtyForSync(arena);
+        try testing.expectEqual(@as(usize, 1), dirty.len);
+        try testing.expectEqual(@as(i64, 5), dirty[0].progress);
+    }
 }
 
 test "upsertAnime cover_url: an absolute cover survives a later relative re-search (ROD-267)" {

@@ -100,9 +100,26 @@ pub fn defaultPath(arena: Allocator) ![]const u8 {
 /// The pure half of `load`: ZON text → `Auth`, signed-out on any parse failure.
 /// Unknown fields are ignored so a newer file never breaks an older binary.
 fn parse(gpa: Allocator, source: [:0]const u8) Auth {
-    return std.zon.parse.fromSliceAlloc(Auth, gpa, source, null, .{
+    const auth = std.zon.parse.fromSliceAlloc(Auth, gpa, source, null, .{
         .ignore_unknown_fields = true,
-    }) catch .{};
+    }) catch return .{};
+    // A token carrying a C0 control byte (< 0x20) is a corrupt or hand-edited file:
+    // placed in a `Bearer` header, a CR/LF trips std.http's line-terminator assert
+    // (a ReleaseSafe abort), and a bare LF slips that assert and rides onto the wire
+    // as a header-injection vector. Refuse it — signed-out, the same degrade as any
+    // malformed file — so a corrupt token can never reach the network layer. A real
+    // AniList JWT is base64url dot-separated and never contains a control byte.
+    if (hasControlBytes(auth.anilist.access_token)) return .{};
+    return auth;
+}
+
+/// True if `s` carries any C0 control byte (< 0x20) — the bytes (CR, LF, tab, NUL…)
+/// that would break out of, or smuggle into, an HTTP header value.
+fn hasControlBytes(s: []const u8) bool {
+    for (s) |ch| {
+        if (ch < 0x20) return true;
+    }
+    return false;
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -138,6 +155,28 @@ test "malformed ZON degrades to signed out" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expect(!parse(arena.allocator(), "this is not zon !!!").hasAniList());
+}
+
+test "a token carrying control bytes degrades to signed out (ROD-284 hardening)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // A hand-corrupted auth.zon: the ZON `\n`/`\r`/`\t` escapes decode to real
+    // control bytes in the token. Each must refuse to load — a Bearer header built
+    // from it would abort the process (CR/LF) or inject a header (bare LF).
+    try testing.expect(!parse(a,
+        \\.{ .anilist = .{ .access_token = "eyJfake\ntok" } }
+    ).hasAniList());
+    try testing.expect(!parse(a,
+        \\.{ .anilist = .{ .access_token = "eyJfake\r\ntok" } }
+    ).hasAniList());
+    try testing.expect(!parse(a,
+        \\.{ .anilist = .{ .access_token = "eyJfake\ttok" } }
+    ).hasAniList());
+    // A clean JWT-shaped token is untouched by the guard.
+    try testing.expect(parse(a,
+        \\.{ .anilist = .{ .access_token = "eyJfake.tok.en" } }
+    ).hasAniList());
 }
 
 test "unknown fields are ignored, not fatal" {
