@@ -48,7 +48,7 @@ source=(
 )
 # git sources pin by commit, so their integrity anchor is the SHA, not a checksum.
 sha256sums=(
-  '8ff39ddd45721ad830d6c0b1d0c481113352c15a8b62c2c7b05f0841f584106d'
+  '4987bf753a9d95cb4dced7beb3b328eb09c5aad9f55d15f738c62c690bdd5d02'
   'SKIP'
   'SKIP'
   'SKIP'
