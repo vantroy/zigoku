@@ -20,6 +20,7 @@ pub const config = @import("config.zig");
 pub const auth = @import("auth.zig");
 pub const login = @import("login.zig");
 pub const login_loopback = @import("login_loopback.zig");
+pub const sync = @import("sync.zig");
 pub const paths = @import("paths.zig");
 pub const log = @import("log.zig");
 // NB: the log handler is installed via `std_options` in `main.zig` (the exe's
@@ -102,6 +103,7 @@ test {
     _ = auth;
     _ = login;
     _ = login_loopback;
+    _ = sync;
     _ = paths;
     _ = log;
     _ = tui;

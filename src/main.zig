@@ -119,6 +119,17 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ROD-284: `zigoku sync` pushes local watch-state to a connected AniList account
+    // (SaveMediaListEntry) and exits. Like `login`, a subcommand intercepted before
+    // the positional is read as a search query, and config-file-only — nothing in
+    // the TUI surfaces it until ROD-286 wires a Settings trigger onto the same
+    // engine. Delta-only: a run with nothing changed says so and does nothing.
+    if (isSyncCommand(args)) {
+        try runSync(arena, io, out);
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
@@ -148,13 +159,7 @@ pub fn main(init: std.process.Init) !void {
     // Persistence (M2). Best-effort: if the DB can't be opened we note it once
     // and run without history/resume rather than refusing to play anything.
     var store_opt: ?zigoku.Store = openStore(arena) catch |err| blk: {
-        const why: []const u8 = switch (err) {
-            error.SchemaTooNew => "DB was written by a newer Zigoku — delete it to start fresh",
-            error.NoHomeDir => "couldn't locate a data directory (no $HOME/$XDG_DATA_HOME)",
-            error.Unsupported => "this platform isn't supported yet (no data directory)",
-            else => @errorName(err),
-        };
-        try out.print("  (note: persistence off — {s})\n", .{why});
+        try out.print("  (note: persistence off — {s})\n", .{describeOpenStoreError(err)});
         break :blk null;
     };
     defer if (store_opt) |*st| st.close();
@@ -177,6 +182,76 @@ pub fn main(init: std.process.Init) !void {
 fn openStore(arena: std.mem.Allocator) !zigoku.Store {
     const path = try zigoku.store.defaultDbPath(arena);
     return zigoku.Store.open(path);
+}
+
+/// Human-readable reason a `Store.open` failed. Shared by `main`'s best-effort
+/// persistence note and `runSync` (ROD-284) so a new open-error variant is worded
+/// in one place, not two.
+fn describeOpenStoreError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SchemaTooNew => "DB was written by a newer Zigoku — delete it to start fresh",
+        error.NoHomeDir => "couldn't locate a data directory (no $HOME/$XDG_DATA_HOME)",
+        error.Unsupported => "this platform isn't supported yet (no data directory)",
+        else => @errorName(err),
+    };
+}
+
+/// Drive one `zigoku sync` push (ROD-284): open the store, load the AniList token,
+/// run the engine, print a one-shot report. Best-effort throughout — a missing
+/// store or token is a friendly line, never a crash. The engine itself is total
+/// (returns a `Summary`, never errors), so every real outcome is a printed line.
+fn runSync(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    var store = openStore(arena) catch |err| {
+        try out.print("  sync: no local library to push — {s}\n", .{describeOpenStoreError(err)});
+        return;
+    };
+    defer store.close();
+
+    const auth_path = zigoku.auth.defaultPath(arena) catch {
+        try out.print("  sync: couldn't locate a config directory for the token\n", .{});
+        return;
+    };
+    const credentials = zigoku.auth.load(arena, io, auth_path);
+    const now = zigoku.Store.nowSecs();
+
+    // Announce only a push we'll actually attempt — connected AND unexpired, the
+    // same gate the engine applies — so a signed-out or stale token goes straight
+    // to its summary line instead of a misleading "pushing…". Flush so the heads-up
+    // shows before the paced (~2 s/row) pushes begin rather than buffering to the end.
+    if (credentials.hasAniList() and !credentials.anilist.isExpired(now)) {
+        try out.print("  pushing local changes to AniList — this can take a moment…\n", .{});
+        try out.flush();
+    }
+
+    const summary = zigoku.sync.pushAll(arena, io, &store, credentials, now);
+    try printSyncSummary(out, summary);
+}
+
+/// Render a push `Summary` (ROD-284) to human text — one early-stop line, or the
+/// per-row tally plus any advisory footers.
+fn printSyncSummary(out: *Io.Writer, s: zigoku.sync.Summary) !void {
+    if (s.signed_out) {
+        try out.print("  not connected — run `zigoku login` first.\n", .{});
+        return;
+    }
+    if (s.expired) {
+        try out.print("  your AniList token has expired — run `zigoku login` to reconnect.\n", .{});
+        return;
+    }
+    if (s.store_error) {
+        try out.print("  couldn't read the local library; nothing pushed.\n", .{});
+        return;
+    }
+
+    if (s.dirty == 0) {
+        try out.print("  already up to date — nothing to push.\n", .{});
+    } else {
+        try out.print("  pushed {d} of {d} change(s) to AniList.\n", .{ s.pushed, s.dirty });
+    }
+    if (s.failed > 0) try out.print("  {d} push(es) failed — re-run with --debug for details.\n", .{s.failed});
+    if (s.unauthorized) try out.print("  stopped: AniList rejected the token mid-run — run `zigoku login` to reconnect.\n", .{});
+    if (s.rate_limited) try out.print("  stopped: hit AniList's rate limit — run `zigoku sync` again shortly to finish.\n", .{});
+    if (s.no_link > 0) try out.print("  ({d} show(s) have no AniList match yet, so they can't sync.)\n", .{s.no_link});
 }
 
 /// Launch the libvaxis TUI (ROD-71). Persistence is best-effort — if the DB
@@ -442,17 +517,26 @@ fn hasVersionFlag(args: []const [:0]const u8) bool {
     return hasFlag(args, "--version") or hasFlag(args, "-V");
 }
 
-/// True if the first positional (non-flag) argument is `login`, regardless of any
-/// flags before it — so `zigoku --debug login` connects rather than searching for
-/// a show called "login". Same position-independence lesson as `hasVersionFlag`.
-/// A `login` appearing *after* a real query (`zigoku frieren login`) is a search
-/// word, not the subcommand.
-fn isLoginCommand(args: []const [:0]const u8) bool {
+/// True if the first positional (non-flag) argument equals `name`, regardless of
+/// any flags before it — so `zigoku --debug <name>` runs the subcommand rather than
+/// searching for a show called `<name>`. A match appearing *after* a real query
+/// (`zigoku frieren <name>`) is a search word, not the subcommand. The
+/// position-independence lesson `hasVersionFlag` taught, generalized.
+fn isSubcommand(args: []const [:0]const u8, name: []const u8) bool {
     for (args[1..]) |a| {
-        if (std.mem.eql(u8, a, "login")) return true;
-        if (!std.mem.startsWith(u8, a, "-")) return false; // first positional wasn't login
+        if (std.mem.eql(u8, a, name)) return true;
+        if (!std.mem.startsWith(u8, a, "-")) return false; // first positional wasn't it
     }
     return false;
+}
+
+fn isLoginCommand(args: []const [:0]const u8) bool {
+    return isSubcommand(args, "login");
+}
+
+/// ROD-284: `zigoku sync` pushes local watch-state to a connected AniList account.
+fn isSyncCommand(args: []const [:0]const u8) bool {
+    return isSubcommand(args, "sync");
 }
 
 /// ROD-221: the `--version`/`-V` fast-path, factored out of `main` so the
@@ -485,6 +569,57 @@ test "isLoginCommand accepts login behind flags, rejects it as a query word" {
     try std.testing.expect(!isLoginCommand(&[_][:0]const u8{ "zigoku", "frieren" }));
     try std.testing.expect(!isLoginCommand(&[_][:0]const u8{ "zigoku", "frieren", "login" }));
     try std.testing.expect(!isLoginCommand(&[_][:0]const u8{"zigoku"}));
+}
+
+test "isSyncCommand accepts sync behind flags, rejects it as a query word (ROD-284)" {
+    try std.testing.expect(isSyncCommand(&[_][:0]const u8{ "zigoku", "sync" }));
+    try std.testing.expect(isSyncCommand(&[_][:0]const u8{ "zigoku", "--debug", "sync" }));
+    // A real search, and `sync` sitting after a query, must NOT be the subcommand.
+    try std.testing.expect(!isSyncCommand(&[_][:0]const u8{ "zigoku", "frieren" }));
+    try std.testing.expect(!isSyncCommand(&[_][:0]const u8{ "zigoku", "frieren", "sync" }));
+    try std.testing.expect(!isSyncCommand(&[_][:0]const u8{"zigoku"}));
+}
+
+fn renderSummary(s: zigoku.sync.Summary, buf: *std.Io.Writer.Allocating) ![]const u8 {
+    try printSyncSummary(&buf.writer, s);
+    return buf.writer.buffered();
+}
+
+test "printSyncSummary: each mutually-exclusive lead line (ROD-284)" {
+    const Case = struct { s: zigoku.sync.Summary, needle: []const u8 };
+    const cases = [_]Case{
+        .{ .s = .{ .signed_out = true }, .needle = "not connected" },
+        .{ .s = .{ .expired = true }, .needle = "expired" },
+        .{ .s = .{ .store_error = true }, .needle = "couldn't read" },
+        .{ .s = .{ .dirty = 0 }, .needle = "already up to date" },
+        .{ .s = .{ .dirty = 5, .pushed = 5 }, .needle = "pushed 5 of 5" },
+    };
+    for (cases) |c| {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, try renderSummary(c.s, &aw), c.needle) != null);
+    }
+}
+
+test "printSyncSummary: advisory footers stack onto the tally (ROD-284)" {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    const out = try renderSummary(.{ .dirty = 4, .pushed = 2, .failed = 1, .rate_limited = true, .no_link = 3 }, &aw);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pushed 2 of 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rate limit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "no AniList match") != null);
+    // A signed-out lead line short-circuits — no tally, no footers.
+    var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw2.deinit();
+    const out2 = try renderSummary(.{ .signed_out = true, .no_link = 9 }, &aw2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "no AniList match") == null);
+    // The unauthorized footer stacks onto the tally like the others.
+    var aw3 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw3.deinit();
+    const out3 = try renderSummary(.{ .dirty = 3, .pushed = 1, .unauthorized = true }, &aw3);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "pushed 1 of 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "rejected the token") != null);
 }
 
 test "handleVersionFlag emits the version line and signals exit only on a version flag" {

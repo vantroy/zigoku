@@ -334,15 +334,23 @@ fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
     return out;
 }
 
-/// POST a GraphQL body to AniList; returns the response bytes (arena-owned) or
-/// null on transport/HTTP failure. Caller parses the shape it expects.
-/// One enrichment POST, run as a cancelable unit of concurrency by `withDeadline`
-/// (ROD-262). Returns the response body (a slice into `arena`) or errors. Kept
-/// `!`-returning so the deadline race can tell a real result from a timeout: on a
-/// stalled fetch the deadline's cancel turns the blocked recv into error.Canceled,
-/// so this frame unwinds — freeing `client` — instead of hanging. `postGql` maps
-/// every failure back to the graceful null.
-fn fetchGql(arena: Allocator, io: Io, body: []const u8) ![]const u8 {
+/// The raw HTTP outcome of one GraphQL POST — the status code kept alongside the
+/// body so an authed caller (the ROD-284 push) can distinguish a 429 rate-limit
+/// from a 401 from a hard failure. Enrichment collapses all of it to null; see
+/// `postGql`.
+pub const HttpResult = struct { status: std.http.Status, body: []const u8 };
+
+/// One GraphQL POST to AniList. `bearer`, when present, rides as an
+/// `Authorization: Bearer` header — null for the unauthenticated enrichment
+/// queries, set for the authed push mutations (ROD-284). Returns the raw {status,
+/// body}: the status check is deliberately the caller's, because enrichment wants
+/// "non-200 → null" while the push branches on 429/401 vs. success.
+///
+/// One POST, run as a cancelable unit of concurrency by `withDeadline` (ROD-262).
+/// Kept `!`-returning so the deadline race can tell a real result from a timeout:
+/// on a stalled fetch the deadline's cancel turns the blocked recv into
+/// error.Canceled, so this frame unwinds — freeing `client` — instead of hanging.
+fn fetchGql(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) !HttpResult {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
@@ -353,30 +361,138 @@ fn fetchGql(arena: Allocator, io: Io, body: []const u8) ![]const u8 {
     // fetch errors → null (graceful "no enrichment"), mirroring the cover path.
     const resp_buf = try arena.alloc(u8, 2 * 1024 * 1024);
     var resp_w: std.Io.Writer = .fixed(resp_buf);
+
+    // Content-Type/Accept are constant; Authorization is optional, built into the
+    // arena and appended only when a token is supplied. A fixed 3-slot array keeps
+    // the header set on the stack — no allocation for the common unauthed case.
+    var header_buf: [3]std.http.Header = .{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Accept", .value = "application/json" },
+        undefined,
+    };
+    var headers: []const std.http.Header = header_buf[0..2];
+    if (bearer) |tok| {
+        header_buf[2] = .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{tok}) };
+        headers = header_buf[0..3];
+    }
+
     const res = try client.fetch(.{
         .location = .{ .url = ENDPOINT },
         .method = .POST,
         .payload = body,
         .response_writer = &resp_w,
-        .extra_headers = &.{
-            .{ .name = "Content-Type", .value = "application/json" },
-            .{ .name = "Accept", .value = "application/json" },
-        },
+        .extra_headers = headers,
     });
-    if (res.status != .ok) return error.HttpNotOk;
-    return resp_w.buffered();
+    return .{ .status = res.status, .body = resp_w.buffered() };
 }
 
-/// Enrichment POST bounded by `ANILIST_DEADLINE_S` (ROD-262). Every failure —
-/// network error, non-200, over-cap body, or the deadline firing — collapses to
-/// `null`, the "no enrichment" signal every caller already handles.
-fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
-    return deadline.withDeadline(io, .fromSeconds(ANILIST_DEADLINE_S), fetchGql, .{ arena, io, body }) catch |e| {
+/// A GraphQL POST bounded by `ANILIST_DEADLINE_S` (ROD-262), returning the raw
+/// {status, body} or null when the request never completes — transport error,
+/// over-cap body, or the deadline firing. The HTTP status inside a returned result
+/// may still be non-200; classifying that is the caller's job. Shared by
+/// enrichment (`postGql`) and the authed push (`saveMediaListEntry`).
+fn postGqlRaw(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) ?HttpResult {
+    return deadline.withDeadline(io, .fromSeconds(ANILIST_DEADLINE_S), fetchGql, .{ arena, io, body, bearer }) catch |e| {
         if (e == error.Timeout)
             log.debug("anilist POST aborted past {d}s deadline", .{ANILIST_DEADLINE_S});
         return null;
     };
 }
+
+/// Enrichment POST: the unauthenticated queries. Every failure — network error,
+/// non-200, over-cap body, or the deadline firing — collapses to `null`, the "no
+/// enrichment" signal every caller already handles. The push path uses
+/// `postGqlRaw` directly so it can see the status code.
+fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
+    const r = postGqlRaw(arena, io, body, null) orelse return null;
+    if (r.status != .ok) return null;
+    return r.body;
+}
+
+// ── AniList push: SaveMediaListEntry (ROD-284) ───────────────────────────────
+
+/// Map a local list status to AniList's `MediaListStatus` enum. Total and clean:
+/// AniList's REPEATING has no local twin, but it only arises on *pull* (ROD-285) —
+/// every local status maps outward to exactly one AniList value.
+pub fn aniListStatus(s: domain.ListStatus) []const u8 {
+    return switch (s) {
+        .planning => "PLANNING",
+        .watching => "CURRENT",
+        .paused => "PAUSED",
+        .completed => "COMPLETED",
+        .dropped => "DROPPED",
+    };
+}
+
+/// A push either lands (AniList returns the upserted entry id), hits a rate limit
+/// (429 — the engine backs off), finds the token rejected (401 — re-auth needed,
+/// stop the run), or fails otherwise. Distinct arms so the ROD-284 engine reacts
+/// per case instead of collapsing everything to "didn't work".
+pub const PushError = error{ RateLimited, Unauthorized, PushFailed } || Allocator.Error;
+
+const SAVE_MUTATION = "mutation($mediaId:Int,$status:MediaListStatus,$progress:Int){SaveMediaListEntry(mediaId:$mediaId,status:$status,progress:$progress){id}}";
+
+// Interpolated raw into the JSON body with `{s}` (like the enrichment queries), so
+// it must carry nothing that needs JSON-string escaping — enforced at comptime.
+comptime {
+    for (SAVE_MUTATION) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20)
+            @compileError("SAVE_MUTATION contains a character that needs JSON escaping; build the body with std.json instead of {s} interpolation");
+    }
+}
+
+/// Upsert one show's watch-state to AniList via `SaveMediaListEntry` (ROD-284).
+/// Idempotent — AniList upserts keyed on `mediaId`, so re-pushing an unchanged row
+/// is a no-op on their side. Returns the media-list entry id on success. `bearer`
+/// is the OAuth access token (auth.zon); `media_id` is `anime.anilist_id`.
+pub fn saveMediaListEntry(
+    arena: Allocator,
+    io: Io,
+    bearer: []const u8,
+    media_id: i64,
+    status: domain.ListStatus,
+    progress: i64,
+) PushError!i64 {
+    // Values ride as GraphQL variables — never interpolated into the query — so a
+    // media id or status can't break out of the string. The status enum passes as a
+    // JSON string, which AniList accepts for a MediaListStatus variable. The values
+    // are all integers or a fixed enum literal, so the variables object is JSON-safe
+    // built with `{d}`/`{s}` on the same trust basis as GQL_BATCH_FIELDS.
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"query\":\"{s}\",\"variables\":{{\"mediaId\":{d},\"status\":\"{s}\",\"progress\":{d}}}}}",
+        .{ SAVE_MUTATION, media_id, aniListStatus(status), progress },
+    );
+    const r = postGqlRaw(arena, io, body, bearer) orelse return error.PushFailed;
+    return classifySave(arena, r);
+}
+
+/// Map the raw {status, body} of a SaveMediaListEntry POST to the PushError
+/// contract. Split from the POST so the branching is unit-testable without a live
+/// mutation. A 200 whose body carries no `SaveMediaListEntry.id` (a GraphQL-level
+/// error, or `{"data":null}`) is a failed push, not a silent success.
+fn classifySave(arena: Allocator, r: HttpResult) PushError!i64 {
+    switch (r.status) {
+        .ok => {},
+        .too_many_requests => return error.RateLimited, // 429 — engine backs off
+        .unauthorized => return error.Unauthorized, // 401 — token re-auth
+        else => return error.PushFailed,
+    }
+
+    const parsed = std.json.parseFromSlice(SaveResp, arena, r.body, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.PushFailed;
+    const data = parsed.value.data orelse return error.PushFailed;
+    const entry = data.SaveMediaListEntry orelse return error.PushFailed;
+    // `id` is `?i64`: a 200 whose entry object omits `id` (a `{}` — API/schema drift,
+    // or a MITM) is "field present but empty", which must NOT read as a landed push.
+    // Only a real id counts, or the snapshot would advance on a push that never was.
+    return entry.id orelse error.PushFailed;
+}
+
+const SaveResp = struct { data: ?SaveData = null };
+const SaveData = struct { SaveMediaListEntry: ?SaveEntry = null };
+const SaveEntry = struct { id: ?i64 = null };
 
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
     // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
@@ -735,6 +851,39 @@ fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
         } else try out.append(arena, c),
     };
     return out.items;
+}
+
+test "aniListStatus maps every local status to its AniList enum (ROD-284)" {
+    try std.testing.expectEqualStrings("PLANNING", aniListStatus(.planning));
+    try std.testing.expectEqualStrings("CURRENT", aniListStatus(.watching));
+    try std.testing.expectEqualStrings("PAUSED", aniListStatus(.paused));
+    try std.testing.expectEqualStrings("COMPLETED", aniListStatus(.completed));
+    try std.testing.expectEqualStrings("DROPPED", aniListStatus(.dropped));
+}
+
+test "classifySave: id on 200, distinct errors for 429/401/failure (ROD-284)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // 200 carrying the upserted entry id → success.
+    try std.testing.expectEqual(
+        @as(i64, 55),
+        try classifySave(a, .{ .status = .ok, .body = "{\"data\":{\"SaveMediaListEntry\":{\"id\":55}}}" }),
+    );
+
+    // 429 → RateLimited (engine backs off); 401 → Unauthorized (token re-auth).
+    try std.testing.expectError(error.RateLimited, classifySave(a, .{ .status = @enumFromInt(429), .body = "" }));
+    try std.testing.expectError(error.Unauthorized, classifySave(a, .{ .status = @enumFromInt(401), .body = "" }));
+
+    // 200 with no data (GraphQL-level error) and a 5xx both → PushFailed, never a
+    // silent success.
+    try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = .ok, .body = "{\"data\":null}" }));
+    try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = @enumFromInt(500), .body = "oops" }));
+
+    // 200 with the entry present but `id` omitted → "field present but empty" is a
+    // failed push, not a landed one — the snapshot must not advance on it.
+    try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = .ok, .body = "{\"data\":{\"SaveMediaListEntry\":{}}}" }));
 }
 
 test "normalizeTitle folds ASCII punctuation and whitespace" {
