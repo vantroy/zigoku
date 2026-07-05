@@ -202,10 +202,11 @@ fn describeOpenStoreError(err: anyerror) []const u8 {
     };
 }
 
-/// Drive one `zigoku sync` push (ROD-284): open the store, load the AniList token,
-/// run the engine, print a one-shot report. Best-effort throughout — a missing
-/// store or token is a friendly line, never a crash. The engine itself is total
-/// (returns a `Summary`, never errors), so every real outcome is a printed line.
+/// Drive one `zigoku sync`: open the store, load the AniList token, pull remote
+/// changes down and reconcile (ROD-285) then push local changes up (ROD-284),
+/// printing a one-shot report for each direction. Best-effort throughout — a missing
+/// store or token is a friendly line, never a crash. Both engines are total (return
+/// a summary, never error), so every real outcome is a printed line.
 fn runSync(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
     var store = openStore(arena) catch |err| {
         try out.print("  sync: no local library to push — {s}\n", .{describeOpenStoreError(err)});
@@ -220,17 +221,111 @@ fn runSync(arena: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
     const credentials = zigoku.auth.load(arena, io, auth_path);
     const now = zigoku.Store.nowSecs();
 
-    // Announce only a push we'll actually attempt — connected AND unexpired, the
-    // same gate the engine applies — so a signed-out or stale token goes straight
-    // to its summary line instead of a misleading "pushing…". Flush so the heads-up
+    // Announce only a sync we'll actually attempt — connected AND unexpired, the
+    // same gate both engines apply — so a signed-out or stale token goes straight to
+    // its summary line instead of a misleading "syncing…". Flush so the heads-up
     // shows before the paced (~2 s/row) pushes begin rather than buffering to the end.
-    if (credentials.hasAniList() and !credentials.anilist.isExpired(now)) {
-        try out.print("  pushing local changes to AniList — this can take a moment…\n", .{});
+    const usable = credentials.hasAniList() and !credentials.anilist.isExpired(now);
+    if (usable) {
+        try out.print("  syncing with AniList — this can take a moment…\n", .{});
         try out.flush();
     }
 
-    const summary = zigoku.sync.pushAll(arena, io, &store, credentials, now);
-    try printSyncSummary(out, summary);
+    // Pull remote changes down and reconcile FIRST (ROD-285), then push local changes
+    // up (ROD-284). Pull-before-push is load-bearing on a first sync: `pushAll` is a
+    // blind upsert, and every never-synced row is push-dirty, so pushing first would
+    // overwrite AniList's real history with an untouched local default before the
+    // 3-way merge ever saw it (progress destroyed, reported "clean"). Pulling first
+    // lets that remote history land locally (progress = max, nothing lost); the push
+    // then carries the *merged* value up instead of clobbering the account.
+    var skip_push = false;
+    if (usable) {
+        const pull = zigoku.sync.pullAll(arena, io, &store, credentials, now);
+        try printPullSummary(out, pull);
+        // Skip the push if the pull already hit a wall the push would hit too: a
+        // rejected token or a rate limit apply to both, and an unreadable store means
+        // `loadDirtyForSync` will fail the same way — re-running push would only
+        // duplicate the line or, under lock contention, double the busy-timeout stall
+        // (ROD-287). A mere fetch miss (network flaked on the pull) doesn't gate push —
+        // it has its own transport and failure reporting.
+        skip_push = pull.unauthorized or pull.rate_limited or pull.store_error;
+    }
+
+    // Push second. When the token isn't usable, `printPullSummary` stays silent on the
+    // signed-out/expired arms, so this push+`printSyncSummary` is what surfaces that
+    // line (its lead arms own those messages).
+    if (!skip_push) {
+        const push = zigoku.sync.pushAll(arena, io, &store, credentials, now);
+        try printSyncSummary(out, push);
+        // List *which* engaged shows have no AniList link yet (the count is in the
+        // summary line above) — the actionable half, since the user can re-open them to
+        // re-enrich. Best-effort: a failed lookup just drops the list, never the run.
+        if (push.no_link > 0) {
+            const unlinked = store.loadEngagedWithoutAniListId(arena) catch &.{};
+            try printShowList(out, unlinked);
+        }
+    }
+}
+
+/// Longest run of show titles `zigoku sync` lists inline before collapsing the rest
+/// to "… and N more" — enough to be useful, capped so a big unlinked library can't
+/// wall the terminal.
+const SHOW_LIST_CAP: usize = 12;
+
+/// Print an indented bullet list of show titles under a preceding count line, capped
+/// at `SHOW_LIST_CAP`. No-op on an empty slice.
+fn printShowList(out: *Io.Writer, titles: []const []const u8) !void {
+    const shown = @min(titles.len, SHOW_LIST_CAP);
+    for (titles[0..shown]) |t| try out.print("      · {s}\n", .{t});
+    if (titles.len > shown) try out.print("      … and {d} more\n", .{titles.len - shown});
+}
+
+/// Render a pull `PullSummary` (ROD-285) to human text — one early-stop line, or the
+/// reconcile tally plus any advisory footers. Mirrors `printSyncSummary`. The
+/// signed-out/expired arms can't fire here (the caller gates pull on a usable token)
+/// but are handled defensively so a future caller can't leak an empty report.
+fn printPullSummary(out: *Io.Writer, s: zigoku.sync.PullSummary) !void {
+    if (s.signed_out or s.expired) return; // push already said it
+    if (s.no_user_id) {
+        try out.print("  pull skipped: can't tell which AniList account this token is for — run `zigoku login` to reconnect.\n", .{});
+        return;
+    }
+    if (s.unauthorized) {
+        try out.print("  pull stopped: AniList rejected the token — run `zigoku login` to reconnect.\n", .{});
+        return;
+    }
+    if (s.rate_limited) {
+        try out.print("  pull stopped: hit AniList's rate limit — run `zigoku sync` again shortly.\n", .{});
+        return;
+    }
+    if (s.fetch_failed) {
+        try out.print("  pull failed: couldn't fetch your AniList list — re-run with --debug for details.\n", .{});
+        return;
+    }
+    if (s.store_error) {
+        try out.print("  pull: couldn't read the local library; nothing reconciled.\n", .{});
+        return;
+    }
+
+    if (s.updated > 0) {
+        try out.print("  pulled {d} update(s) from AniList.\n", .{s.updated});
+    } else if (s.conflicts == 0) {
+        // Mirror the push side's idiom exactly (they print back-to-back). Suppressed
+        // when conflicts > 0 — the row isn't actually "up to date", it's dirty for the
+        // next push, and the conflicts footer below carries that.
+        try out.print("  already up to date — nothing to pull in.\n", .{});
+    }
+    if (s.conflicts > 0) try out.print("  ({d} show(s) kept your local status over AniList's — they'll push back up next sync.)\n", .{s.conflicts});
+    if (s.contended > 0) try out.print("  ({d} show(s) changed mid-sync — left as-is, will reconcile next run.)\n", .{s.contended});
+    if (s.failed > 0) try out.print("  {d} local update(s) failed to save — re-run with --debug for details.\n", .{s.failed});
+    if (s.unmatched > 0) {
+        try out.print("  ({d} AniList show(s) aren't in your local library yet — not imported.)\n", .{s.unmatched});
+        // These live only on AniList (no local title to show), so print their ids as
+        // lookup links for a manual check. Capped like the push-side list.
+        const shown = @min(s.unmatched_ids.len, SHOW_LIST_CAP);
+        for (s.unmatched_ids[0..shown]) |id| try out.print("      · anilist.co/anime/{d}\n", .{id});
+        if (s.unmatched_ids.len > shown) try out.print("      … and {d} more\n", .{s.unmatched_ids.len - shown});
+    }
 }
 
 /// Render a push `Summary` (ROD-284) to human text — one early-stop line, or the
@@ -637,6 +732,75 @@ test "printSyncSummary: advisory footers stack onto the tally (ROD-284)" {
     const out3 = try renderSummary(.{ .dirty = 3, .pushed = 1, .unauthorized = true }, &aw3);
     try std.testing.expect(std.mem.indexOf(u8, out3, "pushed 1 of 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, out3, "rejected the token") != null);
+}
+
+fn renderPull(s: zigoku.sync.PullSummary, buf: *std.Io.Writer.Allocating) ![]const u8 {
+    try printPullSummary(&buf.writer, s);
+    return buf.writer.buffered();
+}
+
+test "printPullSummary: each mutually-exclusive lead line (ROD-285)" {
+    const Case = struct { s: zigoku.sync.PullSummary, needle: []const u8 };
+    const cases = [_]Case{
+        .{ .s = .{ .no_user_id = true }, .needle = "which AniList account" },
+        .{ .s = .{ .unauthorized = true }, .needle = "rejected the token" },
+        .{ .s = .{ .rate_limited = true }, .needle = "rate limit" },
+        .{ .s = .{ .fetch_failed = true }, .needle = "couldn't fetch" },
+        .{ .s = .{ .store_error = true }, .needle = "couldn't read" },
+        .{ .s = .{ .updated = 0 }, .needle = "already up to date" },
+        .{ .s = .{ .reconciled = 3, .updated = 2 }, .needle = "pulled 2 update" },
+    };
+    for (cases) |c| {
+        var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer aw.deinit();
+        try std.testing.expect(std.mem.indexOf(u8, try renderPull(c.s, &aw), c.needle) != null);
+    }
+}
+
+test "printPullSummary: advisory footers stack; a lead line short-circuits (ROD-285)" {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    const unmatched_ids = [_]i64{ 12345, 67890 };
+    const out = try renderPull(.{ .remote_entries = 9, .reconciled = 4, .updated = 2, .conflicts = 1, .contended = 1, .failed = 1, .unmatched = 2, .unmatched_ids = &unmatched_ids }, &aw);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pulled 2 update") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "kept your local status") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "changed mid-sync") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "failed to save") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "not imported") != null);
+    // The unmatched ids print as lookup links under the count line.
+    try std.testing.expect(std.mem.indexOf(u8, out, "anilist.co/anime/12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "anilist.co/anime/67890") != null);
+    // updated == 0 with conflicts > 0 must NOT print the contradictory "up to date"
+    // lead — the conflicts footer speaks instead.
+    var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw2.deinit();
+    const out2 = try renderPull(.{ .reconciled = 2, .updated = 0, .conflicts = 2 }, &aw2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "already up to date") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "kept your local status") != null);
+    // A no-user-id lead line short-circuits — no tally, no footers.
+    var aw3 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw3.deinit();
+    const out3 = try renderPull(.{ .no_user_id = true, .unmatched = 9 }, &aw3);
+    try std.testing.expect(std.mem.indexOf(u8, out3, "not imported") == null);
+}
+
+test "printShowList: bullets the titles, collapses past the cap (ROD-285)" {
+    var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw.deinit();
+    const three = [_][]const u8{ "Alpha", "Beta", "Gamma" };
+    try printShowList(&aw.writer, &three);
+    const out = aw.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "· Alpha") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "· Gamma") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "more") == null); // under the cap, no collapse
+
+    // Over the cap → first SHOW_LIST_CAP shown, the remainder collapsed to a count.
+    var many: [SHOW_LIST_CAP + 3][]const u8 = undefined;
+    for (&many) |*m| m.* = "Show";
+    var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer aw2.deinit();
+    try printShowList(&aw2.writer, &many);
+    try std.testing.expect(std.mem.indexOf(u8, aw2.writer.buffered(), "… and 3 more") != null);
 }
 
 test "handleVersionFlag emits the version line and signals exit only on a version flag" {

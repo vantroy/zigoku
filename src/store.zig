@@ -766,6 +766,126 @@ pub const Store = struct {
         return c.sqlite3_column_int64(stmt, 0);
     }
 
+    /// The titles behind `countEngagedWithoutAniListId` — the engaged shows that can't
+    /// be pushed for lack of an `anilist_id` — so `zigoku sync` can list *which* shows
+    /// have no AniList link yet (enrichment never resolved one), not just how many. The
+    /// actionable half: the user can re-open these to re-enrich. Most-recently-active
+    /// first (matches the push work-list ordering); titles duped into `arena`.
+    pub fn loadEngagedWithoutAniListId(self: *Store, arena: Allocator) Error![]const []const u8 {
+        const sql =
+            \\SELECT title FROM anime
+            \\WHERE history_visible != 0 AND anilist_id IS NULL
+            \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        var out: std.ArrayList([]const u8) = .empty;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try out.append(arena, try dupeText(arena, stmt, 0) orelse "");
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// One local row eligible for pull/reconcile (ROD-285): the join key + PK to
+    /// write back through, the current local (list_status, progress), and the
+    /// last-synced snapshot — the 3-way-merge ancestor. `synced_status`/
+    /// `synced_progress` are optional: NULL = never synced (no ancestor), which the
+    /// merge treats as a first-contact bootstrap. `anilist_id` is non-optional —
+    /// `loadReconcileRows` filters out rows without one (nothing to join a remote
+    /// entry to).
+    pub const ReconcileRow = struct {
+        source: []const u8,
+        source_id: []const u8,
+        anilist_id: i64,
+        list_status: domain.ListStatus,
+        progress: i64,
+        synced_status: ?domain.ListStatus,
+        synced_progress: ?i64,
+    };
+
+    /// The pull/reconcile candidate set (ROD-285): every engaged, id-bearing row,
+    /// with its last-synced snapshot for the 3-way merge. Same gate as
+    /// `loadDirtyForSync` (engaged + `anilist_id`) but NOT filtered to dirty rows —
+    /// reconcile must see clean rows too, since a *remote* change lands on a row that
+    /// is locally unchanged. Restricting to the engaged library (`history_visible`)
+    /// keeps a merely-browsed search-cache row from being reshaped by a remote list;
+    /// importing onto browsed/absent rows is a deliberate follow-up, not v1. Text
+    /// fields are duped into `arena`.
+    pub fn loadReconcileRows(self: *Store, arena: Allocator) Error![]ReconcileRow {
+        const sql =
+            \\SELECT source, source_id, anilist_id, list_status, progress, synced_status, synced_progress
+            \\FROM anime
+            \\WHERE history_visible != 0
+            \\  AND anilist_id IS NOT NULL
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var rows: std.ArrayList(ReconcileRow) = .empty;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try rows.append(arena, .{
+                .source = try dupeText(arena, stmt, 0) orelse "",
+                .source_id = try dupeText(arena, stmt, 1) orelse "",
+                .anilist_id = c.sqlite3_column_int64(stmt, 2),
+                .list_status = colStatus(stmt, 3),
+                .progress = c.sqlite3_column_int64(stmt, 4),
+                .synced_status = colOptStatus(stmt, 5),
+                .synced_progress = colOptI64(stmt, 6),
+            });
+        }
+        return rows.toOwnedSlice(arena);
+    }
+
+    /// Apply a reconciled pull to one row (ROD-285) — but only if the row still holds
+    /// the `(expected_status, expected_progress)` pair the merge was computed from.
+    /// Sets the merged local (list_status, progress) AND advances the sync snapshot to
+    /// what AniList now holds, in one guarded UPDATE. Returns `true` when the write
+    /// landed, `false` when the guard matched zero rows — i.e. a concurrent writer (the
+    /// TUI's `recordPlay`/`setListStatus`) moved the row between the bulk
+    /// `loadReconcileRows` read and this write. `reconcileAll` computes the merge from a
+    /// point-in-time snapshot with no transaction spanning the loop, so without this
+    /// guard a mid-flight local edit would be silently clobbered (a lost update); the
+    /// guard turns that race into a skip that simply re-reconciles next run. This
+    /// matters more once ROD-286 runs sync in-process alongside the live TUI.
+    ///
+    /// The snapshot becomes the *remote* pair (server truth), not the merged pair — so
+    /// if the merge kept a locally-ahead value (a conflict resolved local-authoritative,
+    /// or a higher local progress), the row reads dirty against the snapshot and the
+    /// next push carries that delta back up. The two directions compose: pull sets the
+    /// baseline to the server, push closes any remaining local→remote gap.
+    pub fn applyPulled(
+        self: *Store,
+        source: []const u8,
+        source_id: []const u8,
+        status: domain.ListStatus,
+        progress: i64,
+        synced_status: domain.ListStatus,
+        synced_progress: i64,
+        expected_status: domain.ListStatus,
+        expected_progress: i64,
+    ) Error!bool {
+        const sql =
+            \\UPDATE anime
+            \\SET list_status = ?, progress = ?, synced_status = ?, synced_progress = ?
+            \\WHERE source = ? AND source_id = ?
+            \\  AND list_status = ? AND progress = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, progress));
+        try bindText(stmt, 3, synced_status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 4, synced_progress));
+        try bindText(stmt, 5, source);
+        try bindText(stmt, 6, source_id);
+        try bindText(stmt, 7, expected_status.str());
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 8, expected_progress));
+        try self.stepDone(stmt);
+        // sqlite3_changes counts rows the WHERE matched — 0 means the guard failed
+        // (the row changed underneath us), not an error.
+        return c.sqlite3_changes(self.db) > 0;
+    }
+
     /// Full stored metadata for one show, or null if it was never persisted.
     pub fn getAnime(self: *Store, arena: Allocator, source: []const u8, source_id: []const u8) Error!?AnimeRecord {
         const sql =
@@ -1449,6 +1569,14 @@ fn colOptI64(stmt: Stmt, idx: c_int) ?i64 {
     if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
     return c.sqlite3_column_int64(stmt, idx);
 }
+/// Like `colStatus`, but preserves the NULL-vs-set distinction: a NULL column
+/// returns null (never synced), not `.planning`. The ROD-285 reconcile needs this —
+/// a NULL snapshot means "no 3-way-merge ancestor", which is a different case from a
+/// snapshot of `planning`.
+fn colOptStatus(stmt: Stmt, idx: c_int) ?domain.ListStatus {
+    if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
+    return colStatus(stmt, idx);
+}
 fn colOptF64(stmt: Stmt, idx: c_int) ?f64 {
     if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
     return c.sqlite3_column_double(stmt, idx);
@@ -1666,6 +1794,113 @@ test "loadDirtyForSync re-flags a row after a status or progress change (ROD-284
         try testing.expectEqual(@as(usize, 1), dirty.len);
         try testing.expectEqual(@as(i64, 5), dirty[0].progress);
     }
+}
+
+test "loadReconcileRows: engaged id-bearing rows only, snapshot NULL until synced (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Engaged + id → a reconcile candidate, even though it is (as yet) clean.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "has-id", .title = "Frieren", .anilist_id = 100, .list_status = .watching, .progress = 3, .history_visible = true }, 1000, arena);
+    // Engaged, no id → nothing to join a remote entry to; excluded.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "no-id", .title = "No Id", .list_status = .watching, .progress = 5, .history_visible = true }, 1001, arena);
+    // Has an id but merely browsed (not engaged) → excluded (v1 doesn't import onto browsed rows).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "Browsed", .anilist_id = 200, .history_visible = false }, 1002, arena);
+
+    const rows = try s.loadReconcileRows(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqualStrings("has-id", rows[0].source_id);
+    try testing.expectEqual(@as(i64, 100), rows[0].anilist_id);
+    try testing.expectEqual(domain.ListStatus.watching, rows[0].list_status);
+    try testing.expectEqual(@as(i64, 3), rows[0].progress);
+    // Never synced → NULL snapshot (a first-contact merge has no ancestor), NOT planning.
+    try testing.expect(rows[0].synced_status == null);
+    try testing.expect(rows[0].synced_progress == null);
+
+    // Once synced, the snapshot reads back as the stamped pair.
+    try s.markSynced(T_SOURCE, "has-id", .watching, 3);
+    const synced = try s.loadReconcileRows(arena);
+    try testing.expectEqual(domain.ListStatus.watching, synced[0].synced_status.?);
+    try testing.expectEqual(@as(i64, 3), synced[0].synced_progress.?);
+}
+
+test "loadEngagedWithoutAniListId: names the engaged, unlinked shows, agreeing with the count (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // Engaged + linked → excluded (it can sync). Engaged + no id → listed. Browsed-only
+    // (hidden) + no id → excluded (not part of the push set).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "linked", .title = "Linked", .anilist_id = 100, .list_status = .watching, .progress = 1, .history_visible = true }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "unlinked", .title = "Unlinked Show", .list_status = .watching, .progress = 1, .history_visible = true }, 1001, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "browsed", .title = "Browsed", .history_visible = false }, 1002, arena);
+
+    const names = try s.loadEngagedWithoutAniListId(arena);
+    try testing.expectEqual(@as(usize, 1), names.len);
+    try testing.expectEqualStrings("Unlinked Show", names[0]);
+    // The list and the count must agree (same predicate).
+    try testing.expectEqual(@as(i64, 1), try s.countEngagedWithoutAniListId());
+}
+
+test "applyPulled: writes merged local pair + a server-truth snapshot; leaves a local-ahead row dirty (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .list_status = .watching, .progress = 3, .history_visible = true }, 1000, arena);
+
+    // Reconcile kept a locally-ahead value (completed@12) while AniList still holds
+    // (watching, 8): local pair = merged, snapshot = remote (server truth). The row
+    // still holds the (watching, 3) it was seeded with → the guard matches, so it lands.
+    try testing.expect(try s.applyPulled(T_SOURCE, "a", .completed, 12, .watching, 8, .watching, 3));
+
+    // The merged local pair landed.
+    const rec = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.completed, rec.list_status);
+    try testing.expectEqual(@as(i64, 12), rec.progress);
+
+    // The snapshot is the remote pair, not the merged one — so the row reads DIRTY
+    // (local completed@12 ≠ snapshot watching@8) and the next push carries it up.
+    const dirty = try s.loadDirtyForSync(arena);
+    try testing.expectEqual(@as(usize, 1), dirty.len);
+    try testing.expectEqual(domain.ListStatus.completed, dirty[0].list_status);
+    try testing.expectEqual(@as(i64, 12), dirty[0].progress);
+
+    // A clean pull-in (merged == remote) instead leaves the row clean. The row now
+    // holds (completed, 12), so that's the expected guard pair.
+    try testing.expect(try s.applyPulled(T_SOURCE, "a", .completed, 12, .completed, 12, .completed, 12));
+    try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+}
+
+test "applyPulled: the optimistic guard skips a row that changed underneath (ROD-285)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .list_status = .watching, .progress = 5, .history_visible = true }, 1000, arena);
+
+    // Reconcile read the row as watching@5. Then a concurrent play (the TUI) advances
+    // it to 7 before this write lands — the exact read-then-write race.
+    try s.recordPlay(T_SOURCE, "a", 7, 2000, true);
+    try testing.expectEqual(@as(i64, 7), (try s.getAnime(arena, T_SOURCE, "a")).?.progress);
+
+    // applyPulled still carries the STALE expected pair (watching@5) from the bulk read.
+    // The guard matches zero rows → false, and the concurrent value (7) is left intact
+    // (no lost update); the row simply re-reconciles next run.
+    const applied = try s.applyPulled(T_SOURCE, "a", .completed, 12, .watching, 5, .watching, 5);
+    try testing.expect(!applied);
+    try testing.expectEqual(@as(i64, 7), (try s.getAnime(arena, T_SOURCE, "a")).?.progress);
 }
 
 test "upsertAnime cover_url: an absolute cover survives a later relative re-search (ROD-267)" {
