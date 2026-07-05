@@ -2121,10 +2121,24 @@ test "action-sync arms on a finished episode, gated on connection (ROD-291)" {
     app.session.translation = .sub;
     app.session.last_checkpoint_pos = 90;
 
-    // A meaningful finish (past NATURAL_END_RATIO) moves progress via recordPlay and
-    // schedules a push.
+    // Connected: a meaningful finish (past NATURAL_END_RATIO) moves progress via
+    // recordPlay and schedules a flush.
     try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
     try testing.expect(app.sync_flush_deadline_ms > 0);
+
+    // Not connected: the same finish must NOT arm. Re-seed the session (finish cleared
+    // it) and disconnect, then drive another meaningful finish.
+    app.sync_flush_deadline_ms = 0;
+    app.anilist_connected = false;
+    app.playing = true;
+    app.session.source = "allanime";
+    app.session.anime_id = try testing.allocator.dupe(u8, "show1");
+    app.session.episode_raw = try testing.allocator.dupe(u8, "4");
+    app.session.episode_index = 4;
+    app.session.translation = .sub;
+    app.session.last_checkpoint_pos = 90;
+    try testTick(&app, .{ .play_error = .{ .final = .{ .time_pos = 1300, .duration = 1440 }, .cause = error.MpvFailed } });
+    try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
 }
 
 test "action-sync debounce fires and clears on .tick (ROD-291)" {
@@ -2140,15 +2154,29 @@ test "action-sync debounce fires and clears on .tick (ROD-291)" {
     try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
 }
 
-test "sync_flushed whispers only when rows landed (ROD-291)" {
+test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (ROD-291)" {
     var app: App = .{};
     app.gpa = testing.allocator;
 
-    // Rows landed → a low-key info whisper.
+    // A push landed → a low-key info whisper.
     try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
     try testing.expectEqual(Toast.Kind.info, t.kind);
     try testing.expect(!t.persistent);
+
+    // A pull that changed local rows flags a history reload so the view refreshes.
+    var rel: App = .{};
+    rel.gpa = testing.allocator;
+    try testing.expect(!rel.history_dirty);
+    try testTick(&rel, .{ .sync_flushed = .{ .reconciled = 1 } });
+    try testing.expect(rel.history_dirty);
+
+    // Mid-session expiry drops the cached connected flag (stops the churn, seeds ROD-295).
+    var exp: App = .{};
+    exp.gpa = testing.allocator;
+    exp.anilist_connected = true;
+    try testTick(&exp, .{ .sync_flushed = .{ .expired = true } });
+    try testing.expect(!exp.anilist_connected);
 
     // Nothing landed (a no-op flush, or a soft failure) → silence: no toast at all.
     var quiet: App = .{};

@@ -6,11 +6,23 @@ const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
 const source_mod = @import("../source.zig");
-const sync = @import("../sync.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
 pub const PositionUpdate = player_mod.PositionUpdate;
+
+/// Result of one action-triggered sync flush (ROD-291), distilled from the pull and
+/// push summaries into just what the UI reacts to — a plain POD (no owned memory) so
+/// it ships across the worker→UI seam by value. `pushed`: rows AniList accepted (drives
+/// the whisper). `reconciled`: local rows the pull's 3-way merge changed (drives a
+/// history reload so the view reflects adopted-from-remote progress). `expired`: the
+/// token was rejected either direction (drops the cached connected flag to stop churn
+/// and seed the ROD-295 reconnect nudge).
+pub const SyncFlushOutcome = struct {
+    pushed: usize = 0,
+    reconciled: usize = 0,
+    expired: bool = false,
+};
 
 /// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
 /// worker→UI messages, posted from background threads and drained in tick().
@@ -40,11 +52,11 @@ pub const Event = union(enum) {
     /// A background BROWSE task (search/enrich) failed; payload is a human-readable
     /// reason. Surfaces as a toast only — never touches History state (ROD-234).
     task_error: []const u8,
-    /// An action-triggered AniList push finished (ROD-291). Payload is the push
-    /// `Summary` — a plain POD with no owned memory, so it ships across the worker→UI
-    /// seam by value. The handler whispers an ambient toast only when something landed;
-    /// soft failures stay silent (the rows stay dirty and retry on the next flush).
-    sync_flushed: sync.Summary,
+    /// An action-triggered AniList sync flush finished (ROD-291). Payload is a distilled
+    /// `SyncFlushOutcome` (POD, ships by value). The handler reloads history if the pull
+    /// changed local rows, drops the connected flag on expiry, and whispers only when a
+    /// push landed; soft failures stay silent (rows stay dirty, retry next flush).
+    sync_flushed: SyncFlushOutcome,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
     /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
     /// `page` is the page number this result set belongs to.

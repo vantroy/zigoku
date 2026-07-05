@@ -721,15 +721,19 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Background task: flush dirty local rows up to AniList (ROD-291). The action-sync
-/// coordinator arms a debounce on a local mutation; when it elapses, .tick spawns
-/// this to run the paced push off the render thread. `sync.pushAll` is total (every
-/// outcome lands in the returned `Summary`, never an error) and delta-only, so this
-/// is a thin wrapper: run it, post the summary for an ambient whisper. `credentials`
-/// is passed by value — its slices live in run()'s session auth arena, which outlives
-/// this thread (joined before teardown). `inflight` is cleared here in a defer so a
-/// failed `postEvent` (queue torn down at quit) can't latch the one-flush gate on.
-/// A dropped or failed push self-heals: unpushed rows stay dirty for the next flush.
+/// Background task: reconcile with AniList then flush local changes up (ROD-291). The
+/// action-sync coordinator arms a debounce on a local mutation; when it elapses, .tick
+/// spawns this off the render thread. Runs **pull-then-push**, the same order as the CLI
+/// `zigoku sync` (main.zig `runSync`): `pullAll` reconciles first (3-way merge, progress
+/// = max) so a value that moved further ahead on another surface is adopted locally
+/// before the push, instead of the push blind-lowering it — the pull-before-push
+/// discipline ROD-285 relies on, now applied to the action path too. Both engines are
+/// total (every outcome lands in a summary, never an error). The push is skipped only
+/// when the pull already hit a wall the push would hit too (401 / 429 / store error).
+/// `credentials` is passed by value — its slices live in run()'s session auth arena.
+/// `inflight` is cleared here in a defer so a failed `postEvent` (queue torn down at
+/// quit) can't latch the one-flush gate on. A dropped or failed flush self-heals:
+/// unpushed rows stay dirty for the next flush.
 pub fn syncFlushTask(
     loop: *Loop,
     gpa: Allocator,
@@ -740,8 +744,23 @@ pub fn syncFlushTask(
     inflight: *std.atomic.Value(bool),
 ) void {
     defer inflight.store(false, .release);
-    const summary = sync.pushAll(gpa, io, store, credentials, now_unix);
-    loop.postEvent(.{ .sync_flushed = summary }) catch |pe|
+
+    const pull = sync.pullAll(gpa, io, store, credentials, now_unix);
+    // `unmatched_ids` is a CLI-only affordance (print ids for manual lookup); the action
+    // path ignores it, so free the gpa-owned slice rather than leak it.
+    if (pull.unmatched_ids.len > 0) gpa.free(pull.unmatched_ids);
+
+    // Skip the push if the pull already hit a wall the push would hit too — a rejected
+    // token or rate limit apply to both, and an unreadable store fails the same way.
+    const skip_push = pull.unauthorized or pull.rate_limited or pull.store_error;
+    const push: ?sync.Summary = if (skip_push) null else sync.pushAll(gpa, io, store, credentials, now_unix);
+
+    const outcome: event_mod.SyncFlushOutcome = .{
+        .pushed = if (push) |p| p.pushed else 0,
+        .reconciled = pull.updated,
+        .expired = pull.expired or if (push) |p| p.expired else false,
+    };
+    loop.postEvent(.{ .sync_flushed = outcome }) catch |pe|
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
