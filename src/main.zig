@@ -318,7 +318,14 @@ fn printPullSummary(out: *Io.Writer, s: zigoku.sync.PullSummary) !void {
     if (s.conflicts > 0) try out.print("  ({d} show(s) kept your local status over AniList's — they'll push back up next sync.)\n", .{s.conflicts});
     if (s.contended > 0) try out.print("  ({d} show(s) changed mid-sync — left as-is, will reconcile next run.)\n", .{s.contended});
     if (s.failed > 0) try out.print("  {d} local update(s) failed to save — re-run with --debug for details.\n", .{s.failed});
-    if (s.unmatched > 0) try out.print("  ({d} AniList show(s) aren't in your local library yet — not imported.)\n", .{s.unmatched});
+    if (s.unmatched > 0) {
+        try out.print("  ({d} AniList show(s) aren't in your local library yet — not imported.)\n", .{s.unmatched});
+        // These live only on AniList (no local title to show), so print their ids as
+        // lookup links for a manual check. Capped like the push-side list.
+        const shown = @min(s.unmatched_ids.len, SHOW_LIST_CAP);
+        for (s.unmatched_ids[0..shown]) |id| try out.print("      · anilist.co/anime/{d}\n", .{id});
+        if (s.unmatched_ids.len > shown) try out.print("      … and {d} more\n", .{s.unmatched_ids.len - shown});
+    }
 }
 
 /// Render a push `Summary` (ROD-284) to human text — one early-stop line, or the
@@ -753,12 +760,16 @@ test "printPullSummary: each mutually-exclusive lead line (ROD-285)" {
 test "printPullSummary: advisory footers stack; a lead line short-circuits (ROD-285)" {
     var aw = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer aw.deinit();
-    const out = try renderPull(.{ .remote_entries = 9, .reconciled = 4, .updated = 2, .conflicts = 1, .contended = 1, .failed = 1, .unmatched = 5 }, &aw);
+    const unmatched_ids = [_]i64{ 12345, 67890 };
+    const out = try renderPull(.{ .remote_entries = 9, .reconciled = 4, .updated = 2, .conflicts = 1, .contended = 1, .failed = 1, .unmatched = 2, .unmatched_ids = &unmatched_ids }, &aw);
     try std.testing.expect(std.mem.indexOf(u8, out, "pulled 2 update") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "kept your local status") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "changed mid-sync") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "failed to save") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "not imported") != null);
+    // The unmatched ids print as lookup links under the count line.
+    try std.testing.expect(std.mem.indexOf(u8, out, "anilist.co/anime/12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "anilist.co/anime/67890") != null);
     // updated == 0 with conflicts > 0 must NOT print the contradictory "up to date"
     // lead — the conflicts footer speaks instead.
     var aw2 = std.Io.Writer.Allocating.init(std.testing.allocator);

@@ -219,6 +219,11 @@ pub const PullSummary = struct {
     /// Distinct remote entries with no engaged, id-bearing local row — not imported
     /// in v1 (that's a follow-up); reported so the skip is visible, not silent.
     unmatched: usize = 0,
+    /// The AniList media ids behind `unmatched` (== `unmatched` in length, barring an
+    /// OOM building the list), so the CLI can print them for a manual lookup instead of
+    /// a bare count. Allocated from the caller's `gpa` so it outlives `reconcileAll`'s
+    /// internal arena; empty when nothing is unmatched.
+    unmatched_ids: []const i64 = &.{},
     /// Rows whose `applyPulled` write errored; logged per row, the run continues.
     failed: usize = 0,
     /// Rows a concurrent local edit (the TUI) moved between our read and our write —
@@ -390,6 +395,15 @@ fn reconcileAll(gpa: Allocator, st: *Store, entries: []const anilist.PulledEntry
 
     // Distinct remote entries that never joined an engaged local row (not imported).
     summary.unmatched = summary.remote_entries - matched.count();
+    // Collect their media ids for the CLI to print (manual lookup on anilist.co). From
+    // `gpa`, not the internal arena, so the slice outlives this call; best-effort — an
+    // OOM here just drops the list, the count above still stands. `entries` are already
+    // deduped, so this is exactly the unmatched set in insertion order.
+    var unmatched_ids: std.ArrayList(i64) = .empty;
+    for (entries) |e| {
+        if (!matched.contains(e.media_id)) unmatched_ids.append(gpa, e.media_id) catch break;
+    }
+    summary.unmatched_ids = unmatched_ids.items;
     return summary;
 }
 
@@ -691,12 +705,16 @@ test "reconcileAll: unmatched remote counted, local-only row untouched (ROD-285)
         .{ .media_id = 42, .status = .watching, .progress = 5 }, // in sync — no write
         .{ .media_id = 99, .status = .completed, .progress = 24 }, // no local row → unmatched
     };
-    const sum = reconcileAll(testing.allocator, &s, &entries);
+    // Pass the test arena as gpa so the unmatched-id list is freed with it (no leak).
+    const sum = reconcileAll(arena, &s, &entries);
 
     try testing.expectEqual(@as(usize, 2), sum.remote_entries);
     try testing.expectEqual(@as(usize, 1), sum.reconciled); // only media 42 joined
     try testing.expectEqual(@as(usize, 0), sum.updated); // 42 already in sync
     try testing.expectEqual(@as(usize, 1), sum.unmatched); // media 99 not imported
+    // The unmatched id is surfaced for the CLI's manual-lookup list.
+    try testing.expectEqual(@as(usize, 1), sum.unmatched_ids.len);
+    try testing.expectEqual(@as(i64, 99), sum.unmatched_ids[0]);
     // No phantom row was created for the unmatched remote entry.
     try testing.expectEqual(@as(usize, 1), (try s.loadReconcileRows(arena)).len);
 }
