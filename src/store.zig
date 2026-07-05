@@ -43,15 +43,29 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 /// `migrate` when the shape changes — never ALTER-and-ignore.
 const SCHEMA_VERSION: c_int = 11;
 
-/// Milliseconds SQLite waits on a held lock before giving up with SQLITE_BUSY, set
-/// once per connection in `open` (ROD-287). Two processes now share one DB as a
+/// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
+/// set once per connection in `open` (ROD-287). Two processes now share one DB as a
 /// normal pattern — the TUI plus a standalone/cron'd `zigoku sync` — so a writer can
-/// find the write lock held by the other. This bounds the wait: long enough to sit
-/// out the other side's one-time migration or a single short UPDATE (the `markSynced`
-/// vs. enrichment-upsert collision), short enough that a pathological pile-up can't
-/// freeze a foreground write for more than a beat. Reads never wait under WAL, so the
-/// render loop — which is all reads — is unaffected regardless of this value.
-const BUSY_TIMEOUT_MS: c_int = 3000;
+/// find the write lock held by the other. WAL lets readers through unblocked, so this
+/// only gates writer-vs-writer contention; the catch (caught in review) is that the
+/// TUI performs its checkpoint/recordPlay writes ON the render/input thread, so a long
+/// wait here freezes the UI, not just a background task. We keep it short on purpose:
+/// real collisions resolve far below this (a one-time migration is <20ms, a lone
+/// markSynced or checkpoint UPDATE is sub-ms), so 250ms is ~10x the realistic worst
+/// case yet caps a foreground stall at a quarter-second. If a genuinely stuck peer ever
+/// burns the whole budget, failing fast is the right call for a render loop — a dropped
+/// checkpoint is recoverable, and a timed-out `open()` falls back to no-store and
+/// recovers next launch. NB this does NOT cover the WAL-mode flip in `open`; SQLite
+/// skips its busy handler for that lock upgrade, so `enableWal` retries it by hand.
+const BUSY_TIMEOUT_MS: c_int = 250;
+
+/// `enableWal` retry budget: attempts × backoff. The WAL-mode flip can return
+/// SQLITE_BUSY under a fresh-open race that `busy_timeout` doesn't cover (see
+/// `enableWal`), so we retry it manually. 100 × 5ms is a 500ms ceiling — orders of
+/// magnitude above the microseconds the winner actually needs, so it converges on the
+/// first retry or two in practice; the ceiling only bounds a pathologically wedged peer.
+const WAL_RETRY_LIMIT: usize = 100;
+const WAL_RETRY_BACKOFF_MS: c_int = 5;
 
 /// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
 /// natural-end window (80%) is where the player path stops offering a mid-episode
@@ -403,9 +417,10 @@ pub const Store = struct {
         errdefer self.close();
         // Bound lock-contention waits before the first statement runs so migrate()'s
         // BEGIN IMMEDIATE — and every later writer — sits out a concurrent holder
-        // instead of erroring immediately (ROD-287). See BUSY_TIMEOUT_MS.
+        // instead of erroring immediately (ROD-287). See BUSY_TIMEOUT_MS. The WAL flip
+        // is the one thing this can't rescue, so it gets its own retry (enableWal).
         _ = c.sqlite3_busy_timeout(self.db, BUSY_TIMEOUT_MS);
-        try self.exec("PRAGMA journal_mode = WAL;");
+        try self.enableWal();
         try self.exec("PRAGMA foreign_keys = ON;");
         try self.migrate();
         return self;
@@ -1199,6 +1214,32 @@ pub const Store = struct {
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    /// Switch the journal to WAL, retrying on SQLITE_BUSY. This can't ride on
+    /// `busy_timeout` (ROD-287, caught in review): when two fresh connections race to
+    /// promote the journal delete→WAL for the first time, the loser needs a brief
+    /// exclusive lock the winner holds, and SQLite deliberately does NOT run the busy
+    /// handler for that lock upgrade — running it could deadlock two mutually-waiting
+    /// upgraders — so the pragma returns SQLITE_BUSY at once regardless of the timeout.
+    /// We retry by hand: the winner finishes WAL setup in microseconds, after which the
+    /// loser's retry sees the journal already in WAL and returns without needing the
+    /// lock at all, so this converges in a round or two on any real filesystem. Bounded
+    /// so a truly wedged peer surfaces as error.Exec (best-effort no-store) instead of
+    /// hanging open() forever. Uses sqlite3_sleep — a portable VFS-backed backoff — so
+    /// the store layer needn't thread an Io handle through just for this.
+    fn enableWal(self: *Store) Error!void {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const rc = c.sqlite3_exec(self.db, "PRAGMA journal_mode = WAL;", null, null, null);
+            if (rc == c.SQLITE_OK) return;
+            if ((rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED) and attempt < WAL_RETRY_LIMIT) {
+                _ = c.sqlite3_sleep(WAL_RETRY_BACKOFF_MS);
+                continue;
+            }
+            std.log.err("store: enable WAL failed (rc={d}): {s}", .{ rc, c.sqlite3_errmsg(self.db) });
+            return error.Exec;
+        }
+    }
+
     fn migrate(self: *Store) Error!void {
         // Fast path: read the version WITHOUT a write lock (reads never block under
         // WAL). The common case — an already-current DB — writes nothing, so routine
@@ -1274,7 +1315,14 @@ pub const Store = struct {
             try self.exec(MIGRATION_V11);
             v = 11;
         }
-        std.debug.assert(v == SCHEMA_VERSION); // invariant: migrations reached target
+        // Invariant: the ladder must have reached the target. Under the old code a
+        // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
+        // left the DB stuck at the old version — annoying but honest. Here the final
+        // bump below is unconditional, so the same slip would stamp a half-applied
+        // schema as current under ReleaseFast, where `std.debug.assert` compiles out —
+        // the exact bug this ticket closes. So we check for real, in every build mode,
+        // and unwind through the errdefer instead of trusting a strippable assert.
+        if (v != SCHEMA_VERSION) return error.Exec;
 
         // One bump at the end: the whole ladder commits atomically below, so per-step
         // bumps would be redundant. Derived from SCHEMA_VERSION so it can't drift.
@@ -1491,44 +1539,21 @@ test "concurrent open migrates atomically — no double-apply, no half-applied s
     try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
 }
 
-test "a second writer waits out a held write lock, then recovers (ROD-287)" {
-    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-
-    var tmp_dir = testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const db_path = try tmpDbPath(arena, &tmp_dir, "contended.db");
-
-    var a = try Store.open(db_path);
-    defer a.close();
-    var b = try Store.open(db_path);
-    defer b.close();
-
-    // Shorten B's patience so the held-lock branch resolves fast instead of blocking
-    // the test for the full BUSY_TIMEOUT_MS.
-    _ = c.sqlite3_busy_timeout(b.db, 50);
-
-    // A holds the write lock. We drive B's contention at the C level so the expected
-    // SQLITE_BUSY doesn't route through the logging exec() wrapper — this test runner
-    // fails a test that logs at .err (see the "bind error" test). The property under
-    // test is busy_timeout's: a second writer (the markSynced-vs-enrichment-upsert
-    // collision) degrades to a clean BUSY, never a crash or a silent dropped write.
-    try a.exec("BEGIN IMMEDIATE;");
-    try testing.expectEqual(c.SQLITE_BUSY, c.sqlite3_exec(b.db, "BEGIN IMMEDIATE;", null, null, null));
-
-    // A releases; the same acquisition on B now succeeds — the collision was transient.
-    try a.exec("COMMIT;");
-    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(b.db, "BEGIN IMMEDIATE;", null, null, null));
-    try testing.expectEqual(c.SQLITE_OK, c.sqlite3_exec(b.db, "COMMIT;", null, null, null));
-
-    // A real write through B then lands and reads back — the handle is healthy, not
-    // wedged by the earlier contention.
-    const seed = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "z1", .name = "Zoro", .eps_sub = 12 }, .sub);
-    try b.upsertAnime(seed, 1000, arena);
-    const rows = try b.loadHistory(arena);
-    try testing.expectEqual(@as(usize, 1), rows.len);
-    try testing.expectEqualStrings("z1", rows[0].source_id);
+test "open() wires the busy_timeout on the connection (ROD-287)" {
+    // Directly assert `open()` configured a non-zero busy_timeout — the half of the fix
+    // that lets a second writer wait out a briefly-held lock instead of erroring at
+    // once (the markSynced-vs-checkpoint collision). The query form of
+    // `PRAGMA busy_timeout` reads back exactly what `sqlite3_busy_timeout` set, so this
+    // fails deterministically if the wiring in `open()` is ever dropped. A prior draft
+    // drove a real contention timeout instead, but that passes on SQLite's own busy
+    // mechanics even with our wiring removed (caught in review) — and it was timing-
+    // dependent. Asserting against the const, not a literal, keeps it valid on a retune.
+    var s = try Store.openMemory();
+    defer s.close();
+    const stmt = try s.prepare("PRAGMA busy_timeout;");
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expectEqual(c.SQLITE_ROW, c.sqlite3_step(stmt));
+    try testing.expectEqual(BUSY_TIMEOUT_MS, c.sqlite3_column_int(stmt, 0));
 }
 
 test "bind error surfaces instead of writing a silent NULL" {

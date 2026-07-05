@@ -192,6 +192,12 @@ fn describeOpenStoreError(err: anyerror) []const u8 {
         error.SchemaTooNew => "DB was written by a newer Zigoku — delete it to start fresh",
         error.NoHomeDir => "couldn't locate a data directory (no $HOME/$XDG_DATA_HOME)",
         error.Unsupported => "this platform isn't supported yet (no data directory)",
+        // The likeliest failure out of the ROD-287 open path: a lost first-open WAL
+        // race, or an older build's half-applied schema that re-migrates into a
+        // duplicate-column conflict. Both surface as error.Exec; name it instead of a
+        // bare "Exec" so the note reads like a diagnosis, not a crash.
+        error.Exec => "the database was busy or its schema conflicted — running without history this session",
+        error.Open => "couldn't open the database file — running without history this session",
         else => @errorName(err),
     };
 }
@@ -264,7 +270,13 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
         zigoku.log.file_path = std.fmt.allocPrint(arena, "{s}/zigoku.log", .{dir}) catch null;
     } else |_| {}
 
-    var store_opt: ?zigoku.Store = openStore(arena) catch null;
+    // Best-effort persistence. Unlike the CLI path, the TUI can't print to stderr (it's
+    // the render surface), so a failure here would otherwise vanish — log the reason to
+    // the file sink instead of swallowing it silently (ROD-287, review follow-up).
+    var store_opt: ?zigoku.Store = openStore(arena) catch |err| blk: {
+        std.log.warn("persistence off — {s}", .{describeOpenStoreError(err)});
+        break :blk null;
+    };
     defer if (store_opt) |*st| st.close();
     var allanime = zigoku.AllAnime.init();
     const provider = allanime.provider();
