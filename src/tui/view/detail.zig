@@ -290,27 +290,23 @@ fn drawTitle(self: *App, win: vaxis.Window, w: u16, info: DetailRenderInfo, star
     return start_row + 1;
 }
 
-/// Alternate title rows (ROD-141): english_name if it differs from the romaji
-/// name already on the title line; native_name in italic (foreign-language rule
-/// DESIGN.md §1.3). Both are nullable — emit only present, non-empty values.
+/// Alternate title rows (ROD-141, generalized by ROD-205 §9.1a): the two title
+/// forms *not* resolved as the primary label, in romaji→english→native order,
+/// each skipped when empty or byte-equal to the primary. Native renders italic
+/// per the foreign-language rule (§1.3); romaji and English alts stay plain fg2.
 /// Returns the next free row.
-fn drawAltTitles(self: *App, win: vaxis.Window, w: u16, h: u16, anime: Anime, start_row: u16) u16 {
+fn drawAltTitles(self: *App, win: vaxis.Window, w: u16, h: u16, anime: Anime, primary: []const u8, start_row: u16) u16 {
     var row = start_row;
 
-    // English name — only if it meaningfully differs from the displayed title.
-    if (anime.english_name) |eng| {
-        if (eng.len > 0 and !std.mem.eql(u8, eng, anime.name) and row < h) {
-            putClipped(win, row, 0, w, eng, self.s(self.palette.fg2, .{}));
-            row += 1;
-        }
-    }
-
-    // Native name — italic per the foreign-language rule (§1.3).
-    if (anime.native_name) |nat| {
-        if (nat.len > 0 and row < h) {
-            putClipped(win, row, 0, w, nat, self.s(self.palette.fg2, .{ .italic = true }));
-            row += 1;
-        }
+    // `primary` is the exact string the title line rendered — passed in, not
+    // re-resolved, so the two can't drift. Equality against the *resolved* primary
+    // de-dupes a fallback target (e.g. `english` with a null english_name resolves
+    // to romaji, so romaji is not repeated as an alt) — the check native lacked.
+    var buf: [2]domain.TitleRow = undefined;
+    for (domain.altTitles(anime.name, anime.english_name, anime.native_name, primary, &buf)) |alt| {
+        if (row >= h) break;
+        putClipped(win, row, 0, w, alt.text, self.s(self.palette.fg2, .{ .italic = alt.native }));
+        row += 1;
     }
 
     return row;
@@ -480,9 +476,10 @@ fn drawHairline(self: *App, win: vaxis.Window, w: u16, row: u16) void {
 fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderInfo, start_row: u16, bloom: bool) u16 {
     var row = drawTitle(self, win, w, info, start_row);
 
-    // Alternate titles (english + native) — only present when the Anime has them.
+    // Alternate titles — de-duped against the same resolved primary the title line
+    // showed (info.title), so the stack can't repeat the primary form.
     if (info.anime) |a| {
-        if (row < h) row = drawAltTitles(self, win, w, h, a, row);
+        if (row < h) row = drawAltTitles(self, win, w, h, a, info.title, row);
     }
 
     // Kanji chips: status + season/year. Omitted entirely when both are absent.
@@ -721,18 +718,22 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 
     var row: u16 = drawCover(self, vx, writer, win, anime, w, null);
 
+    // Primary label under the title-language preference (ROD-205), matching
+    // detailRenderInfo's resolution + "—" empty-backstop. Hoisted so the alt-title
+    // stack de-dupes against the very same string this line renders.
+    const primary = anime.displayTitle(self.config.titleLanguageEnum());
     if (row < h) {
-        if (anime.name.len > 0) {
-            putClipped(win, row, 0, w, anime.name, self.s(self.palette.fg, .{ .bold = true }));
+        if (primary.len > 0) {
+            putClipped(win, row, 0, w, primary, self.s(self.palette.fg, .{ .bold = true }));
         } else {
             putClipped(win, row, 0, w, "—", self.s(self.palette.fg3, .{}));
         }
         row += 1;
     }
 
-    // Alternate titles (english + native) — parity with Browse's drawHeader.
-    // drawAltTitles self-guards; rows with no alternates are unchanged (ROD-231).
-    if (row < h) row = drawAltTitles(self, win, w, h, anime, row);
+    // Alternate titles — the non-primary forms, de-duped against the resolved
+    // primary (drawAltTitles, generalized by ROD-205 §9.1a). Self-guards on width.
+    if (row < h) row = drawAltTitles(self, win, w, h, anime, primary, row);
 
     // Kanji chips (ROD-141): status + season, then the ROD-261 airing countdown +
     // origin. Placed ABOVE the score and hairline to match drawHeader's canonical
@@ -1073,7 +1074,7 @@ test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane
 
 // ── ROD-231: Watchlist/History detail title-parity ───────────────────────────
 
-test "ROD-231: drawAltTitles renders english (when differing) + native rows" {
+test "ROD-231/ROD-205: drawAltTitles de-dupes the two non-primary forms against the resolved primary" {
     const t = std.testing;
     var app: App = .{}; // default palette (terminal_ghost) is enough for self.s()
 
@@ -1089,30 +1090,47 @@ test "ROD-231: drawAltTitles renders english (when differing) + native rows" {
         .screen = &screen,
     };
 
-    // English differs from the romaji name + native present → both rows render.
     const both: Anime = .{
         .id = "ks",
         .name = "Kimetsu no Yaiba",
         .english_name = "Demon Slayer: Kimetsu no Yaiba",
         .native_name = "鬼滅の刃",
     };
-    try t.expectEqual(@as(u16, 2), drawAltTitles(&app, win, 60, 8, both, 0));
-    try t.expectEqualStrings("D", win.readCell(0, 0).?.char.grapheme); // english on row 0
-    try t.expectEqualStrings("鬼", win.readCell(0, 1).?.char.grapheme); // native on row 1
 
-    // English identical to the romaji name → skipped; only the native row renders.
+    // Romaji primary (the default): english + native alts, in romaji→english→native
+    // order minus romaji, so english (row 0) then native (row 1). Only native italic.
+    try t.expectEqual(@as(u16, 2), drawAltTitles(&app, win, 60, 8, both, both.name, 0));
+    try t.expectEqualStrings("D", win.readCell(0, 0).?.char.grapheme); // english alt
+    try t.expectEqualStrings("鬼", win.readCell(0, 1).?.char.grapheme); // native alt
+    try t.expect(!win.readCell(0, 0).?.style.italic); // english alt stays plain (§1.3)
+    try t.expect(win.readCell(0, 1).?.style.italic); // native alt italic (§1.3)
+
+    // English primary: the alts reorder to romaji + native (english self-excludes).
+    try t.expectEqual(@as(u16, 2), drawAltTitles(&app, win, 60, 8, both, both.english_name.?, 0));
+    try t.expectEqualStrings("K", win.readCell(0, 0).?.char.grapheme); // romaji alt now
+    try t.expectEqualStrings("鬼", win.readCell(0, 1).?.char.grapheme); // native alt
+    try t.expect(!win.readCell(0, 0).?.style.italic); // romaji alt plain
+
+    // Native primary: alts are romaji + english, BOTH plain — native italic never
+    // attaches to romaji/english, and native itself is now the (bold) primary line.
+    try t.expectEqual(@as(u16, 2), drawAltTitles(&app, win, 60, 8, both, both.native_name.?, 0));
+    try t.expectEqualStrings("K", win.readCell(0, 0).?.char.grapheme); // romaji alt
+    try t.expectEqualStrings("D", win.readCell(0, 1).?.char.grapheme); // english alt
+    try t.expect(!win.readCell(0, 1).?.style.italic); // english alt plain
+
+    // English byte-equal to the romaji name → skipped; only the native alt renders.
     const eng_dupe: Anime = .{
         .id = "fr",
         .name = "Frieren",
         .english_name = "Frieren",
         .native_name = "葬送のフリーレン",
     };
-    try t.expectEqual(@as(u16, 4), drawAltTitles(&app, win, 60, 8, eng_dupe, 3));
+    try t.expectEqual(@as(u16, 4), drawAltTitles(&app, win, 60, 8, eng_dupe, eng_dupe.name, 3));
     try t.expectEqualStrings("葬", win.readCell(0, 3).?.char.grapheme);
 
     // No alternates → no rows emitted (sparse rows/movies unchanged, no blank line).
     const none: Anime = .{ .id = "y", .name = "Solo" };
-    try t.expectEqual(@as(u16, 5), drawAltTitles(&app, win, 60, 8, none, 5));
+    try t.expectEqual(@as(u16, 5), drawAltTitles(&app, win, 60, 8, none, none.name, 5));
 }
 
 test "ROD-231: animeFromHistoryRecord carries english + native title to the renderer" {

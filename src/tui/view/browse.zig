@@ -111,7 +111,9 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const title_w: u16 = if (show_score or show_eps)
             title_right -| list_title_col -| meta_gap
         else if (w > list_title_col) w - list_title_col else 0;
-        putClipped(win, row, list_title_col, title_w, a.name, title_style);
+        // Primary label under the title-language preference (ROD-205); the resolver
+        // returns a borrow of one of `a`'s title fields, same lifetime as `a.name`.
+        putClipped(win, row, list_title_col, title_w, a.displayTitle(self.config.titleLanguageEnum()), title_style);
 
         if (show_score and slot < scratch.score.len) {
             // Score, right-anchored against the pane edge. A null score (unenriched
@@ -151,4 +153,34 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const footer_color = if (self.search.loading) self.palette.focus else self.palette.fg3;
         centerText(win, row, w, footer, self.s(footer_color, .{}));
     }
+}
+
+test "drawBrowseList renders the primary title under title_language (ROD-205)" {
+    const t = std.testing;
+    var app: App = .{};
+    app.gpa = t.allocator;
+    defer app.search.results.deinit(t.allocator);
+    try app.search.results.append(t.allocator, .{
+        .id = "fr",
+        .name = "Sousou no Frieren",
+        .english_name = "Frieren: Beyond Journey's End",
+        .native_name = "葬送のフリーレン",
+    });
+    app.search.len = 1; // nonzero query length → skip the first-run absent state
+
+    const scratch = try t.allocator.create(RenderScratch);
+    defer t.allocator.destroy(scratch);
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 12, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &screen };
+
+    // First result row is row 0; the title starts at list_title_col (col 2).
+    app.config.title_language = "romaji";
+    drawBrowseList(&app, scratch, win, 12, 60);
+    try t.expectEqualStrings("S", win.readCell(2, 0).?.char.grapheme); // "Sousou no Frieren"
+
+    app.config.title_language = "english";
+    drawBrowseList(&app, scratch, win, 12, 60);
+    try t.expectEqualStrings("F", win.readCell(2, 0).?.char.grapheme); // "Frieren: Beyond…"
 }

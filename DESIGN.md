@@ -92,8 +92,19 @@ thing you should read here." Use it once per visual unit.
 **Dim is not disabled. Dim is receded.** Watched items dim; they are still navigable.
 Disabled (e.g. settings toggle off) dims AND uses `text.dim` fg.
 
-**Italic is for foreign language and inline annotation only** — English subtitles for
-kanji chips, synopsis ellipsis marker, loading animation frames.
+**Italic is for foreign language and inline annotation only** — English fallback
+gloss for kanji chips, synopsis ellipsis marker, loading animation frames, and
+the native-language alt-title row (see below). The italic treatment is pinned
+to the *native/Japanese-script title field specifically* — not to "whichever
+row currently sits in the alt position." Romaji and English never render
+italic, whether they are the primary line or an alt row; native renders
+italic whenever it is an alt row, and drops the treatment entirely once it
+becomes the primary (every primary line is bold, never italic, regardless of
+which form it holds). This distinction matters once the primary title is
+user-selectable (`title_language`, §9.1a, ROD-205): pinning italic to the
+native field — rather than generalizing it to "any non-primary row" — is what
+keeps the default `romaji` preference rendering byte-for-byte identical to
+today, since today's English alt row is already plain `fg2`, never italic.
 
 **Underline is for navigation hints only** — keybind characters in the help line.
 
@@ -538,8 +549,9 @@ results, shows the loading state, refetches with the appropriate `dateRange` val
    on cards — `state.now` is reserved for the `TOP` rank pointer (§0
    one-magenta-at-a-time), so a top-scored #1 card does not double-paint both `TOP`
    and the badge in hot+bold. `[--]` in `text.dim` for unenriched or null scores.
-4. **Title row (row 1).** Romaji title in `text.primary` (unselected) or `state.focus`
-   + bold (selected). Clipped to `cover_w` columns with `…` (§2.1).
+4. **Title row (row 1).** The resolved primary title (`title_language`, §9.1a) in
+   `text.primary` (unselected) or `state.focus` + bold (selected). Clipped to
+   `cover_w` columns with `…` (§2.1).
 5. **View count + genre row (row 2).** Windowed view count in `text.muted`,
    left-anchored. Format: `1.4m` / `660.17k` / `892`. Absent/null: `—` in `text.dim`.
    The count is the windowed metric (`rangeViews`); the All-Time window uses the
@@ -715,14 +727,22 @@ Detail pane score line format:
 ### 4.4 Status Chip (Kanji)
 
 Inline spans, no border; color carries the meaning (Section 2.3). The detail
-header stacks romaji title → english → native (italic) → **chips row** → score+
-genres, so the chips render on their own row beneath the alt-title lines rather
-than trailing the title inline (the alt-titles claim the title's row). On that
-dedicated row the chips sit **flush at column 0**, aligned with the title stack —
-no leading indent. Up to four segments share the row, in fixed order, each pair
-separated by two spaces (ROD-141): **status** chip, **season+year** chip
-(Section 2.3), an **airing countdown** (ROD-261 — releasing shows only), and a
-**non-JP origin marker** (ROD-261 — non-JP shows only) trailing last.
+header stacks **the resolved primary title** → its two alt-title rows →
+**chips row** → score+genres, so the chips render on their own row beneath
+however many alt-title lines are present rather than trailing the title inline
+(the alt-titles claim the title's row). Primary resolution is the
+`title_language` preference (default `romaji`, §9.1a, ROD-205); the two alt
+rows are the remaining forms in `romaji → english → native` order minus
+whichever form is primary, each omitted when null or byte-equal to the primary
+(`drawAltTitles`). Styling is keyed to the *field*, not the row position: the
+native form renders italic whenever it lands in an alt row (unchanged
+behavior), romaji and English alt rows are always plain `fg2`, never italic
+(§1.3). On that dedicated row the chips sit **flush at column 0**, aligned with
+the title stack — no leading indent. Up to four segments share the row, in
+fixed order, each pair separated by two spaces (ROD-141): **status** chip,
+**season+year** chip (Section 2.3), an **airing countdown** (ROD-261 —
+releasing shows only), and a **non-JP origin marker** (ROD-261 — non-JP shows
+only) trailing last.
 
 ```
 Sousou no Frieren
@@ -731,6 +751,12 @@ Frieren: Beyond Journey's End
 完結  秋 2023
 ✦ [93/100] · Adventure · Drama · Fantasy
 ```
+
+Shown above under the default `romaji` preference — romaji bold, then English
+plain and native italic. Under `english`, the same three strings reorder:
+English bold primary, then romaji (plain) and native (italic) as alts. Under
+`native`, native leads bold and is **not** italic — italic only marks it when
+it is an alt, never when it is primary.
 
 When a title carries no alt-title lines, the chips still take their own row for a
 consistent header rhythm. Each segment is omitted entirely when its field is
@@ -1418,16 +1444,23 @@ section are schematic and predate ROD-231; `drawHistoryPreview` renders the deta
 pane top-to-bottom as:
 
 1. cover (or "no art yet")
-2. **title** — romaji name, bold
-3. **english title** — `text.fg2`; omitted when it equals the romaji name *(ROD-231)*
-4. **native title** — `text.fg2` italic (foreign-language rule §1.3); omitted when absent *(ROD-231)*
+2. **title** — the resolved primary title (`title_language`, §9.1a, default
+   `romaji`), bold
+3. **first alt title** — the next form in `romaji → english → native` order
+   minus the resolved primary; `text.fg2`; omitted when null or byte-equal to
+   the primary *(ROD-231, generalized by ROD-205)*
+4. **second alt title** — the remaining form; `text.fg2`, additionally
+   **italic when it is the native form** (foreign-language rule §1.3) —
+   otherwise plain; omitted when null or byte-equal to the primary *(ROD-231,
+   generalized by ROD-205)*
 5. **score · genres** — `[--/100]` until enriched, then §2.2 tiers
 6. hairline
 7. **status + season/year chips** — or the `list_status` label when no chip resolves
 8. **synopsis** — word-wrapped
 
-Rows 3–4 mirror the Browse header's title stack (`drawAltTitles`, §1.3) so the two
-surfaces stay consistent.
+Rows 3–4 mirror the Browse header's title stack (`drawAltTitles`, §4.4/§9.1a) so
+the two surfaces stay consistent — same primary resolution, same alt order,
+same per-field styling.
 
 ---
 
@@ -1555,6 +1588,7 @@ Live-editable. Full width. No cover art.
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
     landing view                  history                              hjkl to cycle
+    title language                romaji                               hjkl to cycle
 
   AniList Sync
   ─────────────────────────────────────────────────────────────────────────────────
@@ -1565,22 +1599,24 @@ Live-editable. Full width. No cover art.
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-> **Reconciled with shipped code (ROD-138, updated ROD-286).** This surface drifted
-> from the M4-era spec across M5/M6, then gained a fourth section in ROD-286. The mock
-> above is what `view/settings.zig` renders today: four sections (Player · Catalog ·
-> Interface · AniList Sync), eleven interactive rows plus three read-only rows (two
-> Catalog, one AniList Sync). Added since the original spec: `resume offset` (ROD-84),
-> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228), `connect` +
-> `sync` (ROD-286). Renamed: `subtitle language` →
-> `translation` (ROD-138 — it always controlled the sub/dub track, never a language).
-> Removed: `audio language` (superseded by the `translation` selector — the sub/dub
-> model has no per-language audio tracks), `preferred title` (deferred to ROD-205),
-> `help line` toggle (replaced by `palette`).
+> **Reconciled with shipped code (ROD-138, updated ROD-286, ROD-205).** This surface
+> drifted from the M4-era spec across M5/M6, then gained a fourth section in ROD-286.
+> The mock above is what `view/settings.zig` renders today: four sections (Player ·
+> Catalog · Interface · AniList Sync), twelve interactive rows plus three read-only
+> rows (two Catalog, one AniList Sync). Added since the original spec: `resume offset`
+> (ROD-84), `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228),
+> `connect` + `sync` (ROD-286), `title language` (ROD-205, §9.1a). Renamed:
+> `subtitle language` → `translation` (ROD-138 — it always controlled the sub/dub
+> track, never a language); `preferred title` → `title language` (ROD-205 — shipped
+> with a fallback chain instead of a single hardcoded field, §9.1a). Removed:
+> `audio language` (superseded by the `translation` selector — the sub/dub model has
+> no per-language audio tracks), `help line` toggle (replaced by `palette`).
 
 > **AniList Sync section (ROD-286).** `account` renders read-only like the Catalog
-> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11,
-> and the interactive-row split is now Player `0..5`, Interface `5..9`, AniList Sync
-> `9..11` — pinned by a `comptime` assert block in `settings_state.zig` so a future
+> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11
+> in ROD-286, then 11 → 12 when ROD-205 added `title language` to Interface. The
+> interactive-row split is now Player `0..5`, Interface `5..10`, AniList Sync
+> `10..12` — pinned by a `comptime` assert block in `settings_state.zig` so a future
 > row insertion that shifts a boundary breaks the build instead of silently
 > misattributing a row to the wrong section header.
 
@@ -1641,6 +1677,14 @@ Notes:
   mock's default state) is a real, expected combination: the switch is honoured, it
   just has nothing to gate yet. Flipping it off makes the rail inert without
   touching the stored token — flip it back on and sync resumes.
+- **title language** (ROD-205, shipped) cycles `romaji · english · native`
+  (`config.title_language`), default `romaji`. Slots into Interface after
+  `landing view`, and is a live-preview `.cycle` row like `palette` and
+  `landing view` — cycling it re-resolves every visible title on the next
+  frame. Full spec, fallback chains, and governed surfaces: §9.1a. Landing
+  this row moved Interface's interactive-row range from `5..9` to `5..10`
+  and AniList Sync's from `9..11` to `10..12` — the `comptime` assert in
+  `settings_state.zig` that pins those boundaries moved with it.
 
 ### 5.5a AniList Connect (ROD-286)
 
@@ -2113,6 +2157,7 @@ revisited without archaeology.
 | Rank prefers a contextual RATED ranking over POPULAR when both exist, and drops the season name even for a season-scoped rank (ROD-261) | RATED reads closer to Rank's quality-signal intent — `popularity`'s raw count was rejected as noise (§5.3b), and a contextual *rank* needs to read as a different, sharper signal than that rejected field, not a rebrand of it. The season name is dropped from the render even when AniList scoped the ranking to a season, because the header's own season/year chip (§4.4) already carries that context on the same screen — repeating it would waste space Rank's 8-col gutter doesn't have. | If a season-scoped rank without the season name reads ambiguous in testing (e.g. a show that spans two cours), reconsider a compact season glyph. |
 | Airing countdown collapses to one coarsest unit and omits itself once stale, rather than showing a negative/zero value (ROD-261) | A combined `Nd Nh` value doesn't fit the chips row's terse register, and a countdown that has silently lapsed (a stale `nextAiringEpisode` in the window between the real airing time and the next enrichment refresh) would read as a bug if shown as `-2h` or `0d`. Omitting it instead degrades to the same "no countdown" state a not-yet-enriched show already renders — a known-good degrade (§9.1), not a new one. | If users want confirmation an episode aired without waiting for refresh, consider a distinct "just aired" state instead of silent omission. |
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row — not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information — honoring Rod's "low-noise, JP shows nothing" ruling. | If CN/KR-origin shows are common enough in a user's library that the marker starts feeling load-bearing rather than incidental, promote it to `text.muted` or a small dedicated icon. |
+| Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§9.1a) | Generalizing italic to "any non-primary title row" would make the English alt row start rendering italic under the **default** `romaji` preference (today it renders plain `fg2`) — a real visual change on an unconfigured upgrade, which the ROD-205 brief locks against ("zero behavior change on upgrade"). Keeping italic keyed to the native/Japanese-script field specifically preserves today's rendering exactly when `title_language = romaji`, while still generalizing correctly for the other two preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider — but only as a fresh value judgment, not to chase "zero behavior change," which native-only italic already satisfies. |
 
 ---
 
@@ -2155,7 +2200,7 @@ aliases.
 | Surface · Field | Source | Rendered when present | Fallback when missing |
 |---|---|---|---|
 | **Browse · score** | AllAnime / AniList `score` | compact `[NN]` badge, right-anchored against the pane edge, §2.2 tier colour (ROD-226) | `[--]` in list-row dim (`fg3`); the episode count seats to the badge's left on a wide pane (title > score > eps) |
-| **Detail · title + alt titles** | AllAnime `name` / `english_name` / `native_name`; AniList fills missing alts | romaji bold, then english + native (italic) alt lines when present and distinct (`drawAltTitles`) | romaji only — no empty alt lines |
+| **Detail · title + alt titles** | AllAnime `name` / `english_name` / `native_name`; AniList fills missing alts | resolved primary bold (`title_language`, §9.1a — default `romaji`), then the other two forms as alt rows in `romaji → english → native` order minus the primary, shown when present and distinct from the primary (`drawAltTitles`) | never blank — the fallback chain (§9.1a) backstops to romaji; an absent alt row is simply skipped, never rendered empty |
 | **Detail · status chip** | AniList `status` (enrichment-only) | kanji status chip (`statusChipFor`) | omitted — no empty chip or placeholder span |
 | **Detail · season chip** | AllAnime `season` / `year`; AniList fills if null | `冬 2026`-style chip when both season and year are known | omitted — never an empty chip |
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
@@ -2169,9 +2214,10 @@ aliases.
 | **History · score badge** | — | not rendered | the `[NN]` badge from §5.4 is omitted; the space is reclaimed by the title |
 | **Episode grid** | AllAnime `episodes()` live fetch | the episode-label grid | loading spinner during fetch; absent-state when no results — `total_episodes` is unused, AllAnime provides the actual list |
 
-The Browse / search list rows render the romaji `name`; applying a user title-language
-preference there (English / Native) is tracked in ROD-205. The `score` row above is the
-only Browse field still pending (ROD-226). There is **no status glyph** on Browse /
+Browse / search list rows, History rows, and Discover cards render the
+**resolved primary title** (`title_language`, §9.1a) rather than a hardcoded
+romaji `name` — see §9.1a for the full spec (ROD-205). The `score` row above is
+the only Browse field still pending (ROD-226). There is **no status glyph** on Browse /
 search rows: History rows come from the local store, so their watch-state is already
 loaded (hence History's status chips), but Browse results come from AllAnime and carry
 no watch-state — a glyph there would need a per-row local-DB (or cache) lookup the
@@ -2196,6 +2242,100 @@ the count already rides the bar and the status is already carried by the group h
 plus the row glyph. §5.4 specs a richer row-1 right-meta (resume indicator `[▸N]`,
 season chip, status kanji); that is **deferred** — the data is in the store/cache, the
 spec just isn't settled — and would return in the title's row when added.
+
+---
+
+### 9.1a Title Language Preference (ROD-205)
+
+Every surface in the table above that renders "the anime's title" as a single
+string was hard-wired to the romaji `name` / `title` field. `title_language` —
+a new config setting, three values, default `romaji` — makes the primary title
+user-selectable, with a fallback chain so a resolved title is **never blank**:
+
+| `title_language` | Fallback chain |
+|---|---|
+| `romaji` **(default)** | romaji → english → native |
+| `english` | english → romaji → native |
+| `native` | native → romaji → english |
+
+Romaji (`domain.Anime.name` / stored `AnimeRecord.title`) is the only field
+every source guarantees non-null — AllAnime always supplies it — so it is the
+common backstop at the end of all three chains: whichever preference is
+active, a title falls through to romaji before it can ever render blank. (If
+even romaji is somehow an empty string, the existing defensive `"—"`
+placeholder in `detailRenderInfo` remains the last-resort backstop beneath the
+chain — unchanged by ROD-205.) There is deliberately **no fourth "Auto"
+value** — every option already resolves as "preferred-with-fallback," so
+`english` already behaves as the English-preferred/Auto case a separate value
+would offer.
+
+**Default is `romaji`.** An upgrading install renders identically to today
+until a user opts in — the fallback chain for `romaji` is the same
+name-then-english-then-native precedence the detail pane's alt-title stack
+already uses today (§4.4).
+
+**Never-blank invariant.** No surface this setting governs may render an empty
+title string. The chain exists precisely so a null or empty `english_name` /
+`native_name` never surfaces as blank text — it silently falls through to the
+next field, ending at romaji (and `"—"` beneath that, per above).
+
+**Where it lives.** `title_language` is a `.cycle` row in Settings →
+Interface, alongside `cover art`, `kanji chips`, `palette`, and `landing view`
+(§5.5) — slotting in after `landing view`:
+
+```
+    title language                romaji                               hjkl to cycle
+```
+
+Like `palette` and `landing view`, this is an immediate-effect toggle: no
+restart, no explicit apply step. Cycling it re-resolves and re-renders every
+visible title on the very next frame — the same live-preview behavior
+`palette` already gives a full-repaint setting (§1.4).
+
+**What it governs** — every surface that renders the anime's title as a
+resolved single string:
+
+- Browse list rows (`view/browse.zig`)
+- History list rows (`view/history.zig`)
+- Detail pane title line — the bold primary in `drawHeader` / `drawTitle`
+  (`detailRenderInfo`, §4.4) and the History preview stack
+  (`drawHistoryPreview`, §5.4a)
+- Discover feed card rows (`view/discover.zig`, §3.8 card anatomy)
+
+**Explicitly excluded: the top bar (§3.4).** `ZIGOKU` is app branding, not a
+show title, and is unaffected regardless of `title_language`.
+
+**Toast copy (§4.7/§4.10).** No toast string today embeds an anime title —
+every event in the §4.10 matrix (`episode N done`, `added to watchlist`,
+`mpv not found — install mpv`, etc.) is title-free (verified against
+`App.pushToast` call sites). The invariant still binds prospectively: if a
+future toast's copy embeds a title, it must resolve through this same chain
+rather than defaulting to romaji. This is a forward-compatible rule, not an
+active change today.
+
+**No new data.** Both shapes already carry all three forms — nothing new is
+persisted or fetched:
+
+| Form | `domain.Anime` field | Stored `AnimeRecord` field |
+|---|---|---|
+| Romaji | `name` | `title` |
+| English | `english_name` | `title_english` |
+| Native | `native_name` | `native_name` |
+
+**Alt-row generalization.** The detail title+alt stack (`drawAltTitles`, §4.4 /
+§5.4a) generalizes the same way the primary line does: the two alt rows are
+whichever two forms are *not* the resolved primary, in `romaji → english →
+native` order, each skipped when null **or** byte-equal to the resolved
+primary — "resolved," not "configured": if a preference falls back (e.g.
+`english` with a null `english_name` resolves to romaji), the alt-row order is
+computed against the field that actually rendered as primary, so the fallback
+target is never duplicated into its own alt row. This generalizes today's
+partial de-dupe (ROD-231 checks only the English alt against romaji; the
+native alt has no equality check at all) into a symmetric rule applied to both
+alt slots against whichever form is primary — a small but real implementation
+delta implementers should carry through, not just a re-labeling. Per-field
+italic styling is unchanged by this generalization (§1.3, §4.4): native is
+italic whenever it is an alt row, romaji and English never are.
 
 ---
 
@@ -2403,8 +2543,8 @@ Both rows are non-interactive (`drawInertRow`: `palette.fg3` + italic, no marker
 no hint) and skipped by `j`/`k` navigation. `enrichment sync` now reads `automatic`;
 `cover art cache` is read-only (was `enter to edit` in the original spec) and shows
 the runtime-resolved cache path (`$XDG_CACHE_HOME`-aware, `$HOME` collapsed to `~`,
-ROD-225) — the mock shows the default-home case. The old `preferred title` row is
-deferred to ROD-205 and not rendered.
+ROD-225) — the mock shows the default-home case. The old `preferred title` row
+shipped under Interface, not Catalog, as `title language` (ROD-205, §5.5/§9.1a).
 
 #### §5.6 Loading / Now Resolving — startup copy
 
@@ -2489,6 +2629,7 @@ post-search enrichment needs no flag); it is currently always `false`.
 | Two-pane split threshold is `pane_split_min = 60`; zoom threshold is `zoom_min = 100` (ROD-113 → ROD-170) | ROD-113 set both thresholds to 100 (`history_split_min`, `detail_two_col_min`). ROD-170 separates them: the two-pane split drops to 60 (the minimum useful list + detail column pair) while the zoom/grid stays at 100. At 60 cols, `detail_w ≈ 25` (`paneSplit(60)`: list_w 30, detail_w 25) — enough for a preview stack (title + chips + score + synopsis, with a 14-col cover) but too narrow for an interactive grid. Keeping the pane split at 60 means users get the persistent preview on common 80-col terminals without needing to go full-screen. The zoom threshold at 100 is unchanged — it is the point at which `detail_w ≈ 57` gives ≥ 8 grid columns. **Resolved (ROD-259):** this is historical — `zoom_min` was retired and the in-pane grid now renders at every two-pane width from `pane_split_min` (60) up; see the `ROD-259: retire zoom_min` row in §10.7. At the time, `detail_two_col_min = 100` was zoom-only, gated on the terminal width (full canvas, not the ~58% pane) — see the ROD-258 row below, which re-keys it to the pane width and pulls the persistent two-pane split under the same gate. | If the preview stack is too cramped at 60–79 cols, raise `pane_split_min` to 80 — but test before changing; the goal is a useful preview, not a perfect one. |
 | `detail_two_col_min` re-keyed from terminal width to detail-pane width (ROD-258) | The History two-pane force-split the detail into two internal columns whenever the *terminal* was ≥ 100 cols, but with the list co-visible the detail pane is only `term − list` (~58 cols at term 100) — a ~22-col cover column that clipped the meta line. `isTwoColumn` now gates on the pane width the columns are actually carved from (`w`, not `term`). One constant, two surfaces: the History persistent two-pane needs its `detail_w` pane to clear 100, i.e. `term ≥ 168` (once the 38% list is subtracted) — considerably higher than the old `term ≥ 100`. The full-screen zoom's pane is `body_w = term − 2`, so its threshold only shifts ~2 cols, to `term ≥ 102` — cosmetic. | If `term ≥ 168` proves too conservative for the persistent split in practice (most 100–167-col users stay single-column), consider a lower threshold dedicated to that surface instead of sharing the zoom's gate. |
 | First-run absent states teach the next action, not just name the void (ROD-211) | Empty Browse/History/no-results screens used to name the void (`no feed yet`, `nothing here yet`) or advertise a `/` that means catalogue-search in Browse but a local filter in History — confusing on first run. The redesign: Browse names itself and teaches `/ find anime` + `P save`; an empty watchlist originally pointed to Browse (its `/` filter has nothing to filter) — repointed to **Discover** in ROD-254 once that zero-input feed shipped (see below); active search/filter counts carry a `[catalogue · N]` / `[history · N]` scope tag so network-vs-local reads at a glance. Token tier: actionable first-run headlines (`search the catalogue`, `nothing watched yet`) render at text.muted (fg2) — one step brighter than the non-actionable persistent absences (`no art yet`, `no episodes`, text.dim/fg3) — because they invite action rather than mark a dead end; key glyphs are state.focus bold and the receded secondary hint (`P save`, the empty-History `B search`) drops to text.dim. This extends the §3 "placeholder/hint = text.dim" rule with a brighter tier for actionable states; no new palette entry. | **Done (ROD-254):** the popular feed shipped as the separate **Discover** view (ROD-247), so the empty-History pointer moved Browse → Discover (an empty watchlist is a user who doesn't yet know what to watch — Discover's job). Empty-Browse "search the catalogue" still stands (Browse stays search-only). |
+| `title_language` has no separate "Auto" value — only `romaji` / `english` / `native` (§9.1a, ROD-205) | Every option already resolves as "preferred-with-fallback": `english` falls back through romaji then native, so it already behaves exactly like an Auto/English-preferred choice would. A fourth value would just be a rename of an existing option — added config surface, no added capability. | If a genuinely different behavior is ever wanted (e.g. preferring the OS locale's script over a fixed preference), that is a new axis, not a fourth value on this one. |
 
 ---
 
@@ -2511,7 +2652,7 @@ universal search query used by Browse.
 | All-Time | `0` |
 
 **Per item:** rank position (derived from result index + 1 on the receiving side),
-cover URL, romaji + native title, view count (`rangeViews` for windowed windows;
+cover URL, romaji + english + native title, view count (`rangeViews` for windowed windows;
 lifetime total for All-Time), `showId`. `TOP` and `NEW` badges are **derived
 render-side** — not payload fields. `TOP` is always rank #1; `NEW` is computed from
 the show's season/year against the current cour (the same season-boundary logic as
@@ -2547,7 +2688,7 @@ falls back where enrichment has not yet completed:
 | Score | `[NN]` badge, tier-coloured per §2.2; 91+ capped at `text.primary` on cards | `[--]` in `text.dim` |
 | Genres | up to 2 genre glyphs in `text.dim`, right-anchored on the view-count row (§3.8a) | glyph pair absent |
 | Season/year | `NEW` badge derivation + top-bar season chip for the selected card | `NEW` badge suppressed; chip absent |
-| Romaji title | shown, clipped | shown as-is (AllAnime always supplies a name) |
+| Primary title (`title_language`, §9.1a) | shown, clipped | never blank — the chain backstops to romaji, which AllAnime always supplies |
 
 ---
 

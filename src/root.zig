@@ -111,6 +111,7 @@ test {
     _ = @import("tui/discover_state.zig"); // ROD-268: pull the slot-hydrate test
     _ = @import("tui/discover_covers.zig");
     _ = @import("tui/view/discover.zig");
+    _ = @import("tui/view/browse.zig"); // ROD-205: browse isn't pulled via app_test, wire it explicitly
     _ = @import("tui/render.zig"); // ROD-285: run progressFill (+ pre-existing render) tests
 
     _ = @import("providers/allanime.zig");

@@ -47,6 +47,7 @@ pub const SettingId = enum {
     kanji_chips,
     palette,
     landing,
+    title_language,
     // ── AniList Sync section (ROD-286) ──
     connect,
     anilist_sync,
@@ -75,6 +76,7 @@ pub const settings_rows = [_]SettingRow{
     .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .landing, .label = "landing view", .kind = .cycle, .hint = "hjkl to cycle" },
+    .{ .id = .title_language, .label = "title language", .kind = .cycle, .hint = "hjkl to cycle" },
     // AniList Sync (ROD-286): a connect *action* (Enter → OAuth flow) and the sync
     // master-switch *toggle*. The section's read-only "account" status row is rendered
     // separately (like Catalog) and is not focusable, so it isn't in this table.
@@ -87,14 +89,14 @@ pub const settings_rows = [_]SettingRow{
 pub const settings_row_count = settings_rows.len;
 
 comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..9 = Interface, 9..end =
+    // `drawSettings` splits this table 0..5 = Player, 5..10 = Interface, 10..end =
     // AniList Sync. Pin the boundaries so inserting/removing a row can't silently
     // misattribute it to the wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 11);
+    std.debug.assert(settings_rows.len == 12);
     std.debug.assert(settings_rows[4].id == .skip_mode); // last Player row
     std.debug.assert(settings_rows[5].id == .cover_art); // first Interface row
-    std.debug.assert(settings_rows[8].id == .landing); // last Interface row
-    std.debug.assert(settings_rows[9].id == .connect); // first AniList Sync row
+    std.debug.assert(settings_rows[9].id == .title_language); // last Interface row (ROD-205)
+    std.debug.assert(settings_rows[10].id == .connect); // first AniList Sync row
 }
 
 const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
@@ -106,6 +108,9 @@ const palette_presets = [_][]const u8{ "terminal_ghost", "phosphor", "nord", "to
 // "last_watched" rejoins the cycle (it was held back in ROD-228 only because it
 // would have silently folded to History).
 const landing_presets = [_][]const u8{ "history", "browse", "last_watched" };
+// Primary show-label forms (ROD-205). No "auto": `english` already resolves as
+// English-preferred-with-fallback, so a fourth value would just alias it.
+const title_language_presets = [_][]const u8{ "romaji", "english", "native" };
 
 /// Step through a preset list to the value after (`dir > 0`) or before the
 /// current one, wrapping. An unrecognized current value starts from index 0.
@@ -145,6 +150,7 @@ fn cycle(config: *Config, id: SettingId, dir: i8) void {
         .resume_offset => config.resume_offset_sec = cyclePresetU32(&resume_presets, config.resume_offset_sec, dir),
         .palette => config.palette = cyclePreset(&palette_presets, config.palette, dir),
         .landing => config.landing = cyclePreset(&landing_presets, config.landing, dir),
+        .title_language => config.title_language = cyclePreset(&title_language_presets, config.title_language, dir),
         else => {},
     }
 }
@@ -334,6 +340,7 @@ pub const SettingsState = struct {
             .kanji_chips => if (config.kanji_chips) "on" else "off",
             .palette => config.palette,
             .landing => config.landing,
+            .title_language => config.title_language,
             .anilist_sync => if (config.anilist_sync_enabled) "on" else "off",
             .connect => "", // an action row has no stored value; its hint carries the affordance
         };

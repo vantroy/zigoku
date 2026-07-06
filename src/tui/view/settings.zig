@@ -56,9 +56,9 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
     y += 1;
 
-    // Interface — the toggle/cycle rows 5..9 (cover art … landing view).
+    // Interface — the toggle/cycle rows 5..10 (cover art … title language).
     y = drawSettingsHeader(self, win, y, w, "Interface");
-    while (i < 9) : (i += 1) {
+    while (i < 10) : (i += 1) {
         const r = settings_rows[i];
         drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
         y += 1;
@@ -66,7 +66,7 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
 
     // AniList Sync (ROD-286) — a read-only account status (like Catalog), then the
-    // interactive connect action + sync master-switch toggle (rows 9..end).
+    // interactive connect action + sync master-switch toggle (rows 10..end).
     y = drawSettingsHeader(self, win, y, w, "AniList Sync");
     drawInertRow(self, win, y, w, "account", accountStatus(self));
     y += 1;
