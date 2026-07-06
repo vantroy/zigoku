@@ -325,10 +325,13 @@ pub const DetailRenderInfo = struct {
 
 pub fn detailRenderInfo(self: *App) DetailRenderInfo {
     const anime = renderedDetailAnime(self);
-    const title: []const u8 = if (anime) |a|
-        if (a.name.len > 0) a.name else "—"
-    else
-        "—";
+    // Primary label under the title-language preference (ROD-205); the resolver's
+    // never-blank chain backstops to romaji, and "—" catches the pathological
+    // all-empty case the same way the old romaji-only path did.
+    const title: []const u8 = if (anime) |a| blk: {
+        const resolved = a.displayTitle(self.config.titleLanguageEnum());
+        break :blk if (resolved.len > 0) resolved else "—";
+    } else "—";
     return .{ .anime = anime, .title = title };
 }
 

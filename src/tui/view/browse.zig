@@ -111,7 +111,9 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const title_w: u16 = if (show_score or show_eps)
             title_right -| list_title_col -| meta_gap
         else if (w > list_title_col) w - list_title_col else 0;
-        putClipped(win, row, list_title_col, title_w, a.name, title_style);
+        // Primary label under the title-language preference (ROD-205); the resolver
+        // returns a borrow of one of `a`'s title fields, same lifetime as `a.name`.
+        putClipped(win, row, list_title_col, title_w, a.displayTitle(self.config.titleLanguageEnum()), title_style);
 
         if (show_score and slot < scratch.score.len) {
             // Score, right-anchored against the pane edge. A null score (unenriched

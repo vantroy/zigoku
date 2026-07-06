@@ -290,27 +290,24 @@ fn drawTitle(self: *App, win: vaxis.Window, w: u16, info: DetailRenderInfo, star
     return start_row + 1;
 }
 
-/// Alternate title rows (ROD-141): english_name if it differs from the romaji
-/// name already on the title line; native_name in italic (foreign-language rule
-/// DESIGN.md §1.3). Both are nullable — emit only present, non-empty values.
+/// Alternate title rows (ROD-141, generalized by ROD-205 §9.1a): the two title
+/// forms *not* resolved as the primary label, in romaji→english→native order,
+/// each skipped when empty or byte-equal to the primary. Native renders italic
+/// per the foreign-language rule (§1.3); romaji and English alts stay plain fg2.
 /// Returns the next free row.
 fn drawAltTitles(self: *App, win: vaxis.Window, w: u16, h: u16, anime: Anime, start_row: u16) u16 {
     var row = start_row;
 
-    // English name — only if it meaningfully differs from the displayed title.
-    if (anime.english_name) |eng| {
-        if (eng.len > 0 and !std.mem.eql(u8, eng, anime.name) and row < h) {
-            putClipped(win, row, 0, w, eng, self.s(self.palette.fg2, .{}));
-            row += 1;
-        }
-    }
-
-    // Native name — italic per the foreign-language rule (§1.3).
-    if (anime.native_name) |nat| {
-        if (nat.len > 0 and row < h) {
-            putClipped(win, row, 0, w, nat, self.s(self.palette.fg2, .{ .italic = true }));
-            row += 1;
-        }
+    // Resolve the same primary the title line shows, then take the other forms as
+    // alts. Equality against the *resolved* primary de-dupes a fallback target
+    // (e.g. `english` with a null english_name resolves to romaji, so romaji is
+    // not repeated as an alt) — the check native previously lacked entirely.
+    const primary = anime.displayTitle(self.config.titleLanguageEnum());
+    var buf: [2]domain.TitleRow = undefined;
+    for (domain.altTitles(anime.name, anime.english_name, anime.native_name, primary, &buf)) |alt| {
+        if (row >= h) break;
+        putClipped(win, row, 0, w, alt.text, self.s(self.palette.fg2, .{ .italic = alt.native }));
+        row += 1;
     }
 
     return row;
@@ -722,16 +719,19 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
     var row: u16 = drawCover(self, vx, writer, win, anime, w, null);
 
     if (row < h) {
-        if (anime.name.len > 0) {
-            putClipped(win, row, 0, w, anime.name, self.s(self.palette.fg, .{ .bold = true }));
+        // Primary label under the title-language preference (ROD-205), matching
+        // detailRenderInfo's resolution + "—" empty-backstop.
+        const primary = anime.displayTitle(self.config.titleLanguageEnum());
+        if (primary.len > 0) {
+            putClipped(win, row, 0, w, primary, self.s(self.palette.fg, .{ .bold = true }));
         } else {
             putClipped(win, row, 0, w, "—", self.s(self.palette.fg3, .{}));
         }
         row += 1;
     }
 
-    // Alternate titles (english + native) — parity with Browse's drawHeader.
-    // drawAltTitles self-guards; rows with no alternates are unchanged (ROD-231).
+    // Alternate titles — the non-primary forms, de-duped against the resolved
+    // primary (drawAltTitles, generalized by ROD-205 §9.1a). Self-guards on width.
     if (row < h) row = drawAltTitles(self, win, w, h, anime, row);
 
     // Kanji chips (ROD-141): status + season, then the ROD-261 airing countdown +

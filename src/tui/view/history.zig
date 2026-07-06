@@ -300,7 +300,11 @@ const DrawCtx = struct {
             self.s(self.palette.fg3, .{ .bg = row_bg })
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
-        putClipped(c.win, row, title_col, c.title_w, rec.title, title_style);
+        // Primary label under the title-language preference (ROD-205). The local
+        // `/` filter still matches the romaji `rec.title` (historyEntryVisible) —
+        // matching the resolved form is a separate search concern, not this ticket.
+        const row_title = domain.preferredTitle(rec.title, rec.title_english, rec.native_name, self.config.titleLanguageEnum());
+        putClipped(c.win, row, title_col, c.title_w, row_title, title_style);
 
         // Row 1 is title-only: the episode count is on the bar row below, not
         // duplicated here (ROD-227). §5.4's richer right-meta — resume indicator

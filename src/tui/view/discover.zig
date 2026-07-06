@@ -223,11 +223,14 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
     // than putClipped's silent cell-boundary clip (DESIGN §2.1/§3.8). The truncated
     // copy lives in scratch so it outlives vx.render(); past the 256-slot cap we
     // fall back to the silent clip (no scratch slot to hold an ellipsised copy).
+    // Primary label under the title-language preference (ROD-205); a borrow of one
+    // of `a`'s title fields, so it truncates/clips exactly as `a.name` did.
+    const card_title = a.displayTitle(self.config.titleLanguageEnum());
     if (vis < scratch.title.len) {
-        const t = render.truncateToWidth(&scratch.title[vis], a.name, geo.cover_w);
+        const t = render.truncateToWidth(&scratch.title[vis], card_title, geo.cover_w);
         put(win, rank_y + 1, x, t, title_sty);
     } else {
-        putClipped(win, rank_y + 1, x, geo.cover_w, a.name, title_sty);
+        putClipped(win, rank_y + 1, x, geo.cover_w, card_title, title_sty);
     }
 
     if (a.view_count) |vc| {

@@ -38,6 +38,7 @@ pub const Config = struct {
     kanji_chips: bool = true,
     palette: []const u8 = "terminal_ghost", // "terminal_ghost" | "phosphor" | "nord" | "tokyonight"
     landing: []const u8 = "history", // "history" | "browse" | "last_watched" (ROD-228)
+    title_language: []const u8 = "romaji", // "romaji" | "english" | "native" — primary show label (ROD-205)
     /// Max simultaneous Discover-grid cover downloads (ROD-240). The pump tops up
     /// to this many in-flight fetches each frame; covers beyond the cap wait for a
     /// slot to free. Read through `discoverCoverConcurrency`, which clamps it to a
@@ -71,6 +72,16 @@ pub const Config = struct {
         if (std.mem.eql(u8, self.landing, "browse")) return .browse;
         if (std.mem.eql(u8, self.landing, "last_watched")) return .last_watched;
         return .history;
+    }
+
+    /// Map `title_language` onto the primary-label choice (ROD-205), defaulting to
+    /// `.romaji` for anything unrecognized — same degrade-at-callsite contract as
+    /// `translationEnum`/`landingEnum`, so an unknown value renders romaji rather
+    /// than failing. Consumers pass the result to `domain.preferredTitle`.
+    pub fn titleLanguageEnum(self: Config) domain.TitleLanguage {
+        if (std.mem.eql(u8, self.title_language, "english")) return .english;
+        if (std.mem.eql(u8, self.title_language, "native")) return .native;
+        return .romaji;
     }
 
     /// Lower / upper bound for `discover_cover_concurrency`. 1 keeps fetches making
@@ -158,6 +169,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqual(want.kanji_chips, got.kanji_chips);
     try testing.expectEqualStrings(want.palette, got.palette);
     try testing.expectEqualStrings(want.landing, got.landing);
+    try testing.expectEqualStrings(want.title_language, got.title_language);
     try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
     try testing.expectEqual(want.anilist_sync_enabled, got.anilist_sync_enabled);
 }
@@ -209,6 +221,7 @@ test "serialized config round-trips back through parse" {
         .kanji_chips = false,
         .palette = "nord",
         .landing = "browse",
+        .title_language = "english",
         .discover_cover_concurrency = 8,
         .anilist_sync_enabled = false,
     };
@@ -232,6 +245,14 @@ test "landingEnum maps browse and last_watched, defaults everything else to hist
     try testing.expectEqual(.history, (Config{ .landing = "history" }).landingEnum());
     try testing.expectEqual(.history, (Config{ .landing = "garbage" }).landingEnum());
     try testing.expectEqual(.history, (Config{}).landingEnum()); // default
+}
+
+test "titleLanguageEnum maps english and native, defaults everything else to romaji (ROD-205)" {
+    try testing.expectEqual(.english, (Config{ .title_language = "english" }).titleLanguageEnum());
+    try testing.expectEqual(.native, (Config{ .title_language = "native" }).titleLanguageEnum());
+    try testing.expectEqual(.romaji, (Config{ .title_language = "romaji" }).titleLanguageEnum());
+    try testing.expectEqual(.romaji, (Config{ .title_language = "garbage" }).titleLanguageEnum());
+    try testing.expectEqual(.romaji, (Config{}).titleLanguageEnum()); // default
 }
 
 test "anilist_sync_enabled defaults on, round-trips a paused value (ROD-286)" {

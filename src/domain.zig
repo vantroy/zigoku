@@ -307,7 +307,87 @@ pub const Anime = struct {
             .dub => self.eps_dub,
         };
     }
+
+    /// The primary label under the user's `title_language` preference (ROD-205),
+    /// with a never-blank fallback chain. A thin shim over `preferredTitle` for
+    /// the live-catalog shape; the stored `AnimeRecord` calls `preferredTitle`
+    /// directly with its own columns. Returns a borrow of one of `self`'s fields
+    /// — never allocates, so it inherits the caller's slice lifetime.
+    pub fn displayTitle(self: Anime, pref: TitleLanguage) []const u8 {
+        return preferredTitle(self.name, self.english_name, self.native_name, pref);
+    }
 };
+
+/// Which title form the UI shows as the primary label (ROD-205). Every value is
+/// "preferred-with-fallback": there is deliberately no separate "Auto" — `english`
+/// already resolves as English-first-then-fallback. `config.titleLanguageEnum`
+/// maps the config string onto this, degrading unknown values to `.romaji`.
+pub const TitleLanguage = enum { romaji, english, native };
+
+/// `s` if it is present and non-empty, else null — an empty string is treated as
+/// absent so a blank `english_name`/`native_name` falls through the chain rather
+/// than rendering an empty primary label.
+fn present(s: ?[]const u8) ?[]const u8 {
+    if (s) |v| if (v.len > 0) return v;
+    return null;
+}
+
+/// Resolve the primary title under `pref` with a never-blank fallback chain
+/// (ROD-205, DESIGN §9.1a). `romaji` is the only form every source guarantees, so
+/// it is the universal backstop at the end of all three chains:
+///   romaji  → romaji → english → native
+///   english → english → romaji → native
+///   native  → native → romaji → english
+/// Returns a borrow of one of the inputs; the final `orelse romaji` never
+/// allocates and yields romaji even if empty (the render sites' own `"—"`
+/// placeholder, e.g. `detailRenderInfo`, backstops that pathological case).
+pub fn preferredTitle(
+    romaji: []const u8,
+    english: ?[]const u8,
+    native: ?[]const u8,
+    pref: TitleLanguage,
+) []const u8 {
+    const rom = present(romaji);
+    return switch (pref) {
+        .romaji => rom orelse present(english) orelse present(native) orelse romaji,
+        .english => present(english) orelse rom orelse present(native) orelse romaji,
+        .native => present(native) orelse rom orelse present(english) orelse romaji,
+    };
+}
+
+/// One rendered title row: the string plus whether it is the native/Japanese-
+/// script form (which alone renders italic per §1.3).
+pub const TitleRow = struct { text: []const u8, native: bool };
+
+/// The alt-title rows to render beneath `primary`, in `romaji → english → native`
+/// order, each skipped when empty OR byte-equal to `primary` (ROD-205, §9.1a).
+/// Because `primary` is always one of the three forms, that form self-excludes by
+/// equality, so at most two rows survive. This generalizes ROD-231's partial
+/// de-dupe (which only checked the English alt against romaji) into a symmetric
+/// rule against whichever form actually resolved as primary — so a fallback
+/// (e.g. `english` with a null `english_name` resolving to romaji) never
+/// duplicates its target into an alt row.
+pub fn altTitles(
+    romaji: []const u8,
+    english: ?[]const u8,
+    native: ?[]const u8,
+    primary: []const u8,
+    out: *[2]TitleRow,
+) []TitleRow {
+    const forms = [_]TitleRow{
+        .{ .text = romaji, .native = false },
+        .{ .text = english orelse "", .native = false },
+        .{ .text = native orelse "", .native = true },
+    };
+    var n: usize = 0;
+    for (forms) |f| {
+        if (f.text.len == 0) continue;
+        if (std.mem.eql(u8, f.text, primary)) continue;
+        out[n] = f;
+        n += 1;
+    }
+    return out[0..n];
+}
 
 /// An episode "number" — a *string*, because anime episode labels aren't
 /// integers: "1", "1.5" (a recap wedged between episodes), "13.5", "SP1" (a
@@ -421,6 +501,61 @@ test "Season.fromString folds AniList and AllAnime spellings" {
 test "Translation.str returns correct tag name" {
     try std.testing.expectEqualStrings("sub", Translation.sub.str());
     try std.testing.expectEqualStrings("dub", Translation.dub.str());
+}
+
+test "preferredTitle honors each preference when all three forms are present (ROD-205)" {
+    const rom = "Sousou no Frieren";
+    const eng = "Frieren: Beyond Journey's End";
+    const nat = "葬送のフリーレン";
+    try std.testing.expectEqualStrings(rom, preferredTitle(rom, eng, nat, .romaji));
+    try std.testing.expectEqualStrings(eng, preferredTitle(rom, eng, nat, .english));
+    try std.testing.expectEqualStrings(nat, preferredTitle(rom, eng, nat, .native));
+}
+
+test "preferredTitle falls through the chain, never blank (ROD-205)" {
+    const rom = "Bleach";
+    // english pref, english absent → romaji (the guaranteed backstop), not native.
+    try std.testing.expectEqualStrings(rom, preferredTitle(rom, null, "ブリーチ", .english));
+    // native pref, native absent → romaji.
+    try std.testing.expectEqualStrings(rom, preferredTitle(rom, "Bleach EN", null, .native));
+    // An empty string is treated as absent (falls through), not rendered blank.
+    try std.testing.expectEqualStrings(rom, preferredTitle(rom, "", "", .english));
+    // Even with romaji itself empty the result is never a crash — degrades to romaji
+    // ("" here), which the render sites' own "—" placeholder backstops.
+    try std.testing.expectEqualStrings("only", preferredTitle("", "only", null, .romaji));
+}
+
+test "altTitles de-dupes against the resolved primary, native-marked (ROD-205)" {
+    const rom = "Sousou no Frieren";
+    const eng = "Frieren: Beyond Journey's End";
+    const nat = "葬送のフリーレン";
+    var buf: [2]TitleRow = undefined;
+
+    // romaji primary → english + native alts, native flagged, romaji→english→native order.
+    var alts = altTitles(rom, eng, nat, rom, &buf);
+    try std.testing.expectEqual(@as(usize, 2), alts.len);
+    try std.testing.expectEqualStrings(eng, alts[0].text);
+    try std.testing.expect(!alts[0].native);
+    try std.testing.expectEqualStrings(nat, alts[1].text);
+    try std.testing.expect(alts[1].native);
+
+    // english primary → romaji then native (order preserved, primary self-excluded).
+    alts = altTitles(rom, eng, nat, eng, &buf);
+    try std.testing.expectEqual(@as(usize, 2), alts.len);
+    try std.testing.expectEqualStrings(rom, alts[0].text);
+    try std.testing.expectEqualStrings(nat, alts[1].text);
+
+    // A form byte-equal to the primary is dropped (english == romaji here).
+    alts = altTitles("Bleach", "Bleach", nat, "Bleach", &buf);
+    try std.testing.expectEqual(@as(usize, 1), alts.len);
+    try std.testing.expectEqualStrings(nat, alts[0].text);
+
+    // Fallback case: english pref resolved to romaji (english null) → only native alt,
+    // the romaji-that-rendered-as-primary is not duplicated into an alt row.
+    const primary = preferredTitle(rom, null, nat, .english);
+    alts = altTitles(rom, null, nat, primary, &buf);
+    try std.testing.expectEqual(@as(usize, 1), alts.len);
+    try std.testing.expectEqualStrings(nat, alts[0].text);
 }
 
 test "Season.kanji returns correct glyphs" {
