@@ -974,6 +974,8 @@ state.now` escalation.
 | `undo` | undo of a status mutation (u key) | info | `undone` | no |
 | `add_to_watchlist` | P on a browse result (upsert ok) | success | `added to watchlist` | no |
 | `add_to_watchlist` | P on a browse result (upsert failed) | error | `couldn't add to watchlist` | no |
+| `sync_flushed` | pull reconciled remote changes (`reconciled > 0`) | info | `↓ N from AniList` | no |
+| `sync_flushed` | push landed (`pushed > 0`) | info | `↑ N to AniList` | no |
 
 Copy: single line, lowercase, no terminal punctuation — status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph
@@ -1016,6 +1018,17 @@ watch is still a real play (it lands in history with a resume point) but does no
 advance N. Accordingly a completed `play_error` (errored at the very end) takes
 the success path; any non-completed `play_error` fires `playback failed`. The two
 are mutually exclusive in `finishPlayback`.
+
+The two `sync_flushed` rows are the git-style ahead/behind idiom: `↓ N from
+AniList` when a pull reconciled remote changes into local rows — the launch pull
+(ROD-293) or an action flush's pull half — and `↑ N to AniList` when the action
+flush (ROD-291) pushed local changes up, both ambient background-sync
+confirmations rather than direct user-triggered outcomes. They ride the one
+shared `sync_flushed` event and are independent — a flush that moved both
+directions enqueues both, in execution order (reconcile, then push). A reconciled
+remote change re-baselines the sync snapshot, so it counts once and never
+re-toasts on later flushes. A no-op sync and every soft failure (rate-limit,
+transient transport, rows left dirty for the next retry) stay silent.
 
 **Deliberate silences** (no toast, no spinner — documented intent, not oversight):
 

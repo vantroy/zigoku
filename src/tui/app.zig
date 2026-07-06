@@ -318,12 +318,13 @@ pub fn run(
     var reload_settled_at_spawn: u32 = 0;
 
     // ROD-293: kick a background pull-on-launch so local reflects edits made on other
-    // devices since last run. Pull-only, off-thread, silent — no-op when unconnected /
+    // devices since last run. Pull-only, off-thread, ambient — no-op when unconnected /
     // no store. Reconciles into the store; a changed row flags a history reload at the
     // safe seam (the reload gate already waits for the initial load via !history_loading,
-    // so this can't race the first paint). The teardown join defer above already covers
-    // its `sync_thread` handle. It shares the action flush's one-flush gate, so a very
-    // early mutation just re-arms behind it (fireSyncFlush sees inflight and waits).
+    // so this can't race the first paint) and whispers a low-key `↓ N from AniList`. The
+    // teardown join defer above already covers its `sync_thread` handle. It shares the
+    // action flush's one-flush gate, so a very early mutation just re-arms behind it
+    // (fireSyncFlush sees inflight and waits).
     app.fireLaunchPull(&loop, io);
 
     // First paint, then the event loop.
@@ -1322,10 +1323,11 @@ pub const App = struct {
     /// action flush (ROD-291) and the quit flush (ROD-294), never the launch fast-path.
     /// Shares the one-at-a-time gate and thread handle with the action flush: this is the
     /// session's first spawn (gate clear, `sync_thread` null), but guard uniformly so it
-    /// can never stack a second sync onto the same store. Silent by design — a reconciled
-    /// remote change flags a history reload via the shared `.sync_flushed` handler
-    /// (`pushed = 0`, so no toast). Called once from run(); the `is_test` guard matches
-    /// `fireSyncFlush` (run() has no unit-test path, but keep the two symmetric).
+    /// can never stack a second sync onto the same store. Ambient — a reconciled remote
+    /// change flags a history reload via the shared `.sync_flushed` handler and whispers
+    /// `↓ N from AniList` (`pushed = 0`, so no ↑ line). Called once from run(); the
+    /// `is_test` guard matches `fireSyncFlush` (run() has no unit-test path, but keep the
+    /// two symmetric).
     fn fireLaunchPull(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return; // don't spawn a real network pull under test
         const st = self.store orelse return;
@@ -1538,22 +1540,31 @@ pub const App = struct {
             },
             .sync_flushed => |outcome| {
                 // ROD-291: the pull-then-push flush settled — or, with pushed == 0, the
-                // ROD-293 launch pull-refresh (same event, silent path). inflight was
-                // already cleared by the worker's defer — nothing to unlatch here.
+                // ROD-293 launch pull-refresh (same event). inflight was already cleared
+                // by the worker's defer — nothing to unlatch here.
                 // The pull reconciled remote changes into local rows: if any actually
                 // changed, the in-memory history slice is stale, so flag a reload at a
-                // safe seam (the same signal a playback write uses).
-                if (outcome.reconciled > 0) self.history_dirty = true;
+                // safe seam (the same signal a playback write uses), and whisper the ↓
+                // direction (ROD-293) — the git-style ahead/behind idiom, symmetric with
+                // the ↑ push below. A reconciled change re-baselines the sync snapshot, so
+                // it counts as `reconciled` exactly once and can't re-toast on later flushes.
+                if (outcome.reconciled > 0) {
+                    self.history_dirty = true;
+                    var buf: [40]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
+                    self.pushToast(.info, msg, false);
+                }
                 // Token rejected mid-session: drop the cached connected flag so we stop
                 // spawning do-nothing flushes on every edit, and seed ROD-295's reconnect
                 // nudge (which re-evaluates connection). The user-facing surface is 295's.
                 if (outcome.expired) self.anilist_connected = false;
                 // Ambient feedback only: whisper a low-key toast when a push actually
                 // landed, stay silent on a no-op or soft failure (unpushed rows stay dirty
-                // and retry on the next flush).
+                // and retry on the next flush). Enqueued after the ↓ above so a flush that
+                // moved both directions reads in execution order — reconcile, then push.
                 if (outcome.pushed > 0) {
                     var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↑ synced {d} to AniList", .{outcome.pushed}) catch "↑ synced to AniList";
+                    const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
                     self.pushToast(.info, msg, false);
                 }
             },

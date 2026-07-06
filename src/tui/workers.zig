@@ -735,7 +735,8 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 /// `MediaListCollection` round trip to adopt edits made on other devices, but leaves the
 /// paced (2 s/row) push to the action flush and the quit flush — a fast, read-only launch
 /// path that never storms the wire. It rides the same `.sync_flushed` event with
-/// `pushed = 0`, so the handler stays silent (a reconciled change still flags a reload).
+/// `pushed = 0`, so the handler emits no ↑ line — just the ambient `↓ N from AniList`
+/// whisper (and a history reload) when the reconcile actually changed local rows.
 ///
 /// `credentials` is passed by value — its slices live in run()'s session auth arena.
 /// `inflight` is cleared here in a defer so a failed `postEvent` (queue torn down at
