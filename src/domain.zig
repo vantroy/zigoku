@@ -55,11 +55,11 @@ pub const ListStatus = enum {
 
     /// The status produced by a play/progress event (ROD-139 §1, auto-transitions
     /// only). `progress` is the post-play high-water mark; `total` is the show's
-    /// episode count (null = unknown/ongoing). `still_airing` is true while the
-    /// season is mid-broadcast (see `isReleasing`) — its `total` then tracks only
-    /// the *aired* count, not the planned finale, so catching up must not complete
-    /// it. Pure + exhaustive so the state machine is unit-testable with no DB.
-    /// Manual states (pause/drop/force) go through `Store.setListStatus`, never here.
+    /// episode count (null = unknown/ongoing). `still_airing` is true when the
+    /// show isn't known-finished (see `isStillAiring`) — its `total` may then be
+    /// the *aired-so-far* count, not the real finale, so catching up must not
+    /// complete it. Pure + exhaustive so the state machine is unit-testable with no
+    /// DB. Manual states (pause/drop/force) go through `Store.setListStatus`, not here.
     pub fn afterPlay(current: ListStatus, progress: i64, total: ?i64, still_airing: bool) ListStatus {
         // A finished show stays finished — a rewatch must not demote it.
         if (current == .completed) return .completed;
@@ -104,17 +104,29 @@ pub const ListStatus = enum {
     };
 };
 
-/// True for a show still releasing weekly — AniList `RELEASING` or AllAnime
-/// `ongoing` (case-insensitive), the same vocab `detail.statusChipFor` reads.
-/// Null/empty/unknown/`FINISHED` → false. The single predicate for "is the season
-/// still airing": `ListStatus.afterPlay` gates auto-completion on it (ROD-296) so
-/// a mid-broadcast show whose `total_episodes` tracks only the *aired* count isn't
-/// marked done the moment you catch up. `FINISHED` overwrites `RELEASING` on the
-/// next enrich (non-null COALESCE), so it self-heals when a season ends — unlike
-/// the `next_airing_episode` proxy, which the COALESCE upsert can never null out.
-pub fn isReleasing(status: ?[]const u8) bool {
-    const s = status orelse return false;
-    return std.ascii.eqlIgnoreCase(s, "RELEASING") or std.ascii.eqlIgnoreCase(s, "ongoing");
+/// Whether a show's episode count is still provisional — i.e. `total_episodes`
+/// may be the aired-so-far count, not the real finale, so it's unsafe to
+/// auto-complete against (ROD-296). `ListStatus.afterPlay` gates auto-completion
+/// on this: a mid-broadcast show isn't marked done the moment you catch up.
+///
+/// Deliberately a *denylist*: only `FINISHED`/`CANCELLED` (AniList
+/// `MediaStatus`) are settled — a finished season's total IS its finale, and a
+/// cancelled show's last-aired count is all there'll ever be. EVERYTHING else is
+/// "still airing" for completion purposes:
+///   - `RELEASING` / AllAnime `ongoing` — the obvious weekly case.
+///   - `HIATUS` — split-cour break; the show WILL resume, `total` is only cour-1.
+///   - `NOT_YET_RELEASED` — no episodes yet (progress 0 anyway; harmless).
+///   - null / empty / unknown — never trust a total we can't classify; a
+///     not-yet-enriched or future AniList status defaults to safe.
+/// Vocab matches `detail.statusChipFor` (case-insensitive). `status` self-heals
+/// via the non-null COALESCE on enrich (`FINISHED` overwrites `RELEASING`) — the
+/// reason we gate on it and not the `next_airing_episode` proxy, which that same
+/// upsert can never null back out once set.
+pub fn isStillAiring(status: ?[]const u8) bool {
+    const s = status orelse return true;
+    if (std.ascii.eqlIgnoreCase(s, "FINISHED")) return false;
+    if (std.ascii.eqlIgnoreCase(s, "CANCELLED")) return false;
+    return true;
 }
 
 /// The user's stream-quality preference (ROD-152). `best`/`worst` are the
@@ -467,26 +479,33 @@ test "ListStatus.afterPlay drives the auto-transition table (ROD-139 §1)" {
 
     // ROD-296: a still-airing show never auto-completes, even when caught up to
     // the latest aired episode (progress == aired count). It stays watching until
-    // the season finishes airing.
+    // the season finishes airing. Covers every non-completed entry state, since the
+    // gate fires before any switch on `current`.
     try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 12, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 13, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 1, 12, true));
+    try std.testing.expectEqual(S.watching, S.afterPlay(.paused, 12, 12, true));
+    try std.testing.expectEqual(S.watching, S.afterPlay(.dropped, 12, 12, true));
     // But a manual/prior completion still wins over the airing gate — no demotion.
     try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 12, 12, true));
 }
 
-test "isReleasing recognises both vocabularies, case-insensitively (ROD-296)" {
-    // AniList RELEASING / AllAnime ongoing → airing (any casing).
-    try std.testing.expect(isReleasing("RELEASING"));
-    try std.testing.expect(isReleasing("releasing"));
-    try std.testing.expect(isReleasing("ongoing"));
-    try std.testing.expect(isReleasing("Ongoing"));
-    // Finished / unscheduled / unknown / absent → not airing.
-    try std.testing.expect(!isReleasing("FINISHED"));
-    try std.testing.expect(!isReleasing("NOT_YET_RELEASED"));
-    try std.testing.expect(!isReleasing("CANCELLED"));
-    try std.testing.expect(!isReleasing(""));
-    try std.testing.expect(!isReleasing(null));
+test "isStillAiring settles only on FINISHED/CANCELLED, else keeps airing (ROD-296)" {
+    // Settled: total_episodes is a trustworthy finale → not airing → completable.
+    try std.testing.expect(!isStillAiring("FINISHED"));
+    try std.testing.expect(!isStillAiring("finished"));
+    try std.testing.expect(!isStillAiring("CANCELLED"));
+    // Not settled: total may be aired-so-far → still airing → never auto-complete.
+    try std.testing.expect(isStillAiring("RELEASING"));
+    try std.testing.expect(isStillAiring("releasing"));
+    try std.testing.expect(isStillAiring("ongoing")); // AllAnime vocab
+    try std.testing.expect(isStillAiring("Ongoing"));
+    try std.testing.expect(isStillAiring("HIATUS")); // split-cour break — will resume
+    try std.testing.expect(isStillAiring("NOT_YET_RELEASED"));
+    // Unknown / unclassifiable / absent → default to safe (don't complete).
+    try std.testing.expect(isStillAiring("SOME_FUTURE_STATUS"));
+    try std.testing.expect(isStillAiring(""));
+    try std.testing.expect(isStillAiring(null));
 }
 
 test "ListStatus.groupRank orders watching → planning → paused → completed → dropped" {

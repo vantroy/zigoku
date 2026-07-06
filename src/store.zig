@@ -948,9 +948,11 @@ pub const Store = struct {
         };
     }
 
-    /// (status, progress high-water, total episodes) for one show, or null if it
-    /// isn't tracked. The minimal read the watch-state machine needs — no arena, no
-    /// full AnimeRecord — and a uniform unknown-show guard for the transition paths.
+    /// (list_status, progress high-water, total episodes, still-airing) for one
+    /// show, or null if it isn't tracked. `airing` folds the airing-status column
+    /// via `domain.isStillAiring` (ROD-296). The minimal read the watch-state
+    /// machine needs — no arena, no full AnimeRecord — and a uniform unknown-show
+    /// guard for the transition paths.
     const StatusRow = struct { status: domain.ListStatus, progress: i64, total: ?i64, airing: bool };
     fn statusRow(self: *Store, source: []const u8, source_id: []const u8) Error!?StatusRow {
         // `status` is the airing-status text (AniList RELEASING/FINISHED, AllAnime
@@ -961,18 +963,20 @@ pub const Store = struct {
         try bindText(stmt, 1, source);
         try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        // Read the status text transiently and fold to a bool before it escapes —
-        // the sqlite pointer is only valid until the next step/finalize.
+        // Fold the status text to a bool before it escapes — the sqlite pointer is
+        // only valid until the next step/finalize, so `isStillAiring` consumes the
+        // transient slice here and nothing stores it. NULL status → still airing
+        // (isStillAiring's "don't trust an unclassified total" default).
         const status_ptr = c.sqlite3_column_text(stmt, 3);
-        const airing = if (status_ptr == null) false else blk: {
+        const status_opt: ?[]const u8 = if (status_ptr == null) null else blk: {
             const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
-            break :blk domain.isReleasing(status_ptr[0..n]);
+            break :blk status_ptr[0..n];
         };
         return .{
             .status = colStatus(stmt, 0),
             .progress = c.sqlite3_column_int64(stmt, 1),
             .total = colOptI64(stmt, 2),
-            .airing = airing,
+            .airing = domain.isStillAiring(status_opt),
         };
     }
 
@@ -983,9 +987,10 @@ pub const Store = struct {
     /// the episode watched-through.
     ///
     /// The new `list_status` is decided by `ListStatus.afterPlay` — a pure function
-    /// of (current status, post-play progress, total). We read the row first so the
-    /// transition lives in testable Zig, not a SQL CASE. Unknown show → silent
-    /// no-op (nothing to play).
+    /// of (current status, post-play progress, total, still-airing). The last input
+    /// keeps a mid-broadcast show from auto-completing when you catch up to the
+    /// latest aired episode (ROD-296). We read the row first so the transition lives
+    /// in testable Zig, not a SQL CASE. Unknown show → silent no-op (nothing to play).
     pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64, completed: bool) Error!void {
         const cur = try self.statusRow(source, source_id) orelse return;
         const new_progress = if (completed) @max(cur.progress, episode_index) else cur.progress;
@@ -2297,7 +2302,10 @@ test "recordPlay auto-completes at the finale and stays completed on rewatch" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3 }, 1000, arena);
+    // FINISHED: total_episodes = 3 is the real finale, so reaching it completes.
+    // (A show with no/unsettled status won't auto-complete — that's the ROD-296
+    // gate; see the still-airing test below.)
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3, .status = "FINISHED" }, 1000, arena);
 
     try s.recordPlay(T_SOURCE, "a", 2, 2000, true); // mid-run → watching
     try testing.expectEqual(domain.ListStatus.watching, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
