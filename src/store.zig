@@ -948,20 +948,35 @@ pub const Store = struct {
         };
     }
 
-    /// (status, progress high-water, total episodes) for one show, or null if it
-    /// isn't tracked. The minimal read the watch-state machine needs — no arena, no
-    /// full AnimeRecord — and a uniform unknown-show guard for the transition paths.
-    const StatusRow = struct { status: domain.ListStatus, progress: i64, total: ?i64 };
+    /// (list_status, progress high-water, total episodes, still-airing) for one
+    /// show, or null if it isn't tracked. `airing` folds the airing-status column
+    /// via `domain.isStillAiring` (ROD-296). The minimal read the watch-state
+    /// machine needs — no arena, no full AnimeRecord — and a uniform unknown-show
+    /// guard for the transition paths.
+    const StatusRow = struct { status: domain.ListStatus, progress: i64, total: ?i64, airing: bool };
     fn statusRow(self: *Store, source: []const u8, source_id: []const u8) Error!?StatusRow {
-        const stmt = try self.prepare("SELECT list_status, progress, total_episodes FROM anime WHERE source = ? AND source_id = ?");
+        // `status` is the airing-status text (AniList RELEASING/FINISHED, AllAnime
+        // ongoing) — the "still releasing" signal `afterPlay` gates on (ROD-296).
+        // Read it transiently and fold to a bool here; no need to dupe the string.
+        const stmt = try self.prepare("SELECT list_status, progress, total_episodes, status FROM anime WHERE source = ? AND source_id = ?");
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, source);
         try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        // Fold the status text to a bool before it escapes — the sqlite pointer is
+        // only valid until the next step/finalize, so `isStillAiring` consumes the
+        // transient slice here and nothing stores it. NULL status → still airing
+        // (isStillAiring's "don't trust an unclassified total" default).
+        const status_ptr = c.sqlite3_column_text(stmt, 3);
+        const status_opt: ?[]const u8 = if (status_ptr == null) null else blk: {
+            const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
+            break :blk status_ptr[0..n];
+        };
         return .{
             .status = colStatus(stmt, 0),
             .progress = c.sqlite3_column_int64(stmt, 1),
             .total = colOptI64(stmt, 2),
+            .airing = domain.isStillAiring(status_opt),
         };
     }
 
@@ -972,13 +987,14 @@ pub const Store = struct {
     /// the episode watched-through.
     ///
     /// The new `list_status` is decided by `ListStatus.afterPlay` — a pure function
-    /// of (current status, post-play progress, total). We read the row first so the
-    /// transition lives in testable Zig, not a SQL CASE. Unknown show → silent
-    /// no-op (nothing to play).
+    /// of (current status, post-play progress, total, still-airing). The last input
+    /// keeps a mid-broadcast show from auto-completing when you catch up to the
+    /// latest aired episode (ROD-296). We read the row first so the transition lives
+    /// in testable Zig, not a SQL CASE. Unknown show → silent no-op (nothing to play).
     pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64, completed: bool) Error!void {
         const cur = try self.statusRow(source, source_id) orelse return;
         const new_progress = if (completed) @max(cur.progress, episode_index) else cur.progress;
-        const new_status = domain.ListStatus.afterPlay(cur.status, new_progress, cur.total);
+        const new_status = domain.ListStatus.afterPlay(cur.status, new_progress, cur.total, cur.airing);
 
         const sql =
             \\UPDATE anime
@@ -2286,7 +2302,10 @@ test "recordPlay auto-completes at the finale and stays completed on rewatch" {
 
     var s = try Store.openMemory();
     defer s.close();
-    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3 }, 1000, arena);
+    // FINISHED: total_episodes = 3 is the real finale, so reaching it completes.
+    // (A show with no/unsettled status won't auto-complete — that's the ROD-296
+    // gate; see the still-airing test below.)
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3, .status = "FINISHED" }, 1000, arena);
 
     try s.recordPlay(T_SOURCE, "a", 2, 2000, true); // mid-run → watching
     try testing.expectEqual(domain.ListStatus.watching, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
@@ -2300,6 +2319,44 @@ test "recordPlay auto-completes at the finale and stays completed on rewatch" {
     try testing.expectEqual(domain.ListStatus.completed, rec.list_status);
     try testing.expectEqual(@as(i64, 3), rec.progress); // high-water held
     try testing.expectEqual(@as(i64, 3), rec.play_count); // every play still counts
+}
+
+test "recordPlay does not auto-complete a still-airing show at the latest aired episode (ROD-296)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    // A weekly show mid-broadcast: 3 episodes aired so far (total tracks the aired
+    // count), AniList status RELEASING → still airing.
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "a",
+        .title = "A",
+        .total_episodes = 3,
+        .status = "RELEASING",
+    }, 1000, arena);
+
+    // Watching the latest aired episode (progress == aired count) must stay
+    // watching, not flip to completed.
+    try s.recordPlay(T_SOURCE, "a", 3, 2000, true);
+    const airing = (try s.getAnime(arena, T_SOURCE, "a")).?;
+    try testing.expectEqual(domain.ListStatus.watching, airing.list_status);
+    try testing.expectEqual(@as(i64, 3), airing.progress); // progress still tracked
+
+    // Once the season finishes airing (status → FINISHED, which overwrites
+    // RELEASING via the non-null COALESCE, and total is the real finale), the next
+    // play that reaches it completes as before.
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "a",
+        .title = "A",
+        .total_episodes = 4,
+        .status = "FINISHED",
+    }, 1001, arena);
+    try s.recordPlay(T_SOURCE, "a", 4, 2001, true);
+    try testing.expectEqual(domain.ListStatus.completed, (try s.getAnime(arena, T_SOURCE, "a")).?.list_status);
 }
 
 test "recordPlay with unknown total never auto-completes" {
