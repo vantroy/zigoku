@@ -83,7 +83,11 @@ fn classify(target: []const u8, state: []const u8) Route {
     return .complete;
 }
 
-pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
+/// Returns whether a token was persisted (`login.signedIn`) so `main` can
+/// bootstrap one full sync on a fresh sign-in (ROD-292). A `LoopbackUnavailable`
+/// error routes the caller to the paste flow instead; any state-valid callback
+/// that isn't `.ok` returns false.
+pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !bool {
     // CSRF nonce first — no real randomness ⇒ decline the listener rather than open
     // one with a guessable/empty state.
     var state: [32]u8 = undefined;
@@ -151,7 +155,8 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
                 // outlive this connection's `recv_buf` (the paste path dupes too).
                 const raw = arena.dupe(u8, query) catch query;
                 const now: i64 = @intCast(c.time(null));
-                switch (login.completeLogin(arena, io, raw, path, now)) {
+                const result = login.completeLogin(arena, io, raw, path, now);
+                switch (result) {
                     .ok => |rec| {
                         request.respond(done_page, .{ .keep_alive = false, .extra_headers = &html_header }) catch {};
                         try out.print("  ✓ signed in as {s} (id {d}). Saved to {s}.\n", .{ rec.anilist.user_name, rec.anilist.user_id, path });
@@ -174,7 +179,7 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
                     },
                 }
                 try out.flush();
-                return; // one state-valid callback ends the flow, success or not.
+                return login.signedIn(result); // one state-valid callback ends the flow, success or not.
             },
         }
     }

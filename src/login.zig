@@ -68,9 +68,22 @@ pub fn completeLogin(arena: Allocator, io: Io, raw: []const u8, path: []const u8
     return .{ .ok = record };
 }
 
+/// Did a completed login actually persist a token? `.ok` is the only arm that
+/// wrote auth.zon; every other arm aborted before saving. `main` gates the
+/// ROD-292 post-login bootstrap sync on this, so a rejected, unreachable, or
+/// unsaved attempt never triggers a stray sync report.
+pub fn signedIn(result: LoginResult) bool {
+    return switch (result) {
+        .ok => true,
+        else => false,
+    };
+}
+
 /// Run the interactive paste login. Builds its own wide stdin reader: a pasted
 /// redirect URL carries a ~1KB JWT, far past main's 256-byte prompt buffer.
-pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
+/// Returns whether a token was persisted (`signedIn`) so `main` can bootstrap
+/// one full sync on a fresh sign-in (ROD-292); an aborted paste returns false.
+pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !bool {
     const path = try auth.defaultPath(arena);
     const existing = auth.load(arena, io, path);
     if (existing.hasAniList()) {
@@ -99,7 +112,7 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
 
     const raw = in.takeDelimiterInclusive('\n') catch {
         try out.writeAll("\n  no input (or a paste past 8 KB) — aborted.\n");
-        return;
+        return false;
     };
     const line = try arena.dupe(u8, std.mem.trim(u8, raw, " \t\r\n"));
 
@@ -107,7 +120,8 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
     try out.flush();
 
     const now: i64 = @intCast(c.time(null));
-    switch (completeLogin(arena, io, line, path, now)) {
+    const result = completeLogin(arena, io, line, path, now);
+    switch (result) {
         .ok => |rec| try out.print("  ✓ signed in as {s} (id {d}). Saved to {s}.\n", .{ rec.anilist.user_name, rec.anilist.user_id, path }),
         .no_token => try out.writeAll("  ✗ couldn't find an access_token in that — aborted.\n"),
         .rejected => try out.writeAll("  ✗ AniList rejected the token (invalid or expired). Re-copy the whole fragment and retry.\n"),
@@ -115,6 +129,7 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !void {
         .save_failed => |err| try out.print("  ✗ verified, but couldn't write {s}: {s}\n", .{ path, @errorName(err) }),
     }
     try out.flush();
+    return signedIn(result);
 }
 
 /// Pull the JWT out of a pasted redirect URL (`…#access_token=<jwt>&…`) or a bare
@@ -245,4 +260,15 @@ test "parseViewerResponse errors on an unparseable body" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     try testing.expectError(error.BadJson, parseViewerResponse(arena.allocator(), "<html>502 Bad Gateway</html>"));
+}
+
+test "signedIn is true only for the persisted-token (.ok) arm (ROD-292)" {
+    // Only `.ok` wrote auth.zon, so only it may trigger the post-login bootstrap
+    // sync — every failure arm must return false or a rejected login would fire a
+    // stray sync report.
+    try testing.expect(signedIn(.{ .ok = .{} }));
+    try testing.expect(!signedIn(.no_token));
+    try testing.expect(!signedIn(.rejected));
+    try testing.expect(!signedIn(.{ .verify_failed = error.Unexpected }));
+    try testing.expect(!signedIn(.{ .save_failed = error.Unexpected }));
 }
