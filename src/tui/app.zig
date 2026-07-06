@@ -317,6 +317,16 @@ pub fn run(
     var reload_inflight = false;
     var reload_settled_at_spawn: u32 = 0;
 
+    // ROD-293: kick a background pull-on-launch so local reflects edits made on other
+    // devices since last run. Pull-only, off-thread, ambient — no-op when unconnected /
+    // no store. Reconciles into the store; a changed row flags a history reload at the
+    // safe seam (the reload gate already waits for the initial load via !history_loading,
+    // so this can't race the first paint) and whispers a low-key `↓ N from AniList`. The
+    // teardown join defer above already covers its `sync_thread` handle. It shares the
+    // action flush's one-flush gate, so a very early mutation just re-arms behind it
+    // (fireSyncFlush sees inflight and waits).
+    app.fireLaunchPull(&loop, io);
+
     // First paint, then the event loop.
     {
         const win = vx.window();
@@ -875,13 +885,16 @@ pub const App = struct {
     /// `cover_sync_deadline_ms`. A local mutation to a linked row arms it; a binge of
     /// episode-marks coalesces into one flush. Serviced in .tick. 0 = nothing pending.
     sync_flush_deadline_ms: i64 = 0,
-    /// One flush at a time. Set true when a `syncFlushTask` is spawned; cleared ONLY by
+    /// One sync at a time. Set true when a `syncFlushTask` is spawned; cleared ONLY by
     /// the worker's own teardown defer (`inflight.store(false)`), which runs on every
     /// exit path — so a dropped `postEvent` can't latch it on. The `.sync_flushed`
     /// handler does NOT clear it. A deadline that fires while this holds re-arms instead
-    /// of stacking a second flush onto the same dirty set.
+    /// of stacking a second flush onto the same dirty set. Shared with the ROD-293
+    /// launch pull, which reuses this exact gate so the launch refresh and the first
+    /// action flush can never run two syncs against the store at once.
     sync_flush_inflight: std.atomic.Value(bool) = .init(false),
-    /// Handle for the in-flight flush thread; joined before spawning the next, and on the
+    /// Handle for the in-flight sync thread (action flush or ROD-293 launch pull — only
+    /// ever one, per the gate above); joined before spawning the next, and on the
     /// error-unwind / test teardown path. The ordinary quit path (`_exit(0)`, ROD-232)
     /// skips that join and abandons the thread — safe and self-healing (see the join
     /// defer in run()).
@@ -975,31 +988,81 @@ pub const App = struct {
     /// is cleared only by its own subsystem's recovery (feed success clears feed
     /// errors; search success clears general errors), never cross-view.
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
-        var idx: usize = 3;
+        const cap = self.toast_queue.len;
+
+        // Persistent toasts are a per-topic SINGLETON (ROD-293 review). The clear side
+        // (search_done/popular_done) already wipes persistent slots by topic, and the
+        // doc contract above assumes one persistent toast per topic — so enforce it on
+        // the push side too: refresh an existing same-topic persistent slot in place
+        // rather than appending a duplicate. Without this, repeated failures (typing
+        // offline → task_error, cycling Discover windows offline → popular_error) stack
+        // duplicate persistent toasts until all three slots are persistent, and the
+        // evict-oldest-non-persistent policy below then has no slot to take — starving
+        // every later toast, transient successes included. With it, persistent occupancy
+        // is capped at the two persistent topics (.general, .feed), so a free
+        // (evictable) slot for transients always exists and the all-persistent branch is
+        // structurally unreachable.
+        if (persistent) {
+            for (&self.toast_queue) |*slot| {
+                if (slot.*) |existing| {
+                    if (existing.persistent and existing.topic == topic) {
+                        slot.* = makeToast(kind, text, persistent, topic);
+                        return;
+                    }
+                }
+            }
+        }
+
+        var idx: usize = cap; // sentinel: no free slot yet
         for (self.toast_queue, 0..) |slot, i| {
             if (slot == null) {
                 idx = i;
                 break;
             }
         }
-        if (idx == 3) {
-            self.toast_queue[0] = self.toast_queue[1];
-            self.toast_queue[1] = self.toast_queue[2];
-            idx = 2;
+        if (idx == cap) {
+            // Queue full: evict the OLDEST NON-persistent toast so a still-showing
+            // persistent error is never shifted out to make room for a transient
+            // whisper. ROD-293 chaos review caught the underlying hazard: a two-way sync
+            // flush now pushes TWO toasts at once (↓ then ↑), doubling the eviction
+            // pressure on this 3-slot FIFO, and the old blind evict-slot-0 dropped a
+            // persistent banner the user needed. The per-topic singleton above
+            // guarantees a non-persistent slot exists here; the all-persistent fallback
+            // is defensive only — log and evict the oldest so new info still lands,
+            // never a silent permanent starve.
+            var victim: usize = 0;
+            const found = for (self.toast_queue, 0..) |slot, i| {
+                if (slot) |t| {
+                    if (!t.persistent) break i;
+                }
+            } else null;
+            if (found) |v| {
+                victim = v;
+            } else {
+                log.debug("toast: queue all-persistent, evicting oldest (unexpected — the per-topic singleton should prevent this)", .{});
+            }
+            // Compact left over the victim, opening the last slot for the newcomer
+            // while preserving the oldest→newest order the TTL sweep and this evict
+            // both assume.
+            var j = victim;
+            while (j + 1 < cap) : (j += 1) self.toast_queue[j] = self.toast_queue[j + 1];
+            idx = cap - 1;
         }
-        // 4000ms (not 2500): a state-change toast (e.g. "episode N done") is
-        // posted the instant mpv exits, but on a tiling WM focus is still
-        // returning from mpv's window, eating the first ~1s. Matches the
-        // Toast.ttl_ms struct default.
+        self.toast_queue[idx] = makeToast(kind, text, persistent, topic);
+    }
+
+    /// Build one `Toast`, capping the copy to the §4.7 36-column budget at this single
+    /// choke point so a long dynamic payload (task_error's `@errorName`) gets a "…"
+    /// affordance instead of being silently sheared by the render clip (ROD-166). The
+    /// [80]u8 text buffer is copied out by value on return — nothing aliases the local.
+    /// 4000ms TTL (not 2500): a state-change toast (e.g. "episode N done") is posted the
+    /// instant mpv exits, but on a tiling WM focus is still returning from mpv's window,
+    /// eating the first ~1s; matches the `Toast.ttl_ms` struct default.
+    fn makeToast(kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) Toast {
         var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000, .topic = topic };
-        // §4.7: cap the copy to the 36-column budget here, at the single choke
-        // point, so a long dynamic payload (task_error's @errorName) gets a "…"
-        // affordance instead of being silently sheared by the render clip
-        // (ROD-166). Static copies are all well under budget — passed through
-        // verbatim. Writes at most 80 bytes into t.text (truncateToWidth guards).
         const copy = render.truncateToWidth(&t.text, text, Toast.max_copy_cols);
         t.text_len = copy.len;
-        self.toast_queue[idx] = t;
+        return t;
     }
 
     /// Unified teardown for app-owned runtime state. Thread joins live in
@@ -1301,11 +1364,43 @@ pub const App = struct {
             t.join();
             self.sync_thread = null;
         }
+        self.spawnSyncWorker(loop, io, st, false); // pull-then-push
+    }
+
+    /// Background pull-on-launch (ROD-293): one `MediaListCollection` round trip at
+    /// startup so local reflects edits made on other devices (an episode watched in the
+    /// AniList mobile app) since last run. Pull-ONLY — the paced push belongs to the
+    /// action flush (ROD-291) and the quit flush (ROD-294), never the launch fast-path.
+    /// Shares the one-at-a-time gate and thread handle with the action flush: this is the
+    /// session's first spawn (gate clear, `sync_thread` null), but guard uniformly so it
+    /// can never stack a second sync onto the same store. Ambient — a reconciled remote
+    /// change flags a history reload via the shared `.sync_flushed` handler and whispers
+    /// `↓ N from AniList` (`pushed = 0`, so no ↑ line). Called once from run(); the
+    /// `is_test` guard matches `fireSyncFlush` (run() has no unit-test path, but keep the
+    /// two symmetric).
+    fn fireLaunchPull(self: *App, loop: *Loop, io: std.Io) void {
+        if (builtin.is_test) return; // don't spawn a real network pull under test
+        const st = self.store orelse return;
+        if (!self.anilist_connected) return;
+        if (self.sync_flush_inflight.load(.acquire)) return; // never stack two syncs
+        if (self.sync_thread) |t| {
+            t.join();
+            self.sync_thread = null;
+        }
+        self.spawnSyncWorker(loop, io, st, true); // pull-only
+    }
+
+    /// Spawn the shared AniList sync worker (ROD-291/293), storing the joinable handle
+    /// and raising the one-flush gate; a spawn failure clears the gate so the coordinator
+    /// isn't latched off. `pull_only` picks the mode: false = the action flush's
+    /// pull-then-push, true = the launch pull-refresh. The caller has already checked the
+    /// gate is clear and reaped any prior handle.
+    fn spawnSyncWorker(self: *App, loop: *Loop, io: std.Io, st: *Store, pull_only: bool) void {
         self.sync_flush_inflight.store(true, .release);
         self.sync_thread = std.Thread.spawn(.{}, workers.syncFlushTask, .{
-            loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight,
+            loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight, pull_only,
         }) catch |e| blk: {
-            log.debug("sync flush spawn failed: {s}", .{@errorName(e)});
+            log.debug("sync worker spawn failed: {s}", .{@errorName(e)});
             self.sync_flush_inflight.store(false, .release);
             break :blk null;
         };
@@ -1494,22 +1589,32 @@ pub const App = struct {
                 self.pushToast(.@"error", msg, true);
             },
             .sync_flushed => |outcome| {
-                // ROD-291: the pull-then-push flush settled. inflight was already cleared
+                // ROD-291: the pull-then-push flush settled — or, with pushed == 0, the
+                // ROD-293 launch pull-refresh (same event). inflight was already cleared
                 // by the worker's defer — nothing to unlatch here.
                 // The pull reconciled remote changes into local rows: if any actually
                 // changed, the in-memory history slice is stale, so flag a reload at a
-                // safe seam (the same signal a playback write uses).
-                if (outcome.reconciled > 0) self.history_dirty = true;
+                // safe seam (the same signal a playback write uses), and whisper the ↓
+                // direction (ROD-293) — the git-style ahead/behind idiom, symmetric with
+                // the ↑ push below. A reconciled change re-baselines the sync snapshot, so
+                // it counts as `reconciled` exactly once and can't re-toast on later flushes.
+                if (outcome.reconciled > 0) {
+                    self.history_dirty = true;
+                    var buf: [40]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
+                    self.pushToast(.info, msg, false);
+                }
                 // Token rejected mid-session: drop the cached connected flag so we stop
                 // spawning do-nothing flushes on every edit, and seed ROD-295's reconnect
                 // nudge (which re-evaluates connection). The user-facing surface is 295's.
                 if (outcome.expired) self.anilist_connected = false;
                 // Ambient feedback only: whisper a low-key toast when a push actually
                 // landed, stay silent on a no-op or soft failure (unpushed rows stay dirty
-                // and retry on the next flush).
+                // and retry on the next flush). Enqueued after the ↓ above so a flush that
+                // moved both directions reads in execution order — reconcile, then push.
                 if (outcome.pushed > 0) {
                     var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↑ synced {d} to AniList", .{outcome.pushed}) catch "↑ synced to AniList";
+                    const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
                     self.pushToast(.info, msg, false);
                 }
             },

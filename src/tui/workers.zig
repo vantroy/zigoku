@@ -730,6 +730,14 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 /// discipline ROD-285 relies on, now applied to the action path too. Both engines are
 /// total (every outcome lands in a summary, never an error). The push is skipped only
 /// when the pull already hit a wall the push would hit too (401 / 429 / store error).
+///
+/// `pull_only` (ROD-293) suppresses the push entirely: the launch pull-refresh runs one
+/// `MediaListCollection` round trip to adopt edits made on other devices, but leaves the
+/// paced (2 s/row) push to the action flush and the quit flush — a fast, read-only launch
+/// path that never storms the wire. It rides the same `.sync_flushed` event with
+/// `pushed = 0`, so the handler emits no ↑ line — just the ambient `↓ N from AniList`
+/// whisper (and a history reload) when the reconcile actually changed local rows.
+///
 /// `credentials` is passed by value — its slices live in run()'s session auth arena.
 /// `inflight` is cleared here in a defer so a failed `postEvent` (queue torn down at
 /// quit) can't latch the one-flush gate on. A dropped or failed flush self-heals:
@@ -742,6 +750,7 @@ pub fn syncFlushTask(
     credentials: auth_mod.Auth,
     now_unix: i64,
     inflight: *std.atomic.Value(bool),
+    pull_only: bool,
 ) void {
     defer inflight.store(false, .release);
 
@@ -750,9 +759,10 @@ pub fn syncFlushTask(
     // path ignores it, so free the gpa-owned slice rather than leak it.
     if (pull.unmatched_ids.len > 0) gpa.free(pull.unmatched_ids);
 
-    // Skip the push if the pull already hit a wall the push would hit too — a rejected
-    // token or rate limit apply to both, and an unreadable store fails the same way.
-    const skip_push = pull.unauthorized or pull.rate_limited or pull.store_error;
+    // Skip the push when it's a pull-only launch refresh (ROD-293), or when the pull
+    // already hit a wall the push would hit too — a rejected token or rate limit apply to
+    // both, and an unreadable store fails the same way.
+    const skip_push = pull_only or pull.unauthorized or pull.rate_limited or pull.store_error;
     const push: ?sync.Summary = if (skip_push) null else sync.pushAll(gpa, io, store, credentials, now_unix);
 
     const outcome: event_mod.SyncFlushOutcome = .{

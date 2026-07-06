@@ -2158,11 +2158,12 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     var app: App = .{};
     app.gpa = testing.allocator;
 
-    // A push landed → a low-key info whisper.
+    // A push landed → a low-key info whisper, in the retuned ↑ idiom (ROD-293).
     try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
     try testing.expectEqual(Toast.Kind.info, t.kind);
     try testing.expect(!t.persistent);
+    try testing.expectEqualStrings("↑ 2 to AniList", t.text[0..t.text_len]);
 
     // A pull that changed local rows flags a history reload so the view refreshes.
     var rel: App = .{};
@@ -2183,6 +2184,115 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     quiet.gpa = testing.allocator;
     try testTick(&quiet, .{ .sync_flushed = .{ .pushed = 0 } });
     try testing.expect(quiet.toast_queue[0] == null);
+}
+
+test "sync_flushed: pull whispers ↓, and a two-way flush enqueues ↓ before ↑ (ROD-293)" {
+    // The launch pull (and an action flush's pull half) whispers a low-key ↓ when a
+    // reconcile lands remote changes — symmetric with the push's ↑, and it flags a
+    // history reload. Drives the handler directly (a pure state fold, no thread or
+    // network), so the toast CONTENT is asserted, not just inspected.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testing.expect(!app.history_dirty);
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 3 } });
+        try testing.expect(app.history_dirty);
+        const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        try testing.expectEqual(Toast.Kind.info, t.kind);
+        try testing.expect(!t.persistent);
+        try testing.expectEqualStrings("↓ 3 from AniList", t.text[0..t.text_len]);
+    }
+
+    // A flush that moved BOTH directions enqueues ↓ before ↑, in execution order
+    // (reconcile, then push) — the ordering contract DESIGN.md §4.10 documents.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 2, .pushed = 5 } });
+        const down = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        const up = app.toast_queue[1] orelse return error.TestExpectationFailed;
+        try testing.expectEqualStrings("↓ 2 from AniList", down.text[0..down.text_len]);
+        try testing.expectEqualStrings("↑ 5 to AniList", up.text[0..up.text_len]);
+    }
+}
+
+test "pushToastTopic: a two-way sync flush must not evict a persistent error toast (ROD-293)" {
+    // Chaos-review repro: the 3-slot toast FIFO used to evict the oldest slot blindly,
+    // so a two-way flush (↓ then ↑, two toasts from one event) shifted a still-showing
+    // persistent error banner out to make room. The fix evicts the oldest NON-persistent
+    // slot instead. Driven through real events (task_error is persistent; sync whispers
+    // are transient) since pushToast is file-private.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+
+        // Fill the queue: a persistent error banner (oldest), then two transient whispers.
+        try testTick(&app, .{ .task_error = "source unreachable" });
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 1 } });
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
+        try testing.expect(app.toast_queue[2] != null); // full
+
+        // Two toasts into the full queue — the old blind evict dropped the banner here.
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 1, .pushed = 1 } });
+
+        var banner_survived = false;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (t.persistent and std.mem.eql(u8, t.text[0..t.text_len], "source unreachable")) banner_survived = true;
+            }
+        }
+        try testing.expect(banner_survived);
+    }
+
+    // Per-topic persistent SINGLETON (re-bless fix): repeated same-topic errors collapse
+    // to one slot carrying the latest text, so the queue can never saturate with
+    // persistent toasts — a transient whisper always still lands (no starvation).
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testTick(&app, .{ .task_error = "err one" });
+        try testTick(&app, .{ .task_error = "err two" });
+        try testTick(&app, .{ .task_error = "err three" }); // all topic .general → one slot
+
+        var persistent_count: usize = 0;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (t.persistent) {
+                    persistent_count += 1;
+                    try testing.expectEqualStrings("err three", t.text[0..t.text_len]); // latest wins
+                }
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), persistent_count);
+
+        // A transient whisper still lands — the persistent singleton left room.
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 7 } });
+        var whisper_landed = false;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (std.mem.eql(u8, t.text[0..t.text_len], "↑ 7 to AniList")) whisper_landed = true;
+            }
+        }
+        try testing.expect(whisper_landed);
+    }
+}
+
+test "pushToastTopic: an all-transient overflow evicts the oldest, order preserved (ROD-293)" {
+    // The common no-persistent-queued path must still behave as a plain oldest-out FIFO
+    // (the fix only changes which slot is evicted when a persistent toast is present).
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 1 } }); // ↑ 1
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } }); // ↑ 2
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 3 } }); // ↑ 3 (queue full)
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 4 } }); // ↑ 4 → evicts ↑ 1
+
+    const s0 = app.toast_queue[0].?;
+    const s1 = app.toast_queue[1].?;
+    const s2 = app.toast_queue[2].?;
+    try testing.expectEqualStrings("↑ 2 to AniList", s0.text[0..s0.text_len]);
+    try testing.expectEqualStrings("↑ 3 to AniList", s1.text[0..s1.text_len]);
+    try testing.expectEqualStrings("↑ 4 to AniList", s2.text[0..s2.text_len]);
 }
 
 test "browse list pane detail render info uses selected anime" {

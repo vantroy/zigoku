@@ -52,10 +52,13 @@ pub const Event = union(enum) {
     /// A background BROWSE task (search/enrich) failed; payload is a human-readable
     /// reason. Surfaces as a toast only — never touches History state (ROD-234).
     task_error: []const u8,
-    /// An action-triggered AniList sync flush finished (ROD-291). Payload is a distilled
-    /// `SyncFlushOutcome` (POD, ships by value). The handler reloads history if the pull
-    /// changed local rows, drops the connected flag on expiry, and whispers only when a
-    /// push landed; soft failures stay silent (rows stay dirty, retry next flush).
+    /// An AniList sync settled: the action-triggered pull-then-push flush (ROD-291), or
+    /// the ROD-293 launch pull-refresh (same event, always `pushed = 0`). Payload is a
+    /// distilled `SyncFlushOutcome` (POD, ships by value). The handler reloads history if
+    /// the pull changed local rows, drops the connected flag on expiry, and whispers the
+    /// git-style direction pair — `↓ N from AniList` when the pull reconciled changes,
+    /// `↑ N to AniList` when a push landed (both `.info`, either or both per flush). Soft
+    /// failures stay silent (rows stay dirty, retry next flush).
     sync_flushed: SyncFlushOutcome,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
     /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
