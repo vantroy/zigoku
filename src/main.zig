@@ -106,15 +106,26 @@ pub fn main(init: std.process.Init) !void {
     // listener (auto-captures the browser redirect); `--paste`, or a loopback that
     // can't start, uses the SSH-safe manual paste flow.
     if (isLoginCommand(args)) {
-        if (hasFlag(args, "--paste")) {
-            try zigoku.login.run(arena, io, out);
-        } else zigoku.login_loopback.run(arena, io, out) catch |err| switch (err) {
-            error.LoopbackUnavailable => {
-                try out.print("  (couldn't start the loopback listener — falling back to paste)\n\n", .{});
-                try zigoku.login.run(arena, io, out);
-            },
-            else => return err,
-        };
+        const signed_in: bool = if (hasFlag(args, "--paste"))
+            try zigoku.login.run(arena, io, out)
+        else
+            zigoku.login_loopback.run(arena, io, out) catch |err| switch (err) {
+                error.LoopbackUnavailable => blk: {
+                    try out.print("  (couldn't start the loopback listener — falling back to paste)\n\n", .{});
+                    break :blk try zigoku.login.run(arena, io, out);
+                },
+                else => return err,
+            };
+        // ROD-292: a fresh sign-in bootstraps one full sync so the account is
+        // immediately in step — pull-then-reconcile, then push, the same visible
+        // report as `zigoku sync`. Gated on a token actually landing (not a
+        // rejected or aborted attempt) so a failed login never trails a stray
+        // sync summary. Best-effort like `runSync` itself: a sync hiccup can't
+        // undo the login that just succeeded.
+        if (signed_in) {
+            try out.writeByte('\n');
+            try runSync(arena, io, out);
+        }
         try out.flush();
         return;
     }
