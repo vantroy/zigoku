@@ -37,7 +37,9 @@ const browse = @import("view/browse.zig");
 const detail = @import("view/detail.zig");
 const settings = @import("view/settings.zig");
 const discover_view = @import("view/discover.zig");
+const connect_view = @import("view/connect.zig");
 const discover_covers_mod = @import("discover_covers.zig");
+const login_loopback = @import("../login_loopback.zig");
 
 /// Current-selection resolution (ROD-277): resolves which anime/record is
 /// focused across Browse/History/Discover/Detail and formats the derived
@@ -286,6 +288,11 @@ pub fn run(
     // wait if we want the flush to actually finish on quit — there's nothing to bound
     // today, since quit never waits on it.)
     defer if (app.sync_thread) |t| t.join();
+    // ROD-286: reap an open connect modal on the error-unwind / test path — cancel the
+    // worker (waking its blocked accept), join it, close the listener, free the arena.
+    // Skipped on the ordinary quit path (`_exit` abandons it, like every other worker);
+    // the worker skips its final postEvent on cancel, so this join can't stall.
+    defer app.teardownConnect(io);
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view workers
@@ -628,6 +635,42 @@ pub const UndoEntry = union(enum) {
     }
 };
 
+/// The live in-TUI AniList connect flow (ROD-286). Non-null exactly while the connect
+/// modal is up: a bound loopback listener + its accept-loop worker are running and the
+/// modal overlays Settings. Every field the worker touches lives behind the boxed
+/// `arena`, so its address is stable no matter where this optional sits in `App`: the
+/// worker borrows `listener` (accept) and `cancel` (poll); the render thread reads
+/// `listener.url` and, on esc, sets `cancel` then wakes the blocked accept
+/// (`login_loopback.requestCancel`). Torn down by `App.teardownConnect`.
+pub const ConnectState = struct {
+    /// Heap-boxed so `listener`/`cancel` keep stable addresses across the thread
+    /// seam; owns the `url`/`path`/`listener`/`cancel` allocations. Freed (with the
+    /// box) in `teardownConnect`, only after the worker is joined.
+    arena: *std.heap.ArenaAllocator,
+    /// The listener the worker accepts on; `url` renders in the modal + opens the
+    /// browser. Lives in `arena`.
+    listener: *login_loopback.Listener,
+    /// Worker cancel flag: set (release) before `requestCancel` so the woken accept
+    /// bails. Lives in `arena`. `std.atomic` for the cross-thread read.
+    cancel: *std.atomic.Value(bool),
+    /// The accept-loop worker handle, joined in `teardownConnect`.
+    thread: ?std.Thread,
+    /// The `[c]` keypress latched an OSC-52 clipboard copy request; serviced in
+    /// `draw` (which owns the tty), which then sets `copied`.
+    copy_requested: bool = false,
+    /// The copy landed (best-effort) — flips the modal hint to "copied ✓".
+    copied: bool = false,
+    /// Tick clock (ms) when the flow began — drives the modal's elapsed hint.
+    started_ms: i64 = 0,
+    /// Scratch for the modal's formatted "waiting… Ns" status line. Owned here, NOT a
+    /// draw-local stack buffer: vaxis keeps the printed slice by reference until
+    /// `vx.render()`, which runs after the view's stack frame is gone — a local buffer
+    /// would dangle and render as garbage (the same hazard as `SettingsState.value_buf`
+    /// and the settings hairline). The connect modal is up for one flow, so one buffer
+    /// on this per-flow state is the natural home.
+    status_buf: [48]u8 = undefined,
+};
+
 pub const App = struct {
     should_quit: bool = false,
 
@@ -899,6 +942,27 @@ pub const App = struct {
     /// skips that join and abandons the thread — safe and self-healing (see the join
     /// defer in run()).
     sync_thread: ?std.Thread = null,
+
+    // ── in-TUI connect modal (ROD-286) ────────────────────────────────────────
+    /// Non-null while the AniList connect modal is live (see `ConnectState`).
+    /// Cleared by `teardownConnect` — from the event drain on a settled outcome,
+    /// from esc-cancel, or from run() teardown on the error-unwind/test path.
+    connect: ?ConnectState = null,
+    /// Session-lived homes for tokens RELOADED after in-session connects. Boot's token
+    /// lives in run()'s auth arena; a fresh connect persists auth.zon and reloads it
+    /// into a new boxed arena here so `anilist_auth`'s slices outlive the (short-lived)
+    /// connect arena.
+    ///
+    /// A LIST, not a single slot, and never freed mid-session (C1, ROD-286 crew review):
+    /// `spawnSyncWorker` hands `anilist_auth` to a flush worker BY VALUE — slices and
+    /// all — and a paced push holds those slices for many seconds. A second in-session
+    /// connect must NOT free the arena a still-running flush is reading its bearer token
+    /// from, so each reconnect RETIRES the prior arena here rather than freeing it.
+    /// `anilist_auth` always points into the last entry. All are freed together in
+    /// `deinitOwnedState`, which runs LAST (LIFO) — after every sync-worker join — so no
+    /// flush can outlive its token. Reconnects are rare, so the held arenas are few.
+    auth_reload_arenas: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
+
     /// Last-seen terminal width (columns). Seeded in layout() every frame from
     /// real geometry so onKey/tick can gate split-browse and wide-history
     /// behaviour without being passed the winsize event.
@@ -1085,6 +1149,22 @@ pub const App = struct {
             self.gpa.free(p);
             self.cover_cache_display = null;
         }
+        // ROD-286: every token reloaded after an in-session connect lives in its own
+        // boxed arena, retired (never freed mid-session — C1) rather than on the next
+        // reconnect. deinitOwnedState runs LAST (LIFO), after every sync-worker join, so
+        // a flush handed `anilist_auth`'s slices can never outlive them.
+        self.freeAuthReloadArenas();
+    }
+
+    /// Free every retired reload arena (C1, ROD-286). Split from `deinitOwnedState` so
+    /// the retirement invariant is testable without constructing a vaxis/writer. pub for
+    /// the app_test regression around `adoptReloadedAuth`.
+    pub fn freeAuthReloadArenas(self: *App) void {
+        for (self.auth_reload_arenas.items) |box| {
+            box.deinit();
+            self.gpa.destroy(box);
+        }
+        self.auth_reload_arenas.deinit(self.gpa);
     }
 
     /// Patch `EpisodeState.progress` (and re-seed the cursor) when the detail pane
@@ -1331,8 +1411,17 @@ pub const App = struct {
     /// clock (`now_ms`, seeded once at boot so it is never the 0 default here) rather
     /// than a fresh syscall — a ≤100 ms-stale timestamp is immaterial against a 3 s
     /// settle, and it keeps every call site free of an `io` param.
+    /// Both conditions the sync rail needs: a usable token (`anilist_connected`) AND
+    /// the user hasn't paused sync (the ROD-286 `anilist_sync_enabled` master switch).
+    /// Every arm/fire gate reads this, so flipping the Settings toggle off makes the
+    /// whole rail inert — no arm, no flush, no launch pull, no connect bootstrap —
+    /// without touching the token; flip it back on and sync resumes.
+    fn syncEnabled(self: *const App) bool {
+        return self.anilist_connected and self.config.anilist_sync_enabled;
+    }
+
     fn armSyncFlush(self: *App) void {
-        if (!self.anilist_connected) return;
+        if (!self.syncEnabled()) return;
         self.sync_flush_deadline_ms = self.now_ms + App.sync_flush_settle_ms;
     }
 
@@ -1352,7 +1441,7 @@ pub const App = struct {
     fn fireSyncFlush(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return; // don't spawn a real network flush under test
         const st = self.store orelse return;
-        if (!self.anilist_connected) return;
+        if (!self.syncEnabled()) return;
         if (self.sync_flush_inflight.load(.acquire)) {
             // Still flushing — retry shortly after it finishes; rows stay dirty.
             self.sync_flush_deadline_ms = nowMs(io) + App.sync_flush_settle_ms;
@@ -1381,7 +1470,7 @@ pub const App = struct {
     fn fireLaunchPull(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return; // don't spawn a real network pull under test
         const st = self.store orelse return;
-        if (!self.anilist_connected) return;
+        if (!self.syncEnabled()) return;
         if (self.sync_flush_inflight.load(.acquire)) return; // never stack two syncs
         if (self.sync_thread) |t| {
             t.join();
@@ -1404,6 +1493,188 @@ pub const App = struct {
             self.sync_flush_inflight.store(false, .release);
             break :blk null;
         };
+    }
+
+    // ── in-TUI connect modal (ROD-286) ────────────────────────────────────────
+
+    /// Kick off the in-TUI AniList connect. Binds the loopback listener on THIS
+    /// (render) thread — so a bind failure is an immediate toast, not a half-open
+    /// modal — opens the browser, spawns the accept-loop worker, and raises the modal.
+    /// A second trigger while a modal is up is ignored (guarded on `connect == null`,
+    /// and a busy port would fail the bind anyway). Errors collapse to one short toast.
+    fn beginConnect(self: *App, loop: *Loop, io: std.Io) void {
+        // Like the sync spawns, a no-op under test: it binds a real port and spawns a
+        // worker, neither of which a unit test can have. The connect-row wiring is
+        // tested at the subsystem seam (SettingsState returns `.connect_requested`).
+        if (builtin.is_test) return;
+        if (self.connect != null) return; // one modal at a time
+        self.connect = self.startConnect(loop, io) catch |e| {
+            // Point the user at the terminal-safe fallback, not a dead end — a busy port
+            // or a spawn failure both leave `zigoku login --paste` as the way through.
+            const msg = switch (e) {
+                error.LoopbackUnavailable => "port busy: zigoku login --paste",
+                else => "can't start: zigoku login --paste",
+            };
+            self.pushToast(.@"error", msg, false);
+            log.debug("connect start failed: {s}", .{@errorName(e)});
+            return;
+        };
+    }
+
+    /// The fallible half of `beginConnect`: allocate the boxed connect arena, bind the
+    /// listener, open the browser, and spawn the worker — with `errdefer` unwinding
+    /// each step (close the socket, free the arena) on any later failure, so a failed
+    /// start never leaks a socket or half-initializes `connect`.
+    fn startConnect(self: *App, loop: *Loop, io: std.Io) !ConnectState {
+        const box = try self.gpa.create(std.heap.ArenaAllocator);
+        box.* = .init(self.gpa);
+        errdefer {
+            box.deinit();
+            self.gpa.destroy(box);
+        }
+        const a = box.allocator();
+
+        const listener = try a.create(login_loopback.Listener);
+        listener.* = try login_loopback.begin(a, io);
+        errdefer listener.server.deinit(io); // close the bound socket if a later step fails
+
+        const cancel = try a.create(std.atomic.Value(bool));
+        cancel.* = .init(false);
+
+        // Best-effort browser launch; the URL is rendered in the modal for manual open.
+        login_loopback.openBrowser(io, listener.url);
+
+        const thread = try std.Thread.spawn(.{}, workers.connectTask, .{ loop, io, listener, a, cancel });
+        return .{
+            .arena = box,
+            .listener = listener,
+            .cancel = cancel,
+            .thread = thread,
+            .started_ms = self.now_ms,
+        };
+    }
+
+    /// Tear down the connect modal: wake + join the worker, close the listener, free
+    /// the arena, clear the slot. Safe whether the worker already returned (event
+    /// drain — a plain join reaps it) or is still blocked in `accept` (esc-cancel /
+    /// run() teardown — the cancel flag + self-connect wake unblock it, and the worker
+    /// skips its `postEvent` on `.canceled`, so the join can't stall on a full queue).
+    /// No-op when no modal is up.
+    fn teardownConnect(self: *App, io: std.Io) void {
+        if (self.connect == null) return;
+        const cs = &self.connect.?;
+        cs.cancel.store(true, .release);
+        login_loopback.requestCancel(io); // wake a blocked accept so the join can't hang
+        if (cs.thread) |t| t.join();
+        cs.listener.server.deinit(io); // close the listen socket (arena won't — it's an fd)
+        cs.arena.deinit();
+        self.gpa.destroy(cs.arena);
+        self.connect = null;
+    }
+
+    /// esc from the modal: tear it down and whisper that the attempt was dropped.
+    fn cancelConnect(self: *App, io: std.Io) void {
+        self.teardownConnect(io);
+        self.pushToast(.info, "sign-in canceled", false);
+    }
+
+    /// Keys while the connect modal is up. esc cancels; `c` requests an OSC-52 copy of
+    /// the auth URL (serviced in `draw`, which owns the tty). Every other key is
+    /// swallowed so a stray F-key can't switch views mid-connect. Ctrl-C (emergency
+    /// quit) is handled by `onKey` before this ever runs.
+    fn onConnectKey(self: *App, key: vaxis.Key, io: std.Io) void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            self.cancelConnect(io);
+            return;
+        }
+        if (key.matches('c', .{})) {
+            if (self.connect) |*cs| cs.copy_requested = true;
+            return;
+        }
+        // everything else: swallowed (modal captures input)
+    }
+
+    /// Drain a settled connect attempt. Close the modal, then react to the POD outcome.
+    /// On `.ok` the worker already persisted auth.zon: reload identity into a
+    /// session-lived arena, mark connected, toast, and kick a pull-then-push bootstrap
+    /// (the in-app twin of the CLI login bootstrap, ROD-292). Failure arms close with a
+    /// short toast; `.canceled` never reaches here (the worker skips its post on cancel).
+    fn onConnectResult(self: *App, outcome: login_loopback.ConnectOutcome, loop: *Loop, io: std.Io) void {
+        // A racing esc may already have torn the modal down; the worker's event still
+        // lands. teardownConnect is a no-op then — but a persisted token still deserves
+        // to be adopted, so we apply the outcome regardless.
+        self.teardownConnect(io);
+        switch (outcome) {
+            .ok => {
+                self.reloadAuthAfterConnect(io);
+                if (self.anilist_connected) {
+                    var buf: [40]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "connected as {s}", .{self.anilist_auth.anilist.user_name}) catch "connected to AniList";
+                    self.pushToast(.success, msg, false);
+                    self.bootstrapSync(loop, io);
+                } else {
+                    // Persisted but not usable (e.g. saved already-expired) — say so
+                    // rather than a silent no-op.
+                    self.pushToast(.warn, "connected, token unusable", false);
+                }
+            },
+            .no_token => self.pushToast(.@"error", "sign-in: no token returned", false),
+            .rejected => self.pushToast(.@"error", "sign-in rejected by AniList", false),
+            .verify_failed => self.pushToast(.@"error", "sign-in: couldn't verify", false),
+            .save_failed => self.pushToast(.@"error", "sign-in: couldn't save token", false),
+            .accept_failed => self.pushToast(.@"error", "sign-in: listener failed", false),
+            .canceled => {}, // esc path already toasted + cleared
+        }
+    }
+
+    /// Reload auth.zon into a fresh session-lived arena after an in-session connect, so
+    /// `anilist_auth`'s slices survive the connect arena's teardown, and adopt it as the
+    /// live token. On failure (no config dir / OOM) `anilist_connected` is left as it
+    /// was, which the caller surfaces as "connected, token unusable".
+    fn reloadAuthAfterConnect(self: *App, io: std.Io) void {
+        const box = self.gpa.create(std.heap.ArenaAllocator) catch return;
+        box.* = .init(self.gpa);
+        const a = box.allocator();
+        const path = auth_mod.defaultPath(a) catch {
+            box.deinit();
+            self.gpa.destroy(box);
+            return;
+        };
+        const reloaded = auth_mod.load(a, io, path);
+        self.adoptReloadedAuth(box, reloaded) catch {
+            // Couldn't track the arena → it would leak at exit; drop this reload rather
+            // than the arena. `anilist_auth` keeps pointing at the prior (still-tracked)
+            // token, so the connect just reads as "token unusable" this session.
+            box.deinit();
+            self.gpa.destroy(box);
+        };
+    }
+
+    /// Adopt `reloaded` (whose string slices live in `box`) as the live token: RETIRE
+    /// `box` into `auth_reload_arenas` (never freed mid-session — C1) and repoint
+    /// `anilist_auth`/`anilist_connected`. Split out so the retirement invariant is
+    /// unit-testable without a live OAuth round trip. Only fails if the list append OOMs
+    /// — the caller then frees `box` itself (it isn't yet tracked here).
+    pub fn adoptReloadedAuth(self: *App, box: *std.heap.ArenaAllocator, reloaded: auth_mod.Auth) !void {
+        try self.auth_reload_arenas.append(self.gpa, box);
+        self.anilist_auth = reloaded;
+        self.anilist_connected = reloaded.hasAniList() and !reloaded.anilist.isExpired(Store.nowSecs());
+    }
+
+    /// One-shot pull-then-push right after an in-session connect — the in-app twin of
+    /// the CLI login bootstrap (ROD-292). Reuses the shared sync worker + one-flush
+    /// gate; a no-op under the master switch/disconnected, or with a flush already live
+    /// (a launch pull / action flush), in which case a later mutation re-arms it.
+    fn bootstrapSync(self: *App, loop: *Loop, io: std.Io) void {
+        if (builtin.is_test) return;
+        const st = self.store orelse return;
+        if (!self.syncEnabled()) return;
+        if (self.sync_flush_inflight.load(.acquire)) return;
+        if (self.sync_thread) |t| {
+            t.join();
+            self.sync_thread = null;
+        }
+        self.spawnSyncWorker(loop, io, st, false); // pull-then-push
     }
 
     fn finishPlayback(self: *App, final_update: ?event_mod.PositionUpdate, completed: bool) void {
@@ -1618,6 +1889,7 @@ pub const App = struct {
                     self.pushToast(.info, msg, false);
                 }
             },
+            .connect_result => |outcome| self.onConnectResult(outcome, loop, io),
             .search_done => |ev| {
                 // Stale check: ignore if query has changed since this search was fired.
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
@@ -2835,6 +3107,19 @@ pub const App = struct {
     }
 
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        // ROD-286: the connect modal is a captured overlay. While it's up it owns esc
+        // (cancel) and c (copy URL); every other key is swallowed so nothing switches
+        // views mid-connect. Ctrl-C still hard-quits (emergency exit) — its worker is
+        // abandoned by the ROD-232 `_exit`, exactly like every other in-flight thread.
+        if (self.connect != null) {
+            if (key.matches('c', .{ .ctrl = true })) {
+                self.should_quit = true;
+                return;
+            }
+            self.onConnectKey(key, io);
+            return;
+        }
+
         // Settings owns its keys first (cycle/toggle/edit/save); anything it
         // doesn't consume falls through to the global chain below.
         if (self.active_view == .settings and self.onSettingsKey(key)) return;
@@ -3611,6 +3896,23 @@ pub const App = struct {
         self.drawContent(vx, writer, win, h);
         chrome.drawToasts(self, win, h);
         chrome.drawBottomBar(self, win, h);
+
+        // ROD-286: the connect modal draws on top of everything — it's a captured
+        // overlay, so nothing beneath it should read as interactive.
+        if (self.connect != null) connect_view.draw(self, win, w, h);
+
+        // Service a pending `[c] copy` here — draw owns the tty, and OSC 52 is a
+        // control write separate from the cell buffer, so it rides the same writer as
+        // render. Best-effort: over tmux/SSH the terminal may drop it, but the URL is
+        // on screen to select by hand, and the "copied" hint reflects the request, not
+        // a confirmation we can't get.
+        if (self.connect) |*cs| {
+            if (cs.copy_requested) {
+                cs.copy_requested = false;
+                vx.copyToSystemClipboard(writer, cs.listener.url, self.gpa) catch {};
+                cs.copied = true;
+            }
+        }
 
         try vx.render(writer);
     }

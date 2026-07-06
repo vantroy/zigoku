@@ -4857,6 +4857,43 @@ test "settings: space toggles a bool field" {
     try testing.expect(app.config.cover_art);
 }
 
+test "reloadAuth retires arenas instead of freeing them — a live flush's token survives a reconnect (ROD-286 C1)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    // Connect #1: a boxed arena holding token strings, adopted as the live token —
+    // exactly the shape reloadAuthAfterConnect builds, minus the auth.zon read.
+    const box1 = try testing.allocator.create(std.heap.ArenaAllocator);
+    box1.* = .init(testing.allocator);
+    const tok1 = try box1.allocator().dupe(u8, "token-one");
+    const name1 = try box1.allocator().dupe(u8, "userone");
+    try app.adoptReloadedAuth(box1, .{ .anilist = .{ .access_token = tok1, .user_name = name1, .token_type = "Bearer" } });
+    try testing.expect(app.anilist_connected);
+    try testing.expectEqualStrings("userone", app.anilist_auth.anilist.user_name);
+
+    // spawnSyncWorker hands anilist_auth BY VALUE — a flush holds this slice into box1
+    // for the whole paced push. Capture that borrow the way a worker would.
+    const borrowed_token = app.anilist_auth.anilist.access_token;
+
+    // Connect #2 while that borrow is live: the OLD arena must NOT be freed. Eagerly
+    // freeing it here was the C1 use-after-free.
+    const box2 = try testing.allocator.create(std.heap.ArenaAllocator);
+    box2.* = .init(testing.allocator);
+    const tok2 = try box2.allocator().dupe(u8, "token-two");
+    const name2 = try box2.allocator().dupe(u8, "usertwo");
+    try app.adoptReloadedAuth(box2, .{ .anilist = .{ .access_token = tok2, .user_name = name2, .token_type = "Bearer" } });
+
+    // Both arenas retained (retired, not freed); the pre-reconnect borrow is intact; the
+    // live token advanced to #2.
+    try testing.expectEqual(@as(usize, 2), app.auth_reload_arenas.items.len);
+    try testing.expectEqualStrings("token-one", borrowed_token); // a UAF read under the old eager free
+    try testing.expectEqualStrings("usertwo", app.anilist_auth.anilist.user_name);
+
+    // The production free path releases every retired arena — the testing allocator's
+    // leak detector fails this test if any is dropped or double-freed.
+    app.freeAuthReloadArenas();
+}
+
 test "settings: enter edits mpv_path; type+confirm commits, esc cancels" {
     var app: App = .{};
     app.gpa = testing.allocator;
