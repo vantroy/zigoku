@@ -45,6 +45,16 @@ pub const Config = struct {
     /// thread storm.
     discover_cover_concurrency: u32 = 4,
 
+    /// Master switch for the AniList sync side-rail (ROD-286). Off = every sync
+    /// entry point no-ops: the action-triggered flush (ROD-291), the pull-on-launch
+    /// (ROD-293), and the connect bootstrap (ROD-292) all check this before they arm
+    /// or spawn, so a user who connected an account but wants sync paused gets a
+    /// completely inert rail — no background threads, no whispers — while the token
+    /// stays put. Defaults on: a fresh connect is expected to sync. The Settings
+    /// "sync" toggle writes this; `hasAniList()` (a token) is orthogonal — this gates
+    /// *whether* to sync, the token gates *whether we can*.
+    anilist_sync_enabled: bool = true,
+
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
     pub fn translationEnum(self: Config) domain.Translation {
@@ -149,6 +159,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqualStrings(want.palette, got.palette);
     try testing.expectEqualStrings(want.landing, got.landing);
     try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
+    try testing.expectEqual(want.anilist_sync_enabled, got.anilist_sync_enabled);
 }
 
 test "empty struct literal yields all defaults" {
@@ -199,6 +210,7 @@ test "serialized config round-trips back through parse" {
         .palette = "nord",
         .landing = "browse",
         .discover_cover_concurrency = 8,
+        .anilist_sync_enabled = false,
     };
 
     var aw = std.Io.Writer.Allocating.init(a);
@@ -220,6 +232,15 @@ test "landingEnum maps browse and last_watched, defaults everything else to hist
     try testing.expectEqual(.history, (Config{ .landing = "history" }).landingEnum());
     try testing.expectEqual(.history, (Config{ .landing = "garbage" }).landingEnum());
     try testing.expectEqual(.history, (Config{}).landingEnum()); // default
+}
+
+test "anilist_sync_enabled defaults on, round-trips a paused value (ROD-286)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Default: sync armed for a freshly-connected account.
+    try testing.expect((Config{}).anilist_sync_enabled);
+    // A user who paused sync must survive a reload as paused, not silently re-armed.
+    try testing.expect(!parse(arena.allocator(), ".{ .anilist_sync_enabled = false }").anilist_sync_enabled);
 }
 
 test "discoverCoverConcurrency clamps to [min, max], default passes through" {

@@ -16,9 +16,18 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const auth = @import("auth.zig");
+const deadline = @import("util/deadline.zig");
 const c = @cImport({
     @cInclude("time.h"); // time(2) — current unix seconds, matching store.zig
 });
+
+/// Wall-clock ceiling for the `Viewer` verify POST (ROD-286), matching the AniList
+/// enrichment deadline in anilist.zig (ROD-262). std has no per-socket read timeout,
+/// so a reachable-but-silent host would otherwise hang the call forever — harmless-ish
+/// in the CLI (Ctrl-C kills it), but in the TUI the connect worker runs this, and
+/// teardown joins that worker on the render thread: an unbounded verify there freezes
+/// the whole UI, unkillable from inside. The bound turns that into a `.verify_failed`.
+const VIEWER_DEADLINE_S = 10;
 
 pub const CLIENT_ID = "43536";
 /// The loopback port — the single source of truth. `REDIRECT` is derived from it,
@@ -178,12 +187,23 @@ fn parseViewerResponse(arena: Allocator, raw_json: []const u8) error{BadJson}!?V
     return data.Viewer;
 }
 
-/// One authenticated `{ Viewer { id name } }` call. Transport failures propagate;
+/// One authenticated `{ Viewer { id name } }` call, bounded by `VIEWER_DEADLINE_S`
+/// (ROD-286). A stalled fetch surfaces as `error.Timeout` — which `completeLogin`
+/// folds into `.verify_failed`, exactly like any other transport failure — instead of
+/// hanging the caller (in the TUI, the connect worker the render thread must join).
+fn fetchViewer(arena: Allocator, io: Io, token: []const u8) !?Viewer {
+    return deadline.withDeadline(io, .fromSeconds(VIEWER_DEADLINE_S), fetchViewerOnce, .{ arena, io, token });
+}
+
+/// The un-bounded verify POST, run as a cancelable unit of concurrency by
+/// `fetchViewer`'s `withDeadline` (ROD-262 idiom): it owns `client` (defer deinit), so
+/// the deadline's cancel turns the blocked recv into `error.Canceled` and this frame
+/// unwinds — freeing the client — rather than leaking it. Transport failures propagate;
 /// an unparseable body surfaces as `error.BadJson`; a parsed-but-viewerless body
 /// (bad token) returns null. Status code is intentionally not gated on: AniList
 /// answers an invalid token with HTTP 400 *and* a JSON error body, so the parse
 /// outcome — not the status — is the reliable "is this token good" signal.
-fn fetchViewer(arena: Allocator, io: Io, token: []const u8) !?Viewer {
+fn fetchViewerOnce(arena: Allocator, io: Io, token: []const u8) !?Viewer {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 

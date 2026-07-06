@@ -4827,7 +4827,10 @@ test "settings: landing cycle steps through all three startup-view presets and w
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = app_mod.settings_row_count - 1; // landing view (last row)
+    // landing view is the last Interface row — index 8, before the two ROD-286 AniList
+    // Sync rows (connect, sync). The settings_state comptime asserts pin [8] == .landing,
+    // so this index breaks the build, not the test, if the table is reordered.
+    app.settings.cursor = 8;
     try testing.expectEqualStrings("history", app.config.landing);
 
     try testTick(&app, keyEv('l', .{})); // history -> browse
@@ -4855,6 +4858,78 @@ test "settings: space toggles a bool field" {
     try testing.expect(!app.config.cover_art);
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(app.config.cover_art);
+}
+
+test "settings: the AniList sync toggle flips the master switch (ROD-286)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = app_mod.settings_row_count - 1; // the `sync` toggle (last row)
+    try testing.expect(app.config.anilist_sync_enabled); // defaults on
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(!app.config.anilist_sync_enabled);
+    try testing.expect(app.settings.dirty); // so leaveSettings persists the paused state
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.config.anilist_sync_enabled);
+}
+
+test "settings: the connect row is an action — inert to cycle/toggle, opens no modal under test (ROD-286)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = app_mod.settings_row_count - 2; // the `connect` action row
+
+    // An action is neither a cycle nor a toggle: h/l/space leave config untouched and
+    // never raise the modal.
+    try testTick(&app, keyEv('l', .{}));
+    try testTick(&app, keyEv('h', .{}));
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.connect == null);
+
+    // Enter routes onKey → onSettingsKey → SettingsState (.connect_requested) →
+    // beginConnect, which is a no-op under test (it would bind a real port). So the
+    // key is consumed, nothing crashes, and no modal is left half-open.
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expect(app.connect == null);
+}
+
+test "reloadAuth retires arenas instead of freeing them — a live flush's token survives a reconnect (ROD-286 C1)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    // Connect #1: a boxed arena holding token strings, adopted as the live token —
+    // exactly the shape reloadAuthAfterConnect builds, minus the auth.zon read.
+    const box1 = try testing.allocator.create(std.heap.ArenaAllocator);
+    box1.* = .init(testing.allocator);
+    const tok1 = try box1.allocator().dupe(u8, "token-one");
+    const name1 = try box1.allocator().dupe(u8, "userone");
+    try app.adoptReloadedAuth(box1, .{ .anilist = .{ .access_token = tok1, .user_name = name1, .token_type = "Bearer" } });
+    try testing.expect(app.anilist_connected);
+    try testing.expectEqualStrings("userone", app.anilist_auth.anilist.user_name);
+
+    // spawnSyncWorker hands anilist_auth BY VALUE — a flush holds this slice into box1
+    // for the whole paced push. Capture that borrow the way a worker would.
+    const borrowed_token = app.anilist_auth.anilist.access_token;
+
+    // Connect #2 while that borrow is live: the OLD arena must NOT be freed. Eagerly
+    // freeing it here was the C1 use-after-free.
+    const box2 = try testing.allocator.create(std.heap.ArenaAllocator);
+    box2.* = .init(testing.allocator);
+    const tok2 = try box2.allocator().dupe(u8, "token-two");
+    const name2 = try box2.allocator().dupe(u8, "usertwo");
+    try app.adoptReloadedAuth(box2, .{ .anilist = .{ .access_token = tok2, .user_name = name2, .token_type = "Bearer" } });
+
+    // Both arenas retained (retired, not freed); the pre-reconnect borrow is intact; the
+    // live token advanced to #2.
+    try testing.expectEqual(@as(usize, 2), app.auth_reload_arenas.items.len);
+    try testing.expectEqualStrings("token-one", borrowed_token); // a UAF read under the old eager free
+    try testing.expectEqualStrings("usertwo", app.anilist_auth.anilist.user_name);
+
+    // The production free path releases every retired arena — the testing allocator's
+    // leak detector fails this test if any is dropped or double-freed.
+    app.freeAuthReloadArenas();
 }
 
 test "settings: enter edits mpv_path; type+confirm commits, esc cancels" {

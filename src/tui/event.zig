@@ -6,6 +6,7 @@ const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
 const source_mod = @import("../source.zig");
+const login_loopback = @import("../login_loopback.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
@@ -60,6 +61,13 @@ pub const Event = union(enum) {
     /// `↑ N to AniList` when a push landed (both `.info`, either or both per flush). Soft
     /// failures stay silent (rows stay dirty, retry next flush).
     sync_flushed: SyncFlushOutcome,
+    /// The in-TUI AniList connect flow settled (ROD-286). Posted once by `connectTask`
+    /// when the loopback worker resolves to a real outcome (a state-valid callback or a
+    /// hard listener error) — NEVER on `.canceled` (esc tears the modal down directly,
+    /// so the worker skips its post, and this event can't race a freed connect arena).
+    /// A POD union (an `anyerror` is a plain error code), so it ships by value: `.ok`
+    /// carries nothing — the handler reloads auth.zon for the freshly-connected identity.
+    connect_result: login_loopback.ConnectOutcome,
     /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
     /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
     /// `page` is the page number this result set belongs to.

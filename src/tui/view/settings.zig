@@ -56,13 +56,36 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
     y += 1;
 
-    // Interface — the remaining toggle rows.
+    // Interface — the toggle/cycle rows 5..9 (cover art … landing view).
     y = drawSettingsHeader(self, win, y, w, "Interface");
+    while (i < 9) : (i += 1) {
+        const r = settings_rows[i];
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
+        y += 1;
+    }
+    y += 1;
+
+    // AniList Sync (ROD-286) — a read-only account status (like Catalog), then the
+    // interactive connect action + sync master-switch toggle (rows 9..end).
+    y = drawSettingsHeader(self, win, y, w, "AniList Sync");
+    drawInertRow(self, win, y, w, "account", accountStatus(self));
+    y += 1;
     while (i < settings_rows.len) : (i += 1) {
         const r = settings_rows[i];
         drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
         y += 1;
     }
+}
+
+/// The read-only "account" value in the AniList Sync section. Connected → the AniList
+/// user name (a session-stable slice from the auth arena — safe to hand vaxis by
+/// reference); a present-but-expired token → a reconnect prompt; otherwise "not
+/// connected". The nuance between the last two is derived from `anilist_connected`
+/// (which already folds in expiry) plus `hasAniList` (a token exists at all).
+fn accountStatus(self: *const App) []const u8 {
+    if (self.anilist_connected) return self.anilist_auth.anilist.user_name;
+    if (self.anilist_auth.hasAniList()) return "reconnect — token expired";
+    return "not connected";
 }
 
 fn drawSettingsHeader(self: *const App, win: vaxis.Window, y: u16, w: u16, title: []const u8) u16 {

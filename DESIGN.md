@@ -1556,18 +1556,33 @@ Live-editable. Full width. No cover art.
     palette                       terminal_ghost                       hjkl to cycle
     landing view                  history                              hjkl to cycle
 
+  AniList Sync
+  ─────────────────────────────────────────────────────────────────────────────────
+    account                       not connected                       [dim + italic]
+    connect                                                         enter to connect
+    sync                          [████ on ████]                     space to toggle
+
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-> **Reconciled with shipped code (ROD-138).** This surface drifted from the M4-era
-> spec across M5/M6. The mock above is what `view/settings.zig` renders as of M6:
-> three sections (Player · Catalog · Interface), nine interactive rows plus two
-> read-only Catalog rows. Added since the original spec: `resume offset` (ROD-84),
-> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228). Renamed: `subtitle language` →
+> **Reconciled with shipped code (ROD-138, updated ROD-286).** This surface drifted
+> from the M4-era spec across M5/M6, then gained a fourth section in ROD-286. The mock
+> above is what `view/settings.zig` renders today: four sections (Player · Catalog ·
+> Interface · AniList Sync), eleven interactive rows plus three read-only rows (two
+> Catalog, one AniList Sync). Added since the original spec: `resume offset` (ROD-84),
+> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228), `connect` +
+> `sync` (ROD-286). Renamed: `subtitle language` →
 > `translation` (ROD-138 — it always controlled the sub/dub track, never a language).
 > Removed: `audio language` (superseded by the `translation` selector — the sub/dub
 > model has no per-language audio tracks), `preferred title` (deferred to ROD-205),
 > `help line` toggle (replaced by `palette`).
+
+> **AniList Sync section (ROD-286).** `account` renders read-only like the Catalog
+> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11,
+> and the interactive-row split is now Player `0..5`, Interface `5..9`, AniList Sync
+> `9..11` — pinned by a `comptime` assert block in `settings_state.zig` so a future
+> row insertion that shifts a boundary breaks the build instead of silently
+> misattributing a row to the wrong section header.
 
 Notes:
 - Focused row: `palette.focus` + bold label over a `palette.bg_surface` row fill.
@@ -1612,6 +1627,149 @@ Notes:
   direct path has no variants — it always returns its single 1080p URL regardless
   of the setting, so the preference is a silent no-op there (not a dead toggle). The
   picker only bites on m3u8/wixmp long-tail sources.
+- **account** (ROD-286) is read-only, like the Catalog rows — `drawInertRow`,
+  `palette.fg3` + italic, not in `settings_rows`, skipped by navigation. Three
+  states: the AniList user name once connected; `reconnect — token expired` when a
+  token exists but was rejected; otherwise `not connected` (the mock's default).
+- **connect** (ROD-286) is the first `action`-kind row: Enter raises the connect
+  modal (§5.5a) rather than editing a value. It renders through the same
+  `drawSettingRow` path as every other row (marker, label, hint), but its value
+  column is always empty — `SettingsState.value()` returns `""` for `.connect`.
+- **sync** (ROD-286) toggles `config.anilist_sync_enabled`, default **on**. This is
+  the master switch for the whole sync rail (both push and pull) — `App.syncEnabled()`
+  ANDs it with `anilist_connected`, so `sync: on` with `account: not connected` (the
+  mock's default state) is a real, expected combination: the switch is honoured, it
+  just has nothing to gate yet. Flipping it off makes the rail inert without
+  touching the stored token — flip it back on and sync resumes.
+
+### 5.5a AniList Connect (ROD-286)
+
+The `connect` action row above raises a captured modal overlay
+(`src/tui/view/connect.zig`) that runs the same OAuth loopback `zigoku login` uses,
+inline in the TUI — no shelling out, no losing the vaxis screen.
+
+**Borderless by design.** The modal is a `palette.bg_elevated` fill, full stop — no
+`┌─┐│└┘` drawn around it. §3.1 (The Borderless Float System) treats box-drawing as a
+last resort, never pane/overlay chrome, and §1.1 already names `bg.elevated` as the
+palette's own "modal-ish overlay" elevation token. A drawn border would have been a
+second, redundant signal fighting the first. The mock below reflects that — it is
+content only, no frame; the rectangle is implied by the `bg_elevated` fill in the real
+render, not by anything drawn.
+
+```
+                            Connect AniList
+
+               approve access in your browser to continue
+
+                  browser didn't open? use this link:
+
+     https://anilist.co/api/v2/oauth/authorize?client_id=43536&redi
+     rect_uri=http://127.0.0.1:8934/callback&response_type=token&st
+     ate=9f2c7a1b4e6d0f3a5c8b1d2e4f6a7b9c
+
+                       ⠠ waiting for approval… 4s
+
+         no callback? run  zigoku login --paste  in a terminal
+
+                              c  copy link
+                              esc  cancel
+
+```
+
+The bottom row (`no callback? run zigoku login --paste in a terminal`) only appears
+once the wait crosses 20s — shown here for completeness. Top-to-bottom this is
+exactly `view/connect.zig`'s row order: title → instruction → fallback caption → URL
+band → status → paste hint (own padded slot, present or not) → `c copy` / `esc
+cancel`, plus a blank pad row above the title and a couple below the last hint.
+
+Notes:
+- **Captured overlay.** While `App.connect != null` the modal owns every keystroke
+  (`App.onKey`) — nothing beneath it can be reached, and it draws last, on top of
+  Settings, on a `palette.bg_elevated` fill so the obscured view can't be mistaken
+  for still-interactive. Only `esc` (cancel) and `c` (copy the authorize URL) do
+  anything; `Ctrl-C` still hard-quits, matching every other in-flight worker in the
+  app.
+- **Hierarchy.** Title in `palette.hot` + bold. The one required action
+  ("approve access…") in `palette.fg2`. The fallback path is visually
+  subordinate — a `palette.fg2` italic caption introduces the authorize URL, which
+  sits in its own `palette.bg_surface` inset band (not the near-invisible dim text
+  the first pass used) since it is a real fallback action, not decoration. `[c]`
+  always copies the *whole* URL regardless of how much of it is visible in the
+  band. (The caption is `fg2`, not `fg3` — `fg3` and `chrome`/border-hairline share
+  a hex in `nord`, so a `fg3` caption there read as nearly invisible against the
+  panel; `fg2` holds real contrast in all four palettes.)
+- **Status line.** Spinner + `waiting for approval… Ns`. The spinner is
+  `palette.focus` while fresh, escalating to `palette.hot` past a few seconds —
+  the same slow-path convention the bottom bar and cover block use (§3.6),
+  reimplemented locally against the modal's own clock rather than the shared one.
+- **Paste-hint fallback (20s).** The loopback only completes when the browser can
+  reach *this host's* `127.0.0.1:PORT` — a remote/SSH session's browser can't, and
+  would otherwise sit on "waiting" forever with no way out but `esc`. Past 20s
+  elapsed (`paste_hint_s` in `connect.zig`), a centred line points at the terminal
+  fallback: `no callback? run zigoku login --paste in a terminal`. It renders in
+  `palette.warn` (amber) — an attention register distinct from every other line in
+  the modal (not `fg2`, which is the same register as the body text it would
+  otherwise blend into; not `hot`, which the spinner above already escalates to
+  past `slow_wait_s`, and the two would compete for "the urgent thing here"). It
+  gets its own padded slot — a blank row above and below, reserved whether or not
+  the hint is showing — so the key hints below don't jump into a new position the
+  instant it appears at 20s.
+- **Key hints.** Two centred `<key>  <action>` lines (the idiom the Browse/History
+  absent states use), not one flat dim line — the bracketed key is `palette.focus`
+  + bold so it actually reads as a key. Both hints' action text is `palette.fg2` —
+  deliberately the same weight, since `cancel` is if anything the more load-bearing
+  of the two and must not read dimmer than `copy link`. `[c]` flips to `copied ✓`
+  in `palette.fg` once used.
+- **Too small to render.** Below roughly `28` cols or `10` rows the modal panel
+  itself would read as clutter, so the modal instead draws one bare
+  `connect: esc to cancel` line on a filled band — a mid-connect resize into a tiny
+  terminal still tells the user the one key that works, instead of leaving Settings
+  visually interactive while silently swallowing every key but `c`/`esc`.
+- **The flow, at a spec level.** `connect` fires `App.beginConnect`, which binds the
+  loopback port and opens the browser **on the render thread** — a bind failure is
+  therefore a synchronous toast, never a half-open modal. A worker thread then runs
+  the accept loop (`login_loopback.awaitConnect`) so the render thread is never
+  blocked; `esc` sets a cancel flag and wakes the worker's blocked `accept` by
+  dialing the port once — a self-connect, the documented way to unblock a stuck
+  `accept` (see `login_loopback.zig`'s own doc comment for the threat model) — and
+  teardown always joins the worker before freeing anything it touched. This is the
+  same `serveConn` core `zigoku login` uses — the two entry points never diverge on
+  CSRF handling or persistence, only on how they wait.
+
+**Browser callback pages.** `login_loopback.zig` serves three small, fully
+self-contained HTML pages (inline `<style>`, no external fonts/images/CDN — they
+have to survive being served off a bare loopback listener) to whichever browser
+tab is driving the flow, CLI or TUI:
+
+| Page | Served when | Copy |
+|---|---|---|
+| `relay_page` | First landing — the token is in `location.hash`, which never reaches the server | "finishing sign-in" + a blinking `▌` (the app's own cursor motif, CSS `steps()`-timed so it's a hard cut, not a fade — §6.4's "no easing" rule holds even in a browser tab) |
+| `done_page` | A state-valid `/callback` completed and persisted | "✓ signed in to AniList / you can close this tab" |
+| `fail_page` | Bad state, no token, a rejected/unreachable verify, or a write failure | "sign-in didn't complete / check your terminal" |
+
+Notes:
+- **Theme-aware.** `@media (prefers-color-scheme: dark)` gives dark browsers a dark
+  shell — the likely case for anyone running a terminal app — while the unstyled
+  default stays a clean light card. The dark palette reuses §1.1's hex values
+  verbatim (`bg.base`, `bg.elevated`, `border.hair`, `text.primary`, `text.muted`,
+  `state.now`) so the tab reads as the same product, not a generic OAuth screen;
+  light mode keeps the same accent identity but darkens it for contrast against a
+  white card — `text.primary`'s neon green reads great on `bg.base`, badly on white.
+- **Branding.** A small "地獄 zigoku" wordmark — the exact top-bar string (§3.4) —
+  above the headline on all three pages.
+- **Security: the address-bar scrub.** `done_page` and `fail_page` both land on a
+  URL still carrying the query string AniList/the listener put there
+  (`/callback?access_token=…`). Both pages open with
+  `<script>history.replaceState(null,'','/')</script>` **before** the stylesheet or
+  body even parse, so the token clears the address bar and this tab's history entry
+  as early as the page can manage it. `relay_page` does **not** get this script — its
+  only job is `location.replace("/callback?" + location.hash.substring(1))`, handing
+  the fragment to the server as a query string, and that line is byte-for-byte
+  load-bearing.
+- **Shared, not duplicated.** All three pages pull their `<style>` block from one
+  constant (`page_style`) rather than three copies, so a palette or contrast fix
+  can't drift out of sync between them — the same "fix drift at the source" instinct
+  as the §1.2 semantic aliases.
 
 ### 5.6 Loading / Now Resolving
 

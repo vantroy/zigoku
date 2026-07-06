@@ -15,6 +15,7 @@ const event_mod = @import("event.zig");
 const log = @import("../log.zig");
 const sync = @import("../sync.zig");
 const auth_mod = @import("../auth.zig");
+const login_loopback = @import("../login_loopback.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -772,6 +773,30 @@ pub fn syncFlushTask(
     };
     loop.postEvent(.{ .sync_flushed = outcome }) catch |pe|
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
+}
+
+/// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
+/// thread and post the settled `ConnectOutcome` back for the UI to adopt. `listener`
+/// and `cancel` are borrowed (owned by `App.ConnectState`'s boxed arena, freed only
+/// after this joins); `arena` is that same connect arena, used for the callback's
+/// verify/persist. On `.canceled` — the UI tore the modal down and is joining us — we
+/// skip the post entirely: there's nothing to report, and posting into a queue no one
+/// is draining (teardown) could wedge the join. Any other outcome is posted best-effort.
+pub fn connectTask(
+    loop: *Loop,
+    io: std.Io,
+    listener: *login_loopback.Listener,
+    arena: Allocator,
+    cancel: *std.atomic.Value(bool),
+) void {
+    const outcome = login_loopback.awaitConnect(listener, arena, io, cancel);
+    switch (outcome) {
+        // Torn down by the UI (esc / teardown) — it's joining us; nothing to report,
+        // and posting into a queue no one is draining could wedge that join.
+        .canceled => {},
+        else => loop.postEvent(.{ .connect_result = outcome }) catch |pe|
+            log.debug("connect postEvent failed: {s}", .{@errorName(pe)}),
+    }
 }
 
 /// Like loadHistoryTask but for the post-playback refresh (ROD-191): posts
