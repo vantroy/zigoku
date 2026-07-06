@@ -317,6 +317,15 @@ pub fn run(
     var reload_inflight = false;
     var reload_settled_at_spawn: u32 = 0;
 
+    // ROD-293: kick a background pull-on-launch so local reflects edits made on other
+    // devices since last run. Pull-only, off-thread, silent — no-op when unconnected /
+    // no store. Reconciles into the store; a changed row flags a history reload at the
+    // safe seam (the reload gate already waits for the initial load via !history_loading,
+    // so this can't race the first paint). The teardown join defer above already covers
+    // its `sync_thread` handle. It shares the action flush's one-flush gate, so a very
+    // early mutation just re-arms behind it (fireSyncFlush sees inflight and waits).
+    app.fireLaunchPull(&loop, io);
+
     // First paint, then the event loop.
     {
         const win = vx.window();
@@ -875,13 +884,16 @@ pub const App = struct {
     /// `cover_sync_deadline_ms`. A local mutation to a linked row arms it; a binge of
     /// episode-marks coalesces into one flush. Serviced in .tick. 0 = nothing pending.
     sync_flush_deadline_ms: i64 = 0,
-    /// One flush at a time. Set true when a `syncFlushTask` is spawned; cleared ONLY by
+    /// One sync at a time. Set true when a `syncFlushTask` is spawned; cleared ONLY by
     /// the worker's own teardown defer (`inflight.store(false)`), which runs on every
     /// exit path — so a dropped `postEvent` can't latch it on. The `.sync_flushed`
     /// handler does NOT clear it. A deadline that fires while this holds re-arms instead
-    /// of stacking a second flush onto the same dirty set.
+    /// of stacking a second flush onto the same dirty set. Shared with the ROD-293
+    /// launch pull, which reuses this exact gate so the launch refresh and the first
+    /// action flush can never run two syncs against the store at once.
     sync_flush_inflight: std.atomic.Value(bool) = .init(false),
-    /// Handle for the in-flight flush thread; joined before spawning the next, and on the
+    /// Handle for the in-flight sync thread (action flush or ROD-293 launch pull — only
+    /// ever one, per the gate above); joined before spawning the next, and on the
     /// error-unwind / test teardown path. The ordinary quit path (`_exit(0)`, ROD-232)
     /// skips that join and abandons the thread — safe and self-healing (see the join
     /// defer in run()).
@@ -1301,11 +1313,42 @@ pub const App = struct {
             t.join();
             self.sync_thread = null;
         }
+        self.spawnSyncWorker(loop, io, st, false); // pull-then-push
+    }
+
+    /// Background pull-on-launch (ROD-293): one `MediaListCollection` round trip at
+    /// startup so local reflects edits made on other devices (an episode watched in the
+    /// AniList mobile app) since last run. Pull-ONLY — the paced push belongs to the
+    /// action flush (ROD-291) and the quit flush (ROD-294), never the launch fast-path.
+    /// Shares the one-at-a-time gate and thread handle with the action flush: this is the
+    /// session's first spawn (gate clear, `sync_thread` null), but guard uniformly so it
+    /// can never stack a second sync onto the same store. Silent by design — a reconciled
+    /// remote change flags a history reload via the shared `.sync_flushed` handler
+    /// (`pushed = 0`, so no toast). Called once from run(); the `is_test` guard matches
+    /// `fireSyncFlush` (run() has no unit-test path, but keep the two symmetric).
+    fn fireLaunchPull(self: *App, loop: *Loop, io: std.Io) void {
+        if (builtin.is_test) return; // don't spawn a real network pull under test
+        const st = self.store orelse return;
+        if (!self.anilist_connected) return;
+        if (self.sync_flush_inflight.load(.acquire)) return; // never stack two syncs
+        if (self.sync_thread) |t| {
+            t.join();
+            self.sync_thread = null;
+        }
+        self.spawnSyncWorker(loop, io, st, true); // pull-only
+    }
+
+    /// Spawn the shared AniList sync worker (ROD-291/293), storing the joinable handle
+    /// and raising the one-flush gate; a spawn failure clears the gate so the coordinator
+    /// isn't latched off. `pull_only` picks the mode: false = the action flush's
+    /// pull-then-push, true = the launch pull-refresh. The caller has already checked the
+    /// gate is clear and reaped any prior handle.
+    fn spawnSyncWorker(self: *App, loop: *Loop, io: std.Io, st: *Store, pull_only: bool) void {
         self.sync_flush_inflight.store(true, .release);
         self.sync_thread = std.Thread.spawn(.{}, workers.syncFlushTask, .{
-            loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight,
+            loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight, pull_only,
         }) catch |e| blk: {
-            log.debug("sync flush spawn failed: {s}", .{@errorName(e)});
+            log.debug("sync worker spawn failed: {s}", .{@errorName(e)});
             self.sync_flush_inflight.store(false, .release);
             break :blk null;
         };
@@ -1494,8 +1537,9 @@ pub const App = struct {
                 self.pushToast(.@"error", msg, true);
             },
             .sync_flushed => |outcome| {
-                // ROD-291: the pull-then-push flush settled. inflight was already cleared
-                // by the worker's defer — nothing to unlatch here.
+                // ROD-291: the pull-then-push flush settled — or, with pushed == 0, the
+                // ROD-293 launch pull-refresh (same event, silent path). inflight was
+                // already cleared by the worker's defer — nothing to unlatch here.
                 // The pull reconciled remote changes into local rows: if any actually
                 // changed, the in-memory history slice is stale, so flag a reload at a
                 // safe seam (the same signal a playback write uses).
