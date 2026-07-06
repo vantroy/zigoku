@@ -2158,11 +2158,12 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     var app: App = .{};
     app.gpa = testing.allocator;
 
-    // A push landed → a low-key info whisper.
+    // A push landed → a low-key info whisper, in the retuned ↑ idiom (ROD-293).
     try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
     try testing.expectEqual(Toast.Kind.info, t.kind);
     try testing.expect(!t.persistent);
+    try testing.expectEqualStrings("↑ 2 to AniList", t.text[0..t.text_len]);
 
     // A pull that changed local rows flags a history reload so the view refreshes.
     var rel: App = .{};
@@ -2183,6 +2184,36 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     quiet.gpa = testing.allocator;
     try testTick(&quiet, .{ .sync_flushed = .{ .pushed = 0 } });
     try testing.expect(quiet.toast_queue[0] == null);
+}
+
+test "sync_flushed: pull whispers ↓, and a two-way flush enqueues ↓ before ↑ (ROD-293)" {
+    // The launch pull (and an action flush's pull half) whispers a low-key ↓ when a
+    // reconcile lands remote changes — symmetric with the push's ↑, and it flags a
+    // history reload. Drives the handler directly (a pure state fold, no thread or
+    // network), so the toast CONTENT is asserted, not just inspected.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testing.expect(!app.history_dirty);
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 3 } });
+        try testing.expect(app.history_dirty);
+        const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        try testing.expectEqual(Toast.Kind.info, t.kind);
+        try testing.expect(!t.persistent);
+        try testing.expectEqualStrings("↓ 3 from AniList", t.text[0..t.text_len]);
+    }
+
+    // A flush that moved BOTH directions enqueues ↓ before ↑, in execution order
+    // (reconcile, then push) — the ordering contract DESIGN.md §4.10 documents.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 2, .pushed = 5 } });
+        const down = app.toast_queue[0] orelse return error.TestExpectationFailed;
+        const up = app.toast_queue[1] orelse return error.TestExpectationFailed;
+        try testing.expectEqualStrings("↓ 2 from AniList", down.text[0..down.text_len]);
+        try testing.expectEqualStrings("↑ 5 to AniList", up.text[0..up.text_len]);
+    }
 }
 
 test "browse list pane detail render info uses selected anime" {
