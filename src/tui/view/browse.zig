@@ -154,3 +154,33 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         centerText(win, row, w, footer, self.s(footer_color, .{}));
     }
 }
+
+test "drawBrowseList renders the primary title under title_language (ROD-205)" {
+    const t = std.testing;
+    var app: App = .{};
+    app.gpa = t.allocator;
+    defer app.search.results.deinit(t.allocator);
+    try app.search.results.append(t.allocator, .{
+        .id = "fr",
+        .name = "Sousou no Frieren",
+        .english_name = "Frieren: Beyond Journey's End",
+        .native_name = "葬送のフリーレン",
+    });
+    app.search.len = 1; // nonzero query length → skip the first-run absent state
+
+    const scratch = try t.allocator.create(RenderScratch);
+    defer t.allocator.destroy(scratch);
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 12, .cols = 60, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &screen };
+
+    // First result row is row 0; the title starts at list_title_col (col 2).
+    app.config.title_language = "romaji";
+    drawBrowseList(&app, scratch, win, 12, 60);
+    try t.expectEqualStrings("S", win.readCell(2, 0).?.char.grapheme); // "Sousou no Frieren"
+
+    app.config.title_language = "english";
+    drawBrowseList(&app, scratch, win, 12, 60);
+    try t.expectEqualStrings("F", win.readCell(2, 0).?.char.grapheme); // "Frieren: Beyond…"
+}

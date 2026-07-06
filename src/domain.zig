@@ -360,13 +360,14 @@ pub fn preferredTitle(
 pub const TitleRow = struct { text: []const u8, native: bool };
 
 /// The alt-title rows to render beneath `primary`, in `romaji → english → native`
-/// order, each skipped when empty OR byte-equal to `primary` (ROD-205, §9.1a).
-/// Because `primary` is always one of the three forms, that form self-excludes by
-/// equality, so at most two rows survive. This generalizes ROD-231's partial
+/// order, each skipped when empty, byte-equal to `primary`, OR byte-equal to an
+/// alt already emitted (ROD-205, §9.1a). This generalizes ROD-231's partial
 /// de-dupe (which only checked the English alt against romaji) into a symmetric
 /// rule against whichever form actually resolved as primary — so a fallback
 /// (e.g. `english` with a null `english_name` resolving to romaji) never
-/// duplicates its target into an alt row.
+/// duplicates its target into an alt row. The `n >= out.len` guard bounds the
+/// write by construction (not by caller convention): even a `primary` matching
+/// none of the three forms can never overrun `out`.
 pub fn altTitles(
     romaji: []const u8,
     english: ?[]const u8,
@@ -381,8 +382,19 @@ pub fn altTitles(
     };
     var n: usize = 0;
     for (forms) |f| {
+        if (n >= out.len) break; // bound by construction — never write past out[1]
         if (f.text.len == 0) continue;
         if (std.mem.eql(u8, f.text, primary)) continue;
+        // Skip a form byte-equal to one already emitted (e.g. english == native,
+        // neither being the primary) — no duplicate alt rows.
+        var dup = false;
+        for (out[0..n]) |prev| {
+            if (std.mem.eql(u8, prev.text, f.text)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
         out[n] = f;
         n += 1;
     }
@@ -556,6 +568,12 @@ test "altTitles de-dupes against the resolved primary, native-marked (ROD-205)" 
     alts = altTitles(rom, null, nat, primary, &buf);
     try std.testing.expectEqual(@as(usize, 1), alts.len);
     try std.testing.expectEqualStrings(nat, alts[0].text);
+
+    // Two alt forms byte-equal to each other (english == native, neither primary)
+    // collapse to a single alt row — no duplicate line.
+    alts = altTitles(rom, "同じ", "同じ", rom, &buf);
+    try std.testing.expectEqual(@as(usize, 1), alts.len);
+    try std.testing.expectEqualStrings("同じ", alts[0].text);
 }
 
 test "Season.kanji returns correct glyphs" {

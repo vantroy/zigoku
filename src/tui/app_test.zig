@@ -301,6 +301,28 @@ test "scope-tagged count fits cnt_scratch (ROD-211)" {
     _ = try std.fmt.bufPrint(&buf, "[watchlist · {d}]", .{999999});
 }
 
+test "detailRenderInfo resolves the primary title through title_language (ROD-205)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .browse; // selectedAnime indexes search.results directly
+    defer app.search.results.deinit(testing.allocator);
+    try app.search.results.append(testing.allocator, .{
+        .id = "fr",
+        .name = "Sousou no Frieren",
+        .english_name = "Frieren: Beyond Journey's End",
+        .native_name = "葬送のフリーレン",
+    });
+    app.list_cursor = 0;
+
+    // The same selected show resolves to a different primary label per preference.
+    app.config.title_language = "romaji";
+    try testing.expectEqualStrings("Sousou no Frieren", app.detailRenderInfo().title);
+    app.config.title_language = "english";
+    try testing.expectEqualStrings("Frieren: Beyond Journey's End", app.detailRenderInfo().title);
+    app.config.title_language = "native";
+    try testing.expectEqualStrings("葬送のフリーレン", app.detailRenderInfo().title);
+}
+
 test "navigation is a no-op with empty history" {
     var app: App = .{};
     app.setHistory(&.{});

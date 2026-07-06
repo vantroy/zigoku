@@ -302,7 +302,7 @@ const DrawCtx = struct {
             self.s(self.palette.fg, .{ .bg = row_bg });
         // Primary label under the title-language preference (ROD-205). The local
         // `/` filter still matches the romaji `rec.title` (historyEntryVisible) —
-        // matching the resolved form is a separate search concern, not this ticket.
+        // matching the resolved form is a separate search concern, tracked in ROD-299.
         const row_title = domain.preferredTitle(rec.title, rec.title_english, rec.native_name, self.config.titleLanguageEnum());
         putClipped(c.win, row, title_col, c.title_w, row_title, title_style);
 

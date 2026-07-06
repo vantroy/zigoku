@@ -436,3 +436,37 @@ test "geometry: covers grow to fill width from cell pixels, fall back when unkno
     // Fewer card rows survive the taller slot — the accepted trade for filled covers.
     try testing.expect(a.rows_visible <= fb.rows_visible);
 }
+
+test "drawCard renders the primary title under title_language (ROD-205)" {
+    const t = std.testing;
+    var app: App = .{};
+    app.gpa = t.allocator;
+    // RenderScratch is large; heap-allocate it rather than blow the test stack.
+    const scratch = try t.allocator.create(app_mod.RenderScratch);
+    defer t.allocator.destroy(scratch);
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 24, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 40, .height = 24, .screen = &screen };
+
+    const geo = geometry(40, 22, 0, 0); // small tier (w < 80): cover_w 14, cover_h 5
+    const a: Anime = .{
+        .id = "fr",
+        .name = "Sousou no Frieren",
+        .english_name = "Frieren: Beyond Journey's End",
+        .native_name = "葬送のフリーレン",
+    };
+    const x: u16 = 2;
+    const title_row: u16 = geo.cover_h + 1; // y=0 → rank row at cover_h, title one below
+    // vis past the scratch cap forces the putClipped fallback (no scratch slot needed).
+    const vis = scratch.title.len;
+
+    // idx=1 avoids the rank-0 "TOP" badge path; the title cell is what we assert.
+    app.config.title_language = "romaji";
+    drawCard(&app, scratch, win, x, 0, geo, vis, 1, a, false);
+    try t.expectEqualStrings("S", win.readCell(x, title_row).?.char.grapheme); // romaji
+
+    app.config.title_language = "native";
+    drawCard(&app, scratch, win, x, 0, geo, vis, 1, a, false);
+    try t.expectEqualStrings("葬", win.readCell(x, title_row).?.char.grapheme); // native
+}
