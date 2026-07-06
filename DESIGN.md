@@ -1588,6 +1588,7 @@ Live-editable. Full width. No cover art.
     kanji chips                   [████ on ████]                     space to toggle
     palette                       terminal_ghost                       hjkl to cycle
     landing view                  history                              hjkl to cycle
+    title language                romaji                               hjkl to cycle
 
   AniList Sync
   ─────────────────────────────────────────────────────────────────────────────────
@@ -1598,24 +1599,24 @@ Live-editable. Full width. No cover art.
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-> **Reconciled with shipped code (ROD-138, updated ROD-286).** This surface drifted
-> from the M4-era spec across M5/M6, then gained a fourth section in ROD-286. The mock
-> above is what `view/settings.zig` renders today: four sections (Player · Catalog ·
-> Interface · AniList Sync), eleven interactive rows plus three read-only rows (two
-> Catalog, one AniList Sync). Added since the original spec: `resume offset` (ROD-84),
-> `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228), `connect` +
-> `sync` (ROD-286). Renamed: `subtitle language` →
-> `translation` (ROD-138 — it always controlled the sub/dub track, never a language).
-> Removed: `audio language` (superseded by the `translation` selector — the sub/dub
-> model has no per-language audio tracks), `preferred title` (deferred to
-> ROD-205 — now specced as `title language`, §9.1a; not yet implemented, so it
-> does not appear in the row/boundary counts above), `help line` toggle
-> (replaced by `palette`).
+> **Reconciled with shipped code (ROD-138, updated ROD-286, ROD-205).** This surface
+> drifted from the M4-era spec across M5/M6, then gained a fourth section in ROD-286.
+> The mock above is what `view/settings.zig` renders today: four sections (Player ·
+> Catalog · Interface · AniList Sync), twelve interactive rows plus three read-only
+> rows (two Catalog, one AniList Sync). Added since the original spec: `resume offset`
+> (ROD-84), `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228),
+> `connect` + `sync` (ROD-286), `title language` (ROD-205, §9.1a). Renamed:
+> `subtitle language` → `translation` (ROD-138 — it always controlled the sub/dub
+> track, never a language); `preferred title` → `title language` (ROD-205 — shipped
+> with a fallback chain instead of a single hardcoded field, §9.1a). Removed:
+> `audio language` (superseded by the `translation` selector — the sub/dub model has
+> no per-language audio tracks), `help line` toggle (replaced by `palette`).
 
 > **AniList Sync section (ROD-286).** `account` renders read-only like the Catalog
-> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11,
-> and the interactive-row split is now Player `0..5`, Interface `5..9`, AniList Sync
-> `9..11` — pinned by a `comptime` assert block in `settings_state.zig` so a future
+> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11
+> in ROD-286, then 11 → 12 when ROD-205 added `title language` to Interface. The
+> interactive-row split is now Player `0..5`, Interface `5..10`, AniList Sync
+> `10..12` — pinned by a `comptime` assert block in `settings_state.zig` so a future
 > row insertion that shifts a boundary breaks the build instead of silently
 > misattributing a row to the wrong section header.
 
@@ -1676,13 +1677,14 @@ Notes:
   mock's default state) is a real, expected combination: the switch is honoured, it
   just has nothing to gate yet. Flipping it off makes the rail inert without
   touching the stored token — flip it back on and sync resumes.
-- **title language** (ROD-205, **specced — not yet implemented**) cycles
-  `romaji · english · native` (`config.title_language`), default `romaji`.
-  Slots into Interface after `landing view`. Full spec, fallback chains, and
-  governed surfaces: §9.1a. Once shipped, Interface's interactive-row range
-  moves from `5..9` to `5..10` and AniList Sync's from `9..11` to `10..12` —
-  the `comptime` assert in `settings_state.zig` that pins those boundaries
-  must move with it.
+- **title language** (ROD-205, shipped) cycles `romaji · english · native`
+  (`config.title_language`), default `romaji`. Slots into Interface after
+  `landing view`, and is a live-preview `.cycle` row like `palette` and
+  `landing view` — cycling it re-resolves every visible title on the next
+  frame. Full spec, fallback chains, and governed surfaces: §9.1a. Landing
+  this row moved Interface's interactive-row range from `5..9` to `5..10`
+  and AniList Sync's from `9..11` to `10..12` — the `comptime` assert in
+  `settings_state.zig` that pins those boundaries moved with it.
 
 ### 5.5a AniList Connect (ROD-286)
 
@@ -2541,8 +2543,8 @@ Both rows are non-interactive (`drawInertRow`: `palette.fg3` + italic, no marker
 no hint) and skipped by `j`/`k` navigation. `enrichment sync` now reads `automatic`;
 `cover art cache` is read-only (was `enter to edit` in the original spec) and shows
 the runtime-resolved cache path (`$XDG_CACHE_HOME`-aware, `$HOME` collapsed to `~`,
-ROD-225) — the mock shows the default-home case. The old `preferred title` row is
-deferred to ROD-205 and not rendered.
+ROD-225) — the mock shows the default-home case. The old `preferred title` row
+shipped under Interface, not Catalog, as `title language` (ROD-205, §5.5/§9.1a).
 
 #### §5.6 Loading / Now Resolving — startup copy
 
