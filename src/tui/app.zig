@@ -989,6 +989,30 @@ pub const App = struct {
     /// errors; search success clears general errors), never cross-view.
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
         const cap = self.toast_queue.len;
+
+        // Persistent toasts are a per-topic SINGLETON (ROD-293 review). The clear side
+        // (search_done/popular_done) already wipes persistent slots by topic, and the
+        // doc contract above assumes one persistent toast per topic — so enforce it on
+        // the push side too: refresh an existing same-topic persistent slot in place
+        // rather than appending a duplicate. Without this, repeated failures (typing
+        // offline → task_error, cycling Discover windows offline → popular_error) stack
+        // duplicate persistent toasts until all three slots are persistent, and the
+        // evict-oldest-non-persistent policy below then has no slot to take — starving
+        // every later toast, transient successes included. With it, persistent occupancy
+        // is capped at the two persistent topics (.general, .feed), so a free
+        // (evictable) slot for transients always exists and the all-persistent branch is
+        // structurally unreachable.
+        if (persistent) {
+            for (&self.toast_queue) |*slot| {
+                if (slot.*) |existing| {
+                    if (existing.persistent and existing.topic == topic) {
+                        slot.* = makeToast(kind, text, persistent, topic);
+                        return;
+                    }
+                }
+            }
+        }
+
         var idx: usize = cap; // sentinel: no free slot yet
         for (self.toast_queue, 0..) |slot, i| {
             if (slot == null) {
@@ -998,18 +1022,25 @@ pub const App = struct {
         }
         if (idx == cap) {
             // Queue full: evict the OLDEST NON-persistent toast so a still-showing
-            // persistent error (source-unreachable, task_error) is never silently
-            // shifted out to make room for a transient whisper. ROD-293 review (chaos)
-            // caught this: a two-way sync flush now pushes TWO toasts at once (↓ then
-            // ↑), doubling the eviction pressure on this 3-slot FIFO, and the old
-            // blind evict-slot-0 would drop a persistent banner the user needed. If
-            // every slot is persistent, drop the incoming toast rather than clobber an
-            // existing error — an already-shown error outranks a newcomer we can defer.
-            const victim = for (self.toast_queue, 0..) |slot, i| {
+            // persistent error is never shifted out to make room for a transient
+            // whisper. ROD-293 chaos review caught the underlying hazard: a two-way sync
+            // flush now pushes TWO toasts at once (↓ then ↑), doubling the eviction
+            // pressure on this 3-slot FIFO, and the old blind evict-slot-0 dropped a
+            // persistent banner the user needed. The per-topic singleton above
+            // guarantees a non-persistent slot exists here; the all-persistent fallback
+            // is defensive only — log and evict the oldest so new info still lands,
+            // never a silent permanent starve.
+            var victim: usize = 0;
+            const found = for (self.toast_queue, 0..) |slot, i| {
                 if (slot) |t| {
                     if (!t.persistent) break i;
                 }
-            } else return; // all persistent → refuse the newcomer
+            } else null;
+            if (found) |v| {
+                victim = v;
+            } else {
+                log.debug("toast: queue all-persistent, evicting oldest (unexpected — the per-topic singleton should prevent this)", .{});
+            }
             // Compact left over the victim, opening the last slot for the newcomer
             // while preserving the oldest→newest order the TTL sweep and this evict
             // both assume.
@@ -1017,19 +1048,21 @@ pub const App = struct {
             while (j + 1 < cap) : (j += 1) self.toast_queue[j] = self.toast_queue[j + 1];
             idx = cap - 1;
         }
-        // 4000ms (not 2500): a state-change toast (e.g. "episode N done") is
-        // posted the instant mpv exits, but on a tiling WM focus is still
-        // returning from mpv's window, eating the first ~1s. Matches the
-        // Toast.ttl_ms struct default.
+        self.toast_queue[idx] = makeToast(kind, text, persistent, topic);
+    }
+
+    /// Build one `Toast`, capping the copy to the §4.7 36-column budget at this single
+    /// choke point so a long dynamic payload (task_error's `@errorName`) gets a "…"
+    /// affordance instead of being silently sheared by the render clip (ROD-166). The
+    /// [80]u8 text buffer is copied out by value on return — nothing aliases the local.
+    /// 4000ms TTL (not 2500): a state-change toast (e.g. "episode N done") is posted the
+    /// instant mpv exits, but on a tiling WM focus is still returning from mpv's window,
+    /// eating the first ~1s; matches the `Toast.ttl_ms` struct default.
+    fn makeToast(kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) Toast {
         var t: Toast = .{ .kind = kind, .persistent = persistent, .ttl_ms = if (persistent) 0 else 4000, .topic = topic };
-        // §4.7: cap the copy to the 36-column budget here, at the single choke
-        // point, so a long dynamic payload (task_error's @errorName) gets a "…"
-        // affordance instead of being silently sheared by the render clip
-        // (ROD-166). Static copies are all well under budget — passed through
-        // verbatim. Writes at most 80 bytes into t.text (truncateToWidth guards).
         const copy = render.truncateToWidth(&t.text, text, Toast.max_copy_cols);
         t.text_len = copy.len;
-        self.toast_queue[idx] = t;
+        return t;
     }
 
     /// Unified teardown for app-owned runtime state. Thread joins live in

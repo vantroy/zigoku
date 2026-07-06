@@ -2244,17 +2244,55 @@ test "pushToastTopic: a two-way sync flush must not evict a persistent error toa
         try testing.expect(banner_survived);
     }
 
-    // All-persistent queue: a transient whisper is refused, not allowed to clobber an
-    // existing error — an already-shown error outranks a newcomer we can defer.
+    // Per-topic persistent SINGLETON (re-bless fix): repeated same-topic errors collapse
+    // to one slot carrying the latest text, so the queue can never saturate with
+    // persistent toasts — a transient whisper always still lands (no starvation).
     {
         var app: App = .{};
         app.gpa = testing.allocator;
-        try testTick(&app, .{ .task_error = "e1" });
-        try testTick(&app, .{ .task_error = "e2" });
-        try testTick(&app, .{ .task_error = "e3" }); // full, all persistent
-        try testTick(&app, .{ .sync_flushed = .{ .pushed = 9 } }); // ↑ whisper → dropped
-        for (app.toast_queue) |slot| try testing.expect(slot.?.persistent);
+        try testTick(&app, .{ .task_error = "err one" });
+        try testTick(&app, .{ .task_error = "err two" });
+        try testTick(&app, .{ .task_error = "err three" }); // all topic .general → one slot
+
+        var persistent_count: usize = 0;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (t.persistent) {
+                    persistent_count += 1;
+                    try testing.expectEqualStrings("err three", t.text[0..t.text_len]); // latest wins
+                }
+            }
+        }
+        try testing.expectEqual(@as(usize, 1), persistent_count);
+
+        // A transient whisper still lands — the persistent singleton left room.
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 7 } });
+        var whisper_landed = false;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (std.mem.eql(u8, t.text[0..t.text_len], "↑ 7 to AniList")) whisper_landed = true;
+            }
+        }
+        try testing.expect(whisper_landed);
     }
+}
+
+test "pushToastTopic: an all-transient overflow evicts the oldest, order preserved (ROD-293)" {
+    // The common no-persistent-queued path must still behave as a plain oldest-out FIFO
+    // (the fix only changes which slot is evicted when a persistent toast is present).
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 1 } }); // ↑ 1
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } }); // ↑ 2
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 3 } }); // ↑ 3 (queue full)
+    try testTick(&app, .{ .sync_flushed = .{ .pushed = 4 } }); // ↑ 4 → evicts ↑ 1
+
+    const s0 = app.toast_queue[0].?;
+    const s1 = app.toast_queue[1].?;
+    const s2 = app.toast_queue[2].?;
+    try testing.expectEqualStrings("↑ 2 to AniList", s0.text[0..s0.text_len]);
+    try testing.expectEqualStrings("↑ 3 to AniList", s1.text[0..s1.text_len]);
+    try testing.expectEqualStrings("↑ 4 to AniList", s2.text[0..s2.text_len]);
 }
 
 test "browse list pane detail render info uses selected anime" {
