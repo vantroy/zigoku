@@ -2216,6 +2216,47 @@ test "sync_flushed: pull whispers ↓, and a two-way flush enqueues ↓ before �
     }
 }
 
+test "pushToastTopic: a two-way sync flush must not evict a persistent error toast (ROD-293)" {
+    // Chaos-review repro: the 3-slot toast FIFO used to evict the oldest slot blindly,
+    // so a two-way flush (↓ then ↑, two toasts from one event) shifted a still-showing
+    // persistent error banner out to make room. The fix evicts the oldest NON-persistent
+    // slot instead. Driven through real events (task_error is persistent; sync whispers
+    // are transient) since pushToast is file-private.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+
+        // Fill the queue: a persistent error banner (oldest), then two transient whispers.
+        try testTick(&app, .{ .task_error = "source unreachable" });
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 1 } });
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 2 } });
+        try testing.expect(app.toast_queue[2] != null); // full
+
+        // Two toasts into the full queue — the old blind evict dropped the banner here.
+        try testTick(&app, .{ .sync_flushed = .{ .reconciled = 1, .pushed = 1 } });
+
+        var banner_survived = false;
+        for (app.toast_queue) |slot| {
+            if (slot) |t| {
+                if (t.persistent and std.mem.eql(u8, t.text[0..t.text_len], "source unreachable")) banner_survived = true;
+            }
+        }
+        try testing.expect(banner_survived);
+    }
+
+    // All-persistent queue: a transient whisper is refused, not allowed to clobber an
+    // existing error — an already-shown error outranks a newcomer we can defer.
+    {
+        var app: App = .{};
+        app.gpa = testing.allocator;
+        try testTick(&app, .{ .task_error = "e1" });
+        try testTick(&app, .{ .task_error = "e2" });
+        try testTick(&app, .{ .task_error = "e3" }); // full, all persistent
+        try testTick(&app, .{ .sync_flushed = .{ .pushed = 9 } }); // ↑ whisper → dropped
+        for (app.toast_queue) |slot| try testing.expect(slot.?.persistent);
+    }
+}
+
 test "browse list pane detail render info uses selected anime" {
     var app: App = .{};
     app.gpa = std.testing.allocator;

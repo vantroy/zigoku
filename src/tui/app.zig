@@ -988,17 +988,34 @@ pub const App = struct {
     /// is cleared only by its own subsystem's recovery (feed success clears feed
     /// errors; search success clears general errors), never cross-view.
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
-        var idx: usize = 3;
+        const cap = self.toast_queue.len;
+        var idx: usize = cap; // sentinel: no free slot yet
         for (self.toast_queue, 0..) |slot, i| {
             if (slot == null) {
                 idx = i;
                 break;
             }
         }
-        if (idx == 3) {
-            self.toast_queue[0] = self.toast_queue[1];
-            self.toast_queue[1] = self.toast_queue[2];
-            idx = 2;
+        if (idx == cap) {
+            // Queue full: evict the OLDEST NON-persistent toast so a still-showing
+            // persistent error (source-unreachable, task_error) is never silently
+            // shifted out to make room for a transient whisper. ROD-293 review (chaos)
+            // caught this: a two-way sync flush now pushes TWO toasts at once (↓ then
+            // ↑), doubling the eviction pressure on this 3-slot FIFO, and the old
+            // blind evict-slot-0 would drop a persistent banner the user needed. If
+            // every slot is persistent, drop the incoming toast rather than clobber an
+            // existing error — an already-shown error outranks a newcomer we can defer.
+            const victim = for (self.toast_queue, 0..) |slot, i| {
+                if (slot) |t| {
+                    if (!t.persistent) break i;
+                }
+            } else return; // all persistent → refuse the newcomer
+            // Compact left over the victim, opening the last slot for the newcomer
+            // while preserving the oldest→newest order the TTL sweep and this evict
+            // both assume.
+            var j = victim;
+            while (j + 1 < cap) : (j += 1) self.toast_queue[j] = self.toast_queue[j + 1];
+            idx = cap - 1;
         }
         // 4000ms (not 2500): a state-change toast (e.g. "episode N done") is
         // posted the instant mpv exits, but on a tiling WM focus is still
