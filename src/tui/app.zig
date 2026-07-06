@@ -3122,7 +3122,7 @@ pub const App = struct {
 
         // Settings owns its keys first (cycle/toggle/edit/save); anything it
         // doesn't consume falls through to the global chain below.
-        if (self.active_view == .settings and self.onSettingsKey(key)) return;
+        if (self.active_view == .settings and self.onSettingsKey(key, loop, io)) return;
 
         // q quits the app — full stop (§10.6, ROD-210), with no back-nav: unlike
         // Esc, q never peels a layer. The `input_mode == .normal` guard keeps a
@@ -3824,7 +3824,7 @@ pub const App = struct {
     /// never touches nav/palette/translation/toasts — it reports *what changed*
     /// and the projection lives here, in the controller. Persistence no longer
     /// rides a key verdict: it moved to App.leaveSettings (ROD-210).
-    fn onSettingsKey(self: *App, key: vaxis.Key) bool {
+    fn onSettingsKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io) bool {
         switch (self.settings.onKey(key, &self.config)) {
             .ignored => return false,
             .consumed => return true,
@@ -3834,6 +3834,13 @@ pub const App = struct {
                 // `config`, which the subsystem just mutated.
                 self.translation = self.config.translationEnum();
                 self.palette = paletteFromConfig(self.config.palette);
+                return true;
+            },
+            // ROD-286: the connect action row fires the in-TUI OAuth flow. The
+            // settings subsystem can't reach `loop`/`io` (by design — it never touches
+            // App-live state), so it reports the intent and the controller projects it.
+            .connect_requested => {
+                self.beginConnect(loop, io);
                 return true;
             },
         }

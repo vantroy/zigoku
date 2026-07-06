@@ -47,9 +47,16 @@ pub const SettingId = enum {
     kanji_chips,
     palette,
     landing,
+    // ── AniList Sync section (ROD-286) ──
+    connect,
+    anilist_sync,
 };
 
-pub const SettingKind = enum { text, cycle, toggle };
+/// `action` (ROD-286): a focusable row whose Enter fires a side effect rather than
+/// editing a config value — the connect row kicks off the OAuth flow. It has no stored
+/// value (`value()` returns ""), and the controller, not the subsystem, runs the effect
+/// (the subsystem reports `.connect_requested`; it never reaches into App).
+pub const SettingKind = enum { text, cycle, toggle, action };
 
 pub const SettingRow = struct {
     id: SettingId,
@@ -68,6 +75,11 @@ pub const settings_rows = [_]SettingRow{
     .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .landing, .label = "landing view", .kind = .cycle, .hint = "hjkl to cycle" },
+    // AniList Sync (ROD-286): a connect *action* (Enter → OAuth flow) and the sync
+    // master-switch *toggle*. The section's read-only "account" status row is rendered
+    // separately (like Catalog) and is not focusable, so it isn't in this table.
+    .{ .id = .connect, .label = "connect", .kind = .action, .hint = "enter to connect" },
+    .{ .id = .anilist_sync, .label = "sync", .kind = .toggle, .hint = "space to toggle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not
@@ -75,12 +87,14 @@ pub const settings_rows = [_]SettingRow{
 pub const settings_row_count = settings_rows.len;
 
 comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..end = Interface. Pin the
-    // boundary so inserting/removing a row can't silently misattribute it to the
-    // wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 9);
-    std.debug.assert(settings_rows[4].id == .skip_mode);
-    std.debug.assert(settings_rows[5].id == .cover_art);
+    // `drawSettings` splits this table 0..5 = Player, 5..9 = Interface, 9..end =
+    // AniList Sync. Pin the boundaries so inserting/removing a row can't silently
+    // misattribute it to the wrong group header — this breaks the build instead.
+    std.debug.assert(settings_rows.len == 11);
+    std.debug.assert(settings_rows[4].id == .skip_mode); // last Player row
+    std.debug.assert(settings_rows[5].id == .cover_art); // first Interface row
+    std.debug.assert(settings_rows[8].id == .landing); // last Interface row
+    std.debug.assert(settings_rows[9].id == .connect); // first AniList Sync row
 }
 
 const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
@@ -139,6 +153,7 @@ fn toggle(config: *Config, id: SettingId) void {
     switch (id) {
         .cover_art => config.cover_art = !config.cover_art,
         .kanji_chips => config.kanji_chips = !config.kanji_chips,
+        .anilist_sync => config.anilist_sync_enabled = !config.anilist_sync_enabled, // ROD-286 master switch
         else => {},
     }
 }
@@ -182,6 +197,10 @@ pub const SettingsState = struct {
         /// Consumed and `config` mutated in a way App projects live (palette /
         /// translation). Controller re-syncs those from config.
         config_changed,
+        /// Consumed: an `.action` row was invoked (ROD-286 — the connect row). The
+        /// subsystem can't run the effect (it never reaches into App/loop/io), so it
+        /// reports the intent and the controller (`onSettingsKey`) fires `beginConnect`.
+        connect_requested,
     };
 
     /// Reset to a clean entry state (top row, not editing). Called by the
@@ -238,6 +257,9 @@ pub const SettingsState = struct {
         }
         if (key.matches(vaxis.Key.enter, .{})) {
             if (row.kind == .text) self.beginEdit(config, row.id);
+            // ROD-286: Enter on an action row (only `.connect` today) asks the
+            // controller to run the side effect. Report intent; don't touch App here.
+            if (row.kind == .action) return .connect_requested;
             return .consumed;
         }
         // `q` is no longer a settings verdict (ROD-210): it falls through to the
@@ -312,6 +334,8 @@ pub const SettingsState = struct {
             .kanji_chips => if (config.kanji_chips) "on" else "off",
             .palette => config.palette,
             .landing => config.landing,
+            .anilist_sync => if (config.anilist_sync_enabled) "on" else "off",
+            .connect => "", // an action row has no stored value; its hint carries the affordance
         };
     }
 };
