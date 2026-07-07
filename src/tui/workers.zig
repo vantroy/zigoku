@@ -775,6 +775,138 @@ pub fn syncFlushTask(
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
+/// Poll interval (ms) for `pushOnQuit`'s pool-independent wait — how often it wakes to
+/// check whether the push landed (an early exit). Small enough that a fast push exits
+/// quit near-instantly; the syscall cost of the (≤ deadline/interval) short sleeps is
+/// nothing against a one-time quit. ROD-294.
+const quit_poll_ms: u64 = 5;
+
+/// ROD-294: bounded best-effort push on quit — the mirror of `syncFlushTask`'s launch
+/// pull at the far end of the session. Called synchronously from run()'s fast-exit path,
+/// AFTER the terminal is restored and BEFORE `_exit`: if rows are still dirty, land as
+/// many as `deadline_ms` allows so a push that failed mid-session (offline, a dropped
+/// 429) doesn't wait for the next launch. Posts NO event — a pure store+network call
+/// that never touches the loop or tty, so it sidesteps the ROD-179/232 event-queue wedge
+/// that retired the graceful drain.
+///
+/// Runs the push on its OWN thread and bounds the WAIT with a libc-`nanosleep` poll loop,
+/// deliberately NOT `withDeadline`: withDeadline arms its timer on the same `Io` thread
+/// pool the push competes for, so under pool starvation (OS thread exhaustion) it runs
+/// the op inline with NO deadline (deadline.zig:43) — and this call sits one line before
+/// the ROD-232 `_exit`, where an unbounded op on a silent socket is exactly the quit-hang
+/// ROD-232 exists to kill. `nanosleep` is a direct libc syscall (the app links libc),
+/// independent of the pool, so the quit thread ALWAYS returns by the deadline no matter
+/// what the push thread is doing — a stalled or starved push is abandoned to `_exit` like
+/// every other ROD-232 worker. Best-effort: whatever doesn't land stays dirty and
+/// re-flushes next launch (`sync.pushAll` stamps each row as it lands, so a cut-short run
+/// leaves a consistent partial — proven by sync.zig's "401 mid-run" test). The caller has
+/// already checked we're connected and that no sync worker (pull or push) is inflight —
+/// the quit push must never run alongside a pull (ROD-285 ordering).
+pub fn pushOnQuit(
+    gpa: Allocator,
+    io: std.Io,
+    store: *Store,
+    credentials: auth_mod.Auth,
+    now_unix: i64,
+    deadline_ms: i64,
+) void {
+    // `done` is heap-allocated and intentionally leaked: `quitPushBody` sets it in a
+    // defer that can run AFTER we return (we abandon a slow push), so it must outlive
+    // this stack frame — a stack `done` would dangle under the abandoned thread. `_exit`
+    // reclaims it moments later, like every other ROD-232 abandoned-worker resource. On
+    // spawn failure we're its only owner and free it; on success the (possibly still
+    // running) thread is its last writer, so we must not.
+    const done = gpa.create(std.atomic.Value(bool)) catch return;
+    done.* = .init(false);
+    const t = std.Thread.spawn(.{}, quitPushBody, .{ gpa, io, store, credentials, now_unix, done }) catch {
+        gpa.destroy(done);
+        return;
+    };
+    // Wait for the push to land, up to the deadline, waking every `quit_poll_ms` for an
+    // early exit. Bound the loop on a MONOTONIC WALL CLOCK, not an iteration count:
+    // `nanosleep` returns early on any delivered signal, and this process keeps a live
+    // SIGWINCH handler through quit (vaxis installs it process-wide and it is never reset),
+    // so a fixed poll count would let a terminal-resize storm mid-quit collapse the whole
+    // budget to milliseconds. Re-reading the clock each pass makes a cut-short sleep
+    // harmless — we just loop and sleep again — so the push reliably gets its full window
+    // while quit stays capped.
+    //
+    // `deadline_ms` is validated (not asserted): a non-positive/oversized value skips the
+    // wait rather than trap or wrap — the assert form was compiled out in Release. The
+    // multiply saturates so an oversized deadline can't overflow to a garbage budget.
+    const ms = std.math.cast(u64, deadline_ms) orelse return;
+    const budget_ns: u64 = ms *| std.time.ns_per_ms;
+    // A failed clock read returns 0. If the FIRST read failed we cannot wall-clock-bound,
+    // so skip the wait outright rather than risk an unbounded loop (`0 -% 0 = 0 < budget`
+    // forever) — best-effort degrades to "don't wait," never to "hang." A LATER failure
+    // also returns 0, but `0 -% start` wraps huge and ends the loop on the next compare.
+    const start = monotonicNs();
+    if (start != 0) {
+        while (!done.load(.acquire) and monotonicNs() -% start < budget_ns) nanosleepMs(quit_poll_ms);
+    }
+    // Done or timed out: never join — a starved/stalled push must not block quit. `detach`
+    // hands the thread to the runtime; `_exit` reaps it (and the leaked `done`) on our heels.
+    t.detach();
+}
+
+/// The quit push body (ROD-294), run on its own thread so `pushOnQuit` can bound the WAIT
+/// with a pool-independent timer. Sets `done` on every exit path so the caller's poll
+/// loop wakes early on the happy path. The dirty pre-check lives here, INSIDE the bounded
+/// region, so even a wedged storage layer can't stall it past the deadline; it reuses
+/// `pushAll`'s own work-list query so the dirty predicate has one source and can't drift.
+fn quitPushBody(
+    gpa: Allocator,
+    io: std.Io,
+    store: *Store,
+    credentials: auth_mod.Auth,
+    now_unix: i64,
+    done: *std.atomic.Value(bool),
+) void {
+    defer done.store(true, .release);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const dirty = store.loadDirtyForSync(arena.allocator()) catch return;
+    if (dirty.len == 0) return;
+    // Total (returns `Summary`, never errors). Its own inner per-POST deadline may go
+    // unbounded under pool starvation, but the caller's poll loop bounds QUIT regardless,
+    // so a stalled push here is just abandoned. Outcome discarded — the render surface is
+    // gone; unlanded rows stay dirty and re-flush next launch.
+    _ = sync.pushAll(gpa, io, store, credentials, now_unix);
+}
+
+/// Pool-independent ~`ms`-millisecond sleep via libc `nanosleep` (the app links libc),
+/// used by `pushOnQuit`'s wait loop so the quit bound can't depend on the `Io` thread
+/// pool the push is competing for. A signal (EINTR) may cut it short — harmless: the
+/// wait loop is bounded by a monotonic clock, not by this sleep completing. ROD-294.
+fn nanosleepMs(ms: u64) void {
+    var req = msToTimespec(ms);
+    _ = std.c.nanosleep(&req, null);
+}
+
+/// Split a millisecond count into a `timespec` (whole seconds + remainder nanoseconds).
+/// Pure — factored out of `nanosleepMs` so the arithmetic is unit-testable without a real
+/// sleep. ROD-294.
+fn msToTimespec(ms: u64) std.c.timespec {
+    return .{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+}
+
+/// Monotonic clock in nanoseconds via libc `clock_gettime` — the wall-clock reference for
+/// `pushOnQuit`'s pool-independent wait bound. CLOCK_MONOTONIC is immune to wall-clock/NTP
+/// jumps. Returns 0 as a failure sentinel (near-impossible on a real OS — a vDSO read):
+/// `pushOnQuit` treats a first-read 0 as "skip the wait" and a later 0 as "end the wait,"
+/// so a clock failure can never hang, only shorten. Saturating arithmetic so an absurd
+/// uptime can't overflow to a small value that would truncate the bound. ROD-294.
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec *| std.time.ns_per_s +| nsec;
+}
+
 /// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
 /// thread and post the settled `ConnectOutcome` back for the UI to adopt. `listener`
 /// and `cancel` are borrowed (owned by `App.ConnectState`'s boxed arena, freed only
@@ -1347,6 +1479,20 @@ test "coverCachePath nests the stem under covers/ with a .jpg suffix (ROD-171)" 
     defer arena.deinit();
     const path = try coverCachePath(arena.allocator(), "https://example.com/cover.jpg");
     try std.testing.expect(std.mem.endsWith(u8, path, "/covers/f8ebf6e202ed59a9.jpg"));
+}
+
+test "msToTimespec splits milliseconds into whole seconds and remainder nanos (ROD-294)" {
+    // The quit-push wait sleeps in `quit_poll_ms` increments and uses this to build the
+    // libc timespec; a sign/units slip here would mis-scale the poll interval.
+    const a = msToTimespec(5); // the poll interval: sub-second
+    try std.testing.expectEqual(@as(@TypeOf(a.sec), 0), a.sec);
+    try std.testing.expectEqual(@as(@TypeOf(a.nsec), 5_000_000), a.nsec);
+    const b = msToTimespec(2000); // exact seconds, zero remainder
+    try std.testing.expectEqual(@as(@TypeOf(b.sec), 2), b.sec);
+    try std.testing.expectEqual(@as(@TypeOf(b.nsec), 0), b.nsec);
+    const c = msToTimespec(2345); // seconds + a nanosecond remainder
+    try std.testing.expectEqual(@as(@TypeOf(c.sec), 2), c.sec);
+    try std.testing.expectEqual(@as(@TypeOf(c.nsec), 345_000_000), c.nsec);
 }
 
 test "dupeOwnedAnime round-trips the widened metadata fields leak-clean (ROD-140)" {
