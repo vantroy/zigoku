@@ -190,6 +190,27 @@ pub fn play(
         // injection) and `consider` gates the URL. Keep that contract intact.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
+    if (link.user_agent) |ua| {
+        // mpv's ffmpeg HTTP path otherwise sends its default `Lavf/*` User-Agent,
+        // which the CDN's Cloudflare edge flags as a bot and 403s intermittently
+        // (ROD-309). The provider sets this to the same browser UA its resolver used
+        // to pass CF, so the whole HLS chain looks like the client that resolved it.
+        // Dedicated `--user-agent` (not header-fields-append) so it REPLACES the
+        // default rather than sending two conflicting UA headers. Same untrusted-bytes
+        // contract as Referer: cleanArg-vetted upstream, no CR/LF header injection.
+        try argv.append(arena, try std.fmt.allocPrint(arena, "--user-agent={s}", .{ua}));
+    }
+    if (std.mem.startsWith(u8, link.url, "http")) {
+        // Be a gentler HTTP client so the CDN's Cloudflare bot/rate scoring stops
+        // sampling us into an intermittent 403 (ROD-309). `multiple_requests=1`: keep
+        // the TCP/TLS connection alive across the HLS chain instead of ffmpeg's default
+        // `Connection: close`, which otherwise opens a fresh handshake per segment —
+        // hundreds an episode, the exact burst that spikes a per-IP rate score. `icy=0`:
+        // drop the `Icy-MetaData: 1` SHOUTcast header ffmpeg sends by default, a pure
+        // non-browser tell no real player emits for HLS. Constant literal, protocol-layer
+        // options only (guarded to http(s) urls), no untrusted data in the argv.
+        try argv.append(arena, "--stream-lavf-o=multiple_requests=1,icy=0");
+    }
     if (link.cloaked_segments) {
         // The stream's HLS segments use a disguised extension (senshi serves `.ts`
         // as `.jpg`; ROD-301). ffmpeg's HLS demuxer gates on a segment-extension

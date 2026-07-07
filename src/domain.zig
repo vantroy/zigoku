@@ -436,6 +436,10 @@ pub const StreamLink = struct {
     resolution: ?u32 = null,
     /// HTTP Referer mpv must echo to the CDN, or null if the CDN doesn't gate on it.
     referer: ?[]const u8 = null,
+    /// User-Agent mpv must send, or null to leave ffmpeg's default `Lavf/*`. Set so the
+    /// media fetch presents the same browser-shaped client the resolver used, part of
+    /// looking less like a scraper to the CDN's bot/rate scoring (ROD-309).
+    user_agent: ?[]const u8 = null,
     /// The HLS segments are served under a disguised extension — senshi cloaks its
     /// `.ts` segments as `.jpg` to slip content filters (ROD-301). ffmpeg's HLS
     /// demuxer refuses non-standard segment extensions by default, so the player
