@@ -312,7 +312,10 @@ pub const AllAnime = struct {
 
         const raw = try post(arena, io, body, REFERER_API);
         const parsed = try std.json.parseFromSlice(SResp, arena, raw, .{ .ignore_unknown_fields = true });
-        const data = parsed.value.data orelse return error.NoSearchData;
+        const data = parsed.value.data orelse {
+            logGqlReject("search", raw);
+            return error.NoSearchData;
+        };
 
         var list: std.ArrayList(domain.Anime) = .empty;
         for (data.shows.edges) |e| {
@@ -344,7 +347,14 @@ pub const AllAnime = struct {
 
         const raw = try post(arena, io, body, REFERER_API);
         const parsed = try std.json.parseFromSlice(PResp, arena, raw, .{ .ignore_unknown_fields = true });
-        const pop = (parsed.value.data orelse return error.NoPopularData).queryPopular orelse return error.NoPopularData;
+        const pdata = parsed.value.data orelse {
+            logGqlReject("popular", raw);
+            return error.NoPopularData;
+        };
+        const pop = pdata.queryPopular orelse {
+            logGqlReject("popular", raw);
+            return error.NoPopularData;
+        };
 
         var list: std.ArrayList(domain.Anime) = .empty;
         for (pop.recommendations) |rec| {
@@ -383,7 +393,11 @@ pub const AllAnime = struct {
 
         const raw = try post(arena, io, body, REFERER_API);
         const parsed = try std.json.parseFromSlice(EResp, arena, raw, .{ .ignore_unknown_fields = true });
-        const show = (parsed.value.data orelse return error.NoEpisodeData).show orelse return error.ShowNotFound;
+        const edata = parsed.value.data orelse {
+            logGqlReject("episodes", raw);
+            return error.NoEpisodeData;
+        };
+        const show = edata.show orelse return error.ShowNotFound;
         const arr = switch (tt) {
             .sub => show.availableEpisodesDetail.sub,
             .dub => show.availableEpisodesDetail.dub,
@@ -432,7 +446,14 @@ pub const AllAnime = struct {
 
         const raw = try post(arena, io, body, REFERER_VIDEO);
         const parsed = try std.json.parseFromSlice(VResp, arena, raw, .{ .ignore_unknown_fields = true });
-        const tbp = (parsed.value.data orelse return error.NoVideoData).tobeparsed orelse return error.NotEncrypted;
+        const vdata = parsed.value.data orelse {
+            logGqlReject("video", raw);
+            return error.NoVideoData;
+        };
+        const tbp = vdata.tobeparsed orelse {
+            logGqlReject("video", raw);
+            return error.NotEncrypted;
+        };
 
         const plain = try decryptTobeparsed(arena, tbp);
         const decoded = try std.json.parseFromSlice(Dec, arena, plain, .{ .ignore_unknown_fields = true });
@@ -468,7 +489,14 @@ pub const AllAnime = struct {
                 log.debug("allanime provider {s}: {s}", .{ url, @errorName(e) });
             };
         }
-        const pick = selectVariant(variants.items, quality) orelse return error.NoDirectStream;
+        const pick = selectVariant(variants.items, quality) orelse {
+            // The video op succeeded (we had sources) but none were playable — a
+            // provider/CDN failure, NOT hash rotation. The funnel counts tell the
+            // two apart at a glance (ROD-300); this is always-on, unlike the
+            // per-provider chatter above.
+            log.warn("allanime resolve: no playable variant; {d} source(s) returned, {d} long-tail variant(s) gathered", .{ sources.len, variants.items.len });
+            return error.NoDirectStream;
+        };
         // Make the selector observable: how many rungs we had, and which one the
         // preference landed on. This is the receipt that the cap policy actually
         // fired (and the difference between best/worst is real on this source).
@@ -477,6 +505,24 @@ pub const AllAnime = struct {
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
+
+    /// Head of a rejected GraphQL body we surface on a `data:null` response.
+    /// Bounded because a healthy body runs to kilobytes; the `errors` envelope
+    /// sits at the front, so the head is the whole diagnosis.
+    const GQL_REJECT_LOG_BYTES = 512;
+
+    /// A GraphQL response with `data == null` means AllAnime accepted the HTTP
+    /// request (200) but rejected the *operation* — the signature symptom of a
+    /// rotated persisted-query hash, whose `errors[].message` reads
+    /// `PersistedQueryNotFound`. That message is the entire diagnosis, and it
+    /// lives only in the body we would otherwise discard. Emit a bounded prefix at
+    /// `warn` — always-on, NOT gated behind `--debug`, which is exactly off when a
+    /// user first reports "playback failed" (ROD-300). The body is anime metadata
+    /// with no secrets, so a prefix is safe to write to the log file.
+    fn logGqlReject(stage: []const u8, raw: []const u8) void {
+        const head = raw[0..@min(raw.len, GQL_REJECT_LOG_BYTES)];
+        log.warn("allanime {s}: operation rejected (data:null); body head: {s}", .{ stage, head });
+    }
 
     /// One POST to the AllAnime GraphQL endpoint. Returns the response body
     /// (lives in `arena`). Failures are split into distinct, actionable classes
@@ -500,12 +546,19 @@ pub const AllAnime = struct {
                 .{ .name = "Content-Type", .value = "application/json" },
                 .{ .name = "Referer", .value = referer },
             },
-        }) catch |e| return mapTransportError(e, referer);
+        }) catch |e| {
+            // Always-on transport receipt (ROD-300): log the raw error name here,
+            // at the single call site, so `mapTransportError` stays a pure mapper
+            // (its unit test would otherwise spew warn lines and trip the runner).
+            log.warn("allanime POST {s}: transport {s}", .{ referer, @errorName(e) });
+            return mapTransportError(e);
+        };
         if (res.status != .ok) {
-            // Keep the real status for a --debug session, where the mapped class
-            // ("AllAnime rejected the request") isn't enough; the caller only ever
-            // sees the class, not the code.
-            log.debug("allanime POST {s}: HTTP {d}", .{ referer, @intFromEnum(res.status) });
+            // Keep the real status: the mapped class ("AllAnime rejected the
+            // request") isn't enough — the caller only ever sees the class, not the
+            // code. Always-on (ROD-300): a non-200 from the API is abnormal and is
+            // one of the failure modes we need to see without --debug.
+            log.warn("allanime POST {s}: HTTP {d}", .{ referer, @intFromEnum(res.status) });
             return statusToError(res.status);
         }
         return aw.writer.buffered();
@@ -540,7 +593,7 @@ pub const AllAnime = struct {
     /// failure — an accepted imprecision over standing up a dedicated TLS class.
     /// Everything else (OOM, protocol, local socket misconfig) propagates
     /// unchanged so we never mislabel it as a dead network.
-    fn mapTransportError(e: anyerror, referer: []const u8) anyerror {
+    fn mapTransportError(e: anyerror) anyerror {
         switch (e) {
             // IP-level connect failures.
             error.ConnectionRefused,
@@ -559,10 +612,7 @@ pub const AllAnime = struct {
             error.InvalidDnsARecord,
             error.InvalidDnsAAAARecord,
             error.InvalidDnsCnameRecord,
-            => {
-                log.debug("allanime POST {s}: transport {s} -> NetworkDown", .{ referer, @errorName(e) });
-                return error.NetworkDown;
-            },
+            => return error.NetworkDown,
             else => return e,
         }
     }
@@ -1558,24 +1608,24 @@ test "statusToError: blocked / server-down / other split distinctly (ROD-173)" {
 
 test "mapTransportError: connectivity failures become NetworkDown, rest pass through (ROD-173)" {
     // Genuine connectivity problems on our side → NetworkDown.
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionRefused, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionResetByPeer, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.HostUnreachable, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkUnreachable, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkDown, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.Timeout, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.TlsInitializationFailed, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.HostUnreachable));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkUnreachable));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NetworkDown));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.Timeout));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.TlsInitializationFailed));
     // DNS resolution failures (HostName.LookupError) are their own error values,
     // not aliases of the connect errors — they must land on NetworkDown too so
     // "name didn't resolve" reads as a connectivity problem, per the ticket.
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.UnknownHostName, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NameServerFailure, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NoAddressReturned, "t"));
-    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ResolvConfParseFailed, "t"));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.UnknownHostName));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NameServerFailure));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.NoAddressReturned));
+    try std.testing.expectEqual(error.NetworkDown, AllAnime.mapTransportError(error.ResolvConfParseFailed));
     // Anything that isn't a transport failure must not be mislabelled as a dead
     // network — it propagates unchanged.
-    try std.testing.expectEqual(error.OutOfMemory, AllAnime.mapTransportError(error.OutOfMemory, "t"));
-    try std.testing.expectEqual(error.WriteFailed, AllAnime.mapTransportError(error.WriteFailed, "t"));
+    try std.testing.expectEqual(error.OutOfMemory, AllAnime.mapTransportError(error.OutOfMemory));
+    try std.testing.expectEqual(error.WriteFailed, AllAnime.mapTransportError(error.WriteFailed));
 }
 
 test "coverRequest: absolute refs pass through; relative mcovers get the CDN + referer (ROD-267)" {
