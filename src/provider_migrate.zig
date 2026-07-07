@@ -16,6 +16,7 @@
 const std = @import("std");
 const anilist = @import("anilist.zig");
 const store_mod = @import("store.zig");
+const Senshi = @import("providers/senshi.zig").Senshi;
 
 const Store = store_mod.Store;
 const Io = std.Io;
@@ -33,7 +34,7 @@ pub const Summary = struct {
     skipped: bool = false,
     /// allanime rows carrying an `anilist_id` but no `mal_id` — the work-list size.
     candidates: usize = 0,
-    /// of those, how many AniList returned an `idMal` for.
+    /// of those, how many AniList returned a usable `idMal` for.
     resolved: usize = 0,
     /// rows the post-backfill re-key then moved off the allanime key.
     rekeyed: usize = 0,
@@ -41,11 +42,14 @@ pub const Summary = struct {
     completed: bool = false,
 };
 
-/// Run the one-time backfill against `store`. Owns a scratch arena so its working
-/// memory (the id list + the parsed AniList pages) is freed before the caller
+/// Run the one-time backfill against `store`, printing brief progress to `out` — the
+/// header BEFORE the blocking network pass (so the first post-upgrade launch doesn't
+/// read as a hang), the counts after. Silent when there's nothing to do (marker set,
+/// or zero candidates), so a normal launch prints nothing. Owns a scratch arena so its
+/// working memory (the id list + the parsed AniList pages) is freed before the caller
 /// proceeds into the TUI. Network failures are handled internally; only a store or
 /// allocation fault propagates.
-pub fn run(gpa: Allocator, io: Io, store: *Store) !Summary {
+pub fn run(gpa: Allocator, io: Io, store: *Store, out: *Io.Writer) !Summary {
     var arena_inst = std.heap.ArenaAllocator.init(gpa);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -68,6 +72,11 @@ pub fn run(gpa: Allocator, io: Io, store: *Store) !Summary {
         return sum;
     }
 
+    // Real work ahead: announce it before the blocking round-trips (~11 for a 537-show
+    // library) so the busy terminal is explained rather than reading as a hang.
+    try out.print("  migrating watchlist to {s}…\n", .{Senshi.display_name});
+    try out.flush();
+
     var all_chunks_ok = true;
     var i: usize = 0;
     while (i < ids.len) : (i += CHUNK) {
@@ -89,9 +98,11 @@ pub fn run(gpa: Allocator, io: Io, store: *Store) !Summary {
             else => |e| return e,
         };
         for (metas) |m| {
-            const aid = m.anilist_id orelse continue; // the id AniList echoed back
-            const mal = m.mal_id orelse continue; // AniList entry with no MAL id → dark tail.
-            try store.setMalIdByAnilistId(@intCast(aid), @intCast(mal));
+            const aid = std.math.cast(i64, m.anilist_id orelse continue) orelse continue;
+            const mal_u = m.mal_id orelse continue; // AniList entry with no MAL id → dark tail.
+            if (mal_u == 0) continue; // 0 is not a real MAL id; never key senshi/"0".
+            const mal = std.math.cast(i64, mal_u) orelse continue;
+            try store.setMalIdByAnilistId(aid, mal);
             sum.resolved += 1;
         }
     }
@@ -107,20 +118,13 @@ pub fn run(gpa: Allocator, io: Io, store: *Store) !Summary {
         try store.metaSet(MARKER_KEY, "done");
         sum.completed = true;
     }
-    return sum;
-}
 
-/// Print the one-time progress lines above the TUI before it opens. Silent when there
-/// was nothing to do (marker already set, or zero candidates on a clean pass), so a
-/// normal launch prints nothing.
-pub fn report(out: *Io.Writer, sum: Summary) !void {
-    if (sum.skipped or sum.candidates == 0) return;
-
-    try out.print("  migrating watchlist to senshi…\n", .{});
-    try out.print("    · resolved {d}/{d} shows via AniList\n", .{ sum.resolved, sum.candidates });
+    try out.print("  resolved {d} of {d} show(s) via AniList\n", .{ sum.resolved, sum.candidates });
     if (sum.rekeyed > 0)
-        try out.print("    · re-keyed {d} onto senshi\n", .{sum.rekeyed});
+        try out.print("  moved {d} show(s) to {s}\n", .{ sum.rekeyed, Senshi.display_name });
     if (!sum.completed)
-        try out.print("    · network incomplete — will finish next launch\n", .{});
+        try out.print("  couldn't reach AniList for the rest — it'll finish next launch\n", .{});
     try out.flush();
+
+    return sum;
 }

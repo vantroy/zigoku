@@ -400,12 +400,10 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
         var mig_buf: [4096]u8 = undefined;
         var mig_fw: Io.File.Writer = .init(.stdout(), init.io, &mig_buf);
         const mig_out = &mig_fw.interface;
-        const summary = zigoku.provider_migrate.run(init.gpa, init.io, st) catch |err| blk: {
+        _ = zigoku.provider_migrate.run(init.gpa, init.io, st, mig_out) catch |err| {
             if (zigoku.log.file_path != null)
                 std.log.warn("provider backfill deferred — {s}", .{@errorName(err)});
-            break :blk zigoku.provider_migrate.Summary{};
         };
-        zigoku.provider_migrate.report(mig_out, summary) catch {};
     }
 
     // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.

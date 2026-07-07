@@ -266,7 +266,7 @@ const MIGRATION_V12 =
     \\-- enriched to one MAL id (a dup is resolved by OR IGNORE + the cleanup below).
     \\CREATE TEMP TABLE _rekey_304 AS
     \\  SELECT source_id AS old_id, CAST(mal_id AS TEXT) AS new_id
-    \\    FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL;
+    \\    FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL AND mal_id > 0;
     \\
     \\-- The episode-list cache is provider-specific (senshi may label/segment episodes
     \\-- differently), so drop it for every migrated show rather than carry stale labels;
@@ -3118,6 +3118,42 @@ test "MIGRATION_V12 keeps a pre-existing senshi twin and sweeps the allanime dup
     try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
     try testing.expect((try s.getResume("allanime", "opaqueA", .sub, "1")) == null);
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+}
+
+test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned progress (ROD-304)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Two distinct allanime opaque ids that both enriched to the same MAL id (a
+    // re-upload, or a sub/dub split allanime listed separately). Each carries its own
+    // resume state — one episode overlaps ("1"), the rest are disjoint ("2" vs "3").
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "dupA", .title = "Dup A", .mal_id = 5956 }, 1000, arena);
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "dupB", .title = "Dup B", .mal_id = 5956 }, 1001, arena);
+    try s.saveProgress("allanime", "dupA", .sub, "1", 100, 1400, 1002);
+    try s.saveProgress("allanime", "dupA", .sub, "2", 100, 1400, 1002);
+    try s.saveProgress("allanime", "dupB", .sub, "1", 200, 1400, 1003); // collides with dupA ep 1
+    try s.saveProgress("allanime", "dupB", .sub, "3", 200, 1400, 1003);
+
+    try s.rekeyLegacyProvider();
+
+    // Collapses to exactly one row at the shared senshi key, no allanime leftover, and
+    // crucially no orphaned child — an orphan would have failed the COMMIT's deferred
+    // FK check inside rekeyLegacyProvider, so reaching these asserts already proves it.
+    try testing.expect((try s.getAnime(arena, "senshi", "5956")) != null);
+    try testing.expect((try s.getAnime(arena, "allanime", "dupA")) == null);
+    try testing.expect((try s.getAnime(arena, "allanime", "dupB")) == null);
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+
+    // The union of episodes survives on the senshi key (OR IGNORE keeps one row on the
+    // ep-1 collision); nothing is stranded on the dead allanime keys.
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "1")) != null);
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "2")) != null);
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "3")) != null);
+    try testing.expect((try s.getResume("allanime", "dupA", .sub, "2")) == null);
+    try testing.expect((try s.getResume("allanime", "dupB", .sub, "3")) == null);
 }
 
 test "app_meta round-trips one-time flags (ROD-308)" {
