@@ -281,12 +281,21 @@ pub const Senshi = struct {
 
     /// Parse the /episodes array into numerically-sorted episode labels. Pure over
     /// the response bytes so it's unit-testable without the network.
+    ///
+    /// Drops a phantom "episode 0": senshi lists a prologue slot at ep_id 0 for some
+    /// shows (e.g. Uma Musume: Cinderella Gray's "Gray Phantom"), but its own
+    /// /episode-embeds endpoint rejects 0 with 400 "Invalid episode number" — it is
+    /// never playable, so offering it only lets a user pick a stream that can't
+    /// resolve, which surfaces as a bare "returned an error" toast (ROD-301).
     fn parseEpisodes(arena: Allocator, raw: []const u8) ![]domain.EpisodeNumber {
         const parsed = try std.json.parseFromSlice([]SEp, arena, raw, .{ .ignore_unknown_fields = true });
-        const eps = try arena.alloc(domain.EpisodeNumber, parsed.value.len);
-        for (parsed.value, 0..) |e, i| eps[i] = .{ .raw = try epLabel(arena, e.ep_id) };
-        std.mem.sort(domain.EpisodeNumber, eps, {}, domain.EpisodeNumber.lessThan);
-        return eps;
+        var eps: std.ArrayList(domain.EpisodeNumber) = .empty;
+        for (parsed.value) |e| {
+            if (e.ep_id == 0) continue; // unplayable prologue slot — see above
+            try eps.append(arena, .{ .raw = try epLabel(arena, e.ep_id) });
+        }
+        std.mem.sort(domain.EpisodeNumber, eps.items, {}, domain.EpisodeNumber.lessThan);
+        return eps.items;
     }
 
     // ── resolve ──────────────────────────────────────────────────────────────────
@@ -646,13 +655,14 @@ test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {
     // "10" that must sort after "2" numerically (not lexically).
     const raw =
         \\[{"ep_id":3,"ep_title":"c","ep_filler":false,"intro_start":null},
+        \\ {"ep_id":0,"ep_title":"Gray Phantom"},
         \\ {"ep_id":1,"ep_title":"a"},
         \\ {"ep_id":10,"ep_title":"j"},
         \\ {"ep_id":2,"ep_title":"b"}]
     ;
     const eps = try Senshi.parseEpisodes(a, raw);
-    try testing.expectEqual(@as(usize, 4), eps.len);
-    try testing.expectEqualStrings("1", eps[0].raw);
+    try testing.expectEqual(@as(usize, 4), eps.len); // the phantom ep 0 is dropped
+    try testing.expectEqualStrings("1", eps[0].raw); // first playable episode, not "0"
     try testing.expectEqualStrings("2", eps[1].raw);
     try testing.expectEqualStrings("3", eps[2].raw);
     try testing.expectEqualStrings("10", eps[3].raw); // numeric, not lexical
