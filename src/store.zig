@@ -41,7 +41,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 11;
+const SCHEMA_VERSION: c_int = 13;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes now share one DB as a
@@ -234,6 +234,84 @@ const MIGRATION_V10 =
 const MIGRATION_V11 =
     \\ALTER TABLE anime ADD COLUMN synced_status   TEXT;
     \\ALTER TABLE anime ADD COLUMN synced_progress INTEGER;
+;
+
+// ROD-304: re-key existing rows off the captcha-dead AllAnime provider onto senshi
+// so a user's watchlist survives the default-provider swap instead of going dark.
+//
+// senshi's show handle IS the stringified MAL id, and AniList enrichment already
+// stored that id in `anime.mal_id` (fetched as `idMal` in the same pass that sets
+// `anilist_id`), so every *enriched* row re-keys offline with zero network — the
+// mapping is `(allanime, opaque_id) -> (senshi, CAST(mal_id AS TEXT))`, and that
+// CAST reproduces senshi's key byte-for-byte (`allocPrint("{d}", .{s.id})`). Rows
+// with a NULL `mal_id` (never enriched, or no MAL entry upstream) can't be mapped to
+// a MAL-keyed provider; they're left in place — still visible in History — for the
+// provider-identity epic (ROD-307) to backfill over the network.
+//
+// This is an in-place UPDATE, not a copy: `loadHistory` reads every row regardless of
+// `source`, so additive senshi rows would show each migrated show twice. AllAnime is
+// dead by captcha and its opaque `_id` has no future value (the identity epic joins
+// providers on `mal_id`, which we keep), so destroying that key costs nothing.
+//
+// Foreign keys are ON with `ON DELETE CASCADE` only (no `ON UPDATE`), so moving a
+// parent key transiently orphans its children. `defer_foreign_keys = ON` pushes the
+// checks to COMMIT, where parent + children are consistent again (it resets per
+// transaction, and this whole ladder runs inside migrate()'s one BEGIN IMMEDIATE).
+const MIGRATION_V12 =
+    \\PRAGMA defer_foreign_keys = ON;
+    \\
+    \\-- Freeze the allanime -> senshi mapping before mutating `anime`, so every step
+    \\-- keys off a stable snapshot (old opaque id -> stringified MAL id). old_id is a
+    \\-- per-source PK, so it's unique here; new_id may repeat if two allanime rows
+    \\-- enriched to one MAL id (a dup is resolved by OR IGNORE + the cleanup below).
+    \\CREATE TEMP TABLE _rekey_304 AS
+    \\  SELECT source_id AS old_id, CAST(mal_id AS TEXT) AS new_id
+    \\    FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL AND mal_id > 0;
+    \\
+    \\-- The episode-list cache is provider-specific (senshi may label/segment episodes
+    \\-- differently), so drop it for every migrated show rather than carry stale labels;
+    \\-- senshi refetches lazily on next view.
+    \\DELETE FROM episode_cache
+    \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
+    \\
+    \\-- Resume + fully-watched state follows the show onto its senshi key — this is the
+    \\-- watchlist "not going dark". OR IGNORE tolerates a pre-existing senshi twin's
+    \\-- progress row (user re-added the show under senshi) or an intra-allanime dup;
+    \\-- the superseded straggler is swept below.
+    \\UPDATE OR IGNORE episode_progress
+    \\   SET source = 'senshi',
+    \\       source_id = (SELECT new_id FROM _rekey_304 WHERE old_id = episode_progress.source_id)
+    \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
+    \\
+    \\-- The show rows themselves. OR IGNORE preserves any pre-existing senshi row with
+    \\-- the same MAL id (no clobber, no history loss); the losing allanime row is swept.
+    \\UPDATE OR IGNORE anime
+    \\   SET source = 'senshi',
+    \\       source_id = (SELECT new_id FROM _rekey_304 WHERE old_id = anime.source_id)
+    \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
+    \\
+    \\-- Sweep: any row still bearing a migrated old_id was skipped by OR IGNORE (twin
+    \\-- or dup) and is now a superseded duplicate. Dropping it leaves exactly one row
+    \\-- per show and no orphaned child. Moved rows are already source='senshi', so this
+    \\-- source='allanime' filter can't touch them.
+    \\DELETE FROM episode_progress
+    \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
+    \\DELETE FROM anime
+    \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
+    \\
+    \\DROP TABLE _rekey_304;
+;
+
+// ROD-308: a tiny key/value table for app-level one-time flags that are DB-scoped
+// rather than schema-versioned — the first user is the provider-cutover backfill
+// marker (`app_meta['provider_backfill_v1'] = 'done'`), stamped once the network
+// idMal backfill has fully widened the senshi re-key so it never re-runs. Distinct
+// from `SCHEMA_VERSION` (which gates DDL) and from enrichment metadata.
+const MIGRATION_V13 =
+    \\CREATE TABLE app_meta (
+    \\    key   TEXT NOT NULL PRIMARY KEY,
+    \\    value TEXT NOT NULL
+    \\);
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1382,6 +1460,90 @@ pub const Store = struct {
         }
     }
 
+    // ── ROD-304 / ROD-308: legacy-provider cutover ───────────────────────────
+
+    /// Re-key `(allanime, opaque)` rows that carry a `mal_id` onto `(senshi, <mal>)`
+    /// — the exact transform the v12 schema migration runs, factored out so the
+    /// ROD-308 backfill can invoke it again after it populates fresh `mal_id`s over
+    /// the network. Runs in its own write transaction; the schema-migration path
+    /// instead folds the identical `MIGRATION_V12` SQL into `migrate()`'s ladder txn.
+    /// Idempotent: with no eligible allanime rows the temp table is empty and every
+    /// statement is a no-op.
+    pub fn rekeyLegacyProvider(self: *Store) Error!void {
+        try self.exec("BEGIN IMMEDIATE;");
+        errdefer self.exec("ROLLBACK;") catch {};
+        try self.exec(MIGRATION_V12);
+        try self.exec("COMMIT;");
+    }
+
+    /// AniList ids of the allanime rows that COULD re-key but for a missing `mal_id`
+    /// (enriched before `idMal` joined the enrichment fieldset). These are the
+    /// ROD-308 backfill's work-list: one deterministic AniList `id -> idMal` lookup
+    /// turns each into a migratable row. Returned slice is arena-owned.
+    pub fn listBackfillAnilistIds(self: *Store, arena: Allocator) Error![]i64 {
+        var ids: std.ArrayList(i64) = .empty;
+        const stmt = try self.prepare(
+            \\SELECT anilist_id FROM anime
+            \\WHERE source = 'allanime' AND anilist_id IS NOT NULL AND mal_id IS NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try ids.append(arena, c.sqlite3_column_int64(stmt, 0));
+        }
+        return ids.toOwnedSlice(arena);
+    }
+
+    /// Stamp a resolved `mal_id` onto the allanime row(s) with this `anilist_id`,
+    /// but only where it's still missing — never overwrite an id already present.
+    /// Scoped to `source = 'allanime'` so the backfill can't touch already-migrated
+    /// senshi rows. A no-op if nothing matches.
+    pub fn setMalIdByAnilistId(self: *Store, anilist_id: i64, mal_id: i64) Error!void {
+        const stmt = try self.prepare(
+            \\UPDATE anime SET mal_id = ?
+            \\WHERE source = 'allanime' AND anilist_id = ? AND mal_id IS NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 1, mal_id));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, anilist_id));
+        try self.stepDone(stmt);
+    }
+
+    /// Count allanime rows still carrying a `mal_id` — rows pending an offline re-key.
+    /// The ROD-308 backfill reads this just before `rekeyLegacyProvider` to report how
+    /// many rows its network pass made eligible to move onto senshi.
+    pub fn countMigratableAllanime(self: *Store) Error!usize {
+        const stmt = try self.prepare(
+            \\SELECT COUNT(*) FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
+    }
+
+    /// Read an `app_meta` value (ROD-308 one-time flags). Arena-owned, null if unset.
+    pub fn metaGet(self: *Store, arena: Allocator, key: []const u8) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT value FROM app_meta WHERE key = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, key);
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try dupeText(arena, stmt, 0),
+            c.SQLITE_DONE => null,
+            else => error.Step,
+        };
+    }
+
+    /// Upsert an `app_meta` value (ROD-308 one-time flags).
+    pub fn metaSet(self: *Store, key: []const u8, value: []const u8) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT INTO app_meta (key, value) VALUES (?, ?)
+            \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, key);
+        try bindText(stmt, 2, value);
+        try self.stepDone(stmt);
+    }
+
     fn migrate(self: *Store) Error!void {
         // Fast path: read the version WITHOUT a write lock (reads never block under
         // WAL). The common case — an already-current DB — writes nothing, so routine
@@ -1456,6 +1618,14 @@ pub const Store = struct {
         if (v < 11) {
             try self.exec(MIGRATION_V11);
             v = 11;
+        }
+        if (v < 12) {
+            try self.exec(MIGRATION_V12);
+            v = 12;
+        }
+        if (v < 13) {
+            try self.exec(MIGRATION_V13);
+            v = 13;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -2870,4 +3040,168 @@ test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor 
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "https://s4.anilist.co/real.jpg" }, 1002, arena);
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "HTTPFOO-GARBAGE" }, 1003, arena);
     try testing.expectEqualStrings("https://s4.anilist.co/real.jpg", (try s.getAnime(arena, T_SOURCE, "h")).?.cover_url.?);
+}
+
+test "MIGRATION_V12 re-keys an enriched allanime row onto senshi, leaves dark rows (ROD-304)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // `rekeyLegacyProvider` runs the exact SQL the v12 ladder rung runs (MIGRATION_V12),
+    // just in its own transaction — so it exercises the migration transform directly.
+
+    // Enriched allanime row: carries the mal_id AniList enrichment stored, plus resume
+    // state and a cached episode list — the migratable case.
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren", .anilist_id = 182255, .mal_id = 52991 }, 1000, arena);
+    try s.saveProgress("allanime", "opaqueA", .sub, "1", 300, 1400, 1001);
+    const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "2" } };
+    try s.putCachedEpisodes("allanime", "opaqueA", .sub, &eps, "FINISHED", 1000, arena);
+
+    // Dark allanime row: never enriched (no mal_id) → cannot map to a MAL-keyed
+    // provider. Must be left exactly as-is for the epic's network backfill (ROD-307).
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueDark", .title = "NoMal" }, 1000, arena);
+
+    try s.rekeyLegacyProvider();
+
+    // The enriched row re-keyed onto senshi at the stringified mal_id, content intact.
+    const moved = (try s.getAnime(arena, "senshi", "52991")).?;
+    try testing.expectEqualStrings("Frieren", moved.title);
+    try testing.expectEqual(@as(?i64, 182255), moved.anilist_id);
+    try testing.expectEqual(@as(?i64, 52991), moved.mal_id);
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null); // old key gone
+
+    // Resume state followed the show; the old key holds nothing.
+    try testing.expect((try s.getResume("senshi", "52991", .sub, "1")) != null);
+    try testing.expect((try s.getResume("allanime", "opaqueA", .sub, "1")) == null);
+
+    // Provider-specific episode cache was dropped (senshi refetches lazily), not moved.
+    try testing.expect((try s.getCachedEpisodes(arena, "senshi", "52991", .sub, 1001)) == null);
+
+    // Dark row untouched, and no duplicate: History holds the moved show + the dark row.
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueDark")) != null);
+    try testing.expectEqual(@as(usize, 2), (try s.loadHistory(arena)).len);
+
+    // Idempotent: a second pass finds no allanime row with a mal_id left to move.
+    try s.rekeyLegacyProvider();
+    try testing.expectEqual(@as(usize, 2), (try s.loadHistory(arena)).len);
+    try testing.expect((try s.getAnime(arena, "senshi", "52991")) != null);
+}
+
+test "MIGRATION_V12 keeps a pre-existing senshi twin and sweeps the allanime duplicate (ROD-304)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // The user watched the show under allanime AND, while testing senshi, re-added it
+    // there — both keys exist for MAL 52991, with a live senshi resume position. The
+    // re-key must not clobber the senshi row (UPDATE OR IGNORE) and must not leave the
+    // losing allanime row behind (the sweep) or orphan its child (deferred FK check).
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren (allanime)", .mal_id = 52991 }, 1000, arena);
+    try s.saveProgress("allanime", "opaqueA", .sub, "1", 100, 1400, 1001);
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "52991", .title = "Frieren (senshi)", .mal_id = 52991 }, 2000, arena);
+    try s.saveProgress("senshi", "52991", .sub, "1", 500, 1400, 2001);
+
+    try s.rekeyLegacyProvider();
+
+    // The senshi twin wins: its title and its resume position survive untouched.
+    const twin = (try s.getAnime(arena, "senshi", "52991")).?;
+    try testing.expectEqualStrings("Frieren (senshi)", twin.title);
+    try testing.expectEqual(@as(f64, 500), (try s.getResume("senshi", "52991", .sub, "1")).?.position_secs);
+
+    // The losing allanime duplicate — row and progress — is swept: no orphan, no double.
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
+    try testing.expect((try s.getResume("allanime", "opaqueA", .sub, "1")) == null);
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+}
+
+test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned progress (ROD-304)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Two distinct allanime opaque ids that both enriched to the same MAL id (a
+    // re-upload, or a sub/dub split allanime listed separately). Each carries its own
+    // resume state — one episode overlaps ("1"), the rest are disjoint ("2" vs "3").
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "dupA", .title = "Dup A", .mal_id = 5956 }, 1000, arena);
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "dupB", .title = "Dup B", .mal_id = 5956 }, 1001, arena);
+    try s.saveProgress("allanime", "dupA", .sub, "1", 100, 1400, 1002);
+    try s.saveProgress("allanime", "dupA", .sub, "2", 100, 1400, 1002);
+    try s.saveProgress("allanime", "dupB", .sub, "1", 200, 1400, 1003); // collides with dupA ep 1
+    try s.saveProgress("allanime", "dupB", .sub, "3", 200, 1400, 1003);
+
+    try s.rekeyLegacyProvider();
+
+    // Collapses to exactly one row at the shared senshi key, no allanime leftover, and
+    // crucially no orphaned child — an orphan would have failed the COMMIT's deferred
+    // FK check inside rekeyLegacyProvider, so reaching these asserts already proves it.
+    try testing.expect((try s.getAnime(arena, "senshi", "5956")) != null);
+    try testing.expect((try s.getAnime(arena, "allanime", "dupA")) == null);
+    try testing.expect((try s.getAnime(arena, "allanime", "dupB")) == null);
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+
+    // The union of episodes survives on the senshi key (OR IGNORE keeps one row on the
+    // ep-1 collision); nothing is stranded on the dead allanime keys.
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "1")) != null);
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "2")) != null);
+    try testing.expect((try s.getResume("senshi", "5956", .sub, "3")) != null);
+    try testing.expect((try s.getResume("allanime", "dupA", .sub, "2")) == null);
+    try testing.expect((try s.getResume("allanime", "dupB", .sub, "3")) == null);
+}
+
+test "app_meta round-trips one-time flags (ROD-308)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try testing.expect((try s.metaGet(arena, "provider_backfill_v1")) == null); // unset → null
+    try s.metaSet("provider_backfill_v1", "done");
+    try testing.expectEqualStrings("done", (try s.metaGet(arena, "provider_backfill_v1")).?);
+    try s.metaSet("provider_backfill_v1", "redone"); // upsert overwrites
+    try testing.expectEqualStrings("redone", (try s.metaGet(arena, "provider_backfill_v1")).?);
+}
+
+test "ROD-308 backfill: list anilist-only rows, stamp mal_id, re-key onto senshi" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A: allanime with an anilist_id but no mal_id → the backfill's target.
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren", .anilist_id = 182255 }, 1000, arena);
+    // B: allanime already carrying mal_id → not a backfill target (re-keys offline).
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueB", .title = "Dungeon Meshi", .anilist_id = 153518, .mal_id = 52701 }, 1000, arena);
+    // C: allanime with no ids at all → the hard tail, never a backfill target.
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueC", .title = "NoIds" }, 1000, arena);
+
+    // Work-list is exactly A: anilist_id present, mal_id absent.
+    const ids = try s.listBackfillAnilistIds(arena);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(i64, 182255), ids[0]);
+
+    // The network step resolves 182255 → idMal 52991; stamp it. The stamp is scoped
+    // to still-missing mal_ids, so a second (wrong) stamp for the same id is a no-op.
+    try s.setMalIdByAnilistId(182255, 52991);
+    try s.setMalIdByAnilistId(182255, 99999);
+    try testing.expectEqual(@as(?i64, 52991), (try s.getAnime(arena, "allanime", "opaqueA")).?.mal_id);
+
+    // The reusable re-key now sweeps A (freshly eligible) and B onto senshi; C stays.
+    try s.rekeyLegacyProvider();
+    try testing.expect((try s.getAnime(arena, "senshi", "52991")) != null); // A moved
+    try testing.expect((try s.getAnime(arena, "senshi", "52701")) != null); // B moved
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueC")) != null); // dark, kept
+
+    // Nothing left to back-fill: A moved, C has no anilist_id to resolve.
+    try testing.expectEqual(@as(usize, 0), (try s.listBackfillAnilistIds(arena)).len);
 }
