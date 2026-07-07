@@ -147,6 +147,9 @@ pub const Senshi = struct {
         ani_year: ?u32 = null,
         genres: ?[]const u8 = null, // "Action, Comedy"
         studios: ?[]const u8 = null, // "Lerche, …"
+        // Windowed view counts. Not consumed today — Discover is off for senshi —
+        // but retained (with mapAnime's `view_count` param) for the per-provider
+        // Discover feed that will surface them as the card's ranking metric (ROD-302).
         views_day: ?u64 = null,
         views_week: ?u64 = null,
         views_month: ?u64 = null,

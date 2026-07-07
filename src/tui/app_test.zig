@@ -90,24 +90,6 @@ fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
 }
 
-// Same as dummy_vtable but reports no Discover feed — for the ROD-301 gate test.
-fn dummyNoDiscoverFn(_: *anyopaque) bool {
-    return false;
-}
-const dummy_no_discover_vtable: SourceProvider.VTable = .{
-    .name = dummyNameFn,
-    .displayName = dummyDisplayNameFn,
-    .supportsDiscover = dummyNoDiscoverFn,
-    .search = dummySearchFn,
-    .popular = dummyPopularFn,
-    .episodes = dummyEpisodesFn,
-    .resolve = dummyResolveFn,
-    .coverRequest = dummyCoverRequestFn,
-};
-fn noDiscoverProvider() SourceProvider {
-    return .{ .ptr = undefined, .vtable = &dummy_no_discover_vtable };
-}
-
 /// A provider whose `episodes` fetch parks until the test releases it — a
 /// deterministic stand-in for a slow in-flight network fetch (ROD-179). Per
 /// instance state rides on the vtable's `*anyopaque` self.
@@ -171,16 +153,12 @@ fn initTestLoop() Loop {
 }
 
 fn testTick(app: *App, event: Event) !void {
-    return testTickWith(app, event, dummyProvider());
-}
-
-fn testTickWith(app: *App, event: Event, provider: SourceProvider) !void {
     // Use a properly initialized loop so that background threads spawned during
     // tick() can safely call loop.postEvent() (which locks a mutex via io).
     // tty and vaxis are never accessed by postEvent, so undefined is safe there.
     const io = std.testing.io;
     var loop = initTestLoop();
-    try app.tick(event, &loop, io, provider);
+    try app.tick(event, &loop, io, dummyProvider());
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
@@ -321,16 +299,18 @@ test "quit keys: q from browse and Ctrl-C" {
 }
 
 test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
-    // senshi reports supportsDiscover()=false, so D (and its F3 alias) must not open
-    // Discover — the view stays put (the user gets a toast, not an empty grid).
+    // A source with no feed sets discover_supported=false at startup, so D (and its
+    // F3 alias) must not open Discover — the view stays put (the user gets a toast,
+    // not an empty grid; the [D] top-bar tab is dimmed to match).
     var app: App = .{};
     app.input_mode = .normal;
+    app.discover_supported = false;
     app.active_view = .history;
-    try testTickWith(&app, keyEv('D', .{}), noDiscoverProvider());
+    try testTick(&app, keyEv('D', .{}));
     try testing.expect(app.active_view == .history);
 
     app.active_view = .browse;
-    try testTickWith(&app, keyEv(vaxis.Key.f3, .{}), noDiscoverProvider());
+    try testTick(&app, keyEv(vaxis.Key.f3, .{}));
     try testing.expect(app.active_view == .browse);
 }
 
