@@ -474,6 +474,12 @@ pub fn run(
     // thread is parked in read(); tcsetattr is safe concurrently, and the close
     // can't fault before _exit reaps the thread on its heels.
     tty.deinit();
+    // ROD-294: last act before _exit — flush any still-dirty rows to AniList within a
+    // hard deadline (the mirror of the ROD-293 launch pull at the other end of the
+    // session). The terminal is already restored, so the bounded wait shows a normal
+    // cooked-mode prompt, not a frozen TUI; a dead socket can't hang quit. No-op when
+    // disconnected, clean, or a background flush is already covering the dirty rows.
+    app.quitFlush(io);
     std.c._exit(0);
 }
 
@@ -1493,6 +1499,24 @@ pub const App = struct {
             self.sync_flush_inflight.store(false, .release);
             break :blk null;
         };
+    }
+
+    /// ROD-294: bounded best-effort push on quit — the mirror of `fireLaunchPull` at the
+    /// far end of the session. Called once from run()'s fast-exit path, after the terminal
+    /// is restored and before `_exit`. Only the App-state gate lives here (connected? a
+    /// flush already inflight?); the bounded store+network call is `workers.pushOnQuit`,
+    /// which also skips the deadline machinery when nothing's dirty. Skipped when a
+    /// background flush is inflight — `_exit` abandons that thread, its rows re-flush next
+    /// launch, and a second concurrent pusher here would only race it on the same store.
+    /// Like `fireSyncFlush`, this is orchestration around a real network call with no
+    /// unit-testable seam; the tested logic is `sync.pushAll`'s engine (incl. the
+    /// partial-progress safety net) and `withDeadline`'s race.
+    fn quitFlush(self: *App, io: std.Io) void {
+        if (builtin.is_test) return; // real network; no unit-test path (see fireSyncFlush)
+        const st = self.store orelse return;
+        if (!self.syncEnabled()) return;
+        if (self.sync_flush_inflight.load(.acquire)) return; // a flush already covers these rows
+        workers.pushOnQuit(self.gpa, io, st, self.anilist_auth, Store.nowSecs(), App.quit_push_deadline_ms);
     }
 
     // ── in-TUI connect modal (ROD-286) ────────────────────────────────────────
@@ -3954,6 +3978,13 @@ pub const App = struct {
     /// quick succession → one flush, not three) matters more than latency. The user
     /// never waits on it, so a few seconds of settle is free.
     pub const sync_flush_settle_ms: i64 = 3000;
+
+    /// Wall-clock ceiling (ms) for the best-effort push on quit (ROD-294). Bounded so a
+    /// dead/slow AniList socket can never hang the ROD-232 fast-exit; whatever hasn't
+    /// landed stays dirty and re-flushes next launch. Sized to ~one row: `sync.pushAll`
+    /// paces 2 s between rows (MIN_INTERVAL), so this lands the freshest dirty row and
+    /// bounces rather than stalling quit on a backlog — a safety net, not a bulk flush.
+    pub const quit_push_deadline_ms: i64 = 2000;
 
     pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
 

@@ -775,6 +775,53 @@ pub fn syncFlushTask(
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
+/// ROD-294: bounded best-effort push on quit — the mirror of `syncFlushTask`'s launch
+/// pull at the far end of the session. Called synchronously from run()'s fast-exit
+/// path, AFTER the terminal is restored and BEFORE `_exit`: if rows are still dirty,
+/// land as many as `deadline_ms` allows so a push that failed mid-session (offline, a
+/// dropped 429) doesn't wait for the next launch. Unlike `syncFlushTask` this posts NO
+/// event and spawns no persistent thread — a pure store+network call that never touches
+/// the loop or tty, so it sidesteps the ROD-179/232 event-queue wedge that retired the
+/// graceful drain. Bounded and best-effort by construction: `withDeadline` caps the
+/// wall clock so a dead socket can't hang quit, and whatever doesn't land stays dirty
+/// for next launch — `sync.pushAll` stamps each row as it lands, so a cut-short run
+/// leaves a consistent partial (proven by sync.zig's "401 mid-run" test). The caller
+/// has already checked we're connected and no background flush is inflight.
+pub fn pushOnQuit(
+    gpa: Allocator,
+    io: std.Io,
+    store: *Store,
+    credentials: auth_mod.Auth,
+    now_unix: i64,
+    deadline_ms: i64,
+) void {
+    // Trigger only when there's genuinely dirty work (ROD-294's gate): reuse the push's
+    // own work-list query so the dirty predicate has a single source and can't drift.
+    // Cheap and local (busy_timeout-bounded); skips the deadline machinery on a clean quit.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const dirty = store.loadDirtyForSync(arena.allocator()) catch return;
+    if (dirty.len == 0) return;
+
+    // One bounded pushAll. It's total (returns Summary, never errors), so wrap it in a
+    // `!Summary` shim `withDeadline` can unwrap. Discard the outcome — the render surface
+    // is gone; a timeout just means the rest stay dirty and re-flush next launch.
+    const bound = std.Io.Duration.fromMilliseconds(deadline_ms);
+    _ = deadline.withDeadline(io, bound, pushAllBounded, .{ gpa, io, store, credentials, now_unix }) catch {};
+}
+
+/// `!Summary` shim over the total `sync.pushAll` so `withDeadline` — which unwraps an
+/// error union to race the operation — can bound it. ROD-294.
+fn pushAllBounded(
+    gpa: Allocator,
+    io: std.Io,
+    store: *Store,
+    credentials: auth_mod.Auth,
+    now_unix: i64,
+) !sync.Summary {
+    return sync.pushAll(gpa, io, store, credentials, now_unix);
+}
+
 /// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
 /// thread and post the settled `ConnectOutcome` back for the UI to adopt. `listener`
 /// and `cancel` are borrowed (owned by `App.ConnectState`'s boxed arena, freed only
