@@ -255,18 +255,41 @@ pub const Senshi = struct {
         };
     }
 
-    // ── episodes / resolve — STAGE 2 / 3 stubs ─────────────────────────────────
+    // ── episodes ──────────────────────────────────────────────────────────────
+
+    /// One senshi episode row. `ep_id` is the episode NUMBER — the value resolve()
+    /// feeds into /episode-embeds/{mal_id}/{ep}. senshi also carries the title,
+    /// filler/recap flags, and intro/outro skip offsets on this row; the current
+    /// `domain.EpisodeNumber` (just a label) can't hold them — surfacing senshi's
+    /// built-in skip data to replace the AniSkip round-trip is a ROD-301 follow-up.
+    /// Parsed as f64 to tolerate a fractional recap episode (e.g. 13.5).
+    const SEp = struct { ep_id: f64 };
 
     pub fn episodes(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) ![]domain.EpisodeNumber {
         _ = self;
-        _ = arena;
-        _ = io;
+        // senshi's /episodes list is track-agnostic: it lists every episode once,
+        // and whether an episode has a sub and/or dub is only known at embed time.
+        // So `tt` doesn't filter here — unlike AllAnime, which keyed the list per
+        // track. A dub-only episode still lists; resolve() is where a missing dub
+        // surfaces (stage 3).
         _ = tt;
-        // Stage 2 wires GET /episodes/{show_id}. Log at err (always-on) so a smoke
-        // test that drills into a show explains itself instead of failing silently.
-        log.err("senshi episodes not yet implemented (ROD-301 stage 2); show_id={s}", .{show_id});
-        return error.NotImplemented;
+        try guardShowId(show_id);
+        const url = try std.fmt.allocPrint(arena, API ++ "/episodes/{s}", .{show_id});
+        const raw = try request(arena, io, .GET, url, null);
+        return parseEpisodes(arena, raw);
     }
+
+    /// Parse the /episodes array into numerically-sorted episode labels. Pure over
+    /// the response bytes so it's unit-testable without the network.
+    fn parseEpisodes(arena: Allocator, raw: []const u8) ![]domain.EpisodeNumber {
+        const parsed = try std.json.parseFromSlice([]SEp, arena, raw, .{ .ignore_unknown_fields = true });
+        const eps = try arena.alloc(domain.EpisodeNumber, parsed.value.len);
+        for (parsed.value, 0..) |e, i| eps[i] = .{ .raw = try epLabel(arena, e.ep_id) };
+        std.mem.sort(domain.EpisodeNumber, eps, {}, domain.EpisodeNumber.lessThan);
+        return eps;
+    }
+
+    // ── resolve — STAGE 3 stub ─────────────────────────────────────────────────
 
     pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
@@ -401,6 +424,26 @@ pub const Senshi = struct {
         return std.fmt.parseInt(T, s[0..end], 10) catch null;
     }
 
+    /// Format an episode number as its label: an integral value drops the decimal
+    /// ("1", "12"), a fractional recap keeps it ("13.5"). The bounded integer path
+    /// keeps `@intFromFloat` in range (it's UB out of range); a non-finite value
+    /// degrades to "0" rather than trap.
+    fn epLabel(arena: Allocator, n: f64) ![]const u8 {
+        if (!std.math.isFinite(n)) return arena.dupe(u8, "0");
+        if (n >= 0 and n < 1_000_000 and @floor(n) == n)
+            return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
+        return std.fmt.allocPrint(arena, "{d}", .{n});
+    }
+
+    /// senshi keys shows by numeric MAL id, and our stored `Anime.id` is that id
+    /// stringified — so a well-formed show id is all digits. Enforce that before
+    /// splicing it into a URL path, so a corrupt/hostile id can't smuggle a path
+    /// traversal or a second path segment (e.g. `../…`, `1/x`) onto the wire.
+    fn guardShowId(show_id: []const u8) !void {
+        if (show_id.len == 0) return error.InvalidShowId;
+        for (show_id) |c| if (!std.ascii.isDigit(c)) return error.InvalidShowId;
+    }
+
     /// True if `s` is safe to place in a fetch URL / mpv argv: printable ASCII only
     /// (0x21–0x7e), rejecting CR/LF, spaces and controls. Mirrors AllAnime's guard.
     fn cleanArg(s: []const u8) bool {
@@ -512,6 +555,45 @@ test "jsonEscape escapes quotes and backslashes for the search body" {
     try testing.expectEqualStrings("a\\\"b", try Senshi.jsonEscape(a, "a\"b"));
     try testing.expectEqualStrings("c\\\\d", try Senshi.jsonEscape(a, "c\\d"));
     try testing.expectEqualStrings("plain", try Senshi.jsonEscape(a, "plain"));
+}
+
+test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // Out-of-order, with the extra columns senshi sends that we ignore, and a
+    // "10" that must sort after "2" numerically (not lexically).
+    const raw =
+        \\[{"ep_id":3,"ep_title":"c","ep_filler":false,"intro_start":null},
+        \\ {"ep_id":1,"ep_title":"a"},
+        \\ {"ep_id":10,"ep_title":"j"},
+        \\ {"ep_id":2,"ep_title":"b"}]
+    ;
+    const eps = try Senshi.parseEpisodes(a, raw);
+    try testing.expectEqual(@as(usize, 4), eps.len);
+    try testing.expectEqualStrings("1", eps[0].raw);
+    try testing.expectEqualStrings("2", eps[1].raw);
+    try testing.expectEqualStrings("3", eps[2].raw);
+    try testing.expectEqualStrings("10", eps[3].raw); // numeric, not lexical
+}
+
+test "epLabel: integral drops the decimal, fractional keeps it" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("1", try Senshi.epLabel(a, 1.0));
+    try testing.expectEqualStrings("12", try Senshi.epLabel(a, 12.0));
+    try testing.expectEqualStrings("13.5", try Senshi.epLabel(a, 13.5));
+    try testing.expectEqualStrings("0", try Senshi.epLabel(a, std.math.inf(f64))); // defensive
+}
+
+test "guardShowId accepts a numeric MAL id, rejects traversal/injection" {
+    try Senshi.guardShowId("59708");
+    try testing.expectError(error.InvalidShowId, Senshi.guardShowId(""));
+    try testing.expectError(error.InvalidShowId, Senshi.guardShowId("../etc"));
+    try testing.expectError(error.InvalidShowId, Senshi.guardShowId("59708/x"));
+    try testing.expectError(error.InvalidShowId, Senshi.guardShowId("dsd8y")); // public_id, not our key
 }
 
 test "coverRequest: relative posters get the host; absolute passes through" {
