@@ -1118,6 +1118,10 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
             if (playAttemptRetryable(e, attempt, played)) {
                 const backoff_ms = RETRY_BACKOFFS_MS[attempt];
                 log.warn("mpv open failed for id={s} ep={s} (attempt {d}/{d}) — re-resolving in {d}ms", .{ id, ep_raw, attempt + 1, MAX_PLAY_ATTEMPTS, backoff_ms });
+                // Surface the wait so the backoff reads as "retrying", not a frozen
+                // launch. `attempt` is 0-based, so attempt+1 is this retry's 1-based
+                // number and MAX_PLAY_ATTEMPTS-1 the total retries (ROD-309).
+                loop.postEvent(.{ .play_retry = .{ .attempt = @intCast(attempt + 1), .max = @intCast(MAX_PLAY_ATTEMPTS - 1) } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
                 nanosleepMs(backoff_ms);
                 continue;
             }

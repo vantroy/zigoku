@@ -2345,6 +2345,14 @@ pub const App = struct {
                     self.pushToast(.@"error", copy, false);
                 }
             },
+            .play_retry => |r| {
+                // ROD-309: the CDN 403'd the stream open (a Cloudflare penalty window)
+                // and the worker is re-resolving after a backoff. Transient warn so the
+                // wait reads as "retrying", not a frozen launch.
+                var buf: [48]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "stream blocked — retrying {d}/{d}", .{ r.attempt, r.max }) catch "stream blocked — retrying";
+                self.pushToast(.warn, msg, false);
+            },
             .tick => {
                 const now = nowMs(io);
                 self.now_ms = now;
