@@ -389,6 +389,25 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
         break :blk null;
     };
     defer if (store_opt) |*st| st.close();
+
+    // ROD-308: one-time provider-cutover backfill. The v12 schema migration already
+    // re-keyed the offline-eligible allanime rows onto senshi (ROD-304); this resolves
+    // anilist_id → idMal over the network for rows enriched before idMal existed and
+    // re-keys those too, widening the cutover from ~37% to ~83% of a real watchlist.
+    // Best-effort + marker-gated: a normal launch on an already-migrated DB is a no-op.
+    // Runs BEFORE the vaxis screen so its brief progress prints to normal scrollback.
+    if (store_opt) |*st| {
+        var mig_buf: [4096]u8 = undefined;
+        var mig_fw: Io.File.Writer = .init(.stdout(), init.io, &mig_buf);
+        const mig_out = &mig_fw.interface;
+        const summary = zigoku.provider_migrate.run(init.gpa, init.io, st) catch |err| blk: {
+            if (zigoku.log.file_path != null)
+                std.log.warn("provider backfill deferred — {s}", .{@errorName(err)});
+            break :blk zigoku.provider_migrate.Summary{};
+        };
+        zigoku.provider_migrate.report(mig_out, summary) catch {};
+    }
+
     // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.
     var senshi = zigoku.Senshi.init();
     const provider = senshi.provider();

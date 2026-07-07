@@ -41,7 +41,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 12;
+const SCHEMA_VERSION: c_int = 13;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes now share one DB as a
@@ -300,6 +300,18 @@ const MIGRATION_V12 =
     \\ WHERE source = 'allanime' AND source_id IN (SELECT old_id FROM _rekey_304);
     \\
     \\DROP TABLE _rekey_304;
+;
+
+// ROD-308: a tiny key/value table for app-level one-time flags that are DB-scoped
+// rather than schema-versioned — the first user is the provider-cutover backfill
+// marker (`app_meta['provider_backfill_v1'] = 'done'`), stamped once the network
+// idMal backfill has fully widened the senshi re-key so it never re-runs. Distinct
+// from `SCHEMA_VERSION` (which gates DDL) and from enrichment metadata.
+const MIGRATION_V13 =
+    \\CREATE TABLE app_meta (
+    \\    key   TEXT NOT NULL PRIMARY KEY,
+    \\    value TEXT NOT NULL
+    \\);
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1448,19 +1460,88 @@ pub const Store = struct {
         }
     }
 
-    // ── ROD-304: legacy-provider re-key ───────────────────────────────────────
+    // ── ROD-304 / ROD-308: legacy-provider cutover ───────────────────────────
 
     /// Re-key `(allanime, opaque)` rows that carry a `mal_id` onto `(senshi, <mal>)`
-    /// — the exact transform the v12 schema migration runs, factored out so callers
-    /// that populate fresh `mal_id`s can invoke it directly. Runs in its own write
-    /// transaction; the schema-migration path instead folds the identical
-    /// `MIGRATION_V12` SQL into `migrate()`'s ladder txn. Idempotent: with no eligible
-    /// allanime rows the temp table is empty and every statement is a no-op.
+    /// — the exact transform the v12 schema migration runs, factored out so the
+    /// ROD-308 backfill can invoke it again after it populates fresh `mal_id`s over
+    /// the network. Runs in its own write transaction; the schema-migration path
+    /// instead folds the identical `MIGRATION_V12` SQL into `migrate()`'s ladder txn.
+    /// Idempotent: with no eligible allanime rows the temp table is empty and every
+    /// statement is a no-op.
     pub fn rekeyLegacyProvider(self: *Store) Error!void {
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
         try self.exec(MIGRATION_V12);
         try self.exec("COMMIT;");
+    }
+
+    /// AniList ids of the allanime rows that COULD re-key but for a missing `mal_id`
+    /// (enriched before `idMal` joined the enrichment fieldset). These are the
+    /// ROD-308 backfill's work-list: one deterministic AniList `id -> idMal` lookup
+    /// turns each into a migratable row. Returned slice is arena-owned.
+    pub fn listBackfillAnilistIds(self: *Store, arena: Allocator) Error![]i64 {
+        var ids: std.ArrayList(i64) = .empty;
+        const stmt = try self.prepare(
+            \\SELECT anilist_id FROM anime
+            \\WHERE source = 'allanime' AND anilist_id IS NOT NULL AND mal_id IS NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try ids.append(arena, c.sqlite3_column_int64(stmt, 0));
+        }
+        return ids.toOwnedSlice(arena);
+    }
+
+    /// Stamp a resolved `mal_id` onto the allanime row(s) with this `anilist_id`,
+    /// but only where it's still missing — never overwrite an id already present.
+    /// Scoped to `source = 'allanime'` so the backfill can't touch already-migrated
+    /// senshi rows. A no-op if nothing matches.
+    pub fn setMalIdByAnilistId(self: *Store, anilist_id: i64, mal_id: i64) Error!void {
+        const stmt = try self.prepare(
+            \\UPDATE anime SET mal_id = ?
+            \\WHERE source = 'allanime' AND anilist_id = ? AND mal_id IS NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 1, mal_id));
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 2, anilist_id));
+        try self.stepDone(stmt);
+    }
+
+    /// Count allanime rows still carrying a `mal_id` — rows pending an offline re-key.
+    /// The ROD-308 backfill reads this just before `rekeyLegacyProvider` to report how
+    /// many rows its network pass made eligible to move onto senshi.
+    pub fn countMigratableAllanime(self: *Store) Error!usize {
+        const stmt = try self.prepare(
+            \\SELECT COUNT(*) FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return error.Step;
+        return @intCast(c.sqlite3_column_int64(stmt, 0));
+    }
+
+    /// Read an `app_meta` value (ROD-308 one-time flags). Arena-owned, null if unset.
+    pub fn metaGet(self: *Store, arena: Allocator, key: []const u8) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT value FROM app_meta WHERE key = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, key);
+        return switch (c.sqlite3_step(stmt)) {
+            c.SQLITE_ROW => try dupeText(arena, stmt, 0),
+            c.SQLITE_DONE => null,
+            else => error.Step,
+        };
+    }
+
+    /// Upsert an `app_meta` value (ROD-308 one-time flags).
+    pub fn metaSet(self: *Store, key: []const u8, value: []const u8) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT INTO app_meta (key, value) VALUES (?, ?)
+            \\ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, key);
+        try bindText(stmt, 2, value);
+        try self.stepDone(stmt);
     }
 
     fn migrate(self: *Store) Error!void {
@@ -1541,6 +1622,10 @@ pub const Store = struct {
         if (v < 12) {
             try self.exec(MIGRATION_V12);
             v = 12;
+        }
+        if (v < 13) {
+            try self.exec(MIGRATION_V13);
+            v = 13;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -3033,4 +3118,54 @@ test "MIGRATION_V12 keeps a pre-existing senshi twin and sweeps the allanime dup
     try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
     try testing.expect((try s.getResume("allanime", "opaqueA", .sub, "1")) == null);
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+}
+
+test "app_meta round-trips one-time flags (ROD-308)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try testing.expect((try s.metaGet(arena, "provider_backfill_v1")) == null); // unset → null
+    try s.metaSet("provider_backfill_v1", "done");
+    try testing.expectEqualStrings("done", (try s.metaGet(arena, "provider_backfill_v1")).?);
+    try s.metaSet("provider_backfill_v1", "redone"); // upsert overwrites
+    try testing.expectEqualStrings("redone", (try s.metaGet(arena, "provider_backfill_v1")).?);
+}
+
+test "ROD-308 backfill: list anilist-only rows, stamp mal_id, re-key onto senshi" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A: allanime with an anilist_id but no mal_id → the backfill's target.
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren", .anilist_id = 182255 }, 1000, arena);
+    // B: allanime already carrying mal_id → not a backfill target (re-keys offline).
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueB", .title = "Dungeon Meshi", .anilist_id = 153518, .mal_id = 52701 }, 1000, arena);
+    // C: allanime with no ids at all → the hard tail, never a backfill target.
+    try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueC", .title = "NoIds" }, 1000, arena);
+
+    // Work-list is exactly A: anilist_id present, mal_id absent.
+    const ids = try s.listBackfillAnilistIds(arena);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(i64, 182255), ids[0]);
+
+    // The network step resolves 182255 → idMal 52991; stamp it. The stamp is scoped
+    // to still-missing mal_ids, so a second (wrong) stamp for the same id is a no-op.
+    try s.setMalIdByAnilistId(182255, 52991);
+    try s.setMalIdByAnilistId(182255, 99999);
+    try testing.expectEqual(@as(?i64, 52991), (try s.getAnime(arena, "allanime", "opaqueA")).?.mal_id);
+
+    // The reusable re-key now sweeps A (freshly eligible) and B onto senshi; C stays.
+    try s.rekeyLegacyProvider();
+    try testing.expect((try s.getAnime(arena, "senshi", "52991")) != null); // A moved
+    try testing.expect((try s.getAnime(arena, "senshi", "52701")) != null); // B moved
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
+    try testing.expect((try s.getAnime(arena, "allanime", "opaqueC")) != null); // dark, kept
+
+    // Nothing left to back-fill: A moved, C has no anilist_id to resolve.
+    try testing.expectEqual(@as(usize, 0), (try s.listBackfillAnilistIds(arena)).len);
 }

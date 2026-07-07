@@ -33,7 +33,7 @@ const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "
 // zoom (workers.discoverEnrichTask, keyed on `description == null`); fetching
 // dozens of synopses per page would be bytes for text nobody's reading yet. Keep
 // this set and GQL_FIELDS divergent on purpose.
-const GQL_BATCH_FIELDS = "id averageScore genres season seasonYear startDate{year}";
+const GQL_BATCH_FIELDS = "id idMal averageScore genres season seasonYear startDate{year}";
 
 // Both queries are interpolated raw into a JSON body with `{s}`, so they must
 // contain nothing that needs JSON-string escaping. Enforce at comptime rather
