@@ -174,6 +174,11 @@ pub fn play(
     skip: ?SkipScript,
 ) !void {
     const socket_path = try mpvSocketPath(arena);
+    // mpv writes its own verbose log here so an opaque nonzero exit can be explained
+    // (the HLS/ffmpeg reason: 403, expired token, connection reset, codec error…).
+    // Kept on failure (its path is logged), deleted on a clean exit — see the term
+    // switch below. Sibling of the per-playback socket, so it's collision-free too.
+    const mpv_log_path = try std.fmt.allocPrint(arena, "{s}.log", .{socket_path});
 
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.append(arena, mpv_path);
@@ -205,6 +210,7 @@ pub fn play(
     // property expansion here.
     try argv.append(arena, "--title=zigoku - ${media-title}");
     try argv.append(arena, try std.fmt.allocPrint(arena, "--input-ipc-server={s}", .{socket_path}));
+    try argv.append(arena, try std.fmt.allocPrint(arena, "--log-file={s}", .{mpv_log_path}));
     if (start_seconds > 0) {
         try argv.append(arena, try std.fmt.allocPrint(arena, "--start={d}", .{start_seconds}));
     }
@@ -239,8 +245,27 @@ pub fn play(
     const term = try child.wait(io);
     if (watcher_thread) |t| t.join();
     switch (term) {
-        .exited => |code| if (code != 0) return error.MpvFailed,
-        else => return error.MpvFailed, // signalled / stopped / unknown
+        .exited => |code| {
+            if (code == 0) {
+                std.Io.Dir.deleteFileAbsolute(io, mpv_log_path) catch {}; // clean exit → drop the log
+                return;
+            }
+            // Log the reason we CAN see here (exit status, resume offset, and the
+            // signed/expiring stream URL) and keep mpv's own log for the deep cause.
+            std.log.err("mpv exited nonzero: code={d} start={d}s url={s} mpvlog={s}", .{
+                code, start_seconds, link.url, mpv_log_path,
+            });
+            return error.MpvFailed;
+        },
+        else => {
+            // Format the whole term ({any}), not just its tag: for a signal death the
+            // number (SIGSEGV vs SIGKILL vs SIGABRT) is often the ONLY diagnostic left,
+            // since mpv rarely flushes its --log-file before a signal takes it down.
+            std.log.err("mpv terminated abnormally: {any} start={d}s url={s} mpvlog={s}", .{
+                term, start_seconds, link.url, mpv_log_path,
+            });
+            return error.MpvFailed; // signalled / stopped / unknown
+        },
     }
 }
 
