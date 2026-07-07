@@ -199,6 +199,11 @@ pub const Event = union(enum) {
     /// the mpv-spawn classes (MpvNotFound/MpvFailed) ride the same slot and are
     /// refined into their own copy by ROD-230.
     play_error: struct { final: ?PositionUpdate, cause: anyerror },
+    /// A pre-playback stream open failed (CDN 403 in a Cloudflare penalty window) and
+    /// the worker is re-resolving after a backoff rather than giving up (ROD-309).
+    /// `attempt` is the 1-based retry number, `max` the total retries available, so the
+    /// UI can show a "retrying N/M" toast instead of the backoff reading as a freeze.
+    play_retry: struct { attempt: u8, max: u8 },
     /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
     tick,
 };

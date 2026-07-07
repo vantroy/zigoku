@@ -306,6 +306,9 @@ pub fn run(
     // freed); this drain covers the error-unwind/test paths, blocking until every
     // in-flight cover worker has finished before `loop`/`gpa`/caches tear down.
     defer app.discover_cover_drain.drain();
+    // Error-unwind/test path only (the quit `_exit` skips this defer — see ROD-232
+    // block below). Since ROD-309 the play worker may be mid retry-backoff on a CDN
+    // penalty window, so this join can now sit up to ~6s longer than a single mpv run.
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
@@ -1413,6 +1416,7 @@ pub const App = struct {
             // Player-spawn classes (ROD-230).
             error.MpvNotFound => "mpv not found — install mpv",
             error.MpvFailed => "mpv exited with error",
+            error.MpvOpenFailed => "stream didn't open — try again",
             else => null,
         };
     }
@@ -2343,6 +2347,14 @@ pub const App = struct {
                     const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "playback failed";
                     self.pushToast(.@"error", copy, false);
                 }
+            },
+            .play_retry => |r| {
+                // ROD-309: the CDN 403'd the stream open (a Cloudflare penalty window)
+                // and the worker is re-resolving after a backoff. Transient warn so the
+                // wait reads as "retrying", not a frozen launch.
+                var buf: [48]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "stream didn't open — retrying {d}/{d}", .{ r.attempt, r.max }) catch "stream didn't open — retrying";
+                self.pushToast(.warn, msg, false);
             },
             .tick => {
                 const now = nowMs(io);

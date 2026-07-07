@@ -116,6 +116,7 @@ test {
     _ = @import("tui/view/discover.zig");
     _ = @import("tui/view/browse.zig"); // ROD-205: browse isn't pulled via app_test, wire it explicitly
     _ = @import("tui/render.zig"); // ROD-285: run progressFill (+ pre-existing render) tests
+    _ = @import("tui/workers.zig"); // ROD-309: wire the play-retry gate (+ pre-existing worker tests)
 
     _ = @import("providers/allanime.zig");
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests

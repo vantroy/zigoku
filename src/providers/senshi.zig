@@ -317,11 +317,20 @@ pub const Senshi = struct {
         // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
         // controls that could smuggle a second mpv option or header).
         if (!domain.isAbsoluteUrl(stream) or !cleanArg(stream)) return error.BadStreamUrl;
-        // The stream CDN (ninstream) 403s a refererless GET; mpv echoes this on the
-        // whole HLS chain (master → variant → segments) via --http-header-fields.
-        // `cloaked_segments`: senshi serves its `.ts` segments as `.jpg`, so the
-        // player must relax ffmpeg's HLS segment-extension gate or nothing plays.
-        return .{ .url = stream, .referer = STREAM_REFERER, .cloaked_segments = true };
+        // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv
+        // echoes the referer on the whole HLS chain (master → variant → segments) via
+        // --http-header-fields. `user_agent`: present the same browser UA the resolver
+        // used — part of not tripping the CDN's bot/rate scoring, which intermittently
+        // 403s ffmpeg's scraper-shaped default requests (the player also sends keep-alive
+        // + drops the Icy-MetaData tell; ROD-309). `cloaked_segments`: senshi serves its
+        // `.ts` segments as `.jpg`, so the player must relax ffmpeg's HLS segment-
+        // extension gate or nothing plays.
+        return .{
+            .url = stream,
+            .referer = STREAM_REFERER,
+            .user_agent = UA,
+            .cloaked_segments = true,
+        };
     }
 
     /// Choose the embed URL best matching the requested track. For dub we want the

@@ -893,6 +893,7 @@ fn reportError(out: *Io.Writer, err: anyerror, source_name: []const u8) !void {
     const msg: []const u8 = switch (err) {
         error.MpvNotFound => "mpv isn't on your PATH. Install mpv and try again.",
         error.MpvFailed => "mpv exited badly (closed early, or couldn't play the stream).",
+        error.MpvOpenFailed => "couldn't open the stream (the CDN blocked the request — try again in a moment).",
         error.NoDirectStream => "found the episode, but it only offers stream providers we can't resolve yet — try another show or episode for now.",
         error.NoSearchData => std.fmt.bufPrint(&buf, "{s} returned nothing for that search.", .{source_name}) catch @errorName(err),
         error.ShowNotFound, error.NoEpisodeData => std.fmt.bufPrint(&buf, "{s} had no episode data for that show.", .{source_name}) catch @errorName(err),

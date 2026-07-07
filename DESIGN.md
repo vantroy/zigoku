@@ -960,6 +960,12 @@ events are silent by design. The spinner must also land at the user's attention
 locus — see the §4.6 launching cell for why playback resolves *in the grid*, not
 only the bottom-left corner.
 
+**Exception:** `play_retry` (ROD-309) breaks this rule on purpose — it toasts
+mid-operation, not on a terminal outcome. A stream-open failure triggers a
+re-resolve + relaunch after a 2-4s backoff, and a silent multi-second wait reads
+as a frozen launch; the toast makes the backoff legible without waiting for the
+eventual `play_error`/`play_done`. See its row below.
+
 **In-progress (spinner, §4.8) — bottom-bar spinner active while in flight:**
 
 | Async operation | State flag | Primary locus |
@@ -986,6 +992,8 @@ state.now` escalation.
 | `play_error` | resolve failed — blocked (403 / 451) | error | `{source} blocked us` | no |
 | `play_error` | resolve failed — server-down (5xx) | error | `{source} is down` | no |
 | `play_error` | resolve failed — other non-200 | error | `{source} returned an error` | no |
+| `play_retry` | mpv open failed, retry budget remains | warn | `stream didn't open — retrying N/M` | no |
+| `play_error` | mpv open failed, retry budget exhausted (`MpvOpenFailed`) | error | `stream didn't open — try again` | no |
 | `episodes_error` | network-down (timeout / refused) | error | `network unreachable` | no |
 | `episodes_error` | blocked (403 / 451) | error | `{source} blocked us` | no |
 | `episodes_error` | server-down (5xx) | error | `{source} is down` | no |

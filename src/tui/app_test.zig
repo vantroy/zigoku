@@ -2187,6 +2187,18 @@ test "action-sync arms on a finished episode, gated on connection (ROD-291)" {
     try testing.expectEqual(@as(i64, 0), app.sync_flush_deadline_ms);
 }
 
+test "play_retry surfaces a transient warn toast so the backoff isn't a freeze (ROD-309)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    try testTick(&app, .{ .play_retry = .{ .attempt = 1, .max = 2 } });
+
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.warn, t.kind);
+    try testing.expectEqualStrings("stream didn't open — retrying 1/2", t.text[0..t.text_len]);
+    try testing.expect(!t.persistent); // clears on its own TTL, not a recovery path
+}
+
 test "action-sync debounce fires and clears on .tick (ROD-291)" {
     var app: App = .{};
     app.gpa = testing.allocator;
