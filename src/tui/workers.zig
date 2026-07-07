@@ -822,12 +822,18 @@ pub fn pushOnQuit(
         return;
     };
     // Wait for the push to land, up to the deadline, waking every `quit_poll_ms` for an
-    // early exit. A signal (EINTR) may cut a nanosleep short — harmless, we just poll
-    // sooner and the loop still terminates at `max_polls`.
-    const budget = std.math.cast(u64, deadline_ms) orelse 0;
-    const max_polls = budget / quit_poll_ms;
-    var polls: u64 = 0;
-    while (polls < max_polls and !done.load(.acquire)) : (polls += 1) nanosleepMs(quit_poll_ms);
+    // early exit. Bound the loop on a MONOTONIC WALL CLOCK, not an iteration count:
+    // `nanosleep` returns early on any delivered signal, and this process keeps a live
+    // SIGWINCH handler through quit (vaxis installs it process-wide and it is never reset),
+    // so a fixed poll count would let a terminal-resize storm mid-quit collapse the whole
+    // budget to milliseconds. Re-reading the clock each pass makes a cut-short sleep
+    // harmless — we just loop and sleep again — so the push reliably gets its full window
+    // while quit stays capped. `-%` so a (near-impossible) clock read failure ends the wait
+    // rather than looping on garbage.
+    std.debug.assert(deadline_ms > 0);
+    const budget_ns: u64 = @as(u64, @intCast(deadline_ms)) * std.time.ns_per_ms;
+    const start = monotonicNs();
+    while (!done.load(.acquire) and monotonicNs() -% start < budget_ns) nanosleepMs(quit_poll_ms);
     // Done or timed out: never join — a starved/stalled push must not block quit. `detach`
     // hands the thread to the runtime; `_exit` reaps it (and the leaked `done`) on our heels.
     t.detach();
@@ -860,14 +866,31 @@ fn quitPushBody(
 
 /// Pool-independent ~`ms`-millisecond sleep via libc `nanosleep` (the app links libc),
 /// used by `pushOnQuit`'s wait loop so the quit bound can't depend on the `Io` thread
-/// pool the push is competing for. A signal (EINTR) may cut it short — harmless here.
-/// ROD-294.
+/// pool the push is competing for. A signal (EINTR) may cut it short — harmless: the
+/// wait loop is bounded by a monotonic clock, not by this sleep completing. ROD-294.
 fn nanosleepMs(ms: u64) void {
-    var req: std.c.timespec = .{
+    var req = msToTimespec(ms);
+    _ = std.c.nanosleep(&req, null);
+}
+
+/// Split a millisecond count into a `timespec` (whole seconds + remainder nanoseconds).
+/// Pure — factored out of `nanosleepMs` so the arithmetic is unit-testable without a real
+/// sleep. ROD-294.
+fn msToTimespec(ms: u64) std.c.timespec {
+    return .{
         .sec = @intCast(ms / std.time.ms_per_s),
         .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
-    _ = std.c.nanosleep(&req, null);
+}
+
+/// Monotonic clock in nanoseconds via libc `clock_gettime` — the wall-clock reference for
+/// `pushOnQuit`'s pool-independent wait bound. CLOCK_MONOTONIC is immune to wall-clock/NTP
+/// jumps. A failure (near-impossible on a real OS) returns 0, which ends the wait on the
+/// next compare rather than looping on garbage — safe and best-effort. ROD-294.
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
@@ -1442,6 +1465,20 @@ test "coverCachePath nests the stem under covers/ with a .jpg suffix (ROD-171)" 
     defer arena.deinit();
     const path = try coverCachePath(arena.allocator(), "https://example.com/cover.jpg");
     try std.testing.expect(std.mem.endsWith(u8, path, "/covers/f8ebf6e202ed59a9.jpg"));
+}
+
+test "msToTimespec splits milliseconds into whole seconds and remainder nanos (ROD-294)" {
+    // The quit-push wait sleeps in `quit_poll_ms` increments and uses this to build the
+    // libc timespec; a sign/units slip here would mis-scale the poll interval.
+    const a = msToTimespec(5); // the poll interval: sub-second
+    try std.testing.expectEqual(@as(@TypeOf(a.sec), 0), a.sec);
+    try std.testing.expectEqual(@as(@TypeOf(a.nsec), 5_000_000), a.nsec);
+    const b = msToTimespec(2000); // exact seconds, zero remainder
+    try std.testing.expectEqual(@as(@TypeOf(b.sec), 2), b.sec);
+    try std.testing.expectEqual(@as(@TypeOf(b.nsec), 0), b.nsec);
+    const c = msToTimespec(2345); // seconds + a nanosecond remainder
+    try std.testing.expectEqual(@as(@TypeOf(c.sec), 2), c.sec);
+    try std.testing.expectEqual(@as(@TypeOf(c.nsec), 345_000_000), c.nsec);
 }
 
 test "dupeOwnedAnime round-trips the widened metadata fields leak-clean (ROD-140)" {
