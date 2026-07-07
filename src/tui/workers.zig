@@ -800,7 +800,8 @@ const quit_poll_ms: u64 = 5;
 /// every other ROD-232 worker. Best-effort: whatever doesn't land stays dirty and
 /// re-flushes next launch (`sync.pushAll` stamps each row as it lands, so a cut-short run
 /// leaves a consistent partial — proven by sync.zig's "401 mid-run" test). The caller has
-/// already checked we're connected and that no push-capable flush is inflight.
+/// already checked we're connected and that no sync worker (pull or push) is inflight —
+/// the quit push must never run alongside a pull (ROD-285 ordering).
 pub fn pushOnQuit(
     gpa: Allocator,
     io: std.Io,
@@ -828,12 +829,21 @@ pub fn pushOnQuit(
     // so a fixed poll count would let a terminal-resize storm mid-quit collapse the whole
     // budget to milliseconds. Re-reading the clock each pass makes a cut-short sleep
     // harmless — we just loop and sleep again — so the push reliably gets its full window
-    // while quit stays capped. `-%` so a (near-impossible) clock read failure ends the wait
-    // rather than looping on garbage.
-    std.debug.assert(deadline_ms > 0);
-    const budget_ns: u64 = @as(u64, @intCast(deadline_ms)) * std.time.ns_per_ms;
+    // while quit stays capped.
+    //
+    // `deadline_ms` is validated (not asserted): a non-positive/oversized value skips the
+    // wait rather than trap or wrap — the assert form was compiled out in Release. The
+    // multiply saturates so an oversized deadline can't overflow to a garbage budget.
+    const ms = std.math.cast(u64, deadline_ms) orelse return;
+    const budget_ns: u64 = ms *| std.time.ns_per_ms;
+    // A failed clock read returns 0. If the FIRST read failed we cannot wall-clock-bound,
+    // so skip the wait outright rather than risk an unbounded loop (`0 -% 0 = 0 < budget`
+    // forever) — best-effort degrades to "don't wait," never to "hang." A LATER failure
+    // also returns 0, but `0 -% start` wraps huge and ends the loop on the next compare.
     const start = monotonicNs();
-    while (!done.load(.acquire) and monotonicNs() -% start < budget_ns) nanosleepMs(quit_poll_ms);
+    if (start != 0) {
+        while (!done.load(.acquire) and monotonicNs() -% start < budget_ns) nanosleepMs(quit_poll_ms);
+    }
     // Done or timed out: never join — a starved/stalled push must not block quit. `detach`
     // hands the thread to the runtime; `_exit` reaps it (and the leaked `done`) on our heels.
     t.detach();
@@ -885,12 +895,16 @@ fn msToTimespec(ms: u64) std.c.timespec {
 
 /// Monotonic clock in nanoseconds via libc `clock_gettime` — the wall-clock reference for
 /// `pushOnQuit`'s pool-independent wait bound. CLOCK_MONOTONIC is immune to wall-clock/NTP
-/// jumps. A failure (near-impossible on a real OS) returns 0, which ends the wait on the
-/// next compare rather than looping on garbage — safe and best-effort. ROD-294.
+/// jumps. Returns 0 as a failure sentinel (near-impossible on a real OS — a vDSO read):
+/// `pushOnQuit` treats a first-read 0 as "skip the wait" and a later 0 as "end the wait,"
+/// so a clock failure can never hang, only shorten. Saturating arithmetic so an absurd
+/// uptime can't overflow to a small value that would truncate the bound. ROD-294.
 fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec *| std.time.ns_per_s +| nsec;
 }
 
 /// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
