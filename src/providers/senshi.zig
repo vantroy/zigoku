@@ -1,0 +1,529 @@
+//! senshi.live — a `SourceProvider` that replaces the captcha-walled AllAnime
+//! (ROD-301; the wall is documented in ROD-300: AllAnime bolted a Cloudflare
+//! Turnstile gate onto source resolution, which a headless CLI can't pass).
+//!
+//! senshi is a night-and-day simpler source than AllAnime: plain REST JSON on one
+//! origin, no persisted-query hashes, no AES-GCM `tobeparsed` blob, no `--<hex>`
+//! provider deciphering, and — verified live — no captcha and no `cf_clearance`
+//! cookie required from a raw HTTP client. Everything is keyed by the show's
+//! **MyAnimeList id**, which doubles as our AniSkip key for free.
+//!
+//! The API surface we ride (reversed on ROD-300/301):
+//!   * search + browse → POST /anime/filter  {searchTerm, sortBy, page, limit, …}
+//!   * popularity feed → GET  /anime/trending/{day|week|month}   (a short hot list)
+//!   * episode list    → GET  /episodes/{mal_id}                 (stage 2)
+//!   * stream resolve  → GET  /episode-embeds/{mal_id}/{ep}      (stage 3)
+//!   * cover art       → /posters/{mal_id}.webp
+//!
+//! Like AllAnime, every site-specific fact is quarantined here behind the
+//! `source.SourceProvider` vtable. When senshi dies too: replace this file.
+//!
+//! STAGE 1 (this cut): search + popular + covers wired end-to-end so the catalog
+//! and Discover feed render against senshi. `episodes`/`resolve` are honest,
+//! logged stubs — stages 2 and 3 fill them, and the m3u8/quality machinery gets
+//! lifted out of allanime.zig into a shared module then (ROD-301 stage 3).
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const Io = std.Io;
+const domain = @import("../domain.zig");
+const source = @import("../source.zig");
+const log = @import("../log.zig");
+
+const API = "https://senshi.live";
+// A current Chrome UA. senshi's Cloudflare edge serves a plain client with this
+// UA without a challenge; keep it recent and unremarkable.
+const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+// The stream CDN (ninstream.com) 403s a refererless GET; it gates on this origin.
+// Kept here for stage 3's resolve() so the referer lives behind the vtable.
+const STREAM_REFERER = "https://senshi.live/";
+
+// Cap on a cover ref before it's spliced into a fetch URL (mirrors AllAnime's
+// guard). Real refs are a short `/posters/…webp` path or an absolute cover URL.
+const max_cover_ref_len = 2048;
+
+pub const Senshi = struct {
+    /// Stable identity used by persistence keys `(source_name, show_id)`. NOTE the
+    /// deliberate divergence from AllAnime: senshi keys shows by MAL id, so a user's
+    /// old `("allanime", <opaque id>)` history rows do NOT map here — a fresh start
+    /// until a migration lands (ROD-301 open item).
+    pub const source_name = "senshi";
+
+    /// Human-facing name for user-visible copy (toasts, banners, CLI).
+    pub const display_name = "Senshi";
+
+    pub fn init() Senshi {
+        return .{};
+    }
+
+    /// Pack this concrete provider into the erased `SourceProvider` the app holds.
+    /// `self` must outlive every call made through the returned value.
+    pub fn provider(self: *Senshi) source.SourceProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: source.SourceProvider.VTable = .{
+        .name = nameErased,
+        .displayName = displayNameErased,
+        .search = searchErased,
+        .popular = popularErased,
+        .episodes = episodesErased,
+        .resolve = resolveErased,
+        .coverRequest = coverRequestErased,
+    };
+
+    // ── vtable trampolines: recover the typed self from the erased ptr ──────────
+    fn nameErased(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return source_name;
+    }
+    fn displayNameErased(ptr: *anyopaque) []const u8 {
+        _ = ptr;
+        return display_name;
+    }
+    fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
+        const self: *Senshi = @ptrCast(@alignCast(ptr));
+        return self.search(arena, io, query, opts);
+    }
+    fn popularErased(ptr: *anyopaque, arena: Allocator, io: Io, opts: source.PopularOptions) anyerror![]domain.Anime {
+        const self: *Senshi = @ptrCast(@alignCast(ptr));
+        return self.popular(arena, io, opts);
+    }
+    fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
+        const self: *Senshi = @ptrCast(@alignCast(ptr));
+        return self.episodes(arena, io, show_id, tt);
+    }
+    fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
+        const self: *Senshi = @ptrCast(@alignCast(ptr));
+        return self.resolve(arena, io, show_id, ep, tt, quality);
+    }
+    fn coverRequestErased(ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source.CoverRequest {
+        _ = ptr;
+        // `ref` is untrusted provider data about to be spliced into a URL we fetch.
+        // Reject anything that isn't bounded, non-empty, printable-ASCII URL
+        // material — a CR/LF or space could smuggle a header (mirrors ROD-267).
+        if (ref.len == 0 or ref.len > max_cover_ref_len or !cleanArg(ref))
+            return error.InvalidCoverRef;
+        // Absolute refs (rare — some rows may carry a full CDN url) pass through.
+        if (domain.isAbsoluteUrl(ref)) return .{ .url = try gpa.dupe(u8, ref) };
+        // A senshi-relative `/posters/…webp`: prepend the site host. The poster
+        // host serves a plain client without a referer (verified), but we send the
+        // site referer + UA anyway — harmless where not gated, correct where it is.
+        const sep = if (std.mem.startsWith(u8, ref, "/")) "" else "/";
+        return .{
+            .url = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ API, sep, ref }),
+            .referer = STREAM_REFERER,
+            .user_agent = UA,
+        };
+    }
+
+    // ── the catalog JSON shape ─────────────────────────────────────────────────
+    // senshi returns rich, MAL-keyed anime objects from BOTH /anime/filter (as
+    // `{data:[…]}`) and /anime/trending/{window} (as a bare array). We pull every
+    // field with a `domain.Anime` home in one struct; `ignore_unknown_fields`
+    // drops the social/relations/version columns we don't use. `id` is the MAL id
+    // (the show handle episodes()/resolve() key on) and is always present.
+    const SAnime = struct {
+        id: u64,
+        title: ?[]const u8 = null,
+        title_english: ?[]const u8 = null,
+        anime_picture: ?[]const u8 = null,
+        type: ?[]const u8 = null,
+        ani_source: ?[]const u8 = null,
+        ani_episodes: ?[]const u8 = null, // sent as a JSON *string* ("16")
+        ani_status: ?[]const u8 = null,
+        duration: ?[]const u8 = null, // "23 min per ep"
+        score: ?f64 = null, // 0–10
+        ani_description: ?[]const u8 = null,
+        ani_season: ?[]const u8 = null,
+        ani_year: ?u32 = null,
+        genres: ?[]const u8 = null, // "Action, Comedy"
+        studios: ?[]const u8 = null, // "Lerche, …"
+        views_day: ?u64 = null,
+        views_week: ?u64 = null,
+        views_month: ?u64 = null,
+    };
+    const FilterResp = struct { data: []SAnime = &.{} };
+
+    /// Map one raw senshi anime object to a `domain.Anime`. String fields borrow
+    /// the parsed-JSON slices (caller owns the arena lifetime). `view_count` is the
+    /// windowed count the feed passes in (null for search, where rank isn't views).
+    fn mapAnime(arena: Allocator, s: SAnime, view_count: ?u64) !domain.Anime {
+        // 0–10 → AniList's 0–100 axis, so a senshi score and an AniList-enriched
+        // score read on the same scale. Guard finiteness (@intFromFloat is UB on
+        // NaN/Inf) and clamp a corrupt over-range value.
+        const score: ?u32 = if (s.score) |v| blk: {
+            if (!std.math.isFinite(v) or v <= 0) break :blk null;
+            break :blk @intFromFloat(@min(@round(v * 10.0), 100.0));
+        } else null;
+
+        const total_eps: ?u32 = if (s.ani_episodes) |e| parseLeadingUint(u32, e) else null;
+
+        return .{
+            // The MAL id, stringified, IS the provider show handle — it must
+            // round-trip verbatim into episodes()/resolve().
+            .id = try std.fmt.allocPrint(arena, "{d}", .{s.id}),
+            .name = s.title orelse "(untitled)",
+            .english_name = s.title_english,
+            // senshi's `title` is romaji and it has no separate native field.
+            .native_name = null,
+            .mal_id = s.id, // free AniSkip key — no enrichment round-trip needed.
+            .thumb = s.anime_picture,
+            .kind = s.type,
+            .source_material = s.ani_source,
+            .score = score,
+            // Catalog data doesn't split sub/dub counts (that's only known at
+            // embed time). Surface the total both as `total_episodes` and as the
+            // sub count (the dominant track) so ranking/`has(.sub)` behave; real
+            // per-track availability lands with resolve (stage 3).
+            .eps_sub = total_eps orelse 0,
+            .eps_dub = 0,
+            .total_episodes = total_eps,
+            .duration = if (s.duration) |d| parseLeadingUint(u32, d) else null,
+            .year = s.ani_year,
+            .season = if (s.ani_season) |q| domain.Season.fromString(q) else null,
+            .start_date = if (s.ani_year) |y| domain.Date{ .year = y } else null,
+            .status = mapStatus(s.ani_status),
+            .description = s.ani_description,
+            .genres = try splitCsv(arena, s.genres),
+            .studios = try splitCsv(arena, s.studios),
+            .view_count = view_count,
+        };
+    }
+
+    // ── search ─────────────────────────────────────────────────────────────────
+
+    pub fn search(self: *Senshi, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) ![]domain.Anime {
+        _ = self;
+        // senshi's server matches `searchTerm` across title/english/synonyms and
+        // returns already-relevant results ranked by score — so, unlike AllAnime,
+        // we do NOT re-rank on the romaji `name` (the English query would never
+        // match it). Trust the server's order; just trim to the caller's limit.
+        const body = try std.fmt.allocPrint(
+            arena,
+            "{{\"searchTerm\":\"{s}\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"{s}\"}}",
+            .{ try jsonEscape(arena, query), opts.page, source.search_page_size, langPref(opts.translation) },
+        );
+
+        const raw = try request(arena, io, .POST, API ++ "/anime/filter", body);
+        const parsed = try std.json.parseFromSlice(FilterResp, arena, raw, .{ .ignore_unknown_fields = true });
+
+        var list: std.ArrayList(domain.Anime) = .empty;
+        for (parsed.value.data) |s| try list.append(arena, try mapAnime(arena, s, null));
+        if (list.items.len > opts.limit) list.shrinkRetainingCapacity(opts.limit);
+        return list.items;
+    }
+
+    // ── popular ──────────────────────────────────────────────────────────────────
+
+    pub fn popular(self: *Senshi, arena: Allocator, io: Io, opts: source.PopularOptions) ![]domain.Anime {
+        _ = self;
+        // DESIGN NOTE (ROD-301): senshi's true trending feed
+        // (GET /anime/trending/{day|week|month}) is a SHORT hot list — ~7 items,
+        // no pagination, no all-time. Too thin for the paginated Discover grid.
+        // So the feed rides `/anime/filter` sorted by score (deep + paginated,
+        // exactly what senshi's own /browse does) and surfaces the window's
+        // `views_*` as the card's view_count. Trade-off: the ordering is by score,
+        // not by the windowed views the count shows — an open design call flagged
+        // for Rod (keep a short true-trending feed, or this deep score-browse?).
+        const body = try std.fmt.allocPrint(
+            arena,
+            "{{\"searchTerm\":\"\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"JP\"}}",
+            .{ opts.page, source.popular_page_size },
+        );
+
+        const raw = try request(arena, io, .POST, API ++ "/anime/filter", body);
+        const parsed = try std.json.parseFromSlice(FilterResp, arena, raw, .{ .ignore_unknown_fields = true });
+
+        var list: std.ArrayList(domain.Anime) = .empty;
+        for (parsed.value.data) |s| {
+            const views = windowViews(s, opts.window);
+            try list.append(arena, try mapAnime(arena, s, views));
+        }
+        // No re-sort: the server already ordered the page; rank == array position.
+        return list.items;
+    }
+
+    /// Which `views_*` field tracks the selected window (all-time has no lifetime
+    /// total in the payload, so it borrows the monthly figure — the widest window).
+    fn windowViews(s: SAnime, w: source.PopularWindow) ?u64 {
+        return switch (w) {
+            .daily => s.views_day,
+            .weekly => s.views_week,
+            .monthly, .all_time => s.views_month,
+        };
+    }
+
+    // ── episodes / resolve — STAGE 2 / 3 stubs ─────────────────────────────────
+
+    pub fn episodes(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) ![]domain.EpisodeNumber {
+        _ = self;
+        _ = arena;
+        _ = io;
+        _ = tt;
+        // Stage 2 wires GET /episodes/{show_id}. Log at err (always-on) so a smoke
+        // test that drills into a show explains itself instead of failing silently.
+        log.err("senshi episodes not yet implemented (ROD-301 stage 2); show_id={s}", .{show_id});
+        return error.NotImplemented;
+    }
+
+    pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
+        _ = self;
+        _ = arena;
+        _ = io;
+        _ = tt;
+        _ = quality;
+        log.err("senshi resolve not yet implemented (ROD-301 stage 3); show_id={s} ep={s}", .{ show_id, ep.raw });
+        return error.NotImplemented;
+    }
+
+    // ── internals ────────────────────────────────────────────────────────────────
+    // NOTE (ROD-301 stage 3): the HTTP helper + transport/status error taxonomy
+    // below mirror allanime.zig's. Both get lifted into a shared providers/http.zig
+    // in stage 3 (deferred so this stage touches no other file). Keep the two in
+    // step until then.
+
+    /// One request to the senshi API. `body` non-null → POST that JSON; null → GET.
+    /// Returns the response body (lives in `arena`). Failures split into the same
+    /// actionable classes AllAnime uses (ROD-173) — and, applying the ROD-300
+    /// lesson, the diagnostics are ALWAYS-ON (`warn`), not gated behind `--debug`,
+    /// so the next time senshi shifts, zigoku.log names it without a flag.
+    fn request(arena: Allocator, io: Io, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
+        var client: std.http.Client = .{ .allocator = arena, .io = io };
+        defer client.deinit();
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const extra: []const std.http.Header = if (body != null)
+            &.{ .{ .name = "Content-Type", .value = "application/json" }, .{ .name = "Accept", .value = "application/json" } }
+        else
+            &.{.{ .name = "Accept", .value = "application/json" }};
+        const res = client.fetch(.{
+            .location = .{ .url = url },
+            .method = method,
+            .payload = body,
+            .response_writer = &aw.writer,
+            .headers = .{ .user_agent = .{ .override = UA } },
+            .extra_headers = extra,
+        }) catch |e| {
+            log.warn("senshi {s} {s}: transport {s}", .{ @tagName(method), url, @errorName(e) });
+            return mapTransportError(e);
+        };
+        // senshi's write endpoints answer 201; treat any 2xx as success.
+        if (res.status.class() != .success) {
+            log.warn("senshi {s} {s}: HTTP {d}", .{ @tagName(method), url, @intFromEnum(res.status) });
+            return statusToError(res.status);
+        }
+        return aw.writer.buffered();
+    }
+
+    /// Classify a non-2xx status (ROD-173): 403/451 = blocked; 5xx = source down;
+    /// anything else = the undifferentiated `HttpNotOk` (likely API drift).
+    fn statusToError(status: std.http.Status) error{ Forbidden, ServerError, HttpNotOk } {
+        return switch (status) {
+            .forbidden, .unavailable_for_legal_reasons => error.Forbidden,
+            else => switch (status.class()) {
+                .server_error => error.ServerError,
+                else => error.HttpNotOk,
+            },
+        };
+    }
+
+    /// Map a transport-layer failure to `NetworkDown` when "check your connection"
+    /// is the right advice; everything else propagates unchanged. Mirrors
+    /// allanime.mapTransportError (kept in step until the stage-3 extraction).
+    fn mapTransportError(e: anyerror) anyerror {
+        return switch (e) {
+            error.ConnectionRefused,
+            error.ConnectionResetByPeer,
+            error.HostUnreachable,
+            error.NetworkUnreachable,
+            error.NetworkDown,
+            error.Timeout,
+            error.TlsInitializationFailed,
+            error.UnknownHostName,
+            error.NameServerFailure,
+            error.NoAddressReturned,
+            error.ResolvConfParseFailed,
+            error.DetectingNetworkConfigurationFailed,
+            error.InvalidDnsARecord,
+            error.InvalidDnsAAAARecord,
+            error.InvalidDnsCnameRecord,
+            => error.NetworkDown,
+            else => e,
+        };
+    }
+
+    /// senshi's `ani_status` ("Finished Airing"/"Currently Airing"/"Not yet aired")
+    /// folded onto the canonical vocab `domain.isStillAiring` settles on — it only
+    /// treats an exact `FINISHED`/`CANCELLED` as settled, so a raw "Finished Airing"
+    /// would wrongly read as still-airing and never auto-complete (ROD-296).
+    fn mapStatus(s: ?[]const u8) ?[]const u8 {
+        const v = s orelse return null;
+        if (containsIgnoreCase(v, "finished")) return "FINISHED";
+        if (containsIgnoreCase(v, "cancel")) return "CANCELLED";
+        if (containsIgnoreCase(v, "not yet")) return "NOT_YET_RELEASED";
+        if (containsIgnoreCase(v, "airing") or containsIgnoreCase(v, "current")) return "RELEASING";
+        return v; // unknown → keep raw; isStillAiring defaults it to safe (airing)
+    }
+
+    fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+        return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    }
+
+    /// languagePreference the filter expects: JP audio = the sub track, EN = dub.
+    fn langPref(tt: domain.Translation) []const u8 {
+        return switch (tt) {
+            .sub => "JP",
+            .dub => "EN",
+        };
+    }
+
+    /// Split senshi's comma-space CSV field ("Action, Comedy") into owned slices.
+    /// Null/empty → an empty list. Borrows nothing beyond the arena.
+    fn splitCsv(arena: Allocator, csv: ?[]const u8) ![]const []const u8 {
+        const s = csv orelse return &.{};
+        if (s.len == 0) return &.{};
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = std.mem.splitScalar(u8, s, ',');
+        while (it.next()) |part| {
+            const trimmed = std.mem.trim(u8, part, " \t");
+            if (trimmed.len > 0) try out.append(arena, trimmed);
+        }
+        return out.items;
+    }
+
+    /// Parse the leading run of digits of a string into `T` ("23 min per ep" → 23,
+    /// "16" → 16). Null when there's no leading digit.
+    fn parseLeadingUint(comptime T: type, s: []const u8) ?T {
+        var end: usize = 0;
+        while (end < s.len and std.ascii.isDigit(s[end])) end += 1;
+        if (end == 0) return null;
+        return std.fmt.parseInt(T, s[0..end], 10) catch null;
+    }
+
+    /// True if `s` is safe to place in a fetch URL / mpv argv: printable ASCII only
+    /// (0x21–0x7e), rejecting CR/LF, spaces and controls. Mirrors AllAnime's guard.
+    fn cleanArg(s: []const u8) bool {
+        for (s) |c| if (c < 0x21 or c > 0x7e) return false;
+        return true;
+    }
+
+    /// Escape a UTF-8 string for a JSON string literal — the search query, mainly,
+    /// so a stray `"` can't break the hand-rolled request body. Covers the JSON
+    /// mandatory escapes; sub-0x20 controls become `\u00XX`.
+    fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        for (s) |c| switch (c) {
+            '"' => try out.appendSlice(arena, "\\\""),
+            '\\' => try out.appendSlice(arena, "\\\\"),
+            '\n' => try out.appendSlice(arena, "\\n"),
+            '\r' => try out.appendSlice(arena, "\\r"),
+            '\t' => try out.appendSlice(arena, "\\t"),
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                try out.appendSlice(arena, "\\u00");
+                try out.append(arena, hex[(c >> 4) & 0xf]);
+                try out.append(arena, hex[c & 0xf]);
+            } else try out.append(arena, c),
+        };
+        return out.items;
+    }
+};
+
+// ── Tests ────────────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "mapAnime maps a filter row into a domain.Anime (ROD-301)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const row: Senshi.SAnime = .{
+        .id = 59708,
+        .title = "Youkoso Jitsuryoku Shijou Shugi no Kyoushitsu e 4th Season",
+        .title_english = "Classroom of the Elite 4th Season",
+        .anime_picture = "/posters/59708.webp",
+        .type = "TV",
+        .ani_source = "Light novel",
+        .ani_episodes = "16",
+        .ani_status = "Finished Airing",
+        .duration = "23 min per ep",
+        .score = 7.88,
+        .ani_season = "spring",
+        .ani_year = 2026,
+        .genres = "Drama, Suspense",
+        .studios = "Lerche",
+        .views_week = 1496,
+    };
+    const m = try Senshi.mapAnime(a, row, row.views_week);
+
+    try testing.expectEqualStrings("59708", m.id); // MAL id, stringified → show handle
+    try testing.expectEqual(@as(?u64, 59708), m.mal_id); // free AniSkip key
+    try testing.expectEqualStrings("Classroom of the Elite 4th Season", m.english_name.?);
+    try testing.expectEqual(@as(?u32, 79), m.score.?); // 7.88*10 → round 79
+    try testing.expectEqual(@as(?u32, 16), m.total_episodes.?);
+    try testing.expectEqual(@as(u32, 16), m.eps_sub);
+    try testing.expectEqual(@as(?u32, 23), m.duration.?);
+    try testing.expectEqual(domain.Season.spring, m.season.?);
+    try testing.expectEqual(@as(u32, 2026), m.start_date.?.year);
+    try testing.expectEqualStrings("FINISHED", m.status.?); // folded from "Finished Airing"
+    try testing.expectEqual(@as(usize, 2), m.genres.len);
+    try testing.expectEqualStrings("Drama", m.genres[0]);
+    try testing.expectEqualStrings("Suspense", m.genres[1]);
+    try testing.expectEqual(@as(?u64, 1496), m.view_count);
+}
+
+test "mapStatus folds senshi wording onto the canonical airing vocab (ROD-296)" {
+    // The whole point: isStillAiring must settle a finished show, and keep an
+    // airing one airing, off senshi's prose.
+    try testing.expectEqualStrings("FINISHED", Senshi.mapStatus("Finished Airing").?);
+    try testing.expect(!domain.isStillAiring(Senshi.mapStatus("Finished Airing")));
+    try testing.expectEqualStrings("RELEASING", Senshi.mapStatus("Currently Airing").?);
+    try testing.expect(domain.isStillAiring(Senshi.mapStatus("Currently Airing")));
+    try testing.expectEqualStrings("NOT_YET_RELEASED", Senshi.mapStatus("Not yet aired").?);
+    try testing.expect(Senshi.mapStatus(null) == null);
+}
+
+test "splitCsv splits comma-space lists and drops blanks" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const g = try Senshi.splitCsv(a, "Action, Comedy, Fantasy");
+    try testing.expectEqual(@as(usize, 3), g.len);
+    try testing.expectEqualStrings("Action", g[0]);
+    try testing.expectEqualStrings("Fantasy", g[2]);
+    try testing.expectEqual(@as(usize, 0), (try Senshi.splitCsv(a, null)).len);
+    try testing.expectEqual(@as(usize, 0), (try Senshi.splitCsv(a, "")).len);
+}
+
+test "parseLeadingUint takes the digit prefix only" {
+    try testing.expectEqual(@as(?u32, 23), Senshi.parseLeadingUint(u32, "23 min per ep"));
+    try testing.expectEqual(@as(?u32, 16), Senshi.parseLeadingUint(u32, "16"));
+    try testing.expect(Senshi.parseLeadingUint(u32, "unknown") == null);
+    try testing.expect(Senshi.parseLeadingUint(u32, "") == null);
+}
+
+test "jsonEscape escapes quotes and backslashes for the search body" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("a\\\"b", try Senshi.jsonEscape(a, "a\"b"));
+    try testing.expectEqualStrings("c\\\\d", try Senshi.jsonEscape(a, "c\\d"));
+    try testing.expectEqualStrings("plain", try Senshi.jsonEscape(a, "plain"));
+}
+
+test "coverRequest: relative posters get the host; absolute passes through" {
+    var s = Senshi.init();
+    const p = s.provider();
+    const rel = try p.coverRequest(testing.allocator, "/posters/59708.webp");
+    defer testing.allocator.free(rel.url);
+    try testing.expectEqualStrings("https://senshi.live/posters/59708.webp", rel.url);
+    try testing.expect(rel.referer != null);
+
+    const abs = try p.coverRequest(testing.allocator, "https://cdn.example/x.webp");
+    defer testing.allocator.free(abs.url);
+    try testing.expectEqualStrings("https://cdn.example/x.webp", abs.url);
+    try testing.expect(abs.referer == null);
+}
