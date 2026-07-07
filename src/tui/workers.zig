@@ -1054,6 +1054,25 @@ fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
     } }) catch {};
 }
 
+/// Total mpv launch attempts per play, including the first (ROD-309). The senshi CDN
+/// intermittently 403s the stream open when this IP is in a short Cloudflare penalty
+/// window (classically: restarting an episode seconds after a quit). Two retries after
+/// the initial try give the window time to clear.
+const MAX_PLAY_ATTEMPTS: usize = 3;
+
+/// Backoff before each retry, indexed by the just-failed attempt (0 → before the 2nd
+/// try, 1 → before the 3rd). The windows observed were seconds-long, so ~2s then ~4s
+/// spans them without stalling a genuinely dead stream too long.
+const RETRY_BACKOFFS_MS = [_]u64{ 2000, 4000 };
+
+/// Whether a failed play attempt is worth a re-resolve + relaunch. Retry only when mpv
+/// failed to OPEN the stream (its code-2 signal — the CDN's transient 403/expiry) AND
+/// nothing ever played (so a mid-episode drop or a normal quit never triggers a restart
+/// storm) AND an attempt budget remains. Pure so the gate is testable without spawning mpv.
+fn playAttemptRetryable(cause: anyerror, attempt: usize, played: bool) bool {
+    return cause == error.MpvOpenFailed and !played and attempt + 1 < MAX_PLAY_ATTEMPTS;
+}
+
 /// Background task: resolve stream and launch mpv.
 /// All string params are GPA-owned by this task and freed before return.
 /// `mpv_path` and `skip_mode` are borrowed from `App.config` (ROD-85), which
@@ -1067,27 +1086,48 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
     defer arena.deinit();
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
-    const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
-        // Always-on top-level receipt (ROD-300): one line per failed play, with
-        // the id/ep to correlate against the provider-level lines below it.
-        log.err("resolve failed for id={s} ep={s} tt={s}: {s}", .{ id, ep_raw, translation.str(), @errorName(e) });
-        loop.postEvent(.{ .play_error = .{ .final = null, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
-        return;
-    };
 
-    // ROD-83: fetch OP/ED skip data on this worker thread (never the UI thread).
+    // ROD-83: fetch OP/ED skip data once on this worker thread (never the UI thread);
+    // it doesn't change across the re-resolve retries below, so it's hoisted out.
     const skip = aniskip.prepare(arena.allocator(), io, mal_id, title, aniskip.episodeNumber(ep_raw, episode_ordinal), aniskip.SkipMode.fromString(skip_mode));
 
     var progress: PlaybackProgress = .{};
     var callback_ctx: PlayTaskCallbackCtx = .{ .loop = loop, .progress = &progress };
-    player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
-        .ctx = @ptrCast(&callback_ctx),
-        .func = postPositionUpdate,
-    }, skip) catch |e| {
-        log.err("mpv playback failed for id={s} ep={s}: {s}", .{ id, ep_raw, @errorName(e) });
-        loop.postEvent(.{ .play_error = .{ .final = progress.snapshot(), .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
-        return;
-    };
+
+    // ROD-309 retry loop: re-resolve a FRESH signed URL each attempt (the old one's CDN
+    // token is irrelevant once we're in a penalty window; a re-resolve also dodges an
+    // expiry) and relaunch after a short backoff on a pre-playback open failure.
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
+            // Always-on top-level receipt (ROD-300): one line per failed play, with
+            // the id/ep to correlate against the provider-level lines below it.
+            log.err("resolve failed for id={s} ep={s} tt={s}: {s}", .{ id, ep_raw, translation.str(), @errorName(e) });
+            loop.postEvent(.{ .play_error = .{ .final = null, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+            return;
+        };
+
+        // Fresh counters per attempt; safe to reset — play() joins its watcher thread
+        // before returning, so nothing else touches `progress` here.
+        progress = .{};
+        player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
+            .ctx = @ptrCast(&callback_ctx),
+            .func = postPositionUpdate,
+        }, skip) catch |e| {
+            const played = progress.snapshot() != null;
+            if (playAttemptRetryable(e, attempt, played)) {
+                const backoff_ms = RETRY_BACKOFFS_MS[attempt];
+                log.warn("mpv open failed for id={s} ep={s} (attempt {d}/{d}) — re-resolving in {d}ms", .{ id, ep_raw, attempt + 1, MAX_PLAY_ATTEMPTS, backoff_ms });
+                nanosleepMs(backoff_ms);
+                continue;
+            }
+            log.err("mpv playback failed for id={s} ep={s}: {s}", .{ id, ep_raw, @errorName(e) });
+            loop.postEvent(.{ .play_error = .{ .final = progress.snapshot(), .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+            return;
+        };
+
+        break; // played, or exited cleanly
+    }
 
     loop.postEvent(.{ .play_done = progress.snapshot() }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
@@ -1642,4 +1682,23 @@ test "mergeCoverPreferAbsolute: upgrade frees the old relative thumb, keeps abso
         gpa.free(live.?);
         gpa.free(incoming.?);
     }
+}
+
+test "playAttemptRetryable: only an unplayed open-failure with budget left retries (ROD-309)" {
+    // The retry case: mpv couldn't open the stream, nothing played, tries remain.
+    try std.testing.expect(playAttemptRetryable(error.MpvOpenFailed, 0, false));
+    try std.testing.expect(playAttemptRetryable(error.MpvOpenFailed, 1, false));
+
+    // Budget exhausted — the last allowed attempt does not schedule another.
+    try std.testing.expect(!playAttemptRetryable(error.MpvOpenFailed, MAX_PLAY_ATTEMPTS - 1, false));
+
+    // Playback started before it died → not our transient open 403; never hammer-restart.
+    try std.testing.expect(!playAttemptRetryable(error.MpvOpenFailed, 0, true));
+
+    // A different failure class (mpv missing, signal, generic exit) is not retryable.
+    try std.testing.expect(!playAttemptRetryable(error.MpvFailed, 0, false));
+    try std.testing.expect(!playAttemptRetryable(error.MpvNotFound, 0, false));
+
+    // Guard the backoff table covers every retry the gate permits.
+    try std.testing.expectEqual(MAX_PLAY_ATTEMPTS - 1, RETRY_BACKOFFS_MS.len);
 }

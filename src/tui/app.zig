@@ -1413,6 +1413,7 @@ pub const App = struct {
             // Player-spawn classes (ROD-230).
             error.MpvNotFound => "mpv not found — install mpv",
             error.MpvFailed => "mpv exited with error",
+            error.MpvOpenFailed => "stream didn't open — try again",
             else => null,
         };
     }

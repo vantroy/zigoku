@@ -17,6 +17,10 @@ pub const PlayError = error{
     MpvNotFound,
     /// mpv ran but exited non-zero or was killed by a signal.
     MpvFailed,
+    /// mpv exited code 2 — "nothing could be opened/played" — before any playback.
+    /// For a network stream that's the CDN's transient open failure (403 in a
+    /// Cloudflare penalty window / expiry); retryable with a fresh re-resolve (ROD-309).
+    MpvOpenFailed,
 };
 
 pub const PositionUpdate = struct {
@@ -276,7 +280,10 @@ pub fn play(
             std.log.err("mpv exited nonzero: code={d} start={d}s url={s} mpvlog={s}", .{
                 code, start_seconds, link.url, mpv_log_path,
             });
-            return error.MpvFailed;
+            // Code 2 is mpv's "nothing could be opened/played" — for a network stream the
+            // transient CDN open failure the caller can ride out with a re-resolve. Any
+            // other nonzero code is a real fault we shouldn't hammer-retry.
+            return if (code == 2) error.MpvOpenFailed else error.MpvFailed;
         },
         else => {
             // Format the whole term ({any}), not just its tag: for a signal death the
