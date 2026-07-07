@@ -176,10 +176,10 @@ pub fn main(init: std.process.Init) !void {
     defer if (store_opt) |*st| st.close();
 
     // One provider for the whole CLI run, so both run() and the error reporter
-    // read the source name from the same vtable seam. `allanime` must outlive
-    // both calls — this frame does.
-    var allanime = zigoku.AllAnime.init();
-    const provider = allanime.provider();
+    // read the source name from the same vtable seam. `senshi` must outlive both
+    // calls — this frame does. (ROD-301: AllAnime is captcha-dead — see ROD-300.)
+    var senshi = zigoku.Senshi.init();
+    const provider = senshi.provider();
 
     run(arena, io, out, in, cli, cfg, provider, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err, provider.displayName());
@@ -389,8 +389,9 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
         break :blk null;
     };
     defer if (store_opt) |*st| st.close();
-    var allanime = zigoku.AllAnime.init();
-    const provider = allanime.provider();
+    // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.
+    var senshi = zigoku.Senshi.init();
+    const provider = senshi.provider();
     try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg, cfg_path);
 }
 
@@ -416,8 +417,16 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
 
     try out.print("\n  {d} results:\n\n", .{results.len});
     for (results, 0..) |a, i| {
-        const eps = a.episodeCount(cli.translation);
-        try out.print("  {d:>2}. {s}  ·  {d} {s} eps\n", .{ i + 1, a.name, eps, cli.translation.str() });
+        // Per-track count when the source splits sub/dub; else the track-agnostic
+        // total (senshi doesn't split), never a false "0 {track}" (ROD-301).
+        const per_track = a.episodeCount(cli.translation);
+        if (per_track > 0) {
+            try out.print("  {d:>2}. {s}  ·  {d} {s} eps\n", .{ i + 1, a.name, per_track, cli.translation.str() });
+        } else if (a.total_episodes) |t| {
+            try out.print("  {d:>2}. {s}  ·  {d} eps\n", .{ i + 1, a.name, t });
+        } else {
+            try out.print("  {d:>2}. {s}\n", .{ i + 1, a.name });
+        }
     }
 
     const show_idx = (try promptChoice(out, in, "\n  pick a show # (q to quit): ", results.len)) orelse {

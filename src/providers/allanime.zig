@@ -89,6 +89,7 @@ pub const AllAnime = struct {
     const vtable: source.SourceProvider.VTable = .{
         .name = nameErased,
         .displayName = displayNameErased,
+        .supportsDiscover = supportsDiscoverErased,
         .search = searchErased,
         .popular = popularErased,
         .episodes = episodesErased,
@@ -104,6 +105,10 @@ pub const AllAnime = struct {
     fn displayNameErased(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return display_name;
+    }
+    fn supportsDiscoverErased(ptr: *anyopaque) bool {
+        _ = ptr;
+        return true; // AllAnime's `queryPopular` feed backs the windowed Discover view.
     }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));

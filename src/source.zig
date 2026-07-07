@@ -77,6 +77,12 @@ pub const SourceProvider = struct {
         /// looks best to a user. THE seam for the site name above the vtable — no
         /// copy upstream of here hardcodes it, since the source is swappable.
         displayName: *const fn (ptr: *anyopaque) []const u8,
+        /// Whether this source offers a Discover feed — a windowed, paginated
+        /// popularity ranking via `popular()`. A source with no such feed (senshi:
+        /// its trending endpoint is a ~7-item hot list, not a windowed grid) returns
+        /// false, and the app hides the Discover view for it until a per-provider
+        /// Discover is built. AllAnime's `queryPopular` feed is the reference → true.
+        supportsDiscover: *const fn (ptr: *anyopaque) bool,
         /// Search the catalog; return shows ranked best-match-first.
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
         /// Fetch one page of the source's popularity-ranked feed for `opts.window`,
@@ -102,6 +108,9 @@ pub const SourceProvider = struct {
     }
     pub fn displayName(self: SourceProvider) []const u8 {
         return self.vtable.displayName(self.ptr);
+    }
+    pub fn supportsDiscover(self: SourceProvider) bool {
+        return self.vtable.supportsDiscover(self.ptr);
     }
     pub fn search(self: SourceProvider, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime {
         return self.vtable.search(self.ptr, arena, io, query, opts);

@@ -171,6 +171,7 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    app.discover_supported = provider.supportsDiscover();
     // Seed the cell-pixel cache from the initial resize (the .winsize event was
     // drained above, so read vaxis's settled screen) — Discover's cover-fill height
     // needs it on the first frame (ROD-247).
@@ -731,6 +732,12 @@ pub const App = struct {
     active_view: enum { browse, history, detail, settings, discover } = .history,
     /// Which top-level view opened the standalone detail screen.
     detail_origin: enum { browse, history, discover } = .browse,
+    /// Whether the active source offers a Discover feed (`provider.supportsDiscover()`,
+    /// ROD-301). Cached once at startup — the provider is fixed for a run — so the
+    /// top-bar can dim the `[D]` tab and the D/F3 handler can gate entry without a
+    /// vtable call on every keypress/frame. Defaults true so a bare `App{}` (tests)
+    /// keeps Discover; `run()` sets the real value.
+    discover_supported: bool = true,
 
     /// Which pane has keyboard focus within the current view.
     /// Meaningful in both Browse and History (two-pane at `w >= pane_split_min`,
@@ -3211,6 +3218,16 @@ pub const App = struct {
         if (key.matches(vaxis.Key.f3, .{}) or
             (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
         {
+            // Discover is hidden for a source with no windowed popularity feed
+            // (senshi) until a per-provider Discover is built (ROD-301). Swallow the
+            // key with a one-line toast instead of opening an empty, inert grid; the
+            // top-bar [D] tab is dimmed to match (chrome.drawTopBar).
+            if (!self.discover_supported) {
+                var buf: [80]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "No Discover feed on {s} yet", .{provider.displayName()}) catch "No Discover feed yet";
+                self.pushToast(.info, msg, false);
+                return;
+            }
             if (self.active_view != .discover) {
                 if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .discover;

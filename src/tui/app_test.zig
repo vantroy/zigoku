@@ -71,10 +71,14 @@ fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularO
 fn dummyCoverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
     return .{ .url = try gpa.dupe(u8, ref) };
 }
+fn dummySupportsDiscoverFn(_: *anyopaque) bool {
+    return true;
+}
 
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
+    .supportsDiscover = dummySupportsDiscoverFn,
     .search = dummySearchFn,
     .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
@@ -106,6 +110,9 @@ const GateProvider = struct {
     fn displayNameFn(_: *anyopaque) []const u8 {
         return "TestSrc";
     }
+    fn supportsDiscoverFn(_: *anyopaque) bool {
+        return true;
+    }
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
@@ -122,6 +129,7 @@ const GateProvider = struct {
     const vtable: SourceProvider.VTable = .{
         .name = nameFn,
         .displayName = displayNameFn,
+        .supportsDiscover = supportsDiscoverFn,
         .search = searchFn,
         .popular = popularFn,
         .episodes = episodesFn,
@@ -288,6 +296,22 @@ test "quit keys: q from browse and Ctrl-C" {
     try testing.expect(!app.should_quit);
     try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);
+}
+
+test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
+    // A source with no feed sets discover_supported=false at startup, so D (and its
+    // F3 alias) must not open Discover — the view stays put (the user gets a toast,
+    // not an empty grid; the [D] top-bar tab is dimmed to match).
+    var app: App = .{};
+    app.input_mode = .normal;
+    app.discover_supported = false;
+    app.active_view = .history;
+    try testTick(&app, keyEv('D', .{}));
+    try testing.expect(app.active_view == .history);
+
+    app.active_view = .browse;
+    try testTick(&app, keyEv(vaxis.Key.f3, .{}));
+    try testing.expect(app.active_view == .browse);
 }
 
 test "scope-tagged count fits cnt_scratch (ROD-211)" {
