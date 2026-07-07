@@ -14,6 +14,30 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-08
+
+### Added
+
+- **AniList account sync**: connect your AniList account — from Settings or by running `zigoku login` — and your watchlist syncs both ways in the background. Progress you log locally pushes up; changes made on AniList pull back down; each sync gets a small ↓/↑ toast. A full sync runs right after you connect and again on every launch, and quitting gives one last push a brief window to go out before the app closes. A toggle in the new "AniList Sync" section of Settings turns the whole thing off if you'd rather keep your list local.
+
+- **New streaming source**: the previous source became unusable behind a captcha wall, so zigoku now streams through senshi.live instead — search, episode listings, and playback all moved over, and your existing watchlist carries across automatically.
+
+- **Title language**: pick whether show titles display in English, romaji, or the native script, from Settings.
+
+### Changed
+
+- **Discover is paused on the new source**: senshi.live doesn't have a popularity feed yet, so the Discover tab is disabled until Discover is rebuilt for it.
+
+- **Watchlist migration is best-effort**: moving to the new source automatically matched roughly four in five tracked shows. The rest — titles it couldn't confidently place — will need to be re-added by hand.
+
+### Fixed
+
+- **Playback recovers from source blocks on its own**: when the streaming server briefly blocks a request, zigoku now retries with a fresh attempt instead of failing the episode outright, with a toast if a retry kicks in — an episode that used to need a manual retry or restart now usually plays through by itself. Requests are also sent in a way that triggers far fewer of those blocks in the first place.
+
+- **Airing shows no longer complete themselves early**: catching up to the newest episode released so far used to flip a still-airing show to "completed." It now stays in "watching" until the show itself wraps — including while it's on hiatus or its status is unclear.
+
+- **Safer database upgrades**: the one-time upgrade that runs after you update zigoku is now atomic, closing a couple of rare timing issues that could otherwise leave your local data inconsistent.
+
 ## [0.2.3] - 2026-07-04
 
 ### Added
@@ -190,7 +214,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vantroy/zigoku/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/vantroy/zigoku/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/vantroy/zigoku/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/vantroy/zigoku/compare/v0.2.0...v0.2.1
