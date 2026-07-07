@@ -1068,7 +1068,9 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
     const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
-        log.debug("resolve failed: {s}", .{@errorName(e)});
+        // Always-on top-level receipt (ROD-300): one line per failed play, with
+        // the id/ep to correlate against the provider-level lines below it.
+        log.err("resolve failed for id={s} ep={s} tt={s}: {s}", .{ id, ep_raw, translation.str(), @errorName(e) });
         loop.postEvent(.{ .play_error = .{ .final = null, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
@@ -1082,7 +1084,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
         .ctx = @ptrCast(&callback_ctx),
         .func = postPositionUpdate,
     }, skip) catch |e| {
-        log.debug("mpv playback failed: {s}", .{@errorName(e)});
+        log.err("mpv playback failed for id={s} ep={s}: {s}", .{ id, ep_raw, @errorName(e) });
         loop.postEvent(.{ .play_error = .{ .final = progress.snapshot(), .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
