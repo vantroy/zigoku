@@ -185,6 +185,15 @@ pub fn play(
         // injection) and `consider` gates the URL. Keep that contract intact.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
+    if (link.cloaked_segments) {
+        // The stream's HLS segments use a disguised extension (senshi serves `.ts`
+        // as `.jpg`; ROD-301). ffmpeg's HLS demuxer gates on a segment-extension
+        // allowlist that a stock build limits to real media extensions, so without
+        // this it refuses every segment and playback never starts. `ALL` lifts that
+        // gate for the (https-only, provider-vetted) playlist. This is a constant
+        // literal — no untrusted data reaches the argv here.
+        try argv.append(arena, "--demuxer-lavf-o=allowed_extensions=ALL");
+    }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));
     // Window-manager title carries a stable "zigoku - " prefix so hypr-focus
     // (and taskbars/overviews) can identify the playback window while still

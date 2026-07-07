@@ -436,6 +436,12 @@ pub const StreamLink = struct {
     resolution: ?u32 = null,
     /// HTTP Referer mpv must echo to the CDN, or null if the CDN doesn't gate on it.
     referer: ?[]const u8 = null,
+    /// The HLS segments are served under a disguised extension — senshi cloaks its
+    /// `.ts` segments as `.jpg` to slip content filters (ROD-301). ffmpeg's HLS
+    /// demuxer refuses non-standard segment extensions by default, so the player
+    /// must relax that gate for such a stream. False for sources whose segments
+    /// carry their true extension (AllAnime), keeping the default strict.
+    cloaked_segments: bool = false,
 };
 
 test "episode numeric sort handles decimals and specials" {

@@ -289,16 +289,81 @@ pub const Senshi = struct {
         return eps;
     }
 
-    // ── resolve — STAGE 3 stub ─────────────────────────────────────────────────
+    // ── resolve ──────────────────────────────────────────────────────────────────
+
+    /// One embed row from /episode-embeds/{mal_id}/{ep}: a direct HLS master `url`
+    /// tagged with a `status` track ("Dub", "HardSub", "SoftSub", "Sub"). The other
+    /// columns (server2/serverFM/download/masked_base_url) are ignored.
+    const Embed = struct { url: ?[]const u8 = null, status: ?[]const u8 = null };
 
     pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
-        _ = arena;
-        _ = io;
-        _ = tt;
+        // senshi hands back a standard adaptive HLS master; mpv picks the rendition
+        // off its bandwidth ladder. Honoring the quality *cap* means fetching and
+        // parsing that master for its variants, then applying the cap policy — which
+        // is exactly the machinery being lifted into the shared hls.zig, so quality
+        // support lands with that extraction rather than duplicating the cap logic
+        // here now (ROD-301 follow-up). Until then the pref is a no-op on senshi.
         _ = quality;
-        log.err("senshi resolve not yet implemented (ROD-301 stage 3); show_id={s} ep={s}", .{ show_id, ep.raw });
-        return error.NotImplemented;
+        try guardShowId(show_id);
+        try guardEpLabel(ep.raw);
+
+        const url = try std.fmt.allocPrint(arena, API ++ "/episode-embeds/{s}/{s}", .{ show_id, ep.raw });
+        const raw = try request(arena, io, .GET, url, null);
+        const embeds = try std.json.parseFromSlice([]Embed, arena, raw, .{ .ignore_unknown_fields = true });
+
+        const stream = pickEmbed(embeds.value, tt) orelse {
+            // Always-on: the show/episode exists but the requested track doesn't —
+            // distinct from a network failure, and the receipt says which.
+            log.warn("senshi resolve: no {s} stream for show={s} ep={s} ({d} embed(s))", .{ tt.str(), show_id, ep.raw, embeds.value.len });
+            return error.NoStreamForTrack;
+        };
+        // The embed url is senshi-provided data about to enter mpv's argv: require
+        // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
+        // controls that could smuggle a second mpv option or header).
+        if (!domain.isAbsoluteUrl(stream) or !cleanArg(stream)) return error.BadStreamUrl;
+        // The stream CDN (ninstream) 403s a refererless GET; mpv echoes this on the
+        // whole HLS chain (master → variant → segments) via --http-header-fields.
+        // `cloaked_segments`: senshi serves its `.ts` segments as `.jpg`, so the
+        // player must relax ffmpeg's HLS segment-extension gate or nothing plays.
+        return .{ .url = stream, .referer = STREAM_REFERER, .cloaked_segments = true };
+    }
+
+    /// Choose the embed URL best matching the requested track. For dub we want the
+    /// Dub embed; for sub we prefer a selectable SoftSub, then burned-in HardSub,
+    /// then any other subbed variant. Null when the track isn't offered at all.
+    fn pickEmbed(embeds: []const Embed, tt: domain.Translation) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_score: u8 = 0;
+        for (embeds) |e| {
+            const u = e.url orelse continue;
+            const sc = matchScore(e.status, tt);
+            if (sc > best_score) {
+                best_score = sc;
+                best = u;
+            }
+        }
+        return best;
+    }
+
+    /// Rank an embed's `status` for a track (0 = not this track). Sub prefers
+    /// soft > hard > any-other-sub so a selectable subtitle track wins over a
+    /// burned-in one; a "Dub" is never mistaken for a sub (and vice-versa).
+    fn matchScore(status: ?[]const u8, tt: domain.Translation) u8 {
+        const s = status orelse return 0;
+        return switch (tt) {
+            .dub => if (containsIgnoreCase(s, "dub")) 1 else 0,
+            .sub => if (containsIgnoreCase(s, "dub"))
+                0
+            else if (containsIgnoreCase(s, "soft"))
+                3
+            else if (containsIgnoreCase(s, "hard"))
+                2
+            else if (containsIgnoreCase(s, "sub"))
+                1
+            else
+                0,
+        };
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
@@ -442,6 +507,21 @@ pub const Senshi = struct {
     fn guardShowId(show_id: []const u8) !void {
         if (show_id.len == 0) return error.InvalidShowId;
         for (show_id) |c| if (!std.ascii.isDigit(c)) return error.InvalidShowId;
+    }
+
+    /// An episode label is our own `epLabel` output — digits with at most one
+    /// decimal point ("1", "13.5"). Enforce that before splicing it into the embed
+    /// URL path, so a corrupt label can't smuggle a second path segment or a
+    /// traversal (`../`, `1/x`) onto the wire.
+    fn guardEpLabel(s: []const u8) !void {
+        if (s.len == 0) return error.InvalidEpisode;
+        var dots: u8 = 0;
+        for (s) |c| {
+            if (c == '.') {
+                dots += 1;
+                if (dots > 1) return error.InvalidEpisode;
+            } else if (!std.ascii.isDigit(c)) return error.InvalidEpisode;
+        }
     }
 
     /// True if `s` is safe to place in a fetch URL / mpv argv: printable ASCII only
@@ -594,6 +674,44 @@ test "guardShowId accepts a numeric MAL id, rejects traversal/injection" {
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId("../etc"));
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId("59708/x"));
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId("dsd8y")); // public_id, not our key
+}
+
+test "pickEmbed picks the right track and prefers soft subs (ROD-301)" {
+    const embeds = [_]Senshi.Embed{
+        .{ .url = "https://cdn/dub.m3u8", .status = "Dub" },
+        .{ .url = "https://cdn/hard.m3u8", .status = "HardSub" },
+        .{ .url = "https://cdn/soft.m3u8", .status = "SoftSub" },
+    };
+    // sub → SoftSub wins over HardSub; dub → the Dub embed.
+    try testing.expectEqualStrings("https://cdn/soft.m3u8", Senshi.pickEmbed(&embeds, .sub).?);
+    try testing.expectEqualStrings("https://cdn/dub.m3u8", Senshi.pickEmbed(&embeds, .dub).?);
+
+    // A sub-only show offers no dub → null (resolve turns this into a clear error).
+    const sub_only = [_]Senshi.Embed{.{ .url = "https://cdn/hard.m3u8", .status = "HardSub" }};
+    try testing.expect(Senshi.pickEmbed(&sub_only, .dub) == null);
+    try testing.expectEqualStrings("https://cdn/hard.m3u8", Senshi.pickEmbed(&sub_only, .sub).?);
+
+    // An embed with no url is skipped, not chosen.
+    const no_url = [_]Senshi.Embed{.{ .url = null, .status = "SoftSub" }};
+    try testing.expect(Senshi.pickEmbed(&no_url, .sub) == null);
+}
+
+test "matchScore never crosses sub and dub" {
+    try testing.expectEqual(@as(u8, 0), Senshi.matchScore("Dub", .sub));
+    try testing.expectEqual(@as(u8, 0), Senshi.matchScore("HardSub", .dub));
+    try testing.expectEqual(@as(u8, 0), Senshi.matchScore("Raw", .sub));
+    try testing.expectEqual(@as(u8, 0), Senshi.matchScore(null, .sub));
+    try testing.expect(Senshi.matchScore("SoftSub", .sub) > Senshi.matchScore("HardSub", .sub));
+}
+
+test "guardEpLabel accepts numeric/decimal labels, rejects path tricks" {
+    try Senshi.guardEpLabel("1");
+    try Senshi.guardEpLabel("13.5");
+    try testing.expectError(error.InvalidEpisode, Senshi.guardEpLabel(""));
+    try testing.expectError(error.InvalidEpisode, Senshi.guardEpLabel("1/2"));
+    try testing.expectError(error.InvalidEpisode, Senshi.guardEpLabel("../7"));
+    try testing.expectError(error.InvalidEpisode, Senshi.guardEpLabel("1.2.3"));
+    try testing.expectError(error.InvalidEpisode, Senshi.guardEpLabel("SP1"));
 }
 
 test "coverRequest: relative posters get the host; absolute passes through" {
