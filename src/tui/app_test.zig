@@ -2195,7 +2195,7 @@ test "play_retry surfaces a transient warn toast so the backoff isn't a freeze (
 
     const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
     try testing.expectEqual(Toast.Kind.warn, t.kind);
-    try testing.expectEqualStrings("stream blocked — retrying 1/2", t.text[0..t.text_len]);
+    try testing.expectEqualStrings("stream didn't open — retrying 1/2", t.text[0..t.text_len]);
     try testing.expect(!t.persistent); // clears on its own TTL, not a recovery path
 }
 

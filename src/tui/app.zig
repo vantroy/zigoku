@@ -2353,7 +2353,7 @@ pub const App = struct {
                 // and the worker is re-resolving after a backoff. Transient warn so the
                 // wait reads as "retrying", not a frozen launch.
                 var buf: [48]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "stream blocked — retrying {d}/{d}", .{ r.attempt, r.max }) catch "stream blocked — retrying";
+                const msg = std.fmt.bufPrint(&buf, "stream didn't open — retrying {d}/{d}", .{ r.attempt, r.max }) catch "stream didn't open — retrying";
                 self.pushToast(.warn, msg, false);
             },
             .tick => {
