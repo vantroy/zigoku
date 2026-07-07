@@ -306,6 +306,9 @@ pub fn run(
     // freed); this drain covers the error-unwind/test paths, blocking until every
     // in-flight cover worker has finished before `loop`/`gpa`/caches tear down.
     defer app.discover_cover_drain.drain();
+    // Error-unwind/test path only (the quit `_exit` skips this defer — see ROD-232
+    // block below). Since ROD-309 the play worker may be mid retry-backoff on a CDN
+    // penalty window, so this join can now sit up to ~6s longer than a single mpv run.
     defer if (app.play_thread) |t| t.join();
 
     // Tick thread: 100ms heartbeat for spinner + search debounce. Joins before
