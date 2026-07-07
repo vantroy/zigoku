@@ -188,10 +188,12 @@ pub fn play(
     if (link.cloaked_segments) {
         // The stream's HLS segments use a disguised extension (senshi serves `.ts`
         // as `.jpg`; ROD-301). ffmpeg's HLS demuxer gates on a segment-extension
-        // allowlist that a stock build limits to real media extensions, so without
-        // this it refuses every segment and playback never starts. `ALL` lifts that
-        // gate for the (https-only, provider-vetted) playlist. This is a constant
-        // literal — no untrusted data reaches the argv here.
+        // allowlist a stock build limits to real media extensions; `ALL` lifts it
+        // for the (https-only, provider-vetted) playlist. Defense-in-depth, not
+        // strictly required on every player: current mpv (v0.41) disables that gate
+        // itself via a compat shim, so segments play with or without this — but raw
+        // ffmpeg and mpv builds lacking the shim DO enforce it, so we set it. Constant
+        // literal, no untrusted data in the argv.
         try argv.append(arena, "--demuxer-lavf-o=allowed_extensions=ALL");
     }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));

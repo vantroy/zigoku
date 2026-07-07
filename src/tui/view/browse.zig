@@ -132,8 +132,18 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
             // Only rendered when the pane seats it (the `show_eps` floor).
             if (show_eps and slot < scratch.meta.len) {
                 const tt = self.translation;
-                const eps = if (tt == .dub) a.eps_dub else a.eps_sub;
-                const meta = std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ eps, tt.str() }) catch "";
+                const per_track = if (tt == .dub) a.eps_dub else a.eps_sub;
+                // A source that splits sub/dub reports a real per-track count; one
+                // that lists episodes track-agnostically (senshi) leaves the off-track
+                // at 0 but knows the total — show the track-agnostic total rather than
+                // a false "0 dub", and "[--]" when even that is unknown (mirrors
+                // selection.zig's episode-count fallback and the score column's idiom).
+                const meta = if (per_track > 0)
+                    std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ per_track, tt.str() }) catch ""
+                else if (a.total_episodes) |t|
+                    std.fmt.bufPrint(&scratch.meta[slot], "{d} ep", .{t}) catch ""
+                else
+                    "[--]";
                 const eps_len: u16 = @min(@as(u16, @intCast(meta.len)), eps_w);
                 const eps_at: u16 = eps_zone + (eps_w - eps_len); // right-align within [eps_zone, eps_zone+eps_w)
                 putClipped(win, row, eps_at, eps_len, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));

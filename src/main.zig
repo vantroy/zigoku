@@ -417,8 +417,16 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
 
     try out.print("\n  {d} results:\n\n", .{results.len});
     for (results, 0..) |a, i| {
-        const eps = a.episodeCount(cli.translation);
-        try out.print("  {d:>2}. {s}  ·  {d} {s} eps\n", .{ i + 1, a.name, eps, cli.translation.str() });
+        // Per-track count when the source splits sub/dub; else the track-agnostic
+        // total (senshi doesn't split), never a false "0 {track}" (ROD-301).
+        const per_track = a.episodeCount(cli.translation);
+        if (per_track > 0) {
+            try out.print("  {d:>2}. {s}  ·  {d} {s} eps\n", .{ i + 1, a.name, per_track, cli.translation.str() });
+        } else if (a.total_episodes) |t| {
+            try out.print("  {d:>2}. {s}  ·  {d} eps\n", .{ i + 1, a.name, t });
+        } else {
+            try out.print("  {d:>2}. {s}\n", .{ i + 1, a.name });
+        }
     }
 
     const show_idx = (try promptChoice(out, in, "\n  pick a show # (q to quit): ", results.len)) orelse {

@@ -71,10 +71,14 @@ fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularO
 fn dummyCoverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
     return .{ .url = try gpa.dupe(u8, ref) };
 }
+fn dummySupportsDiscoverFn(_: *anyopaque) bool {
+    return true;
+}
 
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
+    .supportsDiscover = dummySupportsDiscoverFn,
     .search = dummySearchFn,
     .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
@@ -84,6 +88,24 @@ const dummy_vtable: SourceProvider.VTable = .{
 
 fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
+}
+
+// Same as dummy_vtable but reports no Discover feed — for the ROD-301 gate test.
+fn dummyNoDiscoverFn(_: *anyopaque) bool {
+    return false;
+}
+const dummy_no_discover_vtable: SourceProvider.VTable = .{
+    .name = dummyNameFn,
+    .displayName = dummyDisplayNameFn,
+    .supportsDiscover = dummyNoDiscoverFn,
+    .search = dummySearchFn,
+    .popular = dummyPopularFn,
+    .episodes = dummyEpisodesFn,
+    .resolve = dummyResolveFn,
+    .coverRequest = dummyCoverRequestFn,
+};
+fn noDiscoverProvider() SourceProvider {
+    return .{ .ptr = undefined, .vtable = &dummy_no_discover_vtable };
 }
 
 /// A provider whose `episodes` fetch parks until the test releases it — a
@@ -106,6 +128,9 @@ const GateProvider = struct {
     fn displayNameFn(_: *anyopaque) []const u8 {
         return "TestSrc";
     }
+    fn supportsDiscoverFn(_: *anyopaque) bool {
+        return true;
+    }
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
@@ -122,6 +147,7 @@ const GateProvider = struct {
     const vtable: SourceProvider.VTable = .{
         .name = nameFn,
         .displayName = displayNameFn,
+        .supportsDiscover = supportsDiscoverFn,
         .search = searchFn,
         .popular = popularFn,
         .episodes = episodesFn,
@@ -145,12 +171,16 @@ fn initTestLoop() Loop {
 }
 
 fn testTick(app: *App, event: Event) !void {
+    return testTickWith(app, event, dummyProvider());
+}
+
+fn testTickWith(app: *App, event: Event, provider: SourceProvider) !void {
     // Use a properly initialized loop so that background threads spawned during
     // tick() can safely call loop.postEvent() (which locks a mutex via io).
     // tty and vaxis are never accessed by postEvent, so undefined is safe there.
     const io = std.testing.io;
     var loop = initTestLoop();
-    try app.tick(event, &loop, io, dummyProvider());
+    try app.tick(event, &loop, io, provider);
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
@@ -288,6 +318,20 @@ test "quit keys: q from browse and Ctrl-C" {
     try testing.expect(!app.should_quit);
     try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);
+}
+
+test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
+    // senshi reports supportsDiscover()=false, so D (and its F3 alias) must not open
+    // Discover — the view stays put (the user gets a toast, not an empty grid).
+    var app: App = .{};
+    app.input_mode = .normal;
+    app.active_view = .history;
+    try testTickWith(&app, keyEv('D', .{}), noDiscoverProvider());
+    try testing.expect(app.active_view == .history);
+
+    app.active_view = .browse;
+    try testTickWith(&app, keyEv(vaxis.Key.f3, .{}), noDiscoverProvider());
+    try testing.expect(app.active_view == .browse);
 }
 
 test "scope-tagged count fits cnt_scratch (ROD-211)" {

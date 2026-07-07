@@ -3211,6 +3211,15 @@ pub const App = struct {
         if (key.matches(vaxis.Key.f3, .{}) or
             (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
         {
+            // Discover is hidden for a source with no windowed popularity feed
+            // (senshi) until a per-provider Discover is built (ROD-301). Swallow the
+            // key with a one-line toast instead of opening an empty, inert grid.
+            if (!provider.supportsDiscover()) {
+                var buf: [80]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Discover isn't available on {s} yet", .{provider.displayName()}) catch "Discover isn't available yet";
+                self.pushToast(.info, msg, false);
+                return;
+            }
             if (self.active_view != .discover) {
                 if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .discover;

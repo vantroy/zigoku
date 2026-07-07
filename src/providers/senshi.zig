@@ -9,19 +9,19 @@
 //! **MyAnimeList id**, which doubles as our AniSkip key for free.
 //!
 //! The API surface we ride (reversed on ROD-300/301):
-//!   * search + browse → POST /anime/filter  {searchTerm, sortBy, page, limit, …}
-//!   * popularity feed → GET  /anime/trending/{day|week|month}   (a short hot list)
-//!   * episode list    → GET  /episodes/{mal_id}                 (stage 2)
-//!   * stream resolve  → GET  /episode-embeds/{mal_id}/{ep}      (stage 3)
+//!   * search / browse → POST /anime/filter  {searchTerm, sortBy, page, limit, …}
+//!   * episode list    → GET  /episodes/{mal_id}
+//!   * stream resolve  → GET  /episode-embeds/{mal_id}/{ep}
 //!   * cover art       → /posters/{mal_id}.webp
 //!
 //! Like AllAnime, every site-specific fact is quarantined here behind the
 //! `source.SourceProvider` vtable. When senshi dies too: replace this file.
 //!
-//! STAGE 1 (this cut): search + popular + covers wired end-to-end so the catalog
-//! and Discover feed render against senshi. `episodes`/`resolve` are honest,
-//! logged stubs — stages 2 and 3 fill them, and the m3u8/quality machinery gets
-//! lifted out of allanime.zig into a shared module then (ROD-301 stage 3).
+//! Discover is OFF for senshi: it has no time-windowed popularity feed (its
+//! /anime/trending is a ~7-item hot list, not a paginated windowed grid), so
+//! `supportsDiscover()` returns false and `popular()` is an inert stub — the app
+//! hides the Discover view until a per-provider Discover is built. The m3u8/quality
+//! machinery still to be lifted out of allanime.zig into a shared module is ROD-302.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -66,6 +66,7 @@ pub const Senshi = struct {
     const vtable: source.SourceProvider.VTable = .{
         .name = nameErased,
         .displayName = displayNameErased,
+        .supportsDiscover = supportsDiscoverErased,
         .search = searchErased,
         .popular = popularErased,
         .episodes = episodesErased,
@@ -81,6 +82,12 @@ pub const Senshi = struct {
     fn displayNameErased(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return display_name;
+    }
+    fn supportsDiscoverErased(ptr: *anyopaque) bool {
+        _ = ptr;
+        // senshi has no time-windowed popularity feed — Discover stays hidden for it
+        // until a per-provider Discover is built (see the file header + popular()).
+        return false;
     }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
@@ -217,42 +224,18 @@ pub const Senshi = struct {
 
     // ── popular ──────────────────────────────────────────────────────────────────
 
+    /// Inert: senshi exposes no time-windowed popularity feed to back a Discover
+    /// grid. `supportsDiscover()` returns false, so the app never opens the Discover
+    /// view for senshi and this is never called — it returns empty rather than error
+    /// as a belt-and-suspenders no-op. (An earlier cut rode `/anime/filter` sorted by
+    /// score, but that made all four window tabs render the identical grid — flagged
+    /// in review, ROD-301; reverted pending a per-provider Discover.)
     pub fn popular(self: *Senshi, arena: Allocator, io: Io, opts: source.PopularOptions) ![]domain.Anime {
         _ = self;
-        // DESIGN NOTE (ROD-301): senshi's true trending feed
-        // (GET /anime/trending/{day|week|month}) is a SHORT hot list — ~7 items,
-        // no pagination, no all-time. Too thin for the paginated Discover grid.
-        // So the feed rides `/anime/filter` sorted by score (deep + paginated,
-        // exactly what senshi's own /browse does) and surfaces the window's
-        // `views_*` as the card's view_count. Trade-off: the ordering is by score,
-        // not by the windowed views the count shows — an open design call flagged
-        // for Rod (keep a short true-trending feed, or this deep score-browse?).
-        const body = try std.fmt.allocPrint(
-            arena,
-            "{{\"searchTerm\":\"\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"JP\"}}",
-            .{ opts.page, source.popular_page_size },
-        );
-
-        const raw = try request(arena, io, .POST, API ++ "/anime/filter", body);
-        const parsed = try std.json.parseFromSlice(FilterResp, arena, raw, .{ .ignore_unknown_fields = true });
-
-        var list: std.ArrayList(domain.Anime) = .empty;
-        for (parsed.value.data) |s| {
-            const views = windowViews(s, opts.window);
-            try list.append(arena, try mapAnime(arena, s, views));
-        }
-        // No re-sort: the server already ordered the page; rank == array position.
-        return list.items;
-    }
-
-    /// Which `views_*` field tracks the selected window (all-time has no lifetime
-    /// total in the payload, so it borrows the monthly figure — the widest window).
-    fn windowViews(s: SAnime, w: source.PopularWindow) ?u64 {
-        return switch (w) {
-            .daily => s.views_day,
-            .weekly => s.views_week,
-            .monthly, .all_time => s.views_month,
-        };
+        _ = arena;
+        _ = io;
+        _ = opts;
+        return &.{};
     }
 
     // ── episodes ──────────────────────────────────────────────────────────────
