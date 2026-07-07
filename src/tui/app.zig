@@ -475,10 +475,11 @@ pub fn run(
     // can't fault before _exit reaps the thread on its heels.
     tty.deinit();
     // ROD-294: last act before _exit — flush any still-dirty rows to AniList within a
-    // hard deadline (the mirror of the ROD-293 launch pull at the other end of the
-    // session). The terminal is already restored, so the bounded wait shows a normal
-    // cooked-mode prompt, not a frozen TUI; a dead socket can't hang quit. No-op when
-    // disconnected, clean, or a background flush is already covering the dirty rows.
+    // hard, pool-independent deadline (the mirror of the ROD-293 launch pull at the other
+    // end of the session). The terminal is already restored, so the bounded wait shows a
+    // normal cooked-mode prompt, not a frozen TUI; the bound holds even under thread-pool
+    // starvation, so a dead socket can't hang quit. No-op when disconnected or when a
+    // push-capable flush is already covering the dirty rows.
     app.quitFlush(io);
     std.c._exit(0);
 }
@@ -942,6 +943,13 @@ pub const App = struct {
     /// launch pull, which reuses this exact gate so the launch refresh and the first
     /// action flush can never run two syncs against the store at once.
     sync_flush_inflight: std.atomic.Value(bool) = .init(false),
+    /// Mode of the currently-inflight sync worker, meaningful only while
+    /// `sync_flush_inflight` is set: true = a pull-only launch refresh (ROD-293, never
+    /// pushes), false = a push-capable flush (ROD-291). `quitFlush` reads it so it does
+    /// NOT skip the quit push when only a pull-only refresh is running — a pull-only
+    /// worker does not cover the dirty rows. Written and read on the main thread (spawn
+    /// and quit are both main-thread), so a plain bool suffices — no atomic needed.
+    sync_flush_pull_only: bool = false,
     /// Handle for the in-flight sync thread (action flush or ROD-293 launch pull — only
     /// ever one, per the gate above); joined before spawning the next, and on the
     /// error-unwind / test teardown path. The ordinary quit path (`_exit(0)`, ROD-232)
@@ -1491,6 +1499,9 @@ pub const App = struct {
     /// pull-then-push, true = the launch pull-refresh. The caller has already checked the
     /// gate is clear and reaped any prior handle.
     fn spawnSyncWorker(self: *App, loop: *Loop, io: std.Io, st: *Store, pull_only: bool) void {
+        // Record the mode before raising the gate so a concurrent quit read (main thread
+        // too, so no race) sees the right mode for whatever worker is now inflight.
+        self.sync_flush_pull_only = pull_only;
         self.sync_flush_inflight.store(true, .release);
         self.sync_thread = std.Thread.spawn(.{}, workers.syncFlushTask, .{
             loop, self.gpa, io, st, self.anilist_auth, Store.nowSecs(), &self.sync_flush_inflight, pull_only,
@@ -1503,20 +1514,34 @@ pub const App = struct {
 
     /// ROD-294: bounded best-effort push on quit — the mirror of `fireLaunchPull` at the
     /// far end of the session. Called once from run()'s fast-exit path, after the terminal
-    /// is restored and before `_exit`. Only the App-state gate lives here (connected? a
-    /// flush already inflight?); the bounded store+network call is `workers.pushOnQuit`,
-    /// which also skips the deadline machinery when nothing's dirty. Skipped when a
-    /// background flush is inflight — `_exit` abandons that thread, its rows re-flush next
-    /// launch, and a second concurrent pusher here would only race it on the same store.
-    /// Like `fireSyncFlush`, this is orchestration around a real network call with no
-    /// unit-testable seam; the tested logic is `sync.pushAll`'s engine (incl. the
-    /// partial-progress safety net) and `withDeadline`'s race.
+    /// is restored and before `_exit`. Only the App-state gate lives here (connected? does
+    /// an inflight worker already cover the rows?); the hard-bounded store+network call is
+    /// `workers.pushOnQuit`, which spawns the push on its own thread and bounds the wait
+    /// with a pool-independent timer so it can never hang quit. The gate spawns nothing
+    /// when disconnected. The orchestration has no unit-testable seam (real network, like
+    /// `fireSyncFlush`), but the gate DECISION is a pure predicate (`quitPushArmed`) that
+    /// is tested; the push engine (`sync.pushAll`, incl. the partial-progress safety net)
+    /// is covered in sync.zig.
     fn quitFlush(self: *App, io: std.Io) void {
         if (builtin.is_test) return; // real network; no unit-test path (see fireSyncFlush)
         const st = self.store orelse return;
         if (!self.syncEnabled()) return;
-        if (self.sync_flush_inflight.load(.acquire)) return; // a flush already covers these rows
+        if (!quitPushArmed(self.sync_flush_inflight.load(.acquire), self.sync_flush_pull_only)) return;
         workers.pushOnQuit(self.gpa, io, st, self.anilist_auth, Store.nowSecs(), App.quit_push_deadline_ms);
+    }
+
+    /// Whether the quit push should fire, given the current sync-worker state. Fire when
+    /// no flush is inflight, OR when the inflight worker is a pull-only launch refresh —
+    /// a pull-only worker never pushes (ROD-293), so it does NOT cover the dirty rows.
+    /// Skip only when a push-capable flush is already inflight: it's already sending
+    /// these rows and a second concurrent pusher would just double-POST them. Split out
+    /// as a pure predicate because the original gate skipped on ANY inflight flush and so
+    /// silently dropped the quit push for the ~10 s of every launch while the ROD-293
+    /// pull holds the gate — the exact "stuck row never re-pushes on a launch-then-quit"
+    /// regression this ticket exists to prevent. `inflight_pull_only` is read only when
+    /// `inflight` is true; a stale value when `inflight` is false is irrelevant.
+    fn quitPushArmed(inflight: bool, inflight_pull_only: bool) bool {
+        return !inflight or inflight_pull_only;
     }
 
     // ── in-TUI connect modal (ROD-286) ────────────────────────────────────────
@@ -3984,6 +4009,7 @@ pub const App = struct {
     /// landed stays dirty and re-flushes next launch. Sized to ~one row: `sync.pushAll`
     /// paces 2 s between rows (MIN_INTERVAL), so this lands the freshest dirty row and
     /// bounces rather than stalling quit on a backlog — a safety net, not a bulk flush.
+    /// This is the policy (how long); `workers.pushOnQuit` owns the wait mechanism.
     pub const quit_push_deadline_ms: i64 = 2000;
 
     pub const PaneSplit = struct { list_w: u16, detail_x: u16, detail_w: u16 };
@@ -4241,4 +4267,17 @@ test "discoverFillEligible gates the fill on an established, idle, live feed (RO
     // The review blocker: a failed page must veto, else .popular_error wakes the loop
     // and the fill re-fires as fast as the fetch can fail — an unbounded retry storm.
     try testing.expect(!App.discoverFillEligible(false, false, true, 1));
+}
+
+test "quitPushArmed fires the quit push unless a push-capable flush is already inflight (ROD-294)" {
+    // The gate that decides whether the ROD-294 quit push runs. The regression this
+    // pins: the first cut skipped on ANY inflight flush, but the ROD-293 launch pull is
+    // pull-ONLY — it never pushes — so during the ~10 s it holds the gate at every
+    // launch, a stuck dirty row's quit push was silently dropped (launch-then-quit never
+    // re-pushed it). Fire when nothing is inflight, OR when the inflight worker is that
+    // pull-only refresh; skip only a push-capable flush (it already sends the rows).
+    try testing.expect(App.quitPushArmed(false, false)); // idle → fire
+    try testing.expect(App.quitPushArmed(false, true)); // idle (stale mode bit) → fire
+    try testing.expect(App.quitPushArmed(true, true)); // pull-only refresh inflight → still fire (it never pushes)
+    try testing.expect(!App.quitPushArmed(true, false)); // push-capable flush inflight → skip (already sending)
 }

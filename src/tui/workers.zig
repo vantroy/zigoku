@@ -775,18 +775,32 @@ pub fn syncFlushTask(
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
+/// Poll interval (ms) for `pushOnQuit`'s pool-independent wait — how often it wakes to
+/// check whether the push landed (an early exit). Small enough that a fast push exits
+/// quit near-instantly; the syscall cost of the (≤ deadline/interval) short sleeps is
+/// nothing against a one-time quit. ROD-294.
+const quit_poll_ms: u64 = 5;
+
 /// ROD-294: bounded best-effort push on quit — the mirror of `syncFlushTask`'s launch
-/// pull at the far end of the session. Called synchronously from run()'s fast-exit
-/// path, AFTER the terminal is restored and BEFORE `_exit`: if rows are still dirty,
-/// land as many as `deadline_ms` allows so a push that failed mid-session (offline, a
-/// dropped 429) doesn't wait for the next launch. Unlike `syncFlushTask` this posts NO
-/// event and spawns no persistent thread — a pure store+network call that never touches
-/// the loop or tty, so it sidesteps the ROD-179/232 event-queue wedge that retired the
-/// graceful drain. Bounded and best-effort by construction: `withDeadline` caps the
-/// wall clock so a dead socket can't hang quit, and whatever doesn't land stays dirty
-/// for next launch — `sync.pushAll` stamps each row as it lands, so a cut-short run
-/// leaves a consistent partial (proven by sync.zig's "401 mid-run" test). The caller
-/// has already checked we're connected and no background flush is inflight.
+/// pull at the far end of the session. Called synchronously from run()'s fast-exit path,
+/// AFTER the terminal is restored and BEFORE `_exit`: if rows are still dirty, land as
+/// many as `deadline_ms` allows so a push that failed mid-session (offline, a dropped
+/// 429) doesn't wait for the next launch. Posts NO event — a pure store+network call
+/// that never touches the loop or tty, so it sidesteps the ROD-179/232 event-queue wedge
+/// that retired the graceful drain.
+///
+/// Runs the push on its OWN thread and bounds the WAIT with a libc-`nanosleep` poll loop,
+/// deliberately NOT `withDeadline`: withDeadline arms its timer on the same `Io` thread
+/// pool the push competes for, so under pool starvation (OS thread exhaustion) it runs
+/// the op inline with NO deadline (deadline.zig:43) — and this call sits one line before
+/// the ROD-232 `_exit`, where an unbounded op on a silent socket is exactly the quit-hang
+/// ROD-232 exists to kill. `nanosleep` is a direct libc syscall (the app links libc),
+/// independent of the pool, so the quit thread ALWAYS returns by the deadline no matter
+/// what the push thread is doing — a stalled or starved push is abandoned to `_exit` like
+/// every other ROD-232 worker. Best-effort: whatever doesn't land stays dirty and
+/// re-flushes next launch (`sync.pushAll` stamps each row as it lands, so a cut-short run
+/// leaves a consistent partial — proven by sync.zig's "401 mid-run" test). The caller has
+/// already checked we're connected and that no push-capable flush is inflight.
 pub fn pushOnQuit(
     gpa: Allocator,
     io: std.Io,
@@ -795,31 +809,65 @@ pub fn pushOnQuit(
     now_unix: i64,
     deadline_ms: i64,
 ) void {
-    // Trigger only when there's genuinely dirty work (ROD-294's gate): reuse the push's
-    // own work-list query so the dirty predicate has a single source and can't drift.
-    // Cheap and local (busy_timeout-bounded); skips the deadline machinery on a clean quit.
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const dirty = store.loadDirtyForSync(arena.allocator()) catch return;
-    if (dirty.len == 0) return;
-
-    // One bounded pushAll. It's total (returns Summary, never errors), so wrap it in a
-    // `!Summary` shim `withDeadline` can unwrap. Discard the outcome — the render surface
-    // is gone; a timeout just means the rest stay dirty and re-flush next launch.
-    const bound = std.Io.Duration.fromMilliseconds(deadline_ms);
-    _ = deadline.withDeadline(io, bound, pushAllBounded, .{ gpa, io, store, credentials, now_unix }) catch {};
+    // `done` is heap-allocated and intentionally leaked: `quitPushBody` sets it in a
+    // defer that can run AFTER we return (we abandon a slow push), so it must outlive
+    // this stack frame — a stack `done` would dangle under the abandoned thread. `_exit`
+    // reclaims it moments later, like every other ROD-232 abandoned-worker resource. On
+    // spawn failure we're its only owner and free it; on success the (possibly still
+    // running) thread is its last writer, so we must not.
+    const done = gpa.create(std.atomic.Value(bool)) catch return;
+    done.* = .init(false);
+    const t = std.Thread.spawn(.{}, quitPushBody, .{ gpa, io, store, credentials, now_unix, done }) catch {
+        gpa.destroy(done);
+        return;
+    };
+    // Wait for the push to land, up to the deadline, waking every `quit_poll_ms` for an
+    // early exit. A signal (EINTR) may cut a nanosleep short — harmless, we just poll
+    // sooner and the loop still terminates at `max_polls`.
+    const budget = std.math.cast(u64, deadline_ms) orelse 0;
+    const max_polls = budget / quit_poll_ms;
+    var polls: u64 = 0;
+    while (polls < max_polls and !done.load(.acquire)) : (polls += 1) nanosleepMs(quit_poll_ms);
+    // Done or timed out: never join — a starved/stalled push must not block quit. `detach`
+    // hands the thread to the runtime; `_exit` reaps it (and the leaked `done`) on our heels.
+    t.detach();
 }
 
-/// `!Summary` shim over the total `sync.pushAll` so `withDeadline` — which unwraps an
-/// error union to race the operation — can bound it. ROD-294.
-fn pushAllBounded(
+/// The quit push body (ROD-294), run on its own thread so `pushOnQuit` can bound the WAIT
+/// with a pool-independent timer. Sets `done` on every exit path so the caller's poll
+/// loop wakes early on the happy path. The dirty pre-check lives here, INSIDE the bounded
+/// region, so even a wedged storage layer can't stall it past the deadline; it reuses
+/// `pushAll`'s own work-list query so the dirty predicate has one source and can't drift.
+fn quitPushBody(
     gpa: Allocator,
     io: std.Io,
     store: *Store,
     credentials: auth_mod.Auth,
     now_unix: i64,
-) !sync.Summary {
-    return sync.pushAll(gpa, io, store, credentials, now_unix);
+    done: *std.atomic.Value(bool),
+) void {
+    defer done.store(true, .release);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const dirty = store.loadDirtyForSync(arena.allocator()) catch return;
+    if (dirty.len == 0) return;
+    // Total (returns `Summary`, never errors). Its own inner per-POST deadline may go
+    // unbounded under pool starvation, but the caller's poll loop bounds QUIT regardless,
+    // so a stalled push here is just abandoned. Outcome discarded — the render surface is
+    // gone; unlanded rows stay dirty and re-flush next launch.
+    _ = sync.pushAll(gpa, io, store, credentials, now_unix);
+}
+
+/// Pool-independent ~`ms`-millisecond sleep via libc `nanosleep` (the app links libc),
+/// used by `pushOnQuit`'s wait loop so the quit bound can't depend on the `Io` thread
+/// pool the push is competing for. A signal (EINTR) may cut it short — harmless here.
+/// ROD-294.
+fn nanosleepMs(ms: u64) void {
+    var req: std.c.timespec = .{
+        .sec = @intCast(ms / std.time.ms_per_s),
+        .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+    };
+    _ = std.c.nanosleep(&req, null);
 }
 
 /// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
