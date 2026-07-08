@@ -2387,12 +2387,13 @@ pub const App = struct {
 
     /// Soft cap on concurrently-spawned Discover background workers (ROD-264). The feed
     /// fetch, zoom enrich, and batch enrich each spawn an uncapped `std.Thread` on the
-    /// shared `Io.Threaded` pool. A saturation storm (rapid paging + zoom + prefetch on a
-    /// slow link) could pile enough live threads to approach the OS thread/fd ceiling,
-    /// where `std.Thread.spawn` starts failing, which is exactly what tips a fetch onto
-    /// `withDeadline`'s unbounded inline fallback (ROD-264). Bounding our own fan-out
-    /// keeps us clear. In normal use the in-flight set sits far below this; the cap is a
-    /// backstop, not a tuning dial.
+    /// shared `Io.Threaded` pool, whose own `concurrent_limit` is unbounded, so an
+    /// app-level cap is the only backstop. A saturation storm (rapid paging + zoom +
+    /// prefetch on a slow link) could pile enough live threads to approach the OS
+    /// thread/fd ceiling, where `std.Thread.spawn` starts failing, which is exactly what
+    /// tips a fetch onto `withDeadline`'s unbounded inline fallback (ROD-264). Bounding
+    /// our own fan-out keeps us clear. In normal use the in-flight set sits far below
+    /// this; the cap is a backstop, not a tuning dial.
     const discover_enrich_cap = 8;
 
     /// True when the Discover worker pool is at the soft cap (ROD-264 #3): the
