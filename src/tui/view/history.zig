@@ -57,7 +57,7 @@ const hairline = "─" ** hairline_cols;
 fn groupCount(self: *const App, status: ListStatus) usize {
     var n: usize = 0;
     for (self.history) |rec| {
-        if (rec.list_status == status and self.historyEntryVisible(rec.title)) n += 1;
+        if (rec.list_status == status and self.historyEntryVisible(rec)) n += 1;
     }
     return n;
 }
@@ -82,7 +82,7 @@ fn walk(self: *const App, ctx: anytype) u16 {
         phys += 1;
 
         for (self.history, 0..) |rec, idx| {
-            if (rec.list_status != status or !self.historyEntryVisible(rec.title)) continue;
+            if (rec.list_status != status or !self.historyEntryVisible(rec)) continue;
             ctx.onEntry(phys, rec, idx, ordinal, ordinal == self.list_cursor);
             phys += 2;
             ordinal += 1;
@@ -301,8 +301,9 @@ const DrawCtx = struct {
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
         // Primary label under the title-language preference (ROD-205). The local
-        // `/` filter still matches the romaji `rec.title` (historyEntryVisible) —
-        // matching the resolved form is a separate search concern, tracked in ROD-299.
+        // `/` filter matches every present title form (romaji/english/native) via
+        // historyEntryVisible, so a show stays findable by any of its names
+        // regardless of which one this preference renders (ROD-299).
         const row_title = domain.preferredTitle(rec.title, rec.title_english, rec.native_name, self.config.titleLanguageEnum());
         putClipped(c.win, row, title_col, c.title_w, row_title, title_style);
 
