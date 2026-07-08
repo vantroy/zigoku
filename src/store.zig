@@ -41,7 +41,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 13;
+const SCHEMA_VERSION: c_int = 14;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes now share one DB as a
@@ -312,6 +312,147 @@ const MIGRATION_V13 =
     \\    key   TEXT NOT NULL PRIMARY KEY,
     \\    value TEXT NOT NULL
     \\);
+;
+
+// ROD-311: the canonical identity spine (ROD-307 slice 1/3). Introduces
+// `canonical_anime` — one row per distinct AniList id — as the top-level entity
+// that provider rows (senshi, a future anipub) bind UP to via `anime.canonical_id`.
+// This reverts the vertical-slice flip to opaque-first (shaped on AllAnime, whose
+// show id is not a canonical key) back to the v1 canonical-first model: identity +
+// enrichment live once on the canonical entity, shared across bindings and
+// surviving provider swaps, instead of being duplicated per provider row.
+//
+// anilist_id is the PK because AniList is the identity SUPERSET — every enriched
+// entity has an anilist_id; not every has a mal_id (an AllAnime-anilist row with no
+// MAL mapping, an AniList-Discover title with idMal=null). mal_id rides along as a
+// non-unique secondary so MAL-native providers resolve free, but it may be NULL and
+// never keys the spine.
+//
+// ADDITIVE + UNREAD: this slice only populates the shadow. No read path consults
+// canonical_anime yet — loadHistory/getAnime still read the anime-local columns.
+// ROD-312 moves enrichment reads/writes onto canonical via a COALESCE join; this
+// slice is pure additive groundwork (there is no down-migration).
+//
+// The canonical column set MIRRORS anime's identity+enrichment columns (title
+// through country). User-state (list_status, progress, ratings, notes, the sync
+// snapshots, the added/last-watched clocks) and the binding key (source, source_id)
+// deliberately STAY on anime — they are per-binding, not canonical. `title` is
+// seeded from the provider display name and heals to true AniList romaji in
+// ROD-312; `total_episodes` is copied as-is, but its canonical meaning (AniList's
+// total vs a binding's per-translation aired count) is a ROD-312 read-time decision,
+// not settled here.
+//
+// Backfill picks one source row per anilist_id — freshest enrichment (DESC sorts
+// NULLs last in SQLite), then prefer senshi, then lowest rowid — then recovers a
+// mal_id from any sibling binding the winner lacked. Both the tiebreak and the
+// sibling recovery are DORMANT on today's library (every anilist_id is unique, so
+// every group is size 1); they earn their keep once two providers co-bind one id.
+//
+// The whole ladder runs inside migrate()'s one BEGIN IMMEDIATE, so V14 commits
+// atomically with the version bump. Split into a one-shot DDL const and a
+// re-runnable BACKFILL const: the ladder runs them back to back, and the test suite
+// drives BACKFILL alone against seeded rows to pin the dormant tiebreak/recovery
+// before a second provider ever exercises it in the wild. (defer_foreign_keys is set
+// for envelope-parity with V12; V14 fully populates canonical before the link
+// UPDATE, so no FK check is ever actually deferred here.)
+const MIGRATION_V14_DDL =
+    \\PRAGMA defer_foreign_keys = ON;
+    \\
+    \\CREATE TABLE canonical_anime (
+    \\    anilist_id                  INTEGER PRIMARY KEY,  -- AniList id: the canonical spine key
+    \\    mal_id                      INTEGER,              -- secondary (MAL-native); non-unique, may be NULL
+    \\    title                       TEXT,                 -- seeded from provider display; heals to romaji (ROD-312)
+    \\    title_english               TEXT,
+    \\    cover_url                   TEXT,
+    \\    total_episodes              INTEGER,
+    \\    year                        INTEGER,
+    \\    status                      TEXT,
+    \\    description                 TEXT,
+    \\    score                       INTEGER,
+    \\    season                      TEXT,
+    \\    native_name                 TEXT,
+    \\    kind                        TEXT,
+    \\    start_year                  INTEGER,
+    \\    start_month                 INTEGER,
+    \\    start_day                   INTEGER,
+    \\    genres                      TEXT,
+    \\    enrichment_fetched_at       INTEGER,
+    \\    enrichment_fieldset_version INTEGER,
+    \\    studios                     TEXT,
+    \\    duration                    INTEGER,
+    \\    source_material             TEXT,
+    \\    rank                        INTEGER,
+    \\    rank_type                   TEXT,
+    \\    rank_year                   INTEGER,
+    \\    next_airing_at              INTEGER,
+    \\    next_airing_episode         INTEGER,
+    \\    country                     TEXT
+    \\);
+    \\CREATE INDEX idx_canonical_mal ON canonical_anime(mal_id);
+    \\
+    \\-- Binding -> canonical link column (nullable FK; NULL default satisfies SQLite's
+    \\-- ALTER-ADD-COLUMN-with-REFERENCES rule), then its indexes. idx_anime_anilist has
+    \\-- no reader in V14 — it is groundwork for ROD-312's canonical-resolution join.
+    \\ALTER TABLE anime ADD COLUMN canonical_id INTEGER REFERENCES canonical_anime(anilist_id);
+    \\CREATE INDEX idx_anime_canonical ON anime(canonical_id);
+    \\CREATE INDEX idx_anime_anilist   ON anime(anilist_id);
+;
+
+// The data lift, held apart from the DDL above so the migrate test can run it in
+// isolation against a seeded anime table. Idempotent-safe to run once against an
+// empty canonical_anime (the ladder's case, and the test's after openMemory seeds a
+// fresh v14). All the dormant multi-provider logic lives here.
+const MIGRATION_V14_BACKFILL =
+    \\-- One canonical row per distinct anilist_id; the ROW_NUMBER window picks the
+    \\-- best source row when two bindings ever co-bind an id (dormant today: every
+    \\-- group is size 1). DESC on enrichment_fetched_at sorts NULLs last in SQLite.
+    \\INSERT INTO canonical_anime (
+    \\    anilist_id, mal_id, title, title_english, cover_url, total_episodes,
+    \\    year, status, description, score, season, native_name, kind,
+    \\    start_year, start_month, start_day, genres,
+    \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
+    \\    source_material, rank, rank_type, rank_year,
+    \\    next_airing_at, next_airing_episode, country
+    \\)
+    \\SELECT
+    \\    anilist_id, mal_id, title, title_english, cover_url, total_episodes,
+    \\    year, status, description, score, season, native_name, kind,
+    \\    start_year, start_month, start_day, genres,
+    \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
+    \\    source_material, rank, rank_type, rank_year,
+    \\    next_airing_at, next_airing_episode, country
+    \\FROM (
+    \\    SELECT *, ROW_NUMBER() OVER (
+    \\        PARTITION BY anilist_id
+    \\        ORDER BY enrichment_fetched_at DESC,
+    \\                 CASE source WHEN 'senshi' THEN 0 ELSE 1 END,
+    \\                 rowid
+    \\    ) AS _rn
+    \\    FROM anime
+    \\    WHERE anilist_id IS NOT NULL
+    \\)
+    \\WHERE _rn = 1;
+    \\
+    \\-- Recover mal_id from any sibling binding the winner lacked (dormant today).
+    \\UPDATE canonical_anime
+    \\   SET mal_id = (
+    \\       SELECT a.mal_id FROM anime a
+    \\        WHERE a.anilist_id = canonical_anime.anilist_id
+    \\          AND a.mal_id IS NOT NULL
+    \\        ORDER BY a.mal_id
+    \\        LIMIT 1
+    \\   )
+    \\ WHERE mal_id IS NULL
+    \\   AND EXISTS (
+    \\       SELECT 1 FROM anime a
+    \\        WHERE a.anilist_id = canonical_anime.anilist_id
+    \\          AND a.mal_id IS NOT NULL
+    \\   );
+    \\
+    \\-- Link every id-bearing binding. Rows with NULL anilist_id keep canonical_id
+    \\-- NULL — the three-state contract (canonical_id + enrichment_fetched_at) reads
+    \\-- them as pending / confirmed-unmatched.
+    \\UPDATE anime SET canonical_id = anilist_id WHERE anilist_id IS NOT NULL;
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1626,6 +1767,11 @@ pub const Store = struct {
         if (v < 13) {
             try self.exec(MIGRATION_V13);
             v = 13;
+        }
+        if (v < 14) {
+            try self.exec(MIGRATION_V14_DDL);
+            try self.exec(MIGRATION_V14_BACKFILL);
+            v = 14;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -3154,6 +3300,105 @@ test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned pr
     try testing.expect((try s.getResume("senshi", "5956", .sub, "3")) != null);
     try testing.expect((try s.getResume("allanime", "dupA", .sub, "2")) == null);
     try testing.expect((try s.getResume("allanime", "dupB", .sub, "3")) == null);
+}
+
+test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses via freshest+senshi tiebreak and recovers a sibling mal_id (ROD-311)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Scalar readers for the UNREAD shadow — no getCanonical() exists yet (ROD-312),
+    // so the test reads canonical_anime / the link column directly.
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+
+    // openMemory already ran MIGRATION_V14 (DDL + BACKFILL) on empty tables, so
+    // canonical_anime exists and is empty. Seed bindings by hand — a raw INSERT, not
+    // upsertAnime, because the tiebreak keys on enrichment_fetched_at, which the upsert
+    // API doesn't take. Six distinct anilist_ids exercise every tier of the pick:
+    //   100  singleton (senshi)                           → 1:1 lift, mal_id carries
+    //   NULL the unmatched tail                           → no canonical row, stays unlinked
+    //   999  senshi(fresher, NO mal) vs allanime(mal=555) → fresher wins; NULL mal recovers 555
+    //   777  allanime(FRESHER, mal=333) vs senshi(stale)  → freshness is PRIMARY, beats senshi
+    //   888  allanime vs senshi, TIED on enrichment       → senshi wins the tie (secondary key)
+    //   666  two allanime tied on enrichment+source       → lowest rowid wins (final key)
+    //   321  allanime(enriched) vs senshi(NULL enrich)    → NULL sorts LAST, enriched wins
+    try s.exec(
+        \\INSERT INTO anime (source, source_id, title, anilist_id, mal_id, enrichment_fetched_at, added_at) VALUES
+        \\  ('senshi',   'solo', 'Solo Show',    100,  700,  3000, 1000),
+        \\  ('senshi',   'tail', 'No Id',        NULL, NULL, NULL, 1000),
+        \\  ('senshi',   'win',  'Winner',       999,  NULL, 2000, 1000),
+        \\  ('allanime', 'lose', 'Loser',        999,  555,  1000, 1000),
+        \\  ('allanime', 'fa',   'Fresh AL',     777,  333,  5000, 1000),
+        \\  ('senshi',   'ss',   'Stale Senshi', 777,  444,  1000, 1000),
+        \\  ('allanime', 'pa',   'P allanime',   888,  111,  1500, 1000),
+        \\  ('senshi',   'qs',   'Q senshi',     888,  222,  1500, 1000),
+        \\  ('allanime', 'r1',   'Rowid First',  666,  661,  2500, 1000),
+        \\  ('allanime', 'r2',   'Rowid Later',  666,  662,  2500, 1000),
+        \\  ('senshi',   'ne',   'Null Enrich',  321,  811,  NULL, 1000),
+        \\  ('allanime', 'ee',   'Has Enrich',   321,  812,  100,  1000);
+    );
+
+    // Run the exact data lift the ladder runs — the DDL is already applied, so this is
+    // the isolated backfill the const split exists to make testable.
+    try s.exec(MIGRATION_V14_BACKFILL);
+
+    // One canonical row per distinct non-null anilist_id (100, 999, 777, 888, 666, 321).
+    try testing.expectEqual(@as(?i64, 6), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;"));
+    // Eleven of twelve bindings link; the NULL-anilist tail stays unlinked.
+    try testing.expectEqual(@as(?i64, 11), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE canonical_id IS NOT NULL;"));
+    try testing.expectEqual(@as(?i64, null), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'tail';"));
+
+    // Singleton: 1:1 lift, mal_id and link intact.
+    try testing.expectEqual(@as(?i64, 100), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'solo';"));
+    try testing.expectEqual(@as(?i64, 700), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 100;"));
+
+    // Shared 999: freshest binding (senshi 'win') wins the seed; its NULL mal_id
+    // recovers 555 from the older 'lose' sibling; BOTH bindings point at canonical 999.
+    try testing.expectEqualStrings("Winner", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 999;")).?);
+    try testing.expectEqual(@as(?i64, 555), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 999;"));
+    try testing.expectEqual(@as(?i64, 999), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'win';"));
+    try testing.expectEqual(@as(?i64, 999), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'lose';"));
+
+    // Shared 888: tie on enrichment_fetched_at → senshi ('qs') wins the CASE tiebreak,
+    // so title is 'Q senshi' and its own mal_id 222 stands (no sibling recovery needed).
+    try testing.expectEqualStrings("Q senshi", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 888;")).?);
+    try testing.expectEqual(@as(?i64, 222), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 888;"));
+    try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'pa';"));
+    try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'qs';"));
+
+    // Shared 777: freshness is the PRIMARY sort key — the fresher allanime binding
+    // ('fa', enrichment 5000) beats the staler senshi one ('ss', 1000), proving the
+    // enrichment DESC sort outranks the senshi CASE. Guards against a key reorder.
+    try testing.expectEqualStrings("Fresh AL", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 777;")).?);
+    try testing.expectEqual(@as(?i64, 333), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 777;"));
+
+    // Shared 666: two same-source bindings tied on enrichment resolve by lowest rowid
+    // (insertion order) — the first-seeded 'r1' wins deterministically, pinning the
+    // final tiebreak so a group can never collapse to two rows or a nondeterministic one.
+    try testing.expectEqualStrings("Rowid First", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 666;")).?);
+    try testing.expectEqual(@as(?i64, 661), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 666;"));
+
+    // Shared 321: a never-enriched binding (NULL enrichment_fetched_at) sorts LAST under
+    // the DESC primary key, so the enriched allanime 'ee' beats senshi 'ne' — the tie the
+    // two-provider future is most likely to hit (a freshly-added, un-enriched binding).
+    try testing.expectEqualStrings("Has Enrich", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 321;")).?);
+    try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
 }
 
 test "app_meta round-trips one-time flags (ROD-308)" {
