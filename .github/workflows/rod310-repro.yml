@@ -26,6 +26,7 @@ jobs:
       - name: Write the fake mpv (creates the IPC socket, accepts the watcher, exits 2)
         run: |
           cat > fake-mpv.py <<'PY'
+          #!/usr/bin/env python3
           import sys, os, socket, time
           ipc = None
           log = None
@@ -65,6 +66,9 @@ jobs:
           PY
           chmod +x fake-mpv.py
           python3 --version
+          # Self-test: it must exec via its shebang and exit 2, or the spike will
+          # short-circuit on InvalidExe and the repro is meaningless.
+          ./fake-mpv.py --input-ipc-server=/tmp/rod310-selftest.sock; echo "fake mpv exit=$? (expect 2)"
 
       - name: Repro — Debug (full safety checks + backtrace)
         continue-on-error: true
