@@ -14,6 +14,16 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-07-08
+
+### Fixed
+
+- **Failed playback no longer crashes zigoku on macOS**: if a stream failed to open — a transient CDN error when starting an episode, for instance — the app could crash outright on macOS instead of surfacing the failure. Playback errors now report as an error instead of taking the app down.
+
+- **History progress no longer overshoots the episode total**: an airing show whose episode count shrank after it wrapped could show a nonsensical progress fraction — e.g. `14 / 2 eps` — with a full bar. Watched count is now clamped to the total, so the fraction and bar always make sense.
+
+- **History's `/` filter now matches every title form**: filtering by name only checked a show's romaji title, so searching by the English or native name you actually see on screen — if that's your title-language setting — could turn up nothing. The filter now checks romaji, English, and native titles together, so a show is findable by whichever name is on screen.
+
 ## [0.3.0] - 2026-07-08
 
 ### Added
@@ -214,7 +224,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/vantroy/zigoku/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vantroy/zigoku/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/vantroy/zigoku/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/vantroy/zigoku/compare/v0.2.1...v0.2.2
