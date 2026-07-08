@@ -994,12 +994,27 @@ pub const Store = struct {
         // fallback for the unmatched tail (canonical_id NULL → the LEFT JOIN
         // yields NULLs → COALESCE takes the local column). User-state and the
         // binding key stay anime-only. Column ORDER is unchanged — the row
-        // builder below reads by fixed index. No-op on today's data: every
-        // anilist_id group is a singleton, so canonical was seeded == that row's own
-        // anime shadow (a shared-id group would instead read the backfill winner's
-        // values — dormant, per the V14 migration doc). The join starts to matter
-        // once ROD-312's writes land fresher enrichment on canonical than the local
-        // copy, or a second provider co-binds an id.
+        // builder below reads by fixed index.
+        //
+        // ROD-313 (spine 3/3): collapse multi-binding shows to one History card.
+        // Rows binding to the same canonical entity (senshi sub+dub, senshi + a future
+        // anipub) render once. Two invariants live in this GROUP BY:
+        //   1. COALESCE(canonical_id, -anime.rowid), never bare canonical_id: the
+        //      unmatched tail is canonical_id NULL and SQLite groups all NULLs as one,
+        //      so bare grouping would fuse the whole tail into a single card. -rowid is
+        //      unique and can't collide with a real (positive) anilist_id, so each
+        //      unmatched row stays its own group.
+        //   2. MAX(anime.last_watched_at) (the unread trailing column) selects the
+        //      representative: SQLite's single-max rule makes every bare column take its
+        //      value from the MAX row, so source_id/progress/user-state come from the
+        //      most-recently-watched binding — playing the card resumes that one.
+        //      Enrichment columns are group-invariant (co-bound rows share one canonical
+        //      via the join), so the pick decides only user-state, never metadata.
+        // Display-only: no row deleted, no user-state merged; the other binding's row and
+        // its resume state stay put, just off the collapsed card. ORDER BY is unchanged —
+        // the representative's last_watched_at IS the group max, so the card sorts to its
+        // most-recent activity. Reverts to the per-binding view by dropping the MAX
+        // column and the GROUP BY.
         const sql =
             \\SELECT anime.source, anime.source_id,
             \\    COALESCE(c.title, anime.title), COALESCE(c.title_english, anime.title_english),
@@ -1011,10 +1026,12 @@ pub const Store = struct {
             \\    COALESCE(c.start_year, anime.start_year), COALESCE(c.start_month, anime.start_month), COALESCE(c.start_day, anime.start_day), COALESCE(c.genres, anime.genres),
             \\    COALESCE(c.enrichment_fetched_at, anime.enrichment_fetched_at), COALESCE(c.enrichment_fieldset_version, anime.enrichment_fieldset_version), COALESCE(c.studios, anime.studios), COALESCE(c.duration, anime.duration),
             \\    COALESCE(c.source_material, anime.source_material), COALESCE(c.rank, anime.rank), COALESCE(c.rank_type, anime.rank_type), COALESCE(c.rank_year, anime.rank_year),
-            \\    COALESCE(c.next_airing_at, anime.next_airing_at), COALESCE(c.next_airing_episode, anime.next_airing_episode), COALESCE(c.country, anime.country)
+            \\    COALESCE(c.next_airing_at, anime.next_airing_at), COALESCE(c.next_airing_episode, anime.next_airing_episode), COALESCE(c.country, anime.country),
+            \\    MAX(anime.last_watched_at)
             \\FROM anime
             \\LEFT JOIN canonical_anime c ON anime.canonical_id = c.anilist_id
             \\WHERE anime.history_visible != 0
+            \\GROUP BY COALESCE(anime.canonical_id, -anime.rowid)
             \\ORDER BY anime.last_watched_at DESC NULLS LAST, anime.added_at DESC
         ;
         const stmt = try self.prepare(sql);
@@ -3421,6 +3438,75 @@ test "afterPlay completion gate reads airing status through canonical, not the l
     // auto-complete; reading the anime-local RELEASING would keep it .watching (ROD-296).
     try s.recordPlay(T_SOURCE, "g", 12, 2, true);
     try testing.expectEqual(domain.ListStatus.completed, (try s.getAnime(arena, T_SOURCE, "g")).?.list_status);
+}
+
+test "loadHistory collapses two bindings of one canonical entity to a single card (ROD-313)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // One show, two provider bindings resolving UP to the same canonical entity — a
+    // senshi sub/dub split, or senshi + a future anipub. Both tracked (visible). The
+    // user watched the sub most recently (last_watched 5000, ep 12); the dub is the
+    // older touch (4000, ep 3).
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (900, 'Frieren');");
+    try s.upsertAnime(.{
+        .source = "senshi",
+        .source_id = "sub",
+        .title = "Frieren",
+        .anilist_id = 900,
+        .canonical_id = 900,
+        .list_status = .watching,
+        .progress = 12,
+        .last_watched_at = 5000,
+        .history_visible = true,
+    }, 1000, arena);
+    try s.upsertAnime(.{
+        .source = "senshi",
+        .source_id = "dub",
+        .title = "Frieren",
+        .anilist_id = 900,
+        .canonical_id = 900,
+        .list_status = .watching,
+        .progress = 3,
+        .last_watched_at = 4000,
+        .history_visible = true,
+    }, 1001, arena);
+    try s.saveProgress("senshi", "sub", .sub, "12", 300, 1400, 5000);
+    try s.saveProgress("senshi", "dub", .dub, "3", 120, 1400, 4000);
+
+    // One card, not two.
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+
+    // The representative is the most-recently-watched binding (the sub), so the card's
+    // resume key and progress come from it — not the dub.
+    try testing.expectEqualStrings("sub", rows[0].source_id);
+    try testing.expectEqual(@as(i64, 12), rows[0].progress);
+
+    // Display-only: both bindings' rows and their resume state are untouched.
+    try testing.expect((try s.getAnime(arena, "senshi", "sub")) != null);
+    try testing.expect((try s.getAnime(arena, "senshi", "dub")) != null);
+    try testing.expect((try s.getResume("senshi", "sub", .sub, "12")) != null);
+    try testing.expect((try s.getResume("senshi", "dub", .dub, "3")) != null);
+}
+
+test "loadHistory does not collapse the unmatched (NULL canonical_id) tail into one card (ROD-313)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Two distinct unmatched shows — no anilist_id, no canonical binding. SQLite groups
+    // all NULLs together, so a bare `GROUP BY canonical_id` would fuse these (and the
+    // whole real-library tail) into a single card. The -rowid fallback keeps them apart.
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "u1", .title = "Unmatched One", .history_visible = true }, 1000, arena);
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "u2", .title = "Unmatched Two", .history_visible = true }, 1001, arena);
+
+    try testing.expectEqual(@as(usize, 2), (try s.loadHistory(arena)).len);
 }
 
 test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {
