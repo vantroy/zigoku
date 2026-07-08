@@ -75,6 +75,24 @@ fn progressFill(progress: i64, total_episodes: ?i64, bar_w: u16) u16 {
     return @intCast(@min(bw, f));
 }
 
+/// The numerator to render in the "N / M eps" fraction: the watch high-water,
+/// floored at 0 and clamped so it never exceeds a real (positive) total. A stale
+/// high-water above a shrunken total — AniList's planned count overwritten by a
+/// smaller aired count once a show is airing (ROD-297) — would otherwise render a
+/// nonsensical "14 / 2". `progressFill` already paints a full bar once
+/// progress ≥ total, so the clamped "2 / 2" matches the bar the user sees. This
+/// heals the display only; separating planned vs aired in the data model is the
+/// structural follow-up. The `@max(0, …)` floor mirrors `progressFill`'s use-site
+/// defense against a trust-boundary-crossed progress (see PROGRESS_MULT_CEILING),
+/// so a negative never renders "-5 / 12". A non-positive total (the AllAnime
+/// `total_episodes = 0` quirk) has no real denominator to clamp against, so the
+/// floored progress passes through — preserving the pre-existing "N / 0" display.
+fn clampFrac(progress: i64, total: i64) i64 {
+    const p = @max(0, progress);
+    if (total <= 0) return p;
+    return @min(p, total);
+}
+
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette, selected: bool, list_focused: bool) void {
     const is_paused = rec.list_status == .paused;
 
@@ -95,7 +113,7 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail:
     put(win, row, col + 1 + bar_w, "]", style(pal.fg3, .{ .bg = row_bg }));
 
     const frac: []const u8 = if (rec.total_episodes) |total|
-        std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ rec.progress, total }) catch ""
+        std.fmt.bufPrint(frac_buf, "  {d} / {d} eps", .{ clampFrac(rec.progress, total), total }) catch ""
     else
         std.fmt.bufPrint(frac_buf, "  {d} / ? eps", .{rec.progress}) catch "";
     // Clip the frac to whatever the bar row budget leaves after the bracketed bar,
@@ -260,6 +278,26 @@ test "progressFill: proportional, clamped, and overflow-proof on a hostile progr
     // And even with a corrupt-huge total (so p < total, forcing the multiply path),
     // the capped operand keeps the product from overflowing.
     _ = progressFill(std.math.maxInt(i64) - 1, std.math.maxInt(i64), 40); // must not panic
+}
+
+test "clampFrac: caps the shown numerator at a real total (ROD-297)" {
+    // Progress within the total is shown verbatim.
+    try std.testing.expectEqual(@as(i64, 2), clampFrac(2, 12));
+    // The bug: a stale high-water above a shrunken total renders as the total,
+    // never "14 / 2" — the planned count was overwritten by the smaller aired count.
+    try std.testing.expectEqual(@as(i64, 2), clampFrac(14, 2));
+    // Exactly caught up passes through unchanged.
+    try std.testing.expectEqual(@as(i64, 12), clampFrac(12, 12));
+    // AllAnime `total_episodes = 0` quirk: no real denominator, so a positive
+    // progress passes through (keeps the pre-existing "N / 0" display, not "0 / 0").
+    try std.testing.expectEqual(@as(i64, 5), clampFrac(5, 0));
+    // A negative total is treated the same as the 0 quirk.
+    try std.testing.expectEqual(@as(i64, 5), clampFrac(5, -3));
+    // Negative progress floors to empty, mirroring progressFill's use-site defense
+    // against a trust-boundary-crossed value — never "-5 / 12" or a negative in
+    // the 0-quirk branch.
+    try std.testing.expectEqual(@as(i64, 0), clampFrac(-5, 12));
+    try std.testing.expectEqual(@as(i64, 0), clampFrac(-5, 0));
 }
 
 test "barFillColor: focus cyan is the cursor, and the cursor overrides status (ROD-194)" {
