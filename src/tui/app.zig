@@ -1,19 +1,15 @@
 //! Zigoku — TUI shell (ROD-71).
 //!
-//! The libvaxis application skeleton the rest of M3 builds into. It owns:
+//! The libvaxis application skeleton the rest of the app builds into. It owns:
 //!   - vaxis init / alt-screen / teardown,
-//!   - the event loop with a clean render/tick split (tick mutates state,
-//!     draw is a pure function of state),
+//!   - the event loop with a clean render/tick split (tick mutates state, draw is a
+//!     pure function of state),
 //!   - resize handling,
 //!   - the worker→UI seam: background work posts into vaxis's event queue via
-//!     Loop.postEvent, and the main loop drains it through nextEvent. Here that
-//!     seam loads watch History off a background thread; ROD-73's async search
-//!     rides the same rail.
+//!     Loop.postEvent, and the main loop drains it through nextEvent.
 //!
-//! Landing view is History (locked decision — AllAnime is search-first with no
-//! popular feed, so there's nothing to populate a Browse-idle screen with).
-//! The polished views land in their own issues: tabs (ROD-72), search (ROD-73),
-//! detail pane (ROD-74), history filter/progress bars (ROD-75), toasts (ROD-76).
+//! Landing view is History (a locked default; the startup view is resolved from
+//! config.landingEnum below).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -151,14 +147,12 @@ pub fn run(
             vx.caps.rgb = true;
     }
 
-    // Drain events that accumulated during queryTerminal before the first paint.
-    // The tty reader thread may have posted an initial .winsize event (Loop.zig
-    // ttyRun lines 164–167) and/or CPR-derived key_press events: vaxis's
-    // explicit_width/scaled_text queries produce \e[1;1R which Parser.zig decodes
-    // as F3-no-mods ('R' => Key.f3); Loop.zig's guard only consumes F3+shift/alt,
-    // so F3-no-mods leaks through and would trigger our Discover keybind (ROD-249;
-    // it was Settings before the F3/F4 swap). The
-    // tty.getWinsize() call below compensates for any swallowed .winsize event.
+    // Drain events that accumulated during queryTerminal before the first paint. The
+    // tty reader may have posted an initial .winsize and/or CPR-derived key_press:
+    // vaxis's width queries produce \e[1;1R, which Parser decodes as F3-no-mods, and
+    // Loop's guard only consumes F3+shift/alt, so it leaks through and would trigger the
+    // Discover keybind (ROD-249). getWinsize() below compensates for a swallowed
+    // .winsize.
     while (loop.tryEvent() catch null) |_| {}
 
     // Size the screen to the terminal NOW — vx.window() reads vx.screen, which
@@ -199,16 +193,13 @@ pub fn run(
     defer app.deinitOwnedState(&vx, writer);
 
     // ── AniList connection (ROD-291) ──────────────────────────────────────────
-    // Resolve the token once at boot into a session-lived arena so the action-sync
-    // coordinator can hand it to each background flush without re-reading the file.
-    // Best-effort, exactly like the CLI's runSync: an absent or unreadable token
-    // leaves `anilist_connected` false, and every armSyncFlush is then a no-op — the
-    // TUI runs identically, the sync side rail simply never fires. A mid-session expiry
-    // is deliberately NOT re-checked here (the flush's pull/push both return a no-op and
-    // the handler drops `anilist_connected`; the reconnect nudge is ROD-295). The arena
-    // outlives every flush thread on the error-unwind path — its deinit defer is
-    // registered before the sync-thread join below, so LIFO frees the token only after
-    // that join. (On the ordinary quit path both are skipped by `_exit`.)
+    // Resolve the token once at boot into a session-lived arena so each background
+    // flush reuses it without re-reading the file. Best-effort like the CLI's runSync:
+    // an absent/unreadable token leaves `anilist_connected` false and every armSyncFlush
+    // a no-op. Mid-session expiry is not re-checked here (the flush returns a no-op and
+    // drops `anilist_connected`; reconnect nudge is ROD-295). The arena's deinit defer is
+    // registered before the sync-thread join, so LIFO frees the token only after that
+    // join on the error-unwind path (the quit path skips both via `_exit`).
     var auth_arena = std.heap.ArenaAllocator.init(gpa);
     defer auth_arena.deinit();
     if (auth_mod.defaultPath(auth_arena.allocator())) |auth_path| {
@@ -219,21 +210,18 @@ pub fn run(
         log.debug("anilist: no config dir for token: {s}", .{@errorName(e)});
     }
 
-    // Seed the tick clock now so a mutation landing before the first .tick (e.g. a
-    // scripted keypress at launch, as a capture/e2e harness fires) arms the sync
-    // debounce off a real timestamp instead of the 0 default — otherwise that first
-    // deadline would be ~3 s past the epoch and fire on the very next tick, collapsing
-    // the debounce window (ROD-291 review).
+    // Seed the tick clock now so a mutation landing before the first .tick (a scripted
+    // launch keypress from a capture/e2e harness) arms the sync debounce off a real
+    // timestamp, not the 0 default (which would put the first deadline ~3s past the
+    // epoch and fire on the next tick, collapsing the debounce window; ROD-291 review).
     app.now_ms = nowMs(io);
 
-    // History memory lives in a double-buffered pair of arenas owned here and
-    // freed on exit (ROD-191), matching store.loadHistory's arena-in contract.
-    // At any moment one arena backs the live `self.history` slice (`hist_live`);
-    // the other is idle. A post-playback reload fills the idle arena off-thread
-    // and swaps via setHistory once .history_loaded lands — so the old slice stays
-    // valid for vaxis until the new one is ready, and the just-freed arena becomes
-    // the next reload's target. (ROD-141: a slice handed to vaxis must outlive the
-    // frame; that applies to the whole history slice here, not just a chip.)
+    // History memory lives in a double-buffered pair of arenas owned here, freed on
+    // exit (ROD-191). One arena backs the live `self.history` slice (`hist_live`), the
+    // other is idle; a post-playback reload fills the idle arena off-thread and swaps
+    // via setHistory once .history_loaded lands, so the old slice stays valid for vaxis
+    // until the new one is ready. (ROD-141: a slice handed to vaxis must outlive the
+    // frame; that applies to the whole history slice, not just a chip.)
     var hist_arenas: [2]std.heap.ArenaAllocator = .{
         std.heap.ArenaAllocator.init(gpa),
         std.heap.ArenaAllocator.init(gpa),
@@ -245,17 +233,14 @@ pub fn run(
     // result into the same queue the tty reader feeds; tick() drains it. The
     // thread is short-lived and joined before teardown.
     var hist_thread: ?std.Thread = null;
-    // On quit, abandon an in-flight history query before joining so teardown
-    // never blocks on the SELECT: sqlite3_interrupt makes the worker's
-    // sqlite3_step bail, the join returns at once, and the discarded result is
-    // never read. (The episode-prefetch half of ROD-179 is handled separately: a
-    // superseded fetch is detached, not joined — see `episode_drain`.)
+    // On quit, abandon an in-flight history query before joining so teardown never
+    // blocks on the SELECT: sqlite3_interrupt makes the worker's sqlite3_step bail, the
+    // join returns at once, the discarded result is never read. (The episode-prefetch
+    // half of ROD-179 detaches a superseded fetch instead; see `episode_drain`.)
     //
-    // Declared before the search/enrich joins and the episode drain below, so by
-    // LIFO it runs *after* them: every other worker is already reaped when
-    // interrupt fires, so the interrupt can only hit loadHistory's statement —
-    // never a statement another worker started (interrupt also affects statements
-    // that begin before it returns).
+    // Declared before the search/enrich joins and episode drain, so by LIFO it runs
+    // AFTER them: every other worker is already reaped when interrupt fires, so it can
+    // only hit loadHistory's statement, never one another worker started.
     defer if (hist_thread) |t| {
         if (store) |st| st.interrupt();
         t.join();
@@ -281,13 +266,10 @@ pub fn run(
     defer if (app.enrich_thread) |t| t.join();
     // ROD-291: join an in-flight AniList flush on the error-unwind / test teardown path
     // so it can't touch a torn-down loop/store/gpa or the freed token arena. Like the
-    // search/enrich/cover joins above, this defer is SKIPPED on the ordinary quit path —
-    // `q`/Ctrl-C fall through to the ROD-232 fast-exit `_exit(0)`, which abandons every
-    // in-flight worker atomically. That's safe for this writer: the DB is WAL crash-safe
-    // and SaveMediaListEntry is idempotent, so a push abandoned before its markSynced
-    // leaves the row dirty and re-flushes next session. (ROD-294 will add a bounded quit
-    // wait if we want the flush to actually finish on quit — there's nothing to bound
-    // today, since quit never waits on it.)
+    // search/enrich/cover joins above, this defer is SKIPPED on the ordinary quit path
+    // (q/Ctrl-C fall through to the ROD-232 fast-exit `_exit(0)`). Safe for this writer:
+    // the DB is WAL crash-safe and SaveMediaListEntry is idempotent, so a push abandoned
+    // before its markSynced leaves the row dirty and re-flushes next session.
     defer if (app.sync_thread) |t| t.join();
     // ROD-286: reap an open connect modal on the error-unwind / test path — cancel the
     // worker (waking its blocked accept), join it, close the listener, free the arena.
@@ -418,42 +400,33 @@ pub fn run(
         try app.draw(&vx, writer);
     }
 
-    // ROD-232: fast-exit on the quit path. Falling out of the loop only happens
-    // on a user quit (q / Ctrl-C set should_quit; nothing else does), and a user
-    // quit has nothing to wait for. The durable writes already landed: Settings
-    // saves synchronously before should_quit (leaveSettings → config save in
-    // onKey), and playback progress is checkpointed on the main thread as
-    // .position_update events arrive — so abandoning the play worker loses at
-    // most the last few seconds of resume position, not the row (mpv, a detached
-    // child, keeps running; the old play_thread join would have blocked quit on
-    // it). The other in-flight workers (enrich/episode/cover/search) are network
-    // reads; the DB is autocommit and the one on-disk writer (the cover cache) is
-    // crash-safe via atomic rename. So instead of the graceful drain below —
-    // which can sit 5+s on each worker's withDeadline wall clock (ROD-153) and
-    // can deadlock when the bounded event queue fills (a worker's final postEvent
-    // blocks in push() while the main loop has stopped popping; ROD-179 widened
-    // it to N workers) — restore the terminal and terminate, abandoning the
-    // workers for the OS to reap: no wait, no full-queue hang.
+    // ROD-232: fast-exit on the quit path. Falling out of the loop only happens on a
+    // user quit (q / Ctrl-C), which has nothing to wait for: the durable writes already
+    // landed (Settings saves synchronously in onKey; playback progress is checkpointed
+    // on the main thread as .position_update events arrive), so abandoning the play
+    // worker loses at most a few seconds of resume position, not the row (mpv is a
+    // detached child and keeps running). The other workers (enrich/episode/cover/search)
+    // are network reads; the DB is autocommit and the cover cache is crash-safe via
+    // atomic rename. So rather than the graceful drain below (which can sit 5+s on each
+    // worker's withDeadline (ROD-153) and can deadlock when the bounded event queue
+    // fills, a worker's final postEvent blocking in push() while the loop stopped
+    // popping; ROD-179), we restore the terminal and terminate, leaving the workers for
+    // the OS to reap.
     //
-    // Terminate, don't return: the abandoned workers postEvent into the loop's
-    // queue, so the queue must die *with* the process — we can't loop.stop() it
-    // out from under them first or we get a use-after-free. And it must be _exit,
-    // not std.process.exit: libc is linked (build.zig), so the latter routes
-    // through C exit(), which runs atexit handlers and flushes stdio on *this*
-    // thread while the workers are still live — the exact teardown-wedge hazard
-    // we're killing. _exit issues the exit syscall directly: no handlers, no
-    // locks, no stdio. The terminal is already restored and flushed below before
-    // we call it, and every defer (the ThreadDrain barrier + the search/enrich/
-    // cover/play joins) is skipped — those stay for the error-unwind path and
-    // tests, which can't _exit.
-    // ROD-238: this session used Kitty graphics, so a stray terminal response
-    // could still be sitting in the tty queue at exit. The per-frame placement
-    // acks the ROD-236 drain chased are gone at the source now — the vaxis fork
-    // places covers with the `q=2` quiet flag, so the terminal never acks them —
-    // but we still do a fast residual sweep below (and clear the images here)
-    // when a cover was shown. `next_img_id` starts at 1 and only `transmitImage`
-    // bumps it, so `> 1` means a cover was sent; a cover-less quit pays nothing.
-    // Captured before `vx.deinit`.
+    // Terminate, don't return: the abandoned workers postEvent into the loop's queue, so
+    // the queue must die WITH the process; we can't loop.stop() out from under them
+    // (use-after-free). And it must be _exit, not std.process.exit: libc is linked, so
+    // the latter routes through C exit(), which runs atexit handlers and flushes stdio on
+    // THIS thread while the workers are still live: the exact wedge we're killing. _exit
+    // is the exit syscall directly, no handlers/locks/stdio. The terminal is restored and
+    // flushed below first, and every defer (the ThreadDrain barrier + the worker joins)
+    // is skipped; those stay for the error-unwind path and tests, which can't _exit.
+    //
+    // ROD-238: a Kitty cover can leave a stray terminal response in the tty queue at
+    // exit (the vaxis fork's q=2 quiet placement means the terminal never acks, but we
+    // still sweep residuals below and clear the images here when a cover was shown).
+    // `next_img_id` starts at 1 and only `transmitImage` bumps it, so `> 1` means a
+    // cover was sent; a cover-less quit pays nothing. Captured before `vx.deinit`.
     const transmitted_cover = vx.next_img_id > 1;
     if (vx.caps.kitty_graphics) {
         // Drop lingering cover images explicitly — leaving the alt-screen does
@@ -493,23 +466,20 @@ pub fn run(
 /// (vaxis's `ctlseqs.kitty_graphics_clear` omits `q`). ROD-238.
 const kitty_graphics_clear_quiet = "\x1b_Ga=d,q=2\x1b\\";
 
-/// ROD-238: a fast residual sweep of the tty input queue before the ROD-232
-/// `_exit`. The real fix is upstream of here — the vaxis fork places cover images
-/// with the Kitty `q=2` quiet flag, so the terminal no longer acks each per-frame
-/// placement and the `_Gi=N;OK` flood ROD-236 chased never exists. This is the
-/// belt-and-suspenders pass for any lone byte already sitting in the buffer (a
-/// stray response, a final keypress) so it can't echo onto the shell.
+/// ROD-238: a fast residual sweep of the tty input queue before the ROD-232 `_exit`.
+/// The real fix is upstream: the vaxis fork places covers with the Kitty `q=2` quiet
+/// flag, so the terminal no longer acks each placement and the `_Gi=N;OK` flood ROD-236
+/// chased never exists. This is belt-and-suspenders for any lone byte already in the
+/// buffer (a stray response, a final keypress) so it can't echo onto the shell.
 ///
-/// Deliberately NOT a sentinel fence: with the flood gone there is nothing to
-/// fence against, and a sentinel's own reply would become the one response left
-/// in flight — over a high-latency link (tmux/SSH) a bounded wait could give up
-/// before it round-trips and leak `ESC [ ? … c` instead, recreating the very bug
-/// (ROD-236 leaked over exactly such a link). So we only drain what has already
-/// arrived: poll a short grace window, and the instant a poll finds nothing
-/// readable we stop — a clean quit (the q=2 norm) returns in one poll. Bounded by
-/// `max_rounds * poll_ms` so a chatty stream can't wedge quit. Best-effort;
-/// racing the still-parked reader thread is safe (it swallows read errors). The
-/// fd is left non-blocking on return — we `_exit` next, so it is never restored.
+/// Deliberately NOT a sentinel fence: with the flood gone there is nothing to fence, and
+/// a sentinel's own reply would become the response left in flight; over a high-latency
+/// link (tmux/SSH) a bounded wait could give up before it round-trips and leak `ESC [ ?
+/// … c`, recreating the very bug (ROD-236 leaked over exactly such a link). So we drain
+/// only what has already arrived: poll a short grace window and stop the instant a poll
+/// finds nothing (a clean q=2 quit returns in one poll), bounded by `max_rounds *
+/// poll_ms`. Best-effort; racing the parked reader is safe (it swallows read errors).
+/// The fd is left non-blocking on return, since we `_exit` next.
 pub fn drainTtyResponses(fd: std.posix.fd_t) void {
     // fcntl moved behind Io in Zig 0.16; with libc linked, std.c.fcntl is the
     // escape (matches the std.c.unlink/c.time pattern already in store.zig).
@@ -781,18 +751,14 @@ pub const App = struct {
     /// the UI.
     enrich_thread: ?std.Thread = null,
 
-    /// Drain barrier for all three Discover async workers — the Popular feed fetch
-    /// (ROD-239), the lazy zoom-enrich (ROD-239), and the page batch-enrich (ROD-247).
-    /// Before ROD-251 each had its own `?std.Thread` handle joined *on the event
-    /// thread* before spawning the replacement, so cycling windows (1→2→3→4) on a
-    /// slow link froze the UI on the prior fetch's join. Now every worker is detached
-    /// and accounted here, exactly like `episode_drain`: a superseded fetch is never
-    /// joined, its stale result is keep-checked away on arrival (the popular_done
-    /// per-window slot and the merge-by-id in the enrich handlers), and teardown just
-    /// waits the in-flight set out. Concurrency is free here — unlike the cover caches
-    /// (ROD-243), these workers own their input copies and only `postEvent`, touching
-    /// no shared App state. One counter suffices: teardown only needs "none in flight",
-    /// and the three thread handles existed solely to enable the join we've removed.
+    /// Drain barrier for the three Discover async workers: the Popular feed fetch, the
+    /// lazy zoom-enrich, and the page batch-enrich. Before ROD-251 each had its own
+    /// thread handle joined ON the event thread before spawning its replacement, so
+    /// cycling windows (1→2→3→4) on a slow link froze the UI on the prior join. Now every
+    /// worker is detached and accounted here like `episode_drain`: a superseded fetch is
+    /// never joined, its stale result is keep-checked away on arrival, and teardown waits
+    /// the in-flight set out. Concurrency is free (these workers own their input copies
+    /// and only `postEvent`, touching no shared App state), so one counter suffices.
     discover_drain: workers.ThreadDrain = .{},
 
     /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
@@ -966,18 +932,17 @@ pub const App = struct {
     /// from esc-cancel, or from run() teardown on the error-unwind/test path.
     connect: ?ConnectState = null,
     /// Session-lived homes for tokens RELOADED after in-session connects. Boot's token
-    /// lives in run()'s auth arena; a fresh connect persists auth.zon and reloads it
-    /// into a new boxed arena here so `anilist_auth`'s slices outlive the (short-lived)
-    /// connect arena.
+    /// lives in run()'s auth arena; a fresh connect persists auth.zon and reloads it into
+    /// a new boxed arena here so `anilist_auth`'s slices outlive the short-lived connect
+    /// arena.
     ///
-    /// A LIST, not a single slot, and never freed mid-session (C1, ROD-286 crew review):
-    /// `spawnSyncWorker` hands `anilist_auth` to a flush worker BY VALUE — slices and
-    /// all — and a paced push holds those slices for many seconds. A second in-session
-    /// connect must NOT free the arena a still-running flush is reading its bearer token
-    /// from, so each reconnect RETIRES the prior arena here rather than freeing it.
-    /// `anilist_auth` always points into the last entry. All are freed together in
-    /// `deinitOwnedState`, which runs LAST (LIFO) — after every sync-worker join — so no
-    /// flush can outlive its token. Reconnects are rare, so the held arenas are few.
+    /// A LIST, not a single slot, and never freed mid-session (ROD-286): `spawnSyncWorker`
+    /// hands `anilist_auth` to a flush worker BY VALUE, slices and all, and a paced push
+    /// holds them for many seconds. A second connect must NOT free the arena a running
+    /// flush is reading its token from, so each reconnect RETIRES the prior arena rather
+    /// than freeing it (`anilist_auth` always points into the last entry). All are freed
+    /// together in `deinitOwnedState`, which runs LAST (LIFO, after every sync-worker
+    /// join), so no flush can outlive its token.
     auth_reload_arenas: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
 
     /// Last-seen terminal width (columns). Seeded in layout() every frame from
@@ -1071,18 +1036,14 @@ pub const App = struct {
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
         const cap = self.toast_queue.len;
 
-        // Persistent toasts are a per-topic SINGLETON (ROD-293 review). The clear side
-        // (search_done/popular_done) already wipes persistent slots by topic, and the
-        // doc contract above assumes one persistent toast per topic — so enforce it on
-        // the push side too: refresh an existing same-topic persistent slot in place
-        // rather than appending a duplicate. Without this, repeated failures (typing
-        // offline → task_error, cycling Discover windows offline → popular_error) stack
+        // Persistent toasts are a per-topic SINGLETON (ROD-293): refresh an existing
+        // same-topic persistent slot in place rather than appending a duplicate. Without
+        // this, repeated failures (typing offline, cycling Discover offline) stack
         // duplicate persistent toasts until all three slots are persistent, and the
-        // evict-oldest-non-persistent policy below then has no slot to take — starving
-        // every later toast, transient successes included. With it, persistent occupancy
-        // is capped at the two persistent topics (.general, .feed), so a free
-        // (evictable) slot for transients always exists and the all-persistent branch is
-        // structurally unreachable.
+        // evict-oldest-non-persistent policy below then has no slot to take, starving
+        // every later toast including transient successes. With it, persistent occupancy
+        // is capped at the two persistent topics (.general, .feed), so a free slot for
+        // transients always exists and the all-persistent branch is unreachable.
         if (persistent) {
             for (&self.toast_queue) |*slot| {
                 if (slot.*) |existing| {
@@ -1103,14 +1064,12 @@ pub const App = struct {
         }
         if (idx == cap) {
             // Queue full: evict the OLDEST NON-persistent toast so a still-showing
-            // persistent error is never shifted out to make room for a transient
-            // whisper. ROD-293 chaos review caught the underlying hazard: a two-way sync
-            // flush now pushes TWO toasts at once (↓ then ↑), doubling the eviction
-            // pressure on this 3-slot FIFO, and the old blind evict-slot-0 dropped a
-            // persistent banner the user needed. The per-topic singleton above
-            // guarantees a non-persistent slot exists here; the all-persistent fallback
-            // is defensive only — log and evict the oldest so new info still lands,
-            // never a silent permanent starve.
+            // persistent error is never shifted out for a transient whisper (ROD-293
+            // chaos review: a two-way sync flush pushes TWO toasts at once, ↓ then ↑,
+            // and the old blind evict-slot-0 dropped a persistent banner). The per-topic
+            // singleton above guarantees a non-persistent slot exists; the all-persistent
+            // fallback is defensive only, logging and evicting the oldest so new info
+            // still lands rather than silently starving.
             var victim: usize = 0;
             const found = for (self.toast_queue, 0..) |slot, i| {
                 if (slot) |t| {
@@ -1390,22 +1349,17 @@ pub const App = struct {
         return u.reachedCompletion(store_mod.NATURAL_END_RATIO);
     }
 
-    /// The §4.7 toast line for a play/episode failure cause, formatted into `buf`,
-    /// or null when `cause` isn't one we differentiate — the caller supplies its
-    /// own generic fallback ("couldn't load episodes" / "playback failed"). Two
-    /// families: the source classes (ROD-173 — network / blocked / server /
-    /// generic; the source-named ones interpolate `provider.displayName()`, the
-    /// one seam, never hardcode the site name) and the player-spawn classes
-    /// (ROD-230 — mpv missing vs crashed; about the local mpv binary, not the
-    /// source, so static with no name to interpolate). The player-spawn arms only
-    /// fire on the play path; `episodes_error` shares this mapper but can never
-    /// produce an mpv cause (it never spawns mpv) — a third caller must not assume
-    /// these arms apply. These phrasings are the runtime source of truth paired
-    /// with DESIGN.md §4.10; both move together. A
-    /// short source name keeps the copy within the §4.7 36-col budget and a long
-    /// one is truncated by pushToast (ROD-166); an extreme name that overflows
-    /// `buf` falls through to the generic line via `catch null`. Data-shape errors
-    /// (NoEpisodeData, NoDirectStream…) also fall through.
+    /// The §4.7 toast line for a play/episode failure cause, formatted into `buf`, or
+    /// null when `cause` isn't one we differentiate (the caller supplies its own generic
+    /// fallback). Two families: source classes (ROD-173; the source-named ones
+    /// interpolate `provider.displayName()`, never a hardcoded site name) and
+    /// player-spawn classes (ROD-230, about the local mpv binary, so static). The
+    /// player-spawn arms only fire on the play path; `episodes_error` shares this mapper
+    /// but never spawns mpv, so a third caller must not assume those arms apply. These
+    /// phrasings pair with DESIGN.md §4.10 and move together. A short source name keeps
+    /// the copy within the §4.7 36-col budget; a long one is truncated by pushToast
+    /// (ROD-166), and an overflow of `buf` falls through to the generic line via `catch
+    /// null`, as do data-shape errors (NoEpisodeData, NoDirectStream).
     fn failureClassCopy(cause: anyerror, source_name: []const u8, buf: []u8) ?[]const u8 {
         return switch (cause) {
             // Source classes (ROD-173).
@@ -1421,23 +1375,19 @@ pub const App = struct {
         };
     }
 
-    /// Arm the debounced AniList sync (ROD-291). Called at each local mutation that can
-    /// move a linked row's (list_status, progress) pair — a finished episode, a status
-    /// key (p/x/c/w), an undo. Gated on a cached usable token so an unconnected session
-    /// never touches the machinery. Only sets the deadline; .tick fires the actual
-    /// off-thread flush once it elapses, coalescing a burst into one. Uses the last-tick
-    /// clock (`now_ms`, seeded once at boot so it is never the 0 default here) rather
-    /// than a fresh syscall — a ≤100 ms-stale timestamp is immaterial against a 3 s
-    /// settle, and it keeps every call site free of an `io` param.
-    /// Both conditions the sync rail needs: a usable token (`anilist_connected`) AND
-    /// the user hasn't paused sync (the ROD-286 `anilist_sync_enabled` master switch).
-    /// Every arm/fire gate reads this, so flipping the Settings toggle off makes the
-    /// whole rail inert — no arm, no flush, no launch pull, no connect bootstrap —
-    /// without touching the token; flip it back on and sync resumes.
+    /// The sync rail's master gate: a usable token (`anilist_connected`) AND the user
+    /// hasn't paused sync (the ROD-286 `anilist_sync_enabled` toggle). Every arm/fire
+    /// reads this, so flipping the toggle off makes the whole rail inert (no arm, flush,
+    /// launch pull, or connect bootstrap) without touching the token.
     fn syncEnabled(self: *const App) bool {
         return self.anilist_connected and self.config.anilist_sync_enabled;
     }
 
+    /// Arm the debounced AniList sync (ROD-291) at a local mutation that can move a linked
+    /// row's (list_status, progress): a finished episode, a status key, an undo. Only sets
+    /// the deadline; .tick fires the off-thread flush once it elapses, coalescing a burst
+    /// into one. Uses the last-tick `now_ms` (a ≤100ms-stale stamp is immaterial against a
+    /// 3s settle) so no call site needs an `io` param.
     fn armSyncFlush(self: *App) void {
         if (!self.syncEnabled()) return;
         self.sync_flush_deadline_ms = self.now_ms + App.sync_flush_settle_ms;
@@ -1445,17 +1395,15 @@ pub const App = struct {
 
     /// Fire the debounced flush (ROD-291): spawn `syncFlushTask` (pull-then-push, off the
     /// render thread) when `sync_flush_deadline_ms` elapses. Both engines are total, so
-    /// this is just "kick a worker" — no per-row plumbing, and a dropped run self-heals
-    /// (rows stay dirty for the next arm/launch). One flush at a time: if one is still
-    /// running, re-arm rather than stack a second onto the same dirty set.
+    /// this just kicks a worker; a dropped run self-heals (rows stay dirty for the next
+    /// arm/launch). One at a time: if a flush is still running, re-arm rather than stack a
+    /// second on the same dirty set.
     ///
-    /// NOTE (tested-debt): the whole body short-circuits under `builtin.is_test` — it
-    /// spawns a real thread that hits the network, which a unit test can't have. So the
-    /// inflight gate, the reap-before-spawn, and the spawn-failure recovery below are
-    /// exercised only by hand / integration, not the suite. Accepted deliberately: the
-    /// tested logic lives in the pure engines (`sync.zig`'s `reconcile` + its `Effects`
-    /// seam); this function is orchestration around a thread spawn that has no
-    /// unit-testable seam worth the contortion. Keep it thin so that stays true.
+    /// Tested-debt: the body short-circuits under `builtin.is_test` (it spawns a real
+    /// network thread), so the inflight gate, reap-before-spawn, and spawn-failure
+    /// recovery are exercised only by hand. Accepted: the tested logic is in the pure
+    /// engines (`sync.zig`'s `reconcile` + `Effects` seam); this is thin orchestration
+    /// around a thread spawn with no unit-testable seam worth the contortion.
     fn fireSyncFlush(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return; // don't spawn a real network flush under test
         const st = self.store orelse return;
@@ -1475,16 +1423,12 @@ pub const App = struct {
     }
 
     /// Background pull-on-launch (ROD-293): one `MediaListCollection` round trip at
-    /// startup so local reflects edits made on other devices (an episode watched in the
-    /// AniList mobile app) since last run. Pull-ONLY — the paced push belongs to the
-    /// action flush (ROD-291) and the quit flush (ROD-294), never the launch fast-path.
-    /// Shares the one-at-a-time gate and thread handle with the action flush: this is the
-    /// session's first spawn (gate clear, `sync_thread` null), but guard uniformly so it
-    /// can never stack a second sync onto the same store. Ambient — a reconciled remote
-    /// change flags a history reload via the shared `.sync_flushed` handler and whispers
-    /// `↓ N from AniList` (`pushed = 0`, so no ↑ line). Called once from run(); the
-    /// `is_test` guard matches `fireSyncFlush` (run() has no unit-test path, but keep the
-    /// two symmetric).
+    /// startup so local reflects edits made on other devices since last run. Pull-ONLY;
+    /// the paced push belongs to the action flush (ROD-291) and quit flush (ROD-294).
+    /// Shares the one-at-a-time gate and thread handle with the action flush (guard
+    /// uniformly so it can never stack a second sync). Ambient: a reconciled remote change
+    /// flags a history reload and whispers `↓ N from AniList` (no ↑ line). Called once
+    /// from run(); the `is_test` guard matches `fireSyncFlush`.
     fn fireLaunchPull(self: *App, loop: *Loop, io: std.Io) void {
         if (builtin.is_test) return; // don't spawn a real network pull under test
         const st = self.store orelse return;
@@ -2164,16 +2108,14 @@ pub const App = struct {
                 // the next view retries rather than waiting out the TTL on a failed fetch.
                 if (ev.answered) {
                     if (self.store) |st| {
-                        // Persist the fresh content — upsert's COALESCE overwrites the
-                        // drift fields (status/score/description/total_episodes),
-                        // preserves the user columns, and keeps any field AniList
-                        // returned null for — with a fresh freshness stamp, then flag a
-                        // history reload so the open detail/list reflect it.
-                        // history_visible stays false: the MAX-merge preserves the row's
-                        // stored visibility, so a Browse refresh of a hidden cache row
-                        // never reveals an untracked show. ROD-280: stamp_fresh=true here
-                        // — we're inside `if (ev.answered)`, so this only runs on a
-                        // confirmed answer; Store.upsertEnriched owns the stamp gate.
+                        // Persist the fresh content: upsert's COALESCE overwrites the
+                        // drift fields (status/score/description/total_episodes), preserves
+                        // user columns, keeps any field AniList returned null for, and
+                        // stamps freshness, then flags a history reload. history_visible
+                        // stays false: the MAX-merge preserves the row's stored visibility,
+                        // so a Browse refresh of a hidden cache row never reveals an
+                        // untracked show. stamp_fresh=true is safe here (inside
+                        // `if (ev.answered)`, a confirmed answer; upsertEnriched owns the gate).
                         var arena = std.heap.ArenaAllocator.init(self.gpa);
                         defer arena.deinit();
                         st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
@@ -2228,17 +2170,15 @@ pub const App = struct {
                     }
                     // seed_arena (and rec's browse-origin slices) freed here.
                 }
-                // ROD-130: mirror the fresh fetch into the DB + hot LRU so the
-                // next visit to this show is a synchronous cache hit. Source/status
-                // are resolved from nav state here and handed to the subsystem
-                // (ROD-180).
+                // ROD-130: mirror the fresh fetch into the DB + hot LRU so the next visit
+                // to this show is a synchronous cache hit. Source/status are resolved from
+                // nav state here (ROD-180).
                 //
-                // NOTE: currentDetailSourceName reads live UI state. If
-                // the user returned to the History list before this async result
-                // arrived, it falls back to provider.name(), which can mis-key a
-                // non-default-source history show. Harmless today (a mis-keyed entry
-                // is simply never served and ages out), to be fixed by ROD-170,
-                // which captures the fetch's source at fire time.
+                // NOTE: currentDetailSourceName reads live UI state; if the user returned
+                // to the History list before this async result arrived, it falls back to
+                // provider.name() and can mis-key a non-default-source show. Harmless today
+                // (a mis-keyed entry is never served and ages out); ROD-170 will capture
+                // the fetch's source at fire time.
                 const source = selection.currentDetailSourceName(self, provider);
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
@@ -2445,17 +2385,15 @@ pub const App = struct {
         };
     }
 
-    /// Soft cap on concurrently-spawned Discover background workers (ROD-264 #3).
-    /// The feed fetch + zoom enrich + batch enrich each spawn an uncapped raw
-    /// `std.Thread` and share the one `Io.Threaded` pool. A saturation storm (rapid
-    /// paging + zoom + prefetch on a slow link) could pile enough live threads to
-    /// approach the OS thread/fd ceiling — where `std.Thread.spawn` starts failing,
-    /// which is exactly what tips a fetch onto `withDeadline`'s unbounded inline
-    /// fallback (ROD-264 #1; the pool's own `concurrent_limit` is unlimited, so the
-    /// spawn ceiling — not a soft pool cap — is the real trigger). Bounding our own
-    /// fan-out keeps us clear of it, the source-level fix that lets the fallback
-    /// stay as-is. In normal use the in-flight set sits far below this; the cap is a
-    /// backstop, not a tuning dial.
+    /// Soft cap on concurrently-spawned Discover background workers (ROD-264). The feed
+    /// fetch, zoom enrich, and batch enrich each spawn an uncapped `std.Thread` on the
+    /// shared `Io.Threaded` pool, whose own `concurrent_limit` is unbounded, so an
+    /// app-level cap is the only backstop. A saturation storm (rapid paging + zoom +
+    /// prefetch on a slow link) could pile enough live threads to approach the OS
+    /// thread/fd ceiling, where `std.Thread.spawn` starts failing, which is exactly what
+    /// tips a fetch onto `withDeadline`'s unbounded inline fallback (ROD-264). Bounding
+    /// our own fan-out keeps us clear. In normal use the in-flight set sits far below
+    /// this; the cap is a backstop, not a tuning dial.
     const discover_enrich_cap = 8;
 
     /// True when the Discover worker pool is at the soft cap (ROD-264 #3): the
@@ -2621,16 +2559,15 @@ pub const App = struct {
     /// geometries, never in practice (ROD-243 review).
     const max_pump_urls = 128;
 
-    /// Fetch the covers for the visible Discover cards + one prefetch row, then evict
-    /// off-screen slots back to the pool cap (ROD-243). Runs on the UI thread from
-    /// run(), right after `layout` settles `scroll`, so the grid geometry is known.
-    /// Bounded parallelism (ROD-240): each missing cover gets its own detached
-    /// worker, capped at `config.discoverCoverConcurrency` in-flight at once. There
-    /// is no explicit queue — every frame this re-plans against live slot state and
-    /// tops the in-flight set back up to the cap as workers finish, so covers beyond
-    /// the cap wait, scrolled-past cards are never fetched, and fast scrolling can't
-    /// spawn unbounded requests. No-op outside Discover; the spawn is gated under
-    /// test (the plan + the in-flight mark still run, so tests exercise both).
+    /// Fetch covers for the visible Discover cards + one prefetch row, then evict
+    /// off-screen slots back to the pool cap (ROD-243). Runs on the UI thread from run()
+    /// after `layout` settles `scroll`, so grid geometry is known. Bounded parallelism
+    /// (ROD-240): each missing cover gets a detached worker, capped at
+    /// `config.discoverCoverConcurrency` in flight. No explicit queue; every frame
+    /// re-plans against live slot state and tops the in-flight set back to the cap as
+    /// workers finish, so covers beyond the cap wait and fast scrolling can't spawn
+    /// unbounded requests. No-op outside Discover; the spawn is gated under test (the plan
+    /// + in-flight mark still run).
     pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         if (self.active_view != .discover) return;
 
@@ -2799,21 +2736,17 @@ pub const App = struct {
     }
 
     /// The pure refresh-on-view decision, split from `maybeRefreshEnrichment` so it's
-    /// unit-testable without that function's `is_test` network guard. Refresh a
-    /// TRACKED, STALE show UNLESS a competing enrich path is already covering it:
-    ///   * `discover_inflight`    — a Discover feed/zoom enrich is running (discover_drain),
-    ///   * `search_enrich_active` — a live Browse search-page enrich is running (enrich_thread),
-    ///   * `refresh_inflight`     — another refresh-on-view is already in flight.
+    /// unit-testable without that function's `is_test` network guard. Refresh a TRACKED,
+    /// STALE show UNLESS a competing enrich path already covers it:
+    ///   * `discover_inflight`:    a Discover feed/zoom enrich is running,
+    ///   * `search_enrich_active`: a live Browse search-page enrich is running,
+    ///   * `refresh_inflight`:     another refresh-on-view is already in flight.
     ///
-    /// Only tracked rows refresh here: a hidden Browse/Discover cache row (history_visible=0)
-    /// has its OWN enrich path, so refreshing it would just double-fetch.
-    ///
-    /// ROD-279: the three competing-path skips kill the residual double-fetch — post-ROD-280
-    /// the feed/search enrich paths persist AND freshness-stamp the row, so they heal
-    /// staleness too; letting refresh also fire would double-hit AniList for a tracked show
-    /// that's currently in the feed / a live search batch. Coarse by design (any competing
-    /// enrich, not per-id): a skipped refresh just heals on the next open — the same
-    /// rationale as the single-refresh-in-flight cap this generalizes.
+    /// Only tracked rows refresh here: a hidden Browse/Discover cache row has its OWN
+    /// enrich path, so refreshing it would double-fetch. The skips exist because those
+    /// paths also persist and freshness-stamp the row (ROD-279/280), so letting refresh
+    /// fire too would double-hit AniList. Coarse by design (any competing enrich, not
+    /// per-id): a skipped refresh just heals on the next open.
     fn shouldRefreshOnView(
         rec: AnimeRecord,
         now: i64,
@@ -3193,16 +3126,13 @@ pub const App = struct {
             return;
         }
 
-        // View switching (ROD-249) — four destinations, each a symmetric pair: an
-        // F-key alias (F1-F4, discoverable §10.2) and a vim-native letter (§6.1):
-        //   F1/B Browse · F2/H History · F3/D Discover · F4/S Settings.
-        // The F-keys are global (can't be typed into a search); each letter carries
-        // the normal-mode guard so a literal B/H/D/S in a search/filter appends to
-        // the query instead of switching. Each is a no-op if already on that view;
-        // leaving Settings persists a dirty tab (leaveSettings). H is a DIRECT goto,
-        // not a toggle — from History it is now a no-op, and B is the way back to
-        // Browse (the old H ↔ toggle is gone). Match shift+letter and bare letter
-        // for the cross-terminal reason as the g/G nav.
+        // View switching (ROD-249): four destinations, each an F-key alias (F1-F4) and a
+        // vim-native letter: F1/B Browse, F2/H History, F3/D Discover, F4/S Settings. The
+        // F-keys are global; each letter carries the normal-mode guard so a literal
+        // B/H/D/S in a search/filter appends to the query instead of switching. Each is a
+        // no-op if already on that view; leaving Settings persists a dirty tab. H is a
+        // DIRECT goto, not a toggle. Match shift+letter and bare letter for the same
+        // cross-terminal reason as the g/G nav.
         if (key.matches(vaxis.Key.f1, .{}) or
             (self.input_mode == .normal and (key.matches('B', .{ .shift = true }) or key.matches('B', .{}))))
         {
@@ -3428,31 +3358,27 @@ pub const App = struct {
         return len < target;
     }
 
-    /// Whether the fill pass may fire for a slot in this state (ROD-272): an
-    /// established feed (page > 0 — page 1 is refreshDiscover's to own), idle (not
-    /// loading — the in-flight debounce), not exhausted (the short-page tail), and
-    /// not failed. The `failed` gate is load-bearing: a fill-fired page that errors
-    /// sets `slot.failed` and *wakes the loop* (.popular_error), so without it this
-    /// every-frame pass would re-fire as fast as the fetch can fail — no tick pacing,
-    /// and the pool cap never trips on near-instant failures (ROD-272 review). A later
-    /// successful page (a user scroll re-fires the prefetch, which clears `failed`)
-    /// resumes the fill; until then the grid degrades to under-filled — exactly the
-    /// pre-ROD-272 behaviour, i.e. the graceful-degradation floor, not a retry storm.
+    /// Whether the fill pass may fire for a slot in this state (ROD-272): an established
+    /// feed (page > 0; page 1 is refreshDiscover's to own), idle (not loading), not
+    /// exhausted, and not failed. The `failed` gate is what prevents a retry storm: a
+    /// fill-fired page that errors sets `slot.failed` and wakes the loop (.popular_error),
+    /// so without it this every-frame pass would re-fire as fast as the fetch can fail. A
+    /// later successful page (a user scroll re-fires the prefetch, clearing `failed`)
+    /// resumes the fill; until then the grid degrades to under-filled, the pre-ROD-272
+    /// graceful-degradation floor rather than a retry storm.
     fn discoverFillEligible(loading: bool, exhausted: bool, failed: bool, page: u32) bool {
         return page > 0 and !loading and !exhausted and !failed;
     }
 
     /// Top the active Discover window up to the visible grid (ROD-272). The feed
-    /// paginates in fixed `popular_page_size` chunks, so on a large monitor the first
-    /// page leaves empty rows below the last card — the cursor-proximity prefetch
-    /// (maybePrefetchDiscover) only fires once the cursor nears the end, and on load
-    /// the cursor sits at 0. This fires the next page whenever the loaded set doesn't
-    /// cover the visible rows (+ peek row), cascading page-by-page until the grid is
-    /// full or the feed is exhausted. Called every frame from run() with the settled
-    /// geometry, so it also refills after a resize grows the viewport. The state guard
-    /// (discoverFillEligible) keeps only one page in flight and — critically — backs
-    /// off on a failed page, so a flaky feed can't turn this every-frame pass into a
-    /// retry storm.
+    /// paginates in fixed `popular_page_size` chunks, so on a large monitor the first page
+    /// leaves empty rows below the last card, and the cursor-proximity prefetch only fires
+    /// once the cursor nears the end (on load it sits at 0). This fires the next page
+    /// whenever the loaded set doesn't cover the visible rows (+ peek row), cascading
+    /// page-by-page until the grid is full or the feed is exhausted. Called every frame
+    /// with settled geometry, so it also refills after a resize. The state guard
+    /// (discoverFillEligible) keeps one page in flight and backs off on a failed page, so
+    /// a flaky feed can't turn this every-frame pass into a retry storm.
     fn maybeFillDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         if (self.active_view != .discover) return;
         const slot = self.discover.activeSlot();
@@ -3735,16 +3661,14 @@ pub const App = struct {
             // above): terminals disagree on whether shift is reported separately.
             self.list_cursor = nav_len - 1;
         }
-        // ROD-202: a cursor move never prefetches episodes. The grid loads lazily
-        // on detail entry (l/→/Enter → fireEpisodesBrowse), matching History, so
-        // scrolling the results list stays smooth and fires zero episode fetches.
-        // The cover preview still tracks the cursor — that's detailSyncTarget,
-        // resolved every frame, not an episode fetch (ROD-156's cover half stays).
+        // ROD-202: a cursor move never prefetches episodes. The grid loads lazily on
+        // detail entry (l/→/Enter → fireEpisodesBrowse), so scrolling the results list
+        // stays smooth. The cover preview still tracks the cursor (detailSyncTarget,
+        // resolved every frame, not an episode fetch).
         //
         // Load-more: at the last result, a downward keystroke pages in the next page.
-        // Must accept the Down arrow too, not just 'j' — the cursor-nav above already
-        // honors both, so a j-only trigger left the ╌ more ╌ footer unreachable for
-        // arrow-key users (ROD-156 parity gap: infinite scroll that wasn't; ROD-201).
+        // Must accept Down as well as 'j' (the cursor-nav above honors both, so a j-only
+        // trigger left the ╌ more ╌ footer unreachable for arrow users; ROD-201).
         if ((key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) and
             self.active_view == .browse and
             self.list_cursor == nav_len - 1 and
