@@ -268,7 +268,17 @@ pub fn play(
     }
 
     const term = try child.wait(io);
-    if (watcher_thread) |t| t.join();
+    if (watcher_thread) |t| {
+        t.join();
+        // Null the handle so the `errdefer` above can't join it a SECOND time when a
+        // nonzero-exit arm below returns an error. A double pthread_join is undefined:
+        // macOS detects it and `Thread.join` hits `unreachable` ("reached unreachable
+        // code"), taking down the app the moment mpv exits non-zero — e.g. a senshi CDN
+        // 403 (ROD-310). Linux's join happens to survive the second call, which is why
+        // this only ever crashed on macOS. The errdefer stays for its one real job:
+        // joining the watcher if `child.wait` itself fails before we reach here.
+        watcher_thread = null;
+    }
     switch (term) {
         .exited => |code| {
             if (code == 0) {
