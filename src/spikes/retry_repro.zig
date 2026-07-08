@@ -59,6 +59,7 @@ pub fn main(init: std.process.Init) !void {
     try out.flush();
 
     var dummy: usize = 0;
+    var final_cause: ?anyerror = null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         // Stub re-resolve: a fresh StreamLink each attempt, same shape senshi hands
@@ -91,12 +92,28 @@ pub fn main(init: std.process.Init) !void {
             }
             try out.print("  → budget exhausted (cause={s}); giving up\n", .{@errorName(e)});
             try out.flush();
+            final_cause = e;
             break;
         };
 
         try out.print("  attempt {d}: play returned OK (unexpected for a code-2 fake)\n", .{attempt + 1});
         try out.flush();
         break;
+    }
+
+    // Guard's teeth: a *regression* here surfaces as a panic during play(), which
+    // aborts and reds CI. But every non-panic outcome would otherwise exit 0 —
+    // including the useless one where the fake mpv never LAUNCHED (a runner image
+    // dropping python3, a bad path): play() would fail MpvNotFound/InvalidExe, the
+    // loop would give up after one attempt, and we'd green while testing nothing,
+    // silently disabling the guard. Assert the expected shape so that degrades to a
+    // red instead: the fake must have driven every attempt to MpvOpenFailed.
+    const drove_the_watcher_path = if (final_cause) |c| c == error.MpvOpenFailed else false;
+    if (!drove_the_watcher_path or attempt + 1 != MAX_PLAY_ATTEMPTS) {
+        const name = if (final_cause) |c| @errorName(c) else "none (play returned OK)";
+        try out.print("REGRESSION GUARD INVALID: expected {d} attempts all failing MpvOpenFailed, got attempts={d} cause={s} — the fake mpv likely never launched, so this run tested NOTHING.\n", .{ MAX_PLAY_ATTEMPTS, attempt + 1, name });
+        try out.flush();
+        std.process.exit(1);
     }
 
     try out.print("repro finished without panic. attempts={d} watcher_cb_hits={d}\n", .{ attempt + 1, cb_hits });
