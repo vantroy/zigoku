@@ -463,6 +463,12 @@ pub const AnimeRecord = struct {
     source: []const u8,
     source_id: []const u8,
     title: []const u8,
+    /// ROD-312: true AniList romaji, write-only carrier for the canonical heal —
+    /// `upsertCanonical` writes `canonical.title = title_romaji orelse title`, so the
+    /// canonical entity holds romaji while `title` (the anime-local column) keeps the
+    /// provider seed. Never read back onto a record; the healed title returns via the
+    /// COALESCE read as `title`. Left null by `loadHistory`/`getAnime`.
+    title_romaji: ?[]const u8 = null,
     title_english: ?[]const u8 = null,
     mal_id: ?i64 = null,
     anilist_id: ?i64 = null,
@@ -534,6 +540,7 @@ pub const AnimeRecord = struct {
             .source = source,
             .source_id = a.id,
             .title = a.name,
+            .title_romaji = a.title_romaji,
             .title_english = a.english_name,
             // A corrupt provider id past i64 range degrades to "not provided"
             // rather than panicking on the cast.
@@ -871,7 +878,9 @@ pub const Store = struct {
 
         try bindOptI64(stmt, 1, a.anilist_id);
         try bindOptI64(stmt, 2, a.mal_id);
-        try bindText(stmt, 3, a.title);
+        // ROD-312 heal: the canonical title is true romaji when enrichment carried
+        // one, else the provider seed (`title`). anime-local `title` stays the seed.
+        try bindText(stmt, 3, a.title_romaji orelse a.title);
         try bindOptText(stmt, 4, a.title_english);
         try bindOptText(stmt, 5, a.cover_url);
         try bindOptI64(stmt, 6, a.total_episodes);
@@ -3269,6 +3278,44 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
     try testing.expectEqualStrings("Resolved v2", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 500;")).?);
     try testing.expectEqualStrings("FINISHED", (try Q.text(arena, &s, "SELECT status FROM canonical_anime WHERE anilist_id = 500;")).?);
     try testing.expectEqual(@as(?i64, 12000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 500;"));
+}
+
+test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+
+    // An id-bearing enrich carries BOTH the provider display name and true romaji.
+    const show: domain.Anime = .{
+        .id = "f1",
+        .name = "Frieren Beyond Journeys End", // provider display seed
+        .title_romaji = "Sousou no Frieren", // AniList romaji
+        .anilist_id = 182255,
+    };
+    try s.upsertEnriched(T_SOURCE, show, .sub, true, true, 9000, arena);
+
+    // canonical.title heals to romaji; the anime-local column keeps the seed as fallback.
+    try testing.expectEqualStrings("Sousou no Frieren", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 182255;")).?);
+    try testing.expectEqualStrings("Frieren Beyond Journeys End", (try Q.text(arena, &s, "SELECT title FROM anime WHERE source_id = 'f1';")).?);
+    // The read path surfaces the healed romaji (COALESCE picks canonical.title).
+    try testing.expectEqualStrings("Sousou no Frieren", (try s.getAnime(arena, T_SOURCE, "f1")).?.title);
+
+    // A resolved show with NO romaji falls back to the provider seed on canonical too
+    // (the `orelse` guard) — never a NULL title.
+    const no_romaji: domain.Anime = .{ .id = "f2", .name = "Only Seed", .anilist_id = 999 };
+    try s.upsertEnriched(T_SOURCE, no_romaji, .sub, true, true, 9000, arena);
+    try testing.expectEqualStrings("Only Seed", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 999;")).?);
 }
 
 test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {
