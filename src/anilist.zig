@@ -50,6 +50,8 @@ comptime {
 pub const Metadata = struct {
     anilist_id: ?u64 = null,
     mal_id: ?u64 = null,
+    /// True AniList romaji (ROD-312) — heals canonical.title off the provider seed.
+    title_romaji: ?[]const u8 = null,
     title_english: ?[]const u8 = null,
     title_native: ?[]const u8 = null,
     thumb: ?[]const u8 = null,
@@ -643,6 +645,7 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
     return .{
         .anilist_id = m.id,
         .mal_id = m.idMal,
+        .title_romaji = try stripControlsOpt(arena, m.title.romaji),
         .title_english = try stripControlsOpt(arena, m.title.english),
         .title_native = try stripControlsOpt(arena, m.title.native),
         .thumb = m.coverImage.large,
@@ -1225,6 +1228,7 @@ test "mediaToMeta maps the widened by-id response shape (ROD-140)" {
     const meta = try mediaToMeta(a, parsed.value.data.?.Media.?);
 
     try std.testing.expectEqual(@as(?u64, 182255), meta.anilist_id);
+    try std.testing.expectEqualStrings("Sousou no Frieren", meta.title_romaji.?); // ROD-312: romaji carried
     try std.testing.expectEqualStrings("葬送のフリーレン", meta.title_native.?);
     try std.testing.expectEqual(domain.Season.fall, meta.season.?);
     try std.testing.expectEqual(@as(u32, 2023), meta.start_date.?.year);

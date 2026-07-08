@@ -463,6 +463,13 @@ pub const AnimeRecord = struct {
     source: []const u8,
     source_id: []const u8,
     title: []const u8,
+    /// ROD-312: true AniList romaji, write-only carrier for the canonical heal.
+    /// `upsertCanonical` heals `canonical.title` to this when present (non-empty),
+    /// preserving a prior heal on a seed-only re-persist rather than downgrading — see
+    /// its anti-downgrade CASE. The anime-local `title` always keeps the provider seed.
+    /// Never read back onto a record; the healed title returns via the COALESCE read as
+    /// `title`. Left null by `loadHistory`/`getAnime`.
+    title_romaji: ?[]const u8 = null,
     title_english: ?[]const u8 = null,
     mal_id: ?i64 = null,
     anilist_id: ?i64 = null,
@@ -519,6 +526,11 @@ pub const AnimeRecord = struct {
     /// Whether this row should appear in the History view. Search-only metadata
     /// cache rows stay hidden until the user explicitly tracks or plays them.
     history_visible: bool = true,
+    /// ROD-312: the binding's link to its canonical entity (== anilist_id today).
+    /// NULL until enrichment resolves an id; set by `upsertEnriched` only after the
+    /// canonical row exists (the FK target). `fromDomain` leaves it null — a plain
+    /// search persist never mints the link.
+    canonical_id: ?i64 = null,
 
     /// Build a row from a freshly-searched show. Only carries what the source
     /// gives us; user state (status/rating/notes/counts) takes table defaults
@@ -529,6 +541,7 @@ pub const AnimeRecord = struct {
             .source = source,
             .source_id = a.id,
             .title = a.name,
+            .title_romaji = a.title_romaji,
             .title_english = a.english_name,
             // A corrupt provider id past i64 range degrades to "not provided"
             // rather than panicking on the cast.
@@ -705,8 +718,8 @@ pub const Store = struct {
             \\    season, native_name, kind, start_year, start_month, start_day, genres,
             \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
             \\    source_material, rank, rank_type, rank_year,
-            \\    next_airing_at, next_airing_episode, country)
-            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\    next_airing_at, next_airing_episode, country, canonical_id)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             \\ON CONFLICT(source, source_id) DO UPDATE SET
             \\    title          = excluded.title,
             \\    title_english  = COALESCE(excluded.title_english, anime.title_english),
@@ -740,7 +753,8 @@ pub const Store = struct {
             \\    rank_year      = COALESCE(excluded.rank_year, anime.rank_year),
             \\    next_airing_at = COALESCE(excluded.next_airing_at, anime.next_airing_at),
             \\    next_airing_episode = COALESCE(excluded.next_airing_episode, anime.next_airing_episode),
-            \\    country        = COALESCE(excluded.country, anime.country)
+            \\    country        = COALESCE(excluded.country, anime.country),
+            \\    canonical_id   = COALESCE(excluded.canonical_id, anime.canonical_id)
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -796,6 +810,129 @@ pub const Store = struct {
         try bindOptI64(stmt, 36, a.next_airing_at);
         try bindOptI64(stmt, 37, a.next_airing_episode);
         try bindOptText(stmt, 38, a.country);
+        // ROD-312: the canonical link. NULL on a plain search persist (COALESCE
+        // preserves any existing link); set to anilist_id by upsertEnriched once the
+        // canonical row exists, so the FK to canonical_anime(anilist_id) is satisfied.
+        try bindOptI64(stmt, 39, a.canonical_id);
+
+        try self.stepDone(stmt);
+    }
+
+    /// Persist enrichment onto the canonical spine (ROD-312). One canonical entity per
+    /// AniList id — called ONLY for id-bearing rows (see `upsertEnriched`'s M1 guard).
+    /// The ON CONFLICT set mirrors `upsertAnime`'s "a re-search never wipes a stored
+    /// value" rule — COALESCE(excluded, canonical) keeps anything the incoming row
+    /// lacks — and the same absolute-cover preference (ROD-267). `title` is the one
+    /// exception to plain COALESCE: it refreshes on conflict ONLY when this row carries
+    /// real (non-empty) romaji (the `?29` flag gates the CASE), otherwise the prior
+    /// canonical title is preserved — including a healed one. This is the anti-downgrade
+    /// invariant: title only ever moves toward "has romaji", never back to a provider
+    /// seed on a later seed-only re-persist (see the bind block for the full reasoning).
+    /// A fresh INSERT still bootstraps `title` non-null via `romaji orelse a.title`.
+    /// `a` already carries the freshness stamp when the caller asked for one, so there
+    /// is no stamp gate here.
+    ///
+    /// M1 (ROD-311 review): `anilist_id` is asserted non-null. `canonical_anime`'s
+    /// `anilist_id` is INTEGER PRIMARY KEY, which auto-assigns a rowid on a NULL insert
+    /// — a caller that skipped the guard would mint a bogus canonical entity for an
+    /// unresolved title rather than error. The assert makes that a loud invariant.
+    fn upsertCanonical(self: *Store, a: AnimeRecord, scratch: Allocator) Error!void {
+        std.debug.assert(a.anilist_id != null);
+        const sql =
+            \\INSERT INTO canonical_anime (anilist_id, mal_id, title, title_english, cover_url,
+            \\    total_episodes, year, status, description, score, season, native_name, kind,
+            \\    start_year, start_month, start_day, genres,
+            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
+            \\    source_material, rank, rank_type, rank_year,
+            \\    next_airing_at, next_airing_episode, country)
+            \\VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            \\ON CONFLICT(anilist_id) DO UPDATE SET
+            \\    mal_id         = COALESCE(excluded.mal_id, canonical_anime.mal_id),
+            \\    title          = CASE WHEN ?29 THEN excluded.title ELSE canonical_anime.title END,
+            \\    title_english  = COALESCE(excluded.title_english, canonical_anime.title_english),
+            \\    cover_url      = CASE
+            \\        WHEN excluded.cover_url GLOB 'http://*' OR excluded.cover_url GLOB 'https://*' THEN excluded.cover_url
+            \\        WHEN canonical_anime.cover_url GLOB 'http://*' OR canonical_anime.cover_url GLOB 'https://*' THEN canonical_anime.cover_url
+            \\        ELSE COALESCE(excluded.cover_url, canonical_anime.cover_url)
+            \\    END,
+            \\    total_episodes = COALESCE(excluded.total_episodes, canonical_anime.total_episodes),
+            \\    year           = COALESCE(excluded.year, canonical_anime.year),
+            \\    status         = COALESCE(excluded.status, canonical_anime.status),
+            \\    description    = COALESCE(excluded.description, canonical_anime.description),
+            \\    score          = COALESCE(excluded.score, canonical_anime.score),
+            \\    season         = COALESCE(excluded.season, canonical_anime.season),
+            \\    native_name    = COALESCE(excluded.native_name, canonical_anime.native_name),
+            \\    kind           = COALESCE(excluded.kind, canonical_anime.kind),
+            \\    start_year     = COALESCE(excluded.start_year, canonical_anime.start_year),
+            \\    start_month    = COALESCE(excluded.start_month, canonical_anime.start_month),
+            \\    start_day      = COALESCE(excluded.start_day, canonical_anime.start_day),
+            \\    genres         = COALESCE(excluded.genres, canonical_anime.genres),
+            \\    enrichment_fetched_at = COALESCE(excluded.enrichment_fetched_at, canonical_anime.enrichment_fetched_at),
+            \\    enrichment_fieldset_version = COALESCE(excluded.enrichment_fieldset_version, canonical_anime.enrichment_fieldset_version),
+            \\    studios        = COALESCE(excluded.studios, canonical_anime.studios),
+            \\    duration       = COALESCE(excluded.duration, canonical_anime.duration),
+            \\    source_material = COALESCE(excluded.source_material, canonical_anime.source_material),
+            \\    rank           = COALESCE(excluded.rank, canonical_anime.rank),
+            \\    rank_type      = COALESCE(excluded.rank_type, canonical_anime.rank_type),
+            \\    rank_year      = COALESCE(excluded.rank_year, canonical_anime.rank_year),
+            \\    next_airing_at = COALESCE(excluded.next_airing_at, canonical_anime.next_airing_at),
+            \\    next_airing_episode = COALESCE(excluded.next_airing_episode, canonical_anime.next_airing_episode),
+            \\    country        = COALESCE(excluded.country, canonical_anime.country)
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+
+        // ROD-312 heal: real romaji only when non-empty — an empty string is "no
+        // romaji", not a title. The heal must never DOWNGRADE: once canonical.title
+        // holds true romaji, a later seed-only re-persist (a Discover/search
+        // hydrate-then-persist that backfilled anilist_id but carries no romaji) must
+        // NOT clobber it back to the provider seed. So the ON CONFLICT above overwrites
+        // `title` ONLY when this row actually carries romaji (the ?29 flag); otherwise
+        // canonical.title is preserved. A fresh INSERT still bootstraps with
+        // romaji-or-seed so a brand-new canonical row is never title-less. anime-local
+        // `title` stays the provider seed regardless.
+        const romaji: ?[]const u8 = if (a.title_romaji) |r| (if (r.len > 0) r else null) else null;
+
+        try bindOptI64(stmt, 1, a.anilist_id);
+        try bindOptI64(stmt, 2, a.mal_id);
+        try bindText(stmt, 3, romaji orelse a.title);
+        try bindOptText(stmt, 4, a.title_english);
+        try bindOptText(stmt, 5, a.cover_url);
+        try bindOptI64(stmt, 6, a.total_episodes);
+        try bindOptI64(stmt, 7, a.year);
+        try bindOptText(stmt, 8, a.status);
+        try bindOptText(stmt, 9, a.description);
+        try bindOptI64(stmt, 10, a.score);
+        try bindOptText(stmt, 11, a.season);
+        try bindOptText(stmt, 12, a.native_name);
+        try bindOptText(stmt, 13, a.kind);
+        try bindOptI64(stmt, 14, a.start_year);
+        try bindOptI64(stmt, 15, a.start_month);
+        try bindOptI64(stmt, 16, a.start_day);
+        // Same empty→NULL rule as upsertAnime: a re-enrich that carries no genres
+        // never wipes a list an earlier one persisted (the COALESCE preserves it).
+        if (a.genres.len == 0) {
+            try checkBind(stmt, c.sqlite3_bind_null(stmt, 17));
+        } else {
+            try bindText(stmt, 17, try joinStrBlob(scratch, a.genres));
+        }
+        try bindOptI64(stmt, 18, a.enrichment_fetched_at);
+        try bindOptI64(stmt, 19, a.enrichment_fieldset_version);
+        if (a.studios.len == 0) {
+            try checkBind(stmt, c.sqlite3_bind_null(stmt, 20));
+        } else {
+            try bindText(stmt, 20, try joinStrBlob(scratch, a.studios));
+        }
+        try bindOptI64(stmt, 21, a.duration);
+        try bindOptText(stmt, 22, a.source_material);
+        try bindOptI64(stmt, 23, a.rank);
+        try bindOptText(stmt, 24, a.rank_type);
+        try bindOptI64(stmt, 25, a.rank_year);
+        try bindOptI64(stmt, 26, a.next_airing_at);
+        try bindOptI64(stmt, 27, a.next_airing_episode);
+        try bindOptText(stmt, 28, a.country);
+        // ?29: "this row carries real romaji" — gates the anti-downgrade title CASE.
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 29, if (romaji != null) 1 else 0));
 
         try self.stepDone(stmt);
     }
@@ -815,6 +952,16 @@ pub const Store = struct {
     /// `now` timestamps both the stamp and `upsertAnime`'s `added_at` default — pass
     /// one value per page so a batch shares a timestamp. `scratch` is the genres-blob
     /// arena, same contract as `upsertAnime`.
+    ///
+    /// ROD-312: id-bearing rows persist enrichment onto the canonical spine FIRST
+    /// (`upsertCanonical`), then link the binding (`canonical_id = anilist_id`) as the
+    /// anime row is written — the FK target must exist before the link is set, and the
+    /// two autocommit writes are ordered to guarantee it. A row with no resolved
+    /// `anilist_id` (an unmatched provider row, a Discover idMal=null) skips canonical
+    /// entirely and persists to anime-local columns exactly as before — the M1 guard
+    /// that stops the write path minting a bogus canonical entity. `loadHistory` /
+    /// `getAnime` then read enrichment back as COALESCE(canonical, anime-local), so the
+    /// canonical copy an id-bearing row just wrote is the one that surfaces.
     pub fn upsertEnriched(
         self: *Store,
         source: []const u8,
@@ -831,23 +978,44 @@ pub const Store = struct {
             rec.enrichment_fetched_at = now;
             rec.enrichment_fieldset_version = ENRICHMENT_FIELDSET_VERSION;
         }
+        if (rec.anilist_id != null) {
+            try self.upsertCanonical(rec, scratch);
+            rec.canonical_id = rec.anilist_id;
+        }
         return self.upsertAnime(rec, now, scratch);
     }
 
     /// All shows, most-recently-watched first (then most-recently-added). Every
     /// text field is duped into `arena`.
     pub fn loadHistory(self: *Store, arena: Allocator) Error![]AnimeRecord {
+        // ROD-312: resolve enrichment through the canonical spine. Every
+        // identity/enrichment column reads COALESCE(canonical, anime-local) —
+        // canonical wins where a binding resolved to one, anime-local is the
+        // fallback for the unmatched tail (canonical_id NULL → the LEFT JOIN
+        // yields NULLs → COALESCE takes the local column). User-state and the
+        // binding key stay anime-only. Column ORDER is unchanged — the row
+        // builder below reads by fixed index. No-op on today's data: every
+        // anilist_id group is a singleton, so canonical was seeded == that row's own
+        // anime shadow (a shared-id group would instead read the backfill winner's
+        // values — dormant, per the V14 migration doc). The join starts to matter
+        // once ROD-312's writes land fresher enrichment on canonical than the local
+        // copy, or a second provider co-binds an id.
         const sql =
-            \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
-            \\    year, status, description, score, total_episodes, list_status,
-            \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
-            \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, studios, duration,
-            \\    source_material, rank, rank_type, rank_year,
-            \\    next_airing_at, next_airing_episode, country
+            \\SELECT anime.source, anime.source_id,
+            \\    COALESCE(c.title, anime.title), COALESCE(c.title_english, anime.title_english),
+            \\    COALESCE(c.mal_id, anime.mal_id), anime.anilist_id, COALESCE(c.cover_url, anime.cover_url),
+            \\    COALESCE(c.year, anime.year), COALESCE(c.status, anime.status), COALESCE(c.description, anime.description),
+            \\    COALESCE(c.score, anime.score), COALESCE(c.total_episodes, anime.total_episodes), anime.list_status,
+            \\    anime.user_rating, anime.notes, anime.play_count, anime.progress, anime.added_at, anime.last_watched_at,
+            \\    COALESCE(c.season, anime.season), COALESCE(c.native_name, anime.native_name), COALESCE(c.kind, anime.kind),
+            \\    COALESCE(c.start_year, anime.start_year), COALESCE(c.start_month, anime.start_month), COALESCE(c.start_day, anime.start_day), COALESCE(c.genres, anime.genres),
+            \\    COALESCE(c.enrichment_fetched_at, anime.enrichment_fetched_at), COALESCE(c.enrichment_fieldset_version, anime.enrichment_fieldset_version), COALESCE(c.studios, anime.studios), COALESCE(c.duration, anime.duration),
+            \\    COALESCE(c.source_material, anime.source_material), COALESCE(c.rank, anime.rank), COALESCE(c.rank_type, anime.rank_type), COALESCE(c.rank_year, anime.rank_year),
+            \\    COALESCE(c.next_airing_at, anime.next_airing_at), COALESCE(c.next_airing_episode, anime.next_airing_episode), COALESCE(c.country, anime.country)
             \\FROM anime
-            \\WHERE history_visible != 0
-            \\ORDER BY last_watched_at DESC NULLS LAST, added_at DESC
+            \\LEFT JOIN canonical_anime c ON anime.canonical_id = c.anilist_id
+            \\WHERE anime.history_visible != 0
+            \\ORDER BY anime.last_watched_at DESC NULLS LAST, anime.added_at DESC
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -1107,16 +1275,25 @@ pub const Store = struct {
 
     /// Full stored metadata for one show, or null if it was never persisted.
     pub fn getAnime(self: *Store, arena: Allocator, source: []const u8, source_id: []const u8) Error!?AnimeRecord {
+        // ROD-312: same canonical-resolution join as loadHistory — enrichment
+        // reads COALESCE(canonical, anime-local), user-state/binding stay local.
+        // `history_visible` (index 28) is anime-only and keeps its mid-list slot;
+        // column ORDER is unchanged so the fixed-index row builder stays valid.
         const sql =
-            \\SELECT source, source_id, title, title_english, mal_id, anilist_id, cover_url,
-            \\    year, status, description, score, total_episodes, list_status,
-            \\    user_rating, notes, play_count, progress, added_at, last_watched_at,
-            \\    season, native_name, kind, start_year, start_month, start_day, genres,
-            \\    enrichment_fetched_at, enrichment_fieldset_version, history_visible, studios, duration,
-            \\    source_material, rank, rank_type, rank_year,
-            \\    next_airing_at, next_airing_episode, country
+            \\SELECT anime.source, anime.source_id,
+            \\    COALESCE(c.title, anime.title), COALESCE(c.title_english, anime.title_english),
+            \\    COALESCE(c.mal_id, anime.mal_id), anime.anilist_id, COALESCE(c.cover_url, anime.cover_url),
+            \\    COALESCE(c.year, anime.year), COALESCE(c.status, anime.status), COALESCE(c.description, anime.description),
+            \\    COALESCE(c.score, anime.score), COALESCE(c.total_episodes, anime.total_episodes), anime.list_status,
+            \\    anime.user_rating, anime.notes, anime.play_count, anime.progress, anime.added_at, anime.last_watched_at,
+            \\    COALESCE(c.season, anime.season), COALESCE(c.native_name, anime.native_name), COALESCE(c.kind, anime.kind),
+            \\    COALESCE(c.start_year, anime.start_year), COALESCE(c.start_month, anime.start_month), COALESCE(c.start_day, anime.start_day), COALESCE(c.genres, anime.genres),
+            \\    COALESCE(c.enrichment_fetched_at, anime.enrichment_fetched_at), COALESCE(c.enrichment_fieldset_version, anime.enrichment_fieldset_version), anime.history_visible, COALESCE(c.studios, anime.studios), COALESCE(c.duration, anime.duration),
+            \\    COALESCE(c.source_material, anime.source_material), COALESCE(c.rank, anime.rank), COALESCE(c.rank_type, anime.rank_type), COALESCE(c.rank_year, anime.rank_year),
+            \\    COALESCE(c.next_airing_at, anime.next_airing_at), COALESCE(c.next_airing_episode, anime.next_airing_episode), COALESCE(c.country, anime.country)
             \\FROM anime
-            \\WHERE source = ? AND source_id = ?
+            \\LEFT JOIN canonical_anime c ON anime.canonical_id = c.anilist_id
+            \\WHERE anime.source = ? AND anime.source_id = ?
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -1177,7 +1354,19 @@ pub const Store = struct {
         // `status` is the airing-status text (AniList RELEASING/FINISHED, AllAnime
         // ongoing) — the "still releasing" signal `afterPlay` gates on (ROD-296).
         // Read it transiently and fold to a bool here; no need to dupe the string.
-        const stmt = try self.prepare("SELECT list_status, progress, total_episodes, status FROM anime WHERE source = ? AND source_id = ?");
+        // ROD-312: the completion gate reads its enrichment inputs (total_episodes,
+        // status) through the canonical join like loadHistory/getAnime, so once a
+        // second provider co-binds a canonical entity, the gate uses the freshest
+        // canonical truth instead of this binding's own stale shadow. list_status and
+        // progress stay anime-local (user state). No-op today under single-provider
+        // dual-write (canonical == the anime shadow); correct when anipub lands.
+        const stmt = try self.prepare(
+            \\SELECT anime.list_status, anime.progress,
+            \\    COALESCE(c.total_episodes, anime.total_episodes), COALESCE(c.status, anime.status)
+            \\FROM anime
+            \\LEFT JOIN canonical_anime c ON anime.canonical_id = c.anilist_id
+            \\WHERE anime.source = ? AND anime.source_id = ?
+        );
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, source);
         try bindText(stmt, 2, source_id);
@@ -3051,6 +3240,189 @@ test "upsertEnriched gates the freshness stamp on stamp_fresh, honors visible (R
     try testing.expect(!stamp_only.history_visible); // ...but still hidden
 }
 
+test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + read-back), M1 skips id-less rows, re-enrich never wipes (ROD-312)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Read the UNREAD spine directly — getCanonical() is a later slice.
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+
+    // 1) An id-bearing enrich (anilist_id resolved) mints a canonical entity, stamps it
+    //    fresh, and links the binding — then getAnime reads it all back THROUGH canonical
+    //    (slice-1 join), closing the write→read loop on the spine.
+    const resolved: domain.Anime = .{
+        .id = "s1",
+        .name = "Resolved",
+        .anilist_id = 500,
+        .mal_id = 700,
+        .score = 88,
+        .native_name = "ネイティブ",
+        .status = "RELEASING",
+        .next_airing_at = 4242,
+    };
+    try s.upsertEnriched(T_SOURCE, resolved, .sub, true, true, 9000, arena);
+
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;"));
+    try testing.expectEqual(@as(?i64, 88), try Q.int(&s, "SELECT score FROM canonical_anime WHERE anilist_id = 500;"));
+    try testing.expectEqual(@as(?i64, 700), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 500;"));
+    try testing.expectEqual(@as(?i64, 9000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 500;"));
+    try testing.expectEqual(@as(?i64, 500), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 's1';"));
+
+    const got = (try s.getAnime(arena, T_SOURCE, "s1")).?;
+    try testing.expectEqual(@as(?i64, 88), got.score);
+    try testing.expectEqualStrings("ネイティブ", got.native_name.?);
+    try testing.expectEqual(@as(?i64, 4242), got.next_airing_at);
+    try testing.expectEqual(@as(?i64, 9000), got.enrichment_fetched_at);
+
+    // 2) M1 guard: an id-less enrich (an unmatched provider row / a Discover idMal=null)
+    //    mints NO canonical row — a NULL PRIMARY KEY insert would fabricate a rowid and a
+    //    bogus entity. Its enrichment persists to anime-local and reads back via fallback.
+    const unresolved: domain.Anime = .{ .id = "s2", .name = "Unmatched", .score = 55 };
+    try s.upsertEnriched(T_SOURCE, unresolved, .sub, true, true, 9000, arena);
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;")); // still just the one
+    try testing.expectEqual(@as(?i64, null), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 's2';"));
+    try testing.expectEqual(@as(?i64, 55), (try s.getAnime(arena, T_SOURCE, "s2")).?.score);
+
+    // 3) Re-enrich never wipes canonical: a partial refresh (no score, fresh romaji +
+    //    status + stamp) preserves the prior score via COALESCE, refreshes the title
+    //    (real romaji wins — see the dedicated no-downgrade test for the seed-only
+    //    case), lets the fresh non-null status win, and advances the clock.
+    const partial: domain.Anime = .{ .id = "s1", .name = "Resolved v2", .title_romaji = "Resolved v2", .anilist_id = 500, .status = "FINISHED" };
+    try s.upsertEnriched(T_SOURCE, partial, .sub, true, true, 12000, arena);
+    try testing.expectEqual(@as(?i64, 88), try Q.int(&s, "SELECT score FROM canonical_anime WHERE anilist_id = 500;"));
+    try testing.expectEqualStrings("Resolved v2", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 500;")).?);
+    try testing.expectEqualStrings("FINISHED", (try Q.text(arena, &s, "SELECT status FROM canonical_anime WHERE anilist_id = 500;")).?);
+    try testing.expectEqual(@as(?i64, 12000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 500;"));
+}
+
+test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+
+    // An id-bearing enrich carries BOTH the provider display name and true romaji.
+    const show: domain.Anime = .{
+        .id = "f1",
+        .name = "Frieren Beyond Journeys End", // provider display seed
+        .title_romaji = "Sousou no Frieren", // AniList romaji
+        .anilist_id = 182255,
+    };
+    try s.upsertEnriched(T_SOURCE, show, .sub, true, true, 9000, arena);
+
+    // canonical.title heals to romaji; the anime-local column keeps the seed as fallback.
+    try testing.expectEqualStrings("Sousou no Frieren", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 182255;")).?);
+    try testing.expectEqualStrings("Frieren Beyond Journeys End", (try Q.text(arena, &s, "SELECT title FROM anime WHERE source_id = 'f1';")).?);
+    // The read path surfaces the healed romaji (COALESCE picks canonical.title).
+    try testing.expectEqualStrings("Sousou no Frieren", (try s.getAnime(arena, T_SOURCE, "f1")).?.title);
+
+    // A resolved show with NO romaji falls back to the provider seed on canonical too
+    // (the `orelse` guard) — never a NULL title.
+    const no_romaji: domain.Anime = .{ .id = "f2", .name = "Only Seed", .anilist_id = 999 };
+    try s.upsertEnriched(T_SOURCE, no_romaji, .sub, true, true, 9000, arena);
+    try testing.expectEqualStrings("Only Seed", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 999;")).?);
+}
+
+test "canonical title never downgrades: a seed-only re-persist after a heal keeps romaji; a later real romaji still refreshes; empty romaji is ignored (ROD-312)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+    const canon = "SELECT title FROM canonical_anime WHERE anilist_id = 700;";
+
+    // Heal: a full enrich carries romaji.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .title_romaji = "Romaji Title", .anilist_id = 700 }, .sub, true, true, 1000, arena);
+    try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
+
+    // The regression review caught: a seed-only re-persist (a Discover/search
+    // hydrate-then-persist — anilist_id backfilled, NO romaji) must NOT clobber the
+    // healed title back to the provider seed. Ordinary, frequent path.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .anilist_id = 700 }, .sub, true, true, 2000, arena);
+    try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
+
+    // An empty-string romaji counts as no-romaji — never blanks the surfaced title.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .title_romaji = "", .anilist_id = 700 }, .sub, true, true, 2500, arena);
+    try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
+
+    // A later REAL romaji still refreshes — romaji always wins; only seeds are ignored.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .title_romaji = "Romaji Fixed", .anilist_id = 700 }, .sub, true, true, 3000, arena);
+    try testing.expectEqualStrings("Romaji Fixed", (try Q.text(arena, &s, canon)).?);
+
+    // Bootstrap: a brand-new canonical row with NO romaji still gets a title (the seed),
+    // never NULL — and a romaji then upgrades it.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d2", .name = "Only Seed", .anilist_id = 800 }, .sub, true, true, 1000, arena);
+    try testing.expectEqualStrings("Only Seed", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 800;")).?);
+    try s.upsertEnriched(T_SOURCE, .{ .id = "d2", .name = "Only Seed", .title_romaji = "Seed Romaji", .anilist_id = 800 }, .sub, true, true, 2000, arena);
+    try testing.expectEqualStrings("Seed Romaji", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 800;")).?);
+}
+
+test "afterPlay completion gate reads airing status through canonical, not the local shadow (ROD-312/ROD-296)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Canonical holds the fresher truth: the show FINISHED airing. The binding's own
+    // shadow still says RELEASING — the stale per-binding value a provider swap strands.
+    // (Constructed by hand; single-provider dual-write can't diverge them today.)
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title, status, total_episodes) VALUES (700, 'X', 'FINISHED', 12);");
+    try s.upsertAnime(.{
+        .source = T_SOURCE,
+        .source_id = "g",
+        .title = "X",
+        .anilist_id = 700,
+        .canonical_id = 700,
+        .status = "RELEASING",
+        .total_episodes = 12,
+        .list_status = .watching,
+        .progress = 11,
+        .history_visible = true,
+    }, 1, arena);
+
+    // Play the final episode. The gate must read canonical's FINISHED (not airing) and
+    // auto-complete; reading the anime-local RELEASING would keep it .watching (ROD-296).
+    try s.recordPlay(T_SOURCE, "g", 12, 2, true);
+    try testing.expectEqual(domain.ListStatus.completed, (try s.getAnime(arena, T_SOURCE, "g")).?.list_status);
+}
+
 test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracked)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -3399,6 +3771,67 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     // two-provider future is most likely to hit (a freshly-added, un-enriched binding).
     try testing.expectEqualStrings("Has Enrich", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 321;")).?);
     try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
+}
+
+test "loadHistory/getAnime resolve enrichment through canonical: linked row reads canonical (per-column COALESCE), unmatched row falls back to anime-local (ROD-312)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Seed the spine by hand (no getCanonical/upsertCanonical yet — that's slice 2)
+    // with values that DIFFER from the anime shadow, so a wrong join is visible: a
+    // read that returned the local column would report the stale seed, not these.
+    // `description` is left NULL on canonical to prove the resolution is per-column
+    // COALESCE, not a whole-row swap — it must fall back to the local description.
+    // The FK (anime.canonical_id -> canonical_anime.anilist_id) forces canonical first.
+    try s.exec(
+        \\INSERT INTO canonical_anime
+        \\  (anilist_id, title, score, native_name, total_episodes, next_airing_at, description)
+        \\VALUES
+        \\  (500, 'Canonical Romaji', 99, 'カノニカル', 24, 1234567, NULL);
+    );
+    try s.exec(
+        \\INSERT INTO anime
+        \\  (source, source_id, title, anilist_id, canonical_id, score, native_name,
+        \\   total_episodes, next_airing_at, description, list_status, progress,
+        \\   history_visible, added_at)
+        \\VALUES
+        \\  ('senshi', 'linked', 'Stale Provider Seed', 500, 500, 10, NULL,
+        \\   1, NULL, 'Local Desc', 'watching', 7, 1, 1000),
+        \\  ('senshi', 'orphan', 'Only Local', NULL, NULL, 42, 'ローカル',
+        \\   13, 555, 'Orphan Desc', 'planning', 3, 1, 900);
+    );
+
+    // getAnime on the linked row: every enrichment column resolves to canonical...
+    const linked = (try s.getAnime(arena, "senshi", "linked")).?;
+    try testing.expectEqualStrings("Canonical Romaji", linked.title);
+    try testing.expectEqual(@as(?i64, 99), linked.score);
+    try testing.expectEqualStrings("カノニカル", linked.native_name.?);
+    try testing.expectEqual(@as(?i64, 24), linked.total_episodes);
+    try testing.expectEqual(@as(?i64, 1234567), linked.next_airing_at);
+    // ...except where canonical is NULL, which falls back to the local column...
+    try testing.expectEqualStrings("Local Desc", linked.description.?);
+    // ...while user-state and the binding key stay anime-local, never canonical.
+    try testing.expectEqualStrings("linked", linked.source_id);
+    try testing.expectEqual(@as(?i64, 500), linked.anilist_id);
+    try testing.expectEqual(domain.ListStatus.watching, linked.list_status);
+    try testing.expectEqual(@as(i64, 7), linked.progress);
+
+    // getAnime on the unmatched row: canonical_id NULL → the LEFT JOIN yields NULLs
+    // → every enrichment column falls back to the anime-local value.
+    const orphan = (try s.getAnime(arena, "senshi", "orphan")).?;
+    try testing.expectEqualStrings("Only Local", orphan.title);
+    try testing.expectEqual(@as(?i64, 42), orphan.score);
+    try testing.expectEqualStrings("ローカル", orphan.native_name.?);
+
+    // loadHistory drives the same join: most-recently-added first (linked 1000 >
+    // orphan 900), and each row shows its resolved title.
+    const hist = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 2), hist.len);
+    try testing.expectEqualStrings("Canonical Romaji", hist[0].title);
+    try testing.expectEqualStrings("Only Local", hist[1].title);
 }
 
 test "app_meta round-trips one-time flags (ROD-308)" {

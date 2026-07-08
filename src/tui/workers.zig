@@ -217,6 +217,7 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
 
     out.name = try alloc.dupe(u8, a.name);
     out.english_name = try dupeOptText(alloc, a.english_name);
+    out.title_romaji = try dupeOptText(alloc, a.title_romaji);
     out.native_name = try dupeOptText(alloc, a.native_name);
     out.thumb = try dupeOptText(alloc, a.thumb);
     out.banner = try dupeOptText(alloc, a.banner);
@@ -235,6 +236,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     alloc.free(a.id);
     if (a.name.len > 0) alloc.free(a.name);
     if (a.english_name) |x| alloc.free(x);
+    if (a.title_romaji) |x| alloc.free(x);
     if (a.native_name) |x| alloc.free(x);
     if (a.thumb) |x| alloc.free(x);
     if (a.banner) |x| alloc.free(x);
@@ -266,6 +268,7 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
 /// freed here. `live`'s id/name/view_count/eps always win (never touched).
 pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
     mergeOptText(&live.english_name, &incoming.english_name);
+    mergeOptText(&live.title_romaji, &incoming.title_romaji);
     mergeOptText(&live.native_name, &incoming.native_name);
     mergeCoverPreferAbsolute(gpa, &live.thumb, &incoming.thumb);
     mergeOptText(&live.banner, &incoming.banner);
@@ -457,6 +460,9 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
 /// search-page enrich and the Discover lazy zoom enrich (ROD-239).
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
+    // ROD-312: stash true romaji alongside the provider `name` (never overwritten
+    // here — see title_romaji's doc), so the canonical write can heal canonical.title.
+    if (a.title_romaji == null) a.title_romaji = dupeOptText(gpa, meta.title_romaji) catch a.title_romaji;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
     // Prefer a fetchable absolute cover over a relative source ref (ROD-267): an
     // AniList/MAL url beats a bare `mcovers/…` that only resolves behind the

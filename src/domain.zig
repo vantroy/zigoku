@@ -238,6 +238,12 @@ pub const Anime = struct {
     id: []const u8,
     name: []const u8,
     english_name: ?[]const u8 = null,
+    /// True AniList romaji title (ROD-312), distinct from `name` (which stays the
+    /// provider display seed). Filled by enrichment; carried to the canonical write
+    /// so `canonical.title` heals to romaji while the anime-local title stays the
+    /// unmatched-row fallback. Write-only on this path — read-back surfaces via
+    /// `canonical.title` through the COALESCE join, so it never needs to hydrate.
+    title_romaji: ?[]const u8 = null,
     /// Native (usually Japanese) title. Populated from the provider search where
     /// available; render-side use lands with the kanji chips (ROD-141).
     native_name: ?[]const u8 = null,
