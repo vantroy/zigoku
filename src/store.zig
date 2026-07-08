@@ -3302,6 +3302,105 @@ test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned pr
     try testing.expect((try s.getResume("allanime", "dupB", .sub, "3")) == null);
 }
 
+test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses via freshest+senshi tiebreak and recovers a sibling mal_id (ROD-311)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Scalar readers for the UNREAD shadow — no getCanonical() exists yet (ROD-312),
+    // so the test reads canonical_anime / the link column directly.
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        fn text(a: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(a, stmt, 0);
+        }
+    };
+
+    // openMemory already ran MIGRATION_V14 (DDL + BACKFILL) on empty tables, so
+    // canonical_anime exists and is empty. Seed bindings by hand — a raw INSERT, not
+    // upsertAnime, because the tiebreak keys on enrichment_fetched_at, which the upsert
+    // API doesn't take. Six distinct anilist_ids exercise every tier of the pick:
+    //   100  singleton (senshi)                           → 1:1 lift, mal_id carries
+    //   NULL the unmatched tail                           → no canonical row, stays unlinked
+    //   999  senshi(fresher, NO mal) vs allanime(mal=555) → fresher wins; NULL mal recovers 555
+    //   777  allanime(FRESHER, mal=333) vs senshi(stale)  → freshness is PRIMARY, beats senshi
+    //   888  allanime vs senshi, TIED on enrichment       → senshi wins the tie (secondary key)
+    //   666  two allanime tied on enrichment+source       → lowest rowid wins (final key)
+    //   321  allanime(enriched) vs senshi(NULL enrich)    → NULL sorts LAST, enriched wins
+    try s.exec(
+        \\INSERT INTO anime (source, source_id, title, anilist_id, mal_id, enrichment_fetched_at, added_at) VALUES
+        \\  ('senshi',   'solo', 'Solo Show',    100,  700,  3000, 1000),
+        \\  ('senshi',   'tail', 'No Id',        NULL, NULL, NULL, 1000),
+        \\  ('senshi',   'win',  'Winner',       999,  NULL, 2000, 1000),
+        \\  ('allanime', 'lose', 'Loser',        999,  555,  1000, 1000),
+        \\  ('allanime', 'fa',   'Fresh AL',     777,  333,  5000, 1000),
+        \\  ('senshi',   'ss',   'Stale Senshi', 777,  444,  1000, 1000),
+        \\  ('allanime', 'pa',   'P allanime',   888,  111,  1500, 1000),
+        \\  ('senshi',   'qs',   'Q senshi',     888,  222,  1500, 1000),
+        \\  ('allanime', 'r1',   'Rowid First',  666,  661,  2500, 1000),
+        \\  ('allanime', 'r2',   'Rowid Later',  666,  662,  2500, 1000),
+        \\  ('senshi',   'ne',   'Null Enrich',  321,  811,  NULL, 1000),
+        \\  ('allanime', 'ee',   'Has Enrich',   321,  812,  100,  1000);
+    );
+
+    // Run the exact data lift the ladder runs — the DDL is already applied, so this is
+    // the isolated backfill the const split exists to make testable.
+    try s.exec(MIGRATION_V14_BACKFILL);
+
+    // One canonical row per distinct non-null anilist_id (100, 999, 777, 888, 666, 321).
+    try testing.expectEqual(@as(?i64, 6), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;"));
+    // Eleven of twelve bindings link; the NULL-anilist tail stays unlinked.
+    try testing.expectEqual(@as(?i64, 11), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE canonical_id IS NOT NULL;"));
+    try testing.expectEqual(@as(?i64, null), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'tail';"));
+
+    // Singleton: 1:1 lift, mal_id and link intact.
+    try testing.expectEqual(@as(?i64, 100), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'solo';"));
+    try testing.expectEqual(@as(?i64, 700), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 100;"));
+
+    // Shared 999: freshest binding (senshi 'win') wins the seed; its NULL mal_id
+    // recovers 555 from the older 'lose' sibling; BOTH bindings point at canonical 999.
+    try testing.expectEqualStrings("Winner", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 999;")).?);
+    try testing.expectEqual(@as(?i64, 555), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 999;"));
+    try testing.expectEqual(@as(?i64, 999), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'win';"));
+    try testing.expectEqual(@as(?i64, 999), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'lose';"));
+
+    // Shared 888: tie on enrichment_fetched_at → senshi ('qs') wins the CASE tiebreak,
+    // so title is 'Q senshi' and its own mal_id 222 stands (no sibling recovery needed).
+    try testing.expectEqualStrings("Q senshi", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 888;")).?);
+    try testing.expectEqual(@as(?i64, 222), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 888;"));
+    try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'pa';"));
+    try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'qs';"));
+
+    // Shared 777: freshness is the PRIMARY sort key — the fresher allanime binding
+    // ('fa', enrichment 5000) beats the staler senshi one ('ss', 1000), proving the
+    // enrichment DESC sort outranks the senshi CASE. Guards against a key reorder.
+    try testing.expectEqualStrings("Fresh AL", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 777;")).?);
+    try testing.expectEqual(@as(?i64, 333), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 777;"));
+
+    // Shared 666: two same-source bindings tied on enrichment resolve by lowest rowid
+    // (insertion order) — the first-seeded 'r1' wins deterministically, pinning the
+    // final tiebreak so a group can never collapse to two rows or a nondeterministic one.
+    try testing.expectEqualStrings("Rowid First", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 666;")).?);
+    try testing.expectEqual(@as(?i64, 661), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 666;"));
+
+    // Shared 321: a never-enriched binding (NULL enrichment_fetched_at) sorts LAST under
+    // the DESC primary key, so the enriched allanime 'ee' beats senshi 'ne' — the tie the
+    // two-provider future is most likely to hit (a freshly-added, un-enriched binding).
+    try testing.expectEqualStrings("Has Enrich", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 321;")).?);
+    try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
+}
+
 test "app_meta round-trips one-time flags (ROD-308)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
