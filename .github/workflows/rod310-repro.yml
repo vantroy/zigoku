@@ -67,8 +67,11 @@ jobs:
           chmod +x fake-mpv.py
           python3 --version
           # Self-test: it must exec via its shebang and exit 2, or the spike will
-          # short-circuit on InvalidExe and the repro is meaningless.
-          ./fake-mpv.py --input-ipc-server=/tmp/rod310-selftest.sock; echo "fake mpv exit=$? (expect 2)"
+          # short-circuit on InvalidExe and the repro is meaningless. `|| rc=$?`
+          # keeps the expected non-zero from tripping `set -e` and aborting the job.
+          rc=0
+          ./fake-mpv.py --input-ipc-server=/tmp/rod310-selftest.sock || rc=$?
+          echo "fake mpv exit=$rc (expect 2)"
 
       - name: Repro — Debug (full safety checks + backtrace)
         continue-on-error: true
