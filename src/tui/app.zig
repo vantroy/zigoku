@@ -4173,16 +4173,32 @@ pub const App = struct {
         }
     }
 
-    pub fn historyEntryVisible(self: *const App, title: []const u8) bool {
+    /// Whether a History row survives the `/` filter: true when the query is
+    /// empty, or when it substring-matches (case-insensitive) ANY of the show's
+    /// present title forms — romaji, english, or native. Matching every form, not
+    /// just the one currently displayed, keeps a show findable by any of its names
+    /// regardless of the `title_language` display preference (ROD-299): a user who
+    /// sees the English label can still find it by the romaji, and vice versa.
+    /// (`indexOfIgnoreCase` case-folds ASCII only, so native/CJK bytes still match
+    /// by exact substring for anyone who types the Japanese name.)
+    pub fn historyEntryVisible(self: *const App, rec: AnimeRecord) bool {
         if (self.history_filter_len == 0) return true;
-        return std.ascii.indexOfIgnoreCase(title, self.history_filter[0..self.history_filter_len]) != null;
+        const q = self.history_filter[0..self.history_filter_len];
+        if (std.ascii.indexOfIgnoreCase(rec.title, q) != null) return true;
+        if (rec.title_english) |t| {
+            if (std.ascii.indexOfIgnoreCase(t, q) != null) return true;
+        }
+        if (rec.native_name) |t| {
+            if (std.ascii.indexOfIgnoreCase(t, q) != null) return true;
+        }
+        return false;
     }
 
     pub fn filteredHistoryLen(self: *const App) usize {
         if (self.history_filter_len == 0) return self.history.len;
         var n: usize = 0;
         for (self.history) |rec| {
-            if (self.historyEntryVisible(rec.title)) n += 1;
+            if (self.historyEntryVisible(rec)) n += 1;
         }
         return n;
     }

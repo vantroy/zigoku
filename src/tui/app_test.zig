@@ -347,6 +347,65 @@ test "detailRenderInfo resolves the primary title through title_language (ROD-20
     try testing.expectEqualStrings("葬送のフリーレン", app.detailRenderInfo().title);
 }
 
+test "history filter matches any present title form, not just romaji (ROD-299)" {
+    var app: App = .{};
+    var recs = [_]AnimeRecord{.{
+        .source = "allanime",
+        .source_id = "fr",
+        .title = "Sousou no Frieren", // romaji
+        .title_english = "Frieren: Beyond Journey's End",
+        .native_name = "葬送のフリーレン",
+        .list_status = .watching,
+    }};
+    app.history = recs[0..];
+
+    const S = struct {
+        fn setFilter(a: *App, q: []const u8) void {
+            @memcpy(a.history_filter[0..q.len], q);
+            a.history_filter_len = q.len;
+        }
+    };
+
+    // No filter → everything is visible.
+    try testing.expect(app.historyEntryVisible(recs[0]));
+
+    // A substring unique to the romaji form matches (the pre-ROD-299 behavior).
+    S.setFilter(&app, "sousou");
+    try testing.expect(app.historyEntryVisible(recs[0]));
+
+    // The bug ROD-299 fixes: a substring unique to the ENGLISH form now matches,
+    // even though romaji is the stored `title` — the user searches what they see.
+    S.setFilter(&app, "journey");
+    try testing.expect(app.historyEntryVisible(recs[0]));
+
+    // Matching stays case-insensitive across every form.
+    S.setFilter(&app, "JOURNEY");
+    try testing.expect(app.historyEntryVisible(recs[0]));
+
+    // A substring unique to the NATIVE form matches by exact bytes (CJK isn't
+    // case-folded, but substring search still finds it).
+    S.setFilter(&app, "葬送");
+    try testing.expect(app.historyEntryVisible(recs[0]));
+
+    // A query present in none of the forms is filtered out.
+    S.setFilter(&app, "naruto");
+    try testing.expect(!app.historyEntryVisible(recs[0]));
+    try testing.expectEqual(@as(usize, 0), app.filteredHistoryLen());
+
+    // A record with english/native absent still matches on romaji and never
+    // dereferences a null alt form.
+    const bare = AnimeRecord{
+        .source = "allanime",
+        .source_id = "nr",
+        .title = "Naruto",
+        .list_status = .watching,
+    };
+    S.setFilter(&app, "naruto");
+    try testing.expect(app.historyEntryVisible(bare));
+    S.setFilter(&app, "journey");
+    try testing.expect(!app.historyEntryVisible(bare));
+}
+
 test "navigation is a no-op with empty history" {
     var app: App = .{};
     app.setHistory(&.{});
