@@ -643,19 +643,15 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     // the grid's rows below.
     const show_grid = self.episodeGridVisible();
 
-    // Two-column layout (ROD-113): cover + header on the left (~38%), synopsis +
-    // episode grid on the right. Only engaged for History-opened detail; the
-    // narrow Browse preview keeps the single vertical stack. Mirrors the §3.2
-    // list/detail split grammar.
-    // Gate on the pane width `w`, not the terminal (ROD-258): with the History
-    // list co-visible the detail pane is `term - list` (see paneSplit), far
-    // narrower than the terminal. The old term-width gate force-split a ~58-col
-    // pane at term 100 into a ~22-col cover column that clipped the meta line.
-    // `w` is the width the columns are actually carved from, so two-column
-    // engages only when the pane can afford it (detail_two_col_min cols of pane,
-    // term ≥ 168 once the 38% list is subtracted); below that the
-    // single-column stack renders instead. The trade is a ~2-col shift of the
-    // full-screen zoom's boundary (pane there is term-2) — cosmetic, and correct.
+    // Two-column layout (ROD-113): cover + header on the left (~38%), synopsis + episode
+    // grid on the right. Only for History-opened detail; the narrow Browse preview keeps
+    // the single vertical stack.
+    // Gate on the pane width `w`, not the terminal (ROD-258): with the History list
+    // co-visible the detail pane is `term - list` (see paneSplit), far narrower than the
+    // terminal, and the old term-width gate force-split a ~58-col pane at term 100 into a
+    // ~22-col cover column that clipped the meta line. `w` is the width the columns are
+    // carved from, so two-column engages only when the pane can afford it
+    // (detail_two_col_min); below that the single-column stack renders.
     if (two_col and isTwoColumn(w)) {
         // Floor of 20 keeps the 20-col cover block fitting the left column even
         // when the gate drops (ROD-170's persistent-pane threshold). Dead at the
@@ -683,14 +679,12 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     }
 
     // Single-column layout: two complementary caps keep the grid usable (ROD-137).
-    //   1. coverHeightCap bounds the cover so it can't starve the grid — critical
-    //      when the terminal reports no pixel size and coverSlotHeight would else
-    //      return the full 28-row aesthetic cap (cover+spacer = 29 of 32 rows).
-    //   2. synopsisCap then clamps the synopsis to leave ≥2 grid rows.
-    // Worst case at a 35-row terminal (pane h=32): coverHeightCap(32)=19, so
-    // cover+spacer=20; worst-case header=7 → row 27; synopsisCap(5)=2; grid spacer
-    // → row 30; grid gets the final 2 rows. Cover=19, synopsis=2, grid=2. (Proven
-    // by the "ROD-137 invariant" test below; constants are the single source.)
+    //   1. coverHeightCap bounds the cover so it can't starve the grid, critical when the
+    //      terminal reports no pixel size (coverSlotHeight would else return the full
+    //      28-row aesthetic cap).
+    //   2. synopsisCap then clamps the synopsis to leave >=2 grid rows.
+    // Worst case (35-row terminal) lands cover=19, synopsis=2, grid=2; proven by the
+    // "ROD-137 invariant" test below, of which these constants are the single source.
     var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
     // Single column: the synopsis + grid follow the header in the same column, so
     // the metadata stays the compact one-line form (no room to bloom) — ROD-260.
@@ -847,19 +841,15 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             else
                 std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
 
-            // §4.6/§5.3: watched cells (index below the high-water mark) recede to
-            // text.dim; the resume cell lights state.now + bold — the loudest
-            // token in the grid, per §4.6 ("most visually prominent cell");
-            // unwatched stay text.muted; the cursor always wins (ROD-131). text.dim
-            // is `fg3` alone — matching the completed/dropped convention in
-            // history.zig; the `.dim` SGR attr is reserved for the paused semantic
-            // (§2.4), so it is deliberately not used here. A launching cell escalates
-            // focus→hot past isSlowPath (§4.8), same as every other slow-path
-            // spinner; it outranks focus/resume/watched. Resume reads apart from the
-            // focus cursor by HUE — resume is state.now (magenta), the cursor is
-            // state.focus (cyan) + the bg.surface band that is the cursor's alone
-            // (§4.6 lists bg.surface on resume too, but sharing it would blur the
-            // cursor, so the band stays cursor-only — color carries resume).
+            // §4.6/§5.3 cell styling: watched cells (below the high-water) recede to
+            // text.dim; the resume cell lights state.now + bold (the loudest token in the
+            // grid); unwatched stay text.muted; the cursor always wins (ROD-131). text.dim
+            // is `fg3` alone, matching history.zig; the `.dim` SGR attr is reserved for the
+            // paused semantic (§2.4), so it is not used here. A launching cell escalates
+            // focus->hot past isSlowPath (§4.8). Resume reads apart from the cursor by HUE:
+            // resume is state.now (magenta), the cursor is state.focus (cyan) plus the
+            // bg.surface band that is the cursor's alone (sharing it would blur the cursor,
+            // so color carries resume).
             const watched = ep_idx < @as(usize, self.episodes.progress);
             const cell_style = if (launching)
                 self.s(if (self.isSlowPath()) self.palette.hot else self.palette.focus, .{ .bg = self.palette.bg_surface, .bold = true })
