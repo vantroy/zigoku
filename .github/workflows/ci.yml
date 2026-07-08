@@ -66,3 +66,16 @@ jobs:
 
       - name: Test
         run: zig build test --summary all
+
+      # Regression guard for ROD-310: a non-zero mpv exit must not double-join the
+      # IPC watcher thread. macOS pthread_join panics ("reached unreachable code")
+      # on a second join; Linux survives it, so ONLY a real Darwin run catches this
+      # class of threading bug — the unit suite is structurally blind to it. Drives
+      # the real player.play() ×3 against a fake mpv that exits 2 (src/spikes/
+      # retry_repro.zig); a panic here fails CI. Debug (max checks) + ReleaseSafe
+      # (the release mode) both, since the crash predates optimize-mode differences.
+      - name: Regression — mpv nonzero exit must not double-join the watcher (ROD-310)
+        run: |
+          chmod +x scripts/fake-mpv-exit2.py
+          zig build spike-retry -- "$PWD/scripts/fake-mpv-exit2.py"
+          zig build spike-retry -Doptimize=ReleaseSafe -- "$PWD/scripts/fake-mpv-exit2.py"

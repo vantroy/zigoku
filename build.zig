@@ -221,6 +221,24 @@ pub fn build(b: *std.Build) void {
     const spike_mpv_step = b.step("spike-mpv", "ROD-57: full pipeline → play in mpv");
     spike_mpv_step.dependOn(&run_spike_mpv.step);
 
+    // spike-retry: drive the ROD-309 retry loop against a fake mpv that exits 2, to
+    // reproduce the macOS retry-path panic on Linux (ROD-310). Imports the zigoku
+    // module for the real player.play(); libc for player's getuid/getpid + child.
+    const spike_retry = b.addExecutable(.{
+        .name = "spike-retry",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/retry_repro.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zigoku", .module = mod }},
+        }),
+    });
+    const run_spike_retry = b.addRunArtifact(spike_retry);
+    if (b.args) |args| run_spike_retry.addArgs(args);
+    const spike_retry_step = b.step("spike-retry", "ROD-310: fake-mpv repro of the retry-path panic");
+    spike_retry_step.dependOn(&run_spike_retry.step);
+
     // spike-tui: prove libvaxis boots under Zig 0.16 (ROD-71). Renders a
     // Terminal Ghost frame + event loop in a real terminal.
     const spike_tui = b.addExecutable(.{
