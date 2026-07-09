@@ -88,6 +88,19 @@ pub const Event = union(enum) {
         anilist_id: i64,
         source_id: []const u8,
     },
+    /// A tier-C Play resolve settled (ROD-328): the worker title-searched the play provider
+    /// for an anilist_id-keyed Browse hit that could not tier-A (`canonicalKey` returned
+    /// null, e.g. a canonical with no MAL id). `ok` true: `source_id` is the provider's
+    /// opaque id for the best catalog match (gpa-owned): the UI thread arms the bind
+    /// (`pending_bind` = `anilist_id`) and fires the episode fetch, which confirms, caches,
+    /// and mints the binding through the shared `.episodes_done` path. `ok` false: no
+    /// confident match (the unmatched state is ROD-329) plus a "couldn't load episodes"
+    /// toast. `source_id` is gpa-owned and freed by the UI thread when non-empty.
+    resolve_play_target: struct {
+        ok: bool,
+        anilist_id: i64,
+        source_id: []const u8,
+    },
     /// Popular-feed results from a background thread (ROD-239). `results` is
     /// gpa-allocated (each Anime's strings owned); App takes ownership into the
     /// feed slot for `window`. `window` is carried so a result lands in its own

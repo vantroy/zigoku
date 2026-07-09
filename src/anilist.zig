@@ -889,7 +889,12 @@ fn candidateScore(show: domain.Anime, m: Media) i32 {
     return score;
 }
 
-fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
+/// Fuzzy title-match score between two titles (higher = closer; a large negative for
+/// no overlap). Normalizes both (strip whitespace/punctuation, lowercase, canonicalize
+/// "Season N") before comparing, so form differences don't sink a real match. Pub so the
+/// ROD-328 provider resolver's tier-C matcher scores against the SAME primitive as this
+/// module's own `candidateScore`: one title-normalization rule, no drift.
+pub fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
     const b = b_opt orelse return -5000;
     if (a.len == 0 or b.len == 0) return -5000;
 

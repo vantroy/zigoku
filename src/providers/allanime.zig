@@ -91,6 +91,7 @@ pub const AllAnime = struct {
         .displayName = displayNameErased,
         .supportsDiscover = supportsDiscoverErased,
         .search = searchErased,
+        .canonicalKey = canonicalKeyErased,
         .popular = popularErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
@@ -117,6 +118,14 @@ pub const AllAnime = struct {
     fn popularErased(ptr: *anyopaque, arena: Allocator, io: Io, opts: source.PopularOptions) anyerror![]domain.Anime {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
         return self.popular(arena, io, opts);
+    }
+    fn canonicalKeyErased(ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
+        _ = ptr;
+        _ = arena;
+        _ = canonical;
+        // AllAnime keys shows by an opaque catalog id, not a canonical MAL/AniList id (its
+        // id lives in the cover thumbnail, tier B, out of this resolver's scope), hence null.
+        return null;
     }
     fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));

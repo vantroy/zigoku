@@ -63,6 +63,7 @@ pub const Senshi = struct {
         .displayName = displayNameErased,
         .supportsDiscover = supportsDiscoverErased,
         .search = searchErased,
+        .canonicalKey = canonicalKeyErased,
         .popular = popularErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
@@ -91,6 +92,14 @@ pub const Senshi = struct {
     fn popularErased(ptr: *anyopaque, arena: Allocator, io: Io, opts: source.PopularOptions) anyerror![]domain.Anime {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
         return self.popular(arena, io, opts);
+    }
+    fn canonicalKeyErased(ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
+        _ = ptr;
+        // senshi's show handle IS the stringified MAL id (see mapAnime + the /episodes
+        // /{mal_id} routes), so a canonical with a MAL id resolves for free. No MAL id →
+        // null, and the resolver falls to a title search (tier C, ROD-328).
+        const mal = canonical.mal_id orelse return null;
+        return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
     fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
