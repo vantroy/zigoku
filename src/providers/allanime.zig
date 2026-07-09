@@ -123,9 +123,8 @@ pub const AllAnime = struct {
         _ = ptr;
         _ = arena;
         _ = canonical;
-        // AllAnime keys shows by an opaque catalog id, not by a canonical MAL/AniList id
-        // (its id lives in the cover thumbnail, tier B, out of this resolver's scope). It
-        // does not id-key on a canonical, so the resolver must tier-C search it (ROD-328).
+        // AllAnime keys shows by an opaque catalog id, not a canonical MAL/AniList id (its
+        // id lives in the cover thumbnail, tier B, out of this resolver's scope), hence null.
         return null;
     }
     fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {

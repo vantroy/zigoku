@@ -436,8 +436,9 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// hit already confirms the provider stocks the show, so no episode probe here (the Play
 /// path's own episode fetch confirms + caches downstream).
 ///
-/// `canonical` is a gpa-owned deep copy (freed here) so it outlives the fireResolveSearch
-/// return. On a hit the matched id is duped into gpa and transferred to the posted event
+/// `canonical` is a gpa-owned deep copy (freed here) so it outlives the caller's return
+/// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into
+/// gpa and transferred to the posted event
 /// (the UI thread frees it); `for_play` selects `.resolve_play_target` vs `.resolve_add_result`.
 /// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
 /// worker can no longer touch loop/gpa.

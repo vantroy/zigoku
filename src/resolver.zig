@@ -1,7 +1,7 @@
 //! Zigoku: provider binding resolver (ROD-328).
 //!
-//! The tier-C half of `resolveBinding`: given a KNOWN canonical (an AniList search hit,
-//! fully enriched) and a play provider that does NOT id-key on a canonical id
+//! The tier-C half of the provider-binding resolve: given a KNOWN canonical (an AniList
+//! search hit, fully enriched) and a play provider that does NOT id-key on a canonical id
 //! (`SourceProvider.canonicalKey` returned null), find the provider's own opaque id for
 //! that show by fuzzy-matching the canonical against the provider's catalog-search results.
 //!
@@ -23,8 +23,7 @@ const anilist = @import("anilist.zig");
 const Anime = domain.Anime;
 
 /// Minimum score the best candidate must reach to be a match (mirrors
-/// `anilist.bestMatch`). A single exact/prefix title agreement clears it; below it
-/// the provider is treated as not stocking the show.
+/// `anilist.bestMatch`); below it the provider is treated as not stocking the show.
 const best_floor: i32 = 1200;
 /// Minimum lead the best candidate must hold over the runner-up. Guards against
 /// ambiguous near-ties (a season/spinoff that scores almost as high): an unclear

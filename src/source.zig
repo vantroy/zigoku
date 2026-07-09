@@ -84,10 +84,9 @@ pub const SourceProvider = struct {
         /// ROD-328: this is the resolver's per-provider CATALOG primitive: the tier-C
         /// binding path (fuzzy-match a known canonical title against the provider's own
         /// library to recover its opaque id). It is NOT user-facing discovery search:
-        /// that moved to AniList, off this vtable (see `anilist.search`). Do not re-wire
-        /// the browse/search UI back onto this. Its only caller is the resolver, and it
-        /// is the sole way to bind a provider that can't tier-A (`canonicalKey` returns
-        /// null: obscure/old shows, specialist catalogs).
+        /// that moved to AniList, off this vtable (see `anilist.search`), so do not
+        /// re-wire the browse/search UI back onto this. Its only caller is the resolver,
+        /// used when a provider can't tier-A (`canonicalKey` returned null).
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
         /// Tier-A binding key (ROD-328): if this provider keys its own catalog by a
         /// canonical id (senshi's show id IS the stringified MAL id), return that

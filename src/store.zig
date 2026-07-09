@@ -3476,8 +3476,7 @@ test "bindingSourceId returns an existing provider binding by canonical id, null
     // No binding yet → null (the resolver falls through to tier A / tier C).
     try testing.expect((try s.bindingSourceId(arena, "senshi", 182255)) == null);
 
-    // After a resolve persists the binding, the stored provider id comes back: the tier-0
-    // short-circuit that lets a re-searched hit skip the probe/search on replay.
+    // After a resolve persists the binding, the stored provider id comes back.
     try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena));
     const sid = (try s.bindingSourceId(arena, "senshi", 182255)).?;
     try testing.expectEqualStrings("52991", sid);

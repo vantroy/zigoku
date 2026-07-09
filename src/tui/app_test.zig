@@ -46,8 +46,8 @@ fn sampleHistory() [3]AnimeRecord {
 fn dummySearchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
     return &.{};
 }
-// Mal-keyed like senshi (the dummy's `name()` is "allanime", but its id model is the
-// tier-A one the resolver tests drive): a canonical with a MAL id keys for free, else null.
+// Tier-A capable like senshi, despite `name()` reporting "allanime": the resolver tests
+// need a canonicalKey that doesn't always miss.
 fn dummyCanonicalKeyFn(_: *anyopaque, arena: Allocator, canonical: Anime) anyerror!?[]const u8 {
     const mal = canonical.mal_id orelse return null;
     return try std.fmt.allocPrint(arena, "{d}", .{mal});
@@ -3486,10 +3486,8 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     app.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
     defer app.episodes.freeResults(std.testing.allocator); // fireEpisodesForId dupes for_id/source
 
-    // The tier-C search resolved the provider id; the handler fires the episode fetch (which
-    // binds on episodes_done) and arms pending_bind. dummyProvider.episodes returns empty, so
-    // testTick drains the spawned worker's episodes_done without minting the binding here;
-    // pending_bind stays armed for the fetch, which is exactly the handoff we assert.
+    // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
+    // the binding here; pending_bind stays armed, which is the handoff under test.
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
 
@@ -3504,8 +3502,6 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     app.gpa = std.testing.allocator;
     app.play_resolving = true;
 
-    // A miss carries an empty source_id (no provider match); the handler frees nothing and
-    // must not fire an episode fetch or arm a bind: the unmatched dead-end (ROD-329).
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "" } });
 
     try testing.expect(!app.play_resolving);

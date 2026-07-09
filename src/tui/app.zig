@@ -1992,11 +1992,8 @@ pub const App = struct {
                     self.pushToast(.@"error", "couldn't load episodes", false);
                     return;
                 }
-                // Confirmed provider id: fire the episode fetch, which confirms + caches +
-                // mints the binding through the shared .episodes_done path (bind-before-cache).
-                // fireEpisodesForId nulls pending_bind at entry, so arm it AFTER the call so
-                // only this fire's episodes_done consumes it (a synchronous cache hit leaves
-                // it unconsumed; benign, the binding already exists).
+                // Confirmed match: fire the episode fetch, then arm pending_bind (order
+                // matters: fireEpisodesForId nulls it at entry, same trap as fireEpisodesResolved).
                 self.fireEpisodesForId(loop, io, provider, ev.source_id);
                 self.pending_bind = ev.anilist_id;
             },
@@ -3054,8 +3051,7 @@ pub const App = struct {
         const aid_str = std.fmt.bufPrint(&idbuf, "{d}", .{aid}) catch return .{ .direct = sel.id };
         // A provider-keyed row (id != stringified anilist_id) fetches as-is.
         if (!std.mem.eql(u8, sel.id, aid_str)) return .{ .direct = sel.id };
-        // An unresolved AniList hit. Tier 0: an existing binding on this provider wins, so a
-        // re-resolve never re-runs the tier-A probe or the tier-C search.
+        // Tier 0: an existing binding on this provider wins.
         if (store) |st| {
             if (st.bindingSourceId(scratch, provider.name(), aid_i64) catch null) |sid|
                 return .{ .bound = .{ .id = sid, .anilist_id = aid_i64 } };
@@ -3085,8 +3081,9 @@ pub const App = struct {
 
     /// Shared tail of a resolved Browse fire (ROD-328): the in-flight guard, the episode
     /// spawn, and arming `pending_bind`. `bind` is the canonical anilist_id for a tier-A or
-    /// tier-C resolve (minted on `.episodes_done`) or null for an already-keyed `.direct`
-    /// open. Skips a respawn when the same provider id is already fetching: re-firing would
+    /// tier-C resolve (minted on `.episodes_done`), or null when the binding needs no minting
+    /// (an already-keyed `.direct` open, or a tier-0 `.bound` hit whose row already exists).
+    /// Skips a respawn when the same provider id is already fetching: re-firing would
     /// just abandon the in-flight fetch and start an identical one.
     fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, id: []const u8, bind: ?i64) void {
         const in_flight = self.episodes.loading and
