@@ -1388,14 +1388,15 @@ pub const Store = struct {
     /// A canonical can carry MORE than one binding on one provider (a MAL multi-cour split
     /// that AniList merges: N mal-keyed senshi rows, one anilist_id; the ROD-313 collapse
     /// case), so this is NOT a unique lookup. It picks the SAME representative loadHistory
-    /// surfaces (`ORDER BY last_watched_at DESC NULLS LAST, progress DESC, rowid`), so tier 0
-    /// replays the cour the user is actually watching, deterministically. Uses
-    /// `idx_anime_canonical`. Arena owns the returned string.
+    /// surfaces: `history_visible` rows first (loadHistory ranks only visible rows), then
+    /// most-recently-watched, then furthest progress, then rowid. So tier 0 replays the cour
+    /// the user is actually watching, and never a hidden binding when a visible one exists.
+    /// Uses `idx_anime_canonical`. Arena owns the returned string.
     pub fn bindingSourceId(self: *Store, arena: Allocator, source: []const u8, anilist_id: i64) Error!?[]const u8 {
         const stmt = try self.prepare(
             \\SELECT source_id FROM anime
             \\WHERE canonical_id = ? AND source = ?
-            \\ORDER BY last_watched_at DESC NULLS LAST, progress DESC, rowid
+            \\ORDER BY history_visible DESC, last_watched_at DESC NULLS LAST, progress DESC, rowid
             \\LIMIT 1
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -3529,6 +3530,21 @@ test "bindingSourceId picks loadHistory's representative when a canonical has se
 
     // cour2 was watched more recently (5000 > 1000), so it is the representative despite
     // cour1's higher progress: last_watched_at is the primary sort, progress only a tiebreak.
+    try testing.expectEqualStrings("cour2", (try s.bindingSourceId(arena, "senshi", 901)).?);
+
+    // A hidden binding, even watched more recently than every visible one, must NOT be
+    // picked: loadHistory ranks only visible rows, so tier 0 matches by preferring visible
+    // first. cour3 (hidden, lwa 9000) outranks cour2 on recency but stays unpicked.
+    try s.upsertAnime(.{
+        .source = "senshi",
+        .source_id = "cour3",
+        .title = "Spice and Wolf",
+        .anilist_id = 901,
+        .canonical_id = 901,
+        .progress = 1,
+        .last_watched_at = 9000,
+        .history_visible = false,
+    }, 1002, arena);
     try testing.expectEqualStrings("cour2", (try s.bindingSourceId(arena, "senshi", 901)).?);
 }
 
