@@ -332,8 +332,12 @@ fn mergeStrList(live: *[]const []const u8, incoming: *[]const []const u8) void {
     }
 }
 
-/// Background task: search and post results back to the UI thread.
-pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, query: []const u8, page: u32, translation: domain.Translation) void {
+/// Background task: run a discovery search on AniList (ROD-327) and post the results to
+/// the UI thread. Discovery search is OFF the `SourceProvider` vtable (ROD-324): it
+/// queries AniList directly, so hits are anilist_id-keyed canonical rows, not provider
+/// bindings. Binding a hit to a play provider is the resolver's job (the Play/Add
+/// tier-A path), never this fetch.
+pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, page: u32) void {
     // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
     // on the success path; the UI thread frees it there. On all error paths we free it
     // here explicitly before returning. Do NOT add a defer — it would free the string
@@ -341,11 +345,7 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const raw = provider.search(arena.allocator(), io, query, .{
-        .translation = translation,
-        .limit = source_mod.search_page_size,
-        .page = page,
-    }) catch |e| {
+    const raw = anilist.search(arena.allocator(), io, query, page) catch |e| {
         log.debug("search failed: {s}", .{@errorName(e)});
         gpa.free(query);
         // @errorName is a static string (immortal) — safe to thread into the toast.
@@ -391,6 +391,39 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvi
     };
     // On success: `exact` and `query` are now owned by the event.
     // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
+}
+
+/// Background task: tier-A resolve for add-to-watchlist (ROD-327). A Browse search hit
+/// is anilist_id-keyed; the play provider keys by the stringified mal_id (`candidate_id`).
+/// Probes `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
+/// the show, so the UI thread can mint the binding. A transport failure and an empty list
+/// both collapse to `ok = false` (no state written on a miss; ROD-329 owns the unmatched
+/// state), so both read as the same "couldn't add" outcome.
+///
+/// `candidate_id` ownership transfers to the `resolve_add_result` event on a successful
+/// post (the UI thread frees it on either arm); freed here only if the post fails.
+/// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
+/// worker can no longer touch loop/gpa.
+pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64, translation: domain.Translation, drain: *ThreadDrain) void {
+    defer drain.finish();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const ok = if (provider.episodes(arena.allocator(), io, candidate_id, translation)) |eps|
+        eps.len > 0
+    else |e| blk: {
+        log.debug("resolve-add probe failed: {s}", .{@errorName(e)});
+        break :blk false;
+    };
+
+    loop.postEvent(.{ .resolve_add_result = .{
+        .ok = ok,
+        .anilist_id = anilist_id,
+        .source_id = candidate_id,
+    } }) catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        gpa.free(candidate_id);
+    };
 }
 
 /// Background task: fetch one page of the Popular feed for `window` (ROD-239).

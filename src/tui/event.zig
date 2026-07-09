@@ -76,6 +76,18 @@ pub const Event = union(enum) {
         for_query: []const u8,
         page: u32,
     },
+    /// A tier-A add-to-watchlist resolve settled (ROD-327): the worker probed the play
+    /// provider by the stringified mal_id (`source_id`) for an anilist_id-keyed Browse
+    /// hit. `ok` true: the provider stocks the show, so the UI thread mints the binding
+    /// (`bindCanonical`) revealed and reloads History. `ok` false: resolver miss, no state
+    /// written (ROD-329 owns the unmatched state), plus a "couldn't add" toast. `source_id`
+    /// is gpa-owned; the UI thread frees it on either arm. `anilist_id` links the binding
+    /// to its canonical row.
+    resolve_add_result: struct {
+        ok: bool,
+        anilist_id: i64,
+        source_id: []const u8,
+    },
     /// Popular-feed results from a background thread (ROD-239). `results` is
     /// gpa-allocated (each Anime's strings owned); App takes ownership into the
     /// feed slot for `window`. `window` is carried so a result lands in its own
