@@ -876,8 +876,21 @@ pub const Store = struct {
     /// `episodeCount`, which is 0 for a search hit, so neither placeholder reaches a column.
     /// A caller passing a row with real per-track counts would break that: scope this to
     /// search hits.
-    pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, scratch: Allocator) Error!void {
-        return self.upsertCanonical(AnimeRecord.fromDomain("", anime, .sub), scratch);
+    ///
+    /// `stamp_fresh` advances the ROD-182 freshness clock (same gate contract as
+    /// `upsertEnriched`): pass true ONLY when `anime` carries the full enrichment field set
+    /// from a confirmed answer, false otherwise. AniList discovery search returns the full
+    /// `GQL_FIELDS` (identical to the by-id refresh enrich), so its hits stamp fresh and
+    /// refresh-on-view leaves them alone until the TTL genuinely lapses. A partial-field
+    /// caller (the ROD-325 Discover feed, which nulls score/season) MUST pass false so the
+    /// gaps still draw a refresh.
+    pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, stamp_fresh: bool, now: i64, scratch: Allocator) Error!void {
+        var rec = AnimeRecord.fromDomain("", anime, .sub);
+        if (stamp_fresh) {
+            rec.enrichment_fetched_at = now;
+            rec.enrichment_fieldset_version = ENRICHMENT_FIELDSET_VERSION;
+        }
+        return self.upsertCanonical(rec, scratch);
     }
 
     /// Mint (or link) the provider binding row for a canonical entity (ROD-327): the
@@ -3343,7 +3356,7 @@ test "upsertCanonicalOnly persists a search hit as a canonical entity with no bi
         .season = .fall,
         .genres = &.{ "Adventure", "Fantasy" },
     };
-    try s.upsertCanonicalOnly(hit, arena);
+    try s.upsertCanonicalOnly(hit, false, 0, arena);
 
     // Canonical entity minted (title healed to romaji), carrying the hit's enrichment.
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;"));
@@ -3383,7 +3396,10 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
         .score = 89,
         .total_episodes = 28,
     };
-    try s.upsertCanonicalOnly(hit, arena);
+    // Search returns the full field set → stamp fresh (ROD-327), so refresh-on-view
+    // treats the searched show as current instead of re-fetching it on first open.
+    try s.upsertCanonicalOnly(hit, true, 7000, arena);
+    try testing.expectEqual(@as(?i64, 7000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 182255;"));
 
     // The hydrate reader returns the entity keyed by anilist_id, no binding needed.
     const canon = (try s.getCanonicalByAnilistId(arena, 182255)).?;
@@ -3392,6 +3408,7 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
     try testing.expectEqual(@as(?i64, 182255), canon.anilist_id);
     try testing.expectEqual(@as(?i64, 89), canon.score);
     try testing.expectEqual(@as(?i64, 28), canon.total_episodes);
+    try testing.expectEqual(@as(?i64, 7000), canon.enrichment_fetched_at);
     // An unknown id reads null (the miss the resolver treats as "not canonical yet").
     try testing.expect((try s.getCanonicalByAnilistId(arena, 999999)) == null);
 

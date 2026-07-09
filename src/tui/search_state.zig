@@ -190,10 +190,15 @@ pub const SearchController = struct {
         // capacity, so it's one alloc amortized over the page.
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
+        // AniList discovery search returns the full enrichment field set (GQL_SEARCH is
+        // GQL_FIELDS), so each hit is a confirmed, fully-enriched answer: stamp it fresh
+        // (ROD-327) so the collapse to one pass is real and refresh-on-view doesn't
+        // re-fetch an already-current show on first open. Share one `now` across the page.
+        const now = Store.nowSecs();
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            st.upsertCanonicalOnly(self.results.items[i], arena.allocator()) catch |e| log.debug("upsertCanonicalOnly failed: {s}", .{@errorName(e)});
+            st.upsertCanonicalOnly(self.results.items[i], true, now, arena.allocator()) catch |e| log.debug("upsertCanonicalOnly failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }
