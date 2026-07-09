@@ -1,15 +1,13 @@
 //! Jikan — MyAnimeList ID resolver.
 //!
-//! AniSkip (ROD-83) keys its skip-timestamps on a MyAnimeList id. AllAnime hands
-//! us none, and while AniList usually rides `idMal` along through the enrichment
-//! bridge (see `anilist.zig`), that mapping can miss. Jikan is the unofficial MAL
-//! REST API — no auth, free — and is our fallback to turn a title into a MAL id.
+//! AniSkip (ROD-83) keys its skip-timestamps on a MyAnimeList id. AllAnime hands us none,
+//! and while AniList usually rides `idMal` through the enrichment bridge (`anilist.zig`),
+//! that mapping can miss. Jikan is the unofficial MAL REST API (no auth, free), our fallback
+//! to turn a title into a MAL id.
 //!
-//! This is a side rail, not the playback path. On any failure (network, empty
-//! results, junk JSON) we return `error.NotFound` and callers degrade gracefully.
-//!
-//! Rate limit: Jikan enforces ~3 req/s. Interactive single calls need no throttle.
-//! Batched callers should `std.Thread.sleep(400 * std.time.ns_per_ms)` between hits.
+//! A side rail, not the playback path: on any failure (network, empty results, junk JSON) we
+//! return `error.NotFound` and callers degrade gracefully. Rate limit is ~3 req/s;
+//! interactive single calls need no throttle, batched callers should sleep ~400ms between hits.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

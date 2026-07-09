@@ -1,14 +1,14 @@
-//! AllAnime — the first (and currently only) `SourceProvider`.
+//! AllAnime — a `SourceProvider` (senshi is the current default; this one predates it).
 //!
-//! The working recipe — POST not GET (Cloudflare only challenges GET), Apollo
-//! *persisted-query* sha256 hashes instead of query strings, and an AES-256-GCM
-//! `tobeparsed` blob — was reverse-engineered from anipy-cli (GPL-3.0,
-//! https://github.com/sdaqo/anipy-cli) by observing its protocol and
-//! reimplemented here in Zig. No code was copied. See ROD-91 / ROD-62 / ROD-55.
+//! The working recipe (POST not GET, since Cloudflare only challenges GET; Apollo
+//! persisted-query sha256 hashes instead of query strings; an AES-256-GCM `tobeparsed`
+//! blob) was reverse-engineered from anipy-cli (GPL-3.0,
+//! https://github.com/sdaqo/anipy-cli) by observing its protocol and reimplemented here in
+//! Zig. No code was copied. See ROD-91 / ROD-62 / ROD-55.
 //!
-//! AllAnime is fragile by nature. Every site-specific fact — endpoint, hashes,
-//! referers, the decrypt scheme — is quarantined in this one file behind
-//! `source.SourceProvider`. When it dies: replace this file, not the app.
+//! AllAnime is fragile by nature. Every site-specific fact (endpoint, hashes, referers, the
+//! decrypt scheme) is quarantined in this one file behind `source.SourceProvider`. When it
+//! dies: replace this file, not the app.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -151,19 +151,15 @@ pub const AllAnime = struct {
     // ── search ─────────────────────────────────────────────────────────────────
 
     const AvailEps = struct { sub: u32 = 0, dub: u32 = 0 };
-    // The persisted search op returns far more than the id/name/episodes we
-    // historically parsed. We pull every field with a `domain.Anime` home in one
-    // pass (ROD-181) so the parser never has to grow again. Two of these directly
-    // fix AniList matching — `englishName` (matches AniList's `english` even when
-    // its `romaji` uses an unreconcilable "Nth Season" form) and the year (revives
-    // the year-weighted scoring branch + sequel tie-break) — and the rest seed the
-    // AllAnime-first metadata so the detail pane is populated even when enrichment
-    // never lands. `airedStart`/`season` are optional objects; `score` is a 0–10
-    // float we rescale to AniList's 0–100 in `edgeToAnime`.
-    // `airedStart` carries the real debut date (year+month, sometimes day);
-    // `season` carries the broadcast cours (quarter + year). We keep every field
-    // the payload sends rather than the bare year — the quarter feeds the season
-    // chip and the month feeds the start-date detail row (ROD-140).
+    // The persisted search op returns far more than the id/name/episodes we historically
+    // parsed. We pull every field with a `domain.Anime` home in one pass (ROD-181) so the
+    // parser never has to grow again. Two directly fix AniList matching: `englishName`
+    // (matches AniList's `english` even when its `romaji` uses an unreconcilable "Nth
+    // Season" form) and the year (revives year-weighted scoring + sequel tie-break); the
+    // rest seed AllAnime-first metadata so the detail pane populates even when enrichment
+    // never lands. `airedStart` carries the debut date (year+month, sometimes day) and
+    // `season` the broadcast cour (quarter+year), feeding the season chip and start-date
+    // row (ROD-140). `score` is a 0-10 float rescaled to AniList's 0-100 in `edgeToAnime`.
     const AiredStart = struct { year: ?u32 = null, month: ?u32 = null, day: ?u32 = null };
     const SeasonObj = struct { quarter: ?[]const u8 = null, year: ?u32 = null };
     const SEdge = struct {
@@ -183,17 +179,15 @@ pub const AllAnime = struct {
     const SResp = struct { data: ?SData = null };
 
     // ── popular (queryPopular) ─────────────────────────────────────────────────
-    // The feed envelope is `data.queryPopular.recommendations[]`, each a
-    // `{ anyCard, pageStatus }`. `anyCard` is field-for-field a search `SEdge`
-    // (plus manga-only extras we ignore), so it parses straight into SEdge and
-    // reuses `edgeToAnime`. Both view counts arrive as JSON *strings*:
-    //   * `rangeViews` — views WITHIN the selected window; the feed's rank key for
-    //     daily/weekly/monthly. Null for the All-Time window.
-    //   * `views` — total lifetime views; the rank key only for All-Time.
-    // We display the windowed metric (`rangeViews ?? views`) so the number always
-    // matches the card order — total views are non-monotonic in a windowed feed
-    // (a show can have more lifetime views yet a lower weekly rank). The TOP/NEW
-    // badges the site renders are NOT in the payload — they're derived client-side.
+    // The feed envelope is `data.queryPopular.recommendations[]`, each `{ anyCard,
+    // pageStatus }`. `anyCard` is field-for-field a search `SEdge`, so it parses straight
+    // into SEdge and reuses `edgeToAnime`. Both view counts arrive as JSON strings:
+    //   * `rangeViews`: views within the selected window, the rank key for daily/weekly/
+    //     monthly. Null for All-Time.
+    //   * `views`: total lifetime views, the rank key only for All-Time.
+    // We display the windowed metric (`rangeViews ?? views`) so the number always matches
+    // the card order (lifetime views are non-monotonic in a windowed feed). The TOP/NEW
+    // badges the site renders are NOT in the payload; they're derived client-side.
     const PStatus = struct {
         views: ?[]const u8 = null,
         rangeViews: ?[]const u8 = null,
@@ -227,22 +221,20 @@ pub const AllAnime = struct {
         return std.fmt.parseInt(u64, str, 10) catch null;
     }
 
-    /// AllAnime serves most covers straight from AniList's CDN, and the filename
-    /// embeds the AniList media id: `…/cover/large/bx182255-hash.jpg` → 182255.
-    /// That id is a *deterministic* enrichment join key — strictly better than
-    /// fuzzy title matching — so we mine it here (ROD-181). The leading letters
-    /// are a size/kind bucket (`b`, `bx`, `n`, `nx`…); the digits are the id.
-    /// Returns null for non-AniList thumbnails (~13% are MyAnimeList CDN urls,
-    /// whose path is an image id, not a usable anime id) and any unrecognised
-    /// shape — the caller then falls back to title matching.
+    /// AllAnime serves most covers from AniList's CDN, and the filename embeds the AniList
+    /// media id: `…/cover/large/bx182255-hash.jpg` -> 182255. That id is a deterministic
+    /// enrichment join key, strictly better than fuzzy title matching, so we mine it here
+    /// (ROD-181). The leading letters are a size/kind bucket (`b`, `bx`, `n`, `nx`…); the
+    /// digits are the id. Returns null for non-AniList thumbnails (~13% are MyAnimeList CDN
+    /// urls, whose path is an image id, not a usable anime id) and any unrecognised shape,
+    /// where the caller falls back to title matching.
     ///
-    /// TRUST: this assumes AllAnime's thumbnail truthfully names the show it
-    /// describes. A compromised provider (or a TLS MITM) could embed a wrong-but-
-    /// valid id and mis-enrich one row's cover/synopsis. That is the same trust we
-    /// already place in AllAnime — it picks the title we'd otherwise match on and
-    /// serves the very streams we play — so this widens no boundary; `anilist_id`
-    /// is a nullable enrichment column, not a key (store.zig), so there is no
-    /// collision/persistence beyond a single row, overwritten on the next enrich.
+    /// TRUST: this assumes AllAnime's thumbnail truthfully names the show. A compromised
+    /// provider (or a TLS MITM) could embed a wrong-but-valid id and mis-enrich one row.
+    /// That is the same trust we already place in AllAnime (it picks the title we'd match on
+    /// and serves the streams we play), so it widens no boundary; `anilist_id` is a nullable
+    /// enrichment column, not a key (store.zig), so a bad id can't collide or persist beyond
+    /// a single row, overwritten on the next enrich.
     fn anilistIdFromThumb(url_opt: ?[]const u8) ?u64 {
         const url = url_opt orelse return null;
         if (std.mem.indexOf(u8, url, "anilistcdn/media/anime/cover/") == null) return null;
@@ -516,27 +508,24 @@ pub const AllAnime = struct {
     /// sits at the front, so the head is the whole diagnosis.
     const GQL_REJECT_LOG_BYTES = 512;
 
-    /// A GraphQL response with `data == null` means AllAnime accepted the HTTP
-    /// request (200) but rejected the *operation* — the signature symptom of a
-    /// rotated persisted-query hash, whose `errors[].message` reads
-    /// `PersistedQueryNotFound`. That message is the entire diagnosis, and it
-    /// lives only in the body we would otherwise discard. Emit a bounded prefix at
-    /// `warn` — always-on, NOT gated behind `--debug`, which is exactly off when a
-    /// user first reports "playback failed" (ROD-300). The body is anime metadata
-    /// with no secrets, so a prefix is safe to write to the log file.
+    /// A GraphQL response with `data == null` means AllAnime accepted the HTTP request (200)
+    /// but rejected the OPERATION, the signature of a rotated persisted-query hash, whose
+    /// `errors[].message` reads `PersistedQueryNotFound`. That message is the whole diagnosis
+    /// and lives only in the body we would otherwise discard. Emit a bounded prefix at `warn`,
+    /// always-on and NOT gated behind `--debug` (exactly off when a user first reports
+    /// "playback failed", ROD-300). The body is anime metadata with no secrets, safe to log.
     fn logGqlReject(stage: []const u8, raw: []const u8) void {
         const head = raw[0..@min(raw.len, GQL_REJECT_LOG_BYTES)];
         log.warn("allanime {s}: operation rejected (data:null); body head: {s}", .{ stage, head });
     }
 
-    /// One POST to the AllAnime GraphQL endpoint. Returns the response body
-    /// (lives in `arena`). Failures are split into distinct, actionable classes
-    /// (ROD-173) so the caller can tell the user whether to retry, wait, or reach
-    /// for a VPN, instead of collapsing everything into one signal:
-    ///   * `NetworkDown` — timeout / refused / unreachable on our side.
-    ///   * `Forbidden`   — 403/451: AllAnime is actively blocking us.
-    ///   * `ServerError` — 5xx: the source itself is down.
-    ///   * `HttpNotOk`   — any other non-200 (unexpected — the recipe may have drifted).
+    /// One POST to the AllAnime GraphQL endpoint. Returns the response body (in `arena`).
+    /// Failures split into distinct, actionable classes (ROD-173) so the caller can tell the
+    /// user whether to retry, wait, or reach for a VPN:
+    ///   * `NetworkDown`: timeout / refused / unreachable on our side.
+    ///   * `Forbidden`:   403/451, AllAnime is actively blocking us.
+    ///   * `ServerError`: 5xx, the source itself is down.
+    ///   * `HttpNotOk`:   any other non-200 (the recipe may have drifted).
     fn post(arena: Allocator, io: Io, body: []const u8, referer: []const u8) ![]u8 {
         var client: std.http.Client = .{ .allocator = arena, .io = io };
         defer client.deinit();
@@ -582,22 +571,17 @@ pub const AllAnime = struct {
         };
     }
 
-    /// Map a transport-layer failure from `client.fetch` to `NetworkDown` when
-    /// "check your connection" is the right advice. Two distinct families in
-    /// std.Io's `FetchError` qualify (they are NOT aliases of each other):
-    ///   * IP-level connect failures — refused / reset / host+network
-    ///     unreachable / timeout.
-    ///   * DNS `HostName.LookupError` — NXDOMAIN, SERVFAIL, malformed records,
-    ///     no address returned, unreadable resolv.conf. The ticket calls for DNS
-    ///     to land here, and these are their own error values, so they must be
-    ///     listed explicitly — an earlier draft wrongly assumed they aliased the
-    ///     connect errors.
-    /// `TlsInitializationFailed` is included: against our Cloudflare-fronted
-    /// upstream it is overwhelmingly a reset/intercepted handshake (a network
-    /// condition), though it also absorbs the rare server-side cert-validation
-    /// failure — an accepted imprecision over standing up a dedicated TLS class.
-    /// Everything else (OOM, protocol, local socket misconfig) propagates
-    /// unchanged so we never mislabel it as a dead network.
+    /// Map a transport-layer failure from `client.fetch` to `NetworkDown` when "check your
+    /// connection" is the right advice. Two distinct families in std.Io's `FetchError`
+    /// qualify (they are NOT aliases of each other):
+    ///   * IP-level connect failures: refused / reset / host+network unreachable / timeout.
+    ///   * DNS `HostName.LookupError`: NXDOMAIN, SERVFAIL, malformed records, no address,
+    ///     unreadable resolv.conf. These are their own error values, so they must be listed
+    ///     explicitly (an earlier draft wrongly assumed they aliased the connect errors).
+    /// `TlsInitializationFailed` is included: against our Cloudflare-fronted upstream it is
+    /// overwhelmingly a reset/intercepted handshake, though it also absorbs the rare
+    /// server-side cert-validation failure (an accepted imprecision). Everything else (OOM,
+    /// protocol, local socket misconfig) propagates unchanged so we never mislabel it.
     fn mapTransportError(e: anyerror) anyerror {
         switch (e) {
             // IP-level connect failures.
@@ -677,23 +661,19 @@ pub const AllAnime = struct {
         return w.buffered();
     }
 
-    /// SSRF policy for every long-tail fetch. Only plain http(s); no userinfo
-    /// (defeats `https://allanime.day@evil/…`); and IP-literal or `localhost`
-    /// destinations in private/loopback/link-local space are refused. Paired with
+    /// SSRF policy for every long-tail fetch. Only plain http(s); no userinfo (defeats
+    /// `https://allanime.day@evil/…`); IP-literal or `localhost` destinations in
+    /// private/loopback/link-local space are refused. Paired with
     /// `redirect_behavior=.not_allowed` so a redirect can't bounce past this.
     ///
-    /// We validate the *decoded* host (`getHost`/`toRaw`) — the same bytes
-    /// std.http resolves against. Reading the raw component would let
-    /// `127%2e0%2e0%2e1` slip by as a "hostname" while the client decodes it to
-    /// loopback (a guard/client host disagreement — the percent-encode bypass).
+    /// We validate the DECODED host (`getHost`/`toRaw`), the same bytes std.http resolves
+    /// against. Reading the raw component would let `127%2e0%2e0%2e1` slip by as a
+    /// "hostname" while the client decodes it to loopback (the percent-encode bypass).
     ///
-    /// KNOWN RESIDUAL: a public DNS *name* whose record points at a private IP
-    /// (DNS rebinding) is still NOT caught — std's Io net API exposes no
-    /// pre-connect resolver to inspect, so we can't vet the resolved address
-    /// before the client connects. Closing it needs resolve-then-connect-to-a-
-    /// validated-IP, which the std API doesn't cleanly allow today. Tracked in
-    /// ROD-172. (The body-read wall-clock deadline that used to live here too is
-    /// now closed — see `get`/`withDeadline`, ROD-153.)
+    /// KNOWN RESIDUAL: a public DNS name whose record points at a private IP (DNS rebinding)
+    /// is NOT caught: std's Io net API exposes no pre-connect resolver, so we can't vet the
+    /// resolved address before connecting. Closing it needs resolve-then-connect-to-a-
+    /// validated-IP, which the std API doesn't cleanly allow today (ROD-172).
     fn guardFetchUrl(url: []const u8) !void {
         const uri = std.Uri.parse(url) catch return error.BadFetchUrl;
         if (!std.mem.eql(u8, uri.scheme, "http") and !std.mem.eql(u8, uri.scheme, "https")) return error.BadFetchUrl;
@@ -707,14 +687,12 @@ pub const AllAnime = struct {
         if (parseHostIp(host)) |ip| {
             if (isPrivateIp(ip)) return error.BlockedHost;
         } else {
-            // Not a canonical IP literal. std resolves numeric non-canonical forms
-            // strictly today (they fail to parse → go to DNS as a bogus name, never
-            // loopback), but that's one std change away (the getaddrinfo_a TODO in
-            // Threaded.zig). Reject the alternate IP spellings a real host never
-            // uses, so they can't become a bypass: any ':' (malformed/compressed
-            // IPv6 like `::ffff:7f00:1`) or an all-numeric / `0x`-prefixed IPv4
-            // (`2130706433`, `0x7f.0.0.1`, `127.1`). No public hostname looks like
-            // these, so there are no false positives.
+            // Not a canonical IP literal. std resolves numeric non-canonical forms strictly
+            // today (they fail to parse and go to DNS as a bogus name, never loopback), but
+            // that's one std change away (the getaddrinfo_a TODO in Threaded.zig). Reject the
+            // alternate IP spellings a real host never uses so they can't become a bypass:
+            // any ':' (compressed IPv6 like `::ffff:7f00:1`) or an all-numeric / `0x` IPv4
+            // (`2130706433`, `0x7f.0.0.1`, `127.1`). No public hostname looks like these.
             if (std.mem.indexOfScalar(u8, host, ':') != null) return error.BlockedHost;
             if (looksNumericHost(host)) return error.BlockedHost;
         }
@@ -914,14 +892,13 @@ pub const AllAnime = struct {
         return std.mem.concat(arena, u8, &.{ base[0..dir_end], ref });
     }
 
-    /// Pick the variant matching the user's quality preference from the gathered
-    /// candidates, or null when there are none (ROD-152). Cap policy:
-    ///   `best`  → highest resolution
-    ///   `worst` → lowest resolution
-    ///   a rung  → the highest variant *at or below* the rung; if every variant
-    ///             exceeds it, the lowest available — we never bump a capped user
-    ///             over their ceiling when we can avoid it, but always return
-    ///             *something* the source actually offers (nearest-available).
+    /// Pick the variant matching the user's quality preference from the gathered candidates,
+    /// or null when there are none (ROD-152). Cap policy:
+    ///   `best`:  highest resolution
+    ///   `worst`: lowest resolution
+    ///   a rung:  the highest variant at or below the rung; if every variant exceeds it, the
+    ///            lowest available (never bump a capped user over their ceiling when we can
+    ///            avoid it, but always return something the source offers, nearest-available).
     fn selectVariant(variants: []const domain.StreamLink, quality: domain.Quality) ?domain.StreamLink {
         if (variants.len == 0) return null;
         var pick = variants[0];
@@ -931,15 +908,14 @@ pub const AllAnime = struct {
         return pick;
     }
 
-    /// True if candidate `a` beats incumbent `b` for `quality`. A *known*
-    /// resolution always beats an unknown one (null), and two unknowns tie — we
-    /// never pick a stream on a resolution we can't see over one we can. This
-    /// matters most under a rung cap: an unknown stream (a BANDWIDTH-only
-    /// STREAM-INF) could be any bitrate, so treating it as "0p, safely in budget"
-    /// would hand a capped user the exact firehose the cap exists to prevent.
-    /// Unknowns are thus a last resort, chosen only when *every* candidate is
-    /// unknown. Over known resolutions this is a strict weak order, so the fold
-    /// yields the cap-policy winner regardless of arrival order.
+    /// True if candidate `a` beats incumbent `b` for `quality`. A KNOWN resolution always
+    /// beats an unknown one (null), and two unknowns tie: we never pick a stream on a
+    /// resolution we can't see over one we can. This is sharpest under a rung cap, where an
+    /// unknown stream (a BANDWIDTH-only STREAM-INF) could be any bitrate, so treating it as
+    /// "0p, safely in budget" would hand a capped user the exact firehose the cap prevents.
+    /// Unknowns are thus a last resort, chosen only when EVERY candidate is unknown. Over
+    /// known resolutions this is a strict weak order, so the fold yields the winner
+    /// regardless of arrival order.
     fn preferred(a: domain.StreamLink, b: domain.StreamLink, quality: domain.Quality) bool {
         const ra = a.resolution orelse return false; // unknown `a` never beats `b`
         const rb = b.resolution orelse return true; // known `a` beats unknown `b`
