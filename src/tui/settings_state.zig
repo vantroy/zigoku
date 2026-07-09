@@ -1,24 +1,19 @@
 //! Zigoku — Settings controller subsystem (ROD-161).
 //!
-//! The second cut of the controller/subsystem split (after ROD-160's
-//! `CoverState`). Owns the Settings tab's data model + edit state: the row
-//! table, the cursor over the interactive rows, and the in-progress text-edit
-//! buffer. Cycle/toggle/edit mutate the caller's `Config` *in place* through an
-//! explicitly-passed `*Config` — this struct never reaches back into App or
-//! navigation state.
+//! Owns the Settings tab's data model + edit state: the row table, the cursor over the
+//! interactive rows, and the in-progress text-edit buffer. Cycle/toggle/edit mutate the
+//! caller's `Config` in place through an explicitly-passed `*Config`; this struct never
+//! reaches back into App or navigation state.
 //!
-//! Keystone: the subsystem owns its own state transitions but never
-//! the *projections* of those transitions onto App-live state. `onKey` returns a
-//! `KeyResult` verdict; the controller (App.onSettingsKey) maps `.config_changed`
-//! to a palette/translation re-sync, so the settings struct stays free of `App`,
-//! `palette`, `translation`, toasts, and the `active_view`/`active_pane` writes.
-//! Persistence rides leave/quit, not a key verdict (ROD-210): a `dirty` flag here
-//! tells the controller whether `App.leaveSettings` owes a write. Embed by value
-//! (`settings: SettingsState = .{}`); no back-reference, no `@fieldParentPtr`.
+//! Keystone: the subsystem owns its state transitions but never the PROJECTIONS of those
+//! transitions onto App-live state. `onKey` returns a `KeyResult` verdict; the controller
+//! (App.onSettingsKey) maps `.config_changed` to a palette/translation re-sync, so this
+//! struct stays free of `App`, `palette`, `translation`, toasts, and the view/pane writes.
+//! Persistence rides leave/quit, not a key verdict (ROD-210): a `dirty` flag tells the
+//! controller whether `App.leaveSettings` owes a write. Embed by value; no `@fieldParentPtr`.
 //!
-//! The view (`view/settings.zig`) renders this state; the data model
-//! (`SettingId`/`SettingRow`/`settings_rows`) is re-exported from app.zig so
-//! existing `app_mod.*` references keep resolving.
+//! The view (`view/settings.zig`) renders this; the data model
+//! (`SettingId`/`SettingRow`/`settings_rows`) is re-exported from app.zig.
 
 const std = @import("std");
 const vaxis = @import("vaxis");

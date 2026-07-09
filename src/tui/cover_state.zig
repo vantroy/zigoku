@@ -1,11 +1,5 @@
-//! Zigoku — cover/image subsystem (ROD-160).
-//!
-//! Extracted from app.zig as the pattern-setter for the controller/subsystem
-//! split. Owns one selection's poster art — fetch policy, decoded-pixel +
-//! Kitty-image state, worker-thread lifecycle — and is driven purely through
-//! explicit dependencies (gpa/loop/io/now/vx). It has no dependency on App: the
-//! controller resolves the target id/url from navigation state and passes the
-//! primitives in.
+//! Zigoku — cover/image subsystem (ROD-160). Owns one selection's poster art; see
+//! `CoverState` below for the full contract.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,13 +15,10 @@ const SourceProvider = @import("../source.zig").SourceProvider;
 const coverTask = workers.coverTask;
 
 /// The cover/image subsystem (ROD-160). Owns one selection's poster art: the
-/// fetch/suppress/retry *policy*, the decoded-pixel + Kitty-image state, and the
-/// worker-thread lifecycle. Extracted from App as the pattern-setter for the
-/// controller/subsystem split — it holds only cover state and is driven through
-/// explicit dependencies (`gpa`/`loop`/`io`/`now`/`vx`). It never reaches back
-/// into App or navigation state: the caller resolves the target id/url and
-/// passes them into `sync`. Embed by value on App (`cover: CoverState = .{}`);
-/// no back-reference, no `@fieldParentPtr`.
+/// fetch/suppress/retry policy, the decoded-pixel + Kitty-image state, and the worker-thread
+/// lifecycle. The pattern-setter for the controller/subsystem split, driven through explicit
+/// dependencies (`gpa`/`loop`/`io`/`now`/`vx`). It never reaches back into App: the caller
+/// resolves the target id/url and passes them into `sync`. Embed by value; no `@fieldParentPtr`.
 pub const CoverState = struct {
     /// Cover fetch/decode failure suppression window (ROD-110). After a failure
     /// we suppress refetch of the *same id+url* for this long, then allow one
@@ -104,14 +95,12 @@ pub const CoverState = struct {
     /// Letterboxed placement of an image inside a half-block mosaic grid (ROD-110).
     pub const HalfBlockFit = struct { w: u32, h: u32, off_x: u32, off_y: u32 };
 
-    /// Fit `img_w × img_h` into a `grid_w × grid_h` half-pixel grid, preserving
-    /// aspect. A half-block cell (`▀`) is full-cell *wide* but half-cell *tall*, so
-    /// a half-pixel is `ppc` wide and `pph/2` tall — only square when cells are 2:1.
-    /// We therefore compare in physical-pixel space using the terminal's reported
-    /// `ppc`/`pph` (pixels per column/row). Pass `ppc == 0` or `pph == 0` when the
-    /// terminal won't report pixel metrics, which falls back to assuming square
-    /// half-pixels (the pre-fix behavior — correct on 2:1 cells, off elsewhere).
-    /// Extracted as a pure helper so the aspect math is unit-testable.
+    /// Fit `img_w × img_h` into a `grid_w × grid_h` half-pixel grid, preserving aspect. A
+    /// half-block cell (`▀`) is full-cell wide but half-cell tall, so a half-pixel is `ppc`
+    /// wide and `pph/2` tall (square only on 2:1 cells). We compare in physical-pixel space
+    /// via the terminal's reported `ppc`/`pph`. Pass `ppc == 0`/`pph == 0` when the terminal
+    /// won't report metrics, which falls back to assuming square half-pixels (correct on 2:1,
+    /// off elsewhere). Pure so the aspect math is unit-testable.
     pub fn halfBlockFit(img_w: u32, img_h: u32, grid_w: u32, grid_h: u32, ppc: u32, pph: u32) HalfBlockFit {
         var fit_w = grid_w;
         var fit_h = grid_h;

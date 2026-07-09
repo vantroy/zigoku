@@ -1,15 +1,11 @@
 //! Zigoku — Discover/Popular feed controller subsystem (ROD-239).
 //!
-//! The sixth cut of the controller/subsystem split (after CoverState,
-//! SettingsState, PlaybackSession, EpisodeState, and SearchController). Owns the
-//! *record* of the Popular feed: the active popularity window, the grid
-//! cursor/scroll, and a short-lived per-window result cache. Transport (the
-//! worker thread, the slow-path timer) stays on App, mirroring SearchController —
-//! App resolves nav state and hands primitives in; this struct never reaches back
-//! into App. Embed by value (`discover: DiscoverState = .{}`).
+//! Owns the RECORD of the Popular feed: the active popularity window, the grid
+//! cursor/scroll, and a short-lived per-window result cache. Transport (the worker thread,
+//! the slow-path timer) stays on App, mirroring SearchController: App resolves nav state and
+//! hands primitives in; this struct never reaches back into App. Embed by value.
 //!
-//! The view (`view/discover.zig`) renders this through `self.discover.*`;
-//! DiscoverState is re-exported from app.zig so `app_mod.*` references resolve.
+//! The view (`view/discover.zig`) renders this; DiscoverState is re-exported from app.zig.
 
 const std = @import("std");
 const domain = @import("../domain.zig");
@@ -49,22 +45,20 @@ pub const Slot = struct {
 
 /// The Popular-feed controller (ROD-239).
 ///
-/// ── LOAD-BEARING INVARIANT: one independent slot per window ──────────────────
-/// `slots` is FOUR separate owned lists, one per `PopularWindow` — NEVER a single
-/// shared list that gets re-windowed. This is not an optimization choice; it is a
-/// correctness requirement, because each card's `view_count` is the *windowed*
-/// count (`rangeViews`), so the SAME show carries DIFFERENT counts in different
-/// windows (e.g. ~12k Daily / ~40k Weekly / ~660k lifetime). The feed is also
-/// ranked by that windowed count, so the displayed number must match the slot it
-/// came from or it desyncs from the card's rank. Therefore:
-///   • Never re-tag/re-window a single result list — switch to the window's slot.
-///   • Never intern or share an `Anime` instance across slots; a show present in
-///     all four windows is four independent owned copies.
-///   • Never persist `view_count` to the store — it is window-specific; the
-///     durable `AnimeRecord` (shared with Browse) carries only window-agnostic
-///     facts. (Enforced today: `AnimeRecord` has no view-count column.)
-/// "Optimize" any of these into a shared/persisted count and the displayed number
-/// silently lies about the rank the moment the window changes — see ROD-239.
+/// ── CORRECTNESS INVARIANT: one independent slot per window ──────────────────
+/// `slots` is FOUR separate owned lists, one per `PopularWindow`, NEVER a single shared
+/// list that gets re-windowed. This is a correctness requirement, not an optimization:
+/// each card's `view_count` is the WINDOWED count (`rangeViews`), so the same show carries
+/// different counts in different windows (~12k Daily / ~40k Weekly / ~660k lifetime), and
+/// the feed is ranked by that windowed count, so the displayed number must match the slot
+/// it came from or it desyncs from the card's rank. Therefore:
+///   • Never re-tag/re-window a single result list; switch to the window's slot.
+///   • Never intern or share an `Anime` across slots; a show in all four windows is four
+///     independent owned copies.
+///   • Never persist `view_count` to the store; it is window-specific (enforced: the
+///     durable `AnimeRecord` shared with Browse has no view-count column).
+/// "Optimize" any of these into a shared/persisted count and the displayed number silently
+/// lies about the rank the moment the window changes (ROD-239).
 pub const DiscoverState = struct {
     /// The active popularity window — drives both the segmented bar and the fetch.
     window: source.PopularWindow = .daily,
@@ -96,16 +90,13 @@ pub const DiscoverState = struct {
         slot.exhausted = false;
     }
 
-    /// Backfill a window slot's [offset, offset+count) cards from the local store
-    /// before enrichment fires (ROD-268), the mirror of
-    /// `SearchController.hydrateResultsFromStore`. The popular feed's thumbs are
-    /// provider-relative `mcovers/…` paths with no mineable AniList id, so an
-    /// id-less card would take the flaky title-match path — or, in the batch path,
-    /// be dropped entirely. Feeding the `anilist_id` a past match already stored
-    /// (keyed by `(source, source_id)`) makes that card enrich deterministically
-    /// by id instead. Back-fills nulls only, so a fresher in-memory value from the
-    /// feed is never clobbered. `store`/`source_name` are resolved by App and
-    /// passed in; this never reads App.
+    /// Backfill a window slot's [offset, offset+count) cards from the local store before
+    /// enrichment fires (ROD-268), the mirror of `SearchController.hydrateResultsFromStore`.
+    /// The popular feed's thumbs are provider-relative `mcovers/…` paths with no mineable
+    /// AniList id, so an id-less card takes the flaky title-match path (or in the batch path
+    /// is dropped); feeding the `anilist_id` a past match stored (keyed by (source, source_id))
+    /// makes it enrich deterministically by id. Back-fills nulls only, so a fresher in-memory
+    /// value is never clobbered. `store`/`source_name` are passed in; this never reads App.
     pub fn hydrateSlotFromStore(self: *DiscoverState, gpa: Allocator, store: ?*Store, source_name: []const u8, idx: usize, offset: usize, count: usize) void {
         const st = store orelse return;
         const items = self.slots[idx].results.items;

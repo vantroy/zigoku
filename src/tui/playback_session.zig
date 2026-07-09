@@ -1,21 +1,15 @@
 //! Zigoku — mpv playback session subsystem (ROD-162).
 //!
-//! The third cut of the controller/subsystem split (after ROD-160's CoverState
-//! and ROD-161's SettingsState). Owns the *record* of the currently playing
-//! episode — what show/episode/source is playing, the checkpoint high-water
-//! mark, and the watched-state bookkeeping — and the persistence transitions
-//! over a caller-supplied `Store`. It is driven through explicit dependencies
-//! (`gpa`/`store`); it never reaches back into App.
+//! Owns the RECORD of the currently playing episode (what show/episode/source is playing,
+//! the checkpoint high-water, the watched-state bookkeeping) and the persistence transitions
+//! over a caller-supplied `Store`. Driven through explicit dependencies (`gpa`/`store`); it
+//! never reaches back into App.
 //!
-//! Where the boundary sits: this struct owns the *session record*, not the
-//! *transport*. `playing`, `play_thread`, `current_position`, and
-//! `current_duration` stay on App — those are app-shell concerns (the loading
-//! flag, the thread handle the shell joins, the live position the UI renders),
-//! not session-scoped. The controller (`tick`'s playback-event handlers +
-//! `firePlay`) resolves selection context and orchestrates the thread; it calls
-//! in here for the session transitions and does the transport reset itself.
-//! Embed by value (`session: PlaybackSession = .{}`); no back-reference, no
-//! `@fieldParentPtr`.
+//! Boundary: this struct owns the session record, not the transport. `playing`,
+//! `play_thread`, `current_position`, and `current_duration` stay on App (app-shell concerns:
+//! the loading flag, the thread handle the shell joins, the live position the UI renders).
+//! The controller resolves selection context, orchestrates the thread, and does the transport
+//! reset itself, calling in here for the session transitions. Embed by value; no `@fieldParentPtr`.
 
 const std = @import("std");
 const domain = @import("../domain.zig");
