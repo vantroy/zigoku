@@ -2103,14 +2103,13 @@ test "concurrent open migrates atomically — no double-apply, no half-applied s
 }
 
 test "open() wires the busy_timeout on the connection (ROD-287)" {
-    // Directly assert `open()` configured a non-zero busy_timeout — the half of the fix
-    // that lets a second writer wait out a briefly-held lock instead of erroring at
-    // once (the markSynced-vs-checkpoint collision). The query form of
-    // `PRAGMA busy_timeout` reads back exactly what `sqlite3_busy_timeout` set, so this
-    // fails deterministically if the wiring in `open()` is ever dropped. A prior draft
-    // drove a real contention timeout instead, but that passes on SQLite's own busy
-    // mechanics even with our wiring removed (caught in review) — and it was timing-
-    // dependent. Asserting against the const, not a literal, keeps it valid on a retune.
+    // Directly assert `open()` configured a non-zero busy_timeout, the half of the fix that
+    // lets a second writer wait out a briefly-held lock instead of erroring at once (the
+    // markSynced-vs-checkpoint collision). The query form of `PRAGMA busy_timeout` reads back
+    // exactly what `sqlite3_busy_timeout` set, so this fails deterministically if the wiring
+    // in `open()` is ever dropped. A prior draft drove a real contention timeout, but that
+    // passes on SQLite's own busy mechanics even with our wiring removed (caught in review)
+    // and was timing-dependent. Asserting against the const, not a literal, survives a retune.
     var s = try Store.openMemory();
     defer s.close();
     const stmt = try s.prepare("PRAGMA busy_timeout;");
@@ -3567,15 +3566,13 @@ test "recomputeProgress: no episode_progress rows → 0 (ROD-193)" {
 }
 
 test "recomputeProgress: gap-watch documents strategy-A under-count (ROD-193)" {
-    // Strategy A contract: progress = 1-based index of the last fully-watched row
-    // among the rows PRESENT in episode_progress, sorted by sortKey. Rows for
-    // episodes never started are absent from episode_progress — this is by design.
-    // Gap-watching (only eps 3 and 5 in episode_progress, both fully_watched, no
-    // rows for 1/2/4) yields high_water = 2: the 2-row sorted slice has its last
-    // fully-watched entry at index 1 (0-based), i.e. 1-based index 2.
-    // This LOCKS the intentional under-count: strategy A is correct for contiguous
-    // watchers (the DoD case) and deliberately under-counts gaps. Do not change
-    // this expectation without updating the recomputeProgress doc comment.
+    // recomputeProgress contract: progress = 1-based index of the last fully-watched row
+    // among the rows PRESENT in episode_progress, sorted by sortKey. Episodes never started
+    // are absent from episode_progress, by design. Gap-watching (only eps 3 and 5 present,
+    // both fully_watched, no rows for 1/2/4) yields high_water = 2: the 2-row sorted slice has
+    // its last fully-watched entry at 0-based index 1, i.e. 1-based index 2. This LOCKS the
+    // intentional under-count (correct for contiguous watchers, deliberately under-counting
+    // gaps). Do not change this expectation without updating the recomputeProgress doc comment.
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -3752,9 +3749,9 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     };
 
     // openMemory already ran MIGRATION_V14 (DDL + BACKFILL) on empty tables, so
-    // canonical_anime exists and is empty. Seed bindings by hand — a raw INSERT, not
-    // upsertAnime, because the tiebreak keys on enrichment_fetched_at, which the upsert
-    // API doesn't take. Six distinct anilist_ids exercise every tier of the pick:
+    // canonical_anime exists and is empty. Seed bindings by hand (a raw INSERT, not
+    // upsertAnime, because the tiebreak keys on enrichment_fetched_at, which the upsert API
+    // doesn't take). Six distinct anilist_ids exercise every tier of the pick:
     //   100  singleton (senshi)                           → 1:1 lift, mal_id carries
     //   NULL the unmatched tail                           → no canonical row, stays unlinked
     //   999  senshi(fresher, NO mal) vs allanime(mal=555) → fresher wins; NULL mal recovers 555
