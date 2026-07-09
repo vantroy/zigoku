@@ -143,13 +143,12 @@ pub const SearchController = struct {
         self.results = .empty;
     }
 
-    /// Backfill the [offset, offset+count) result rows from the canonical spine, so a
-    /// re-search of the same query renders rich (cover / synopsis cached from a prior
-    /// visit) instead of looking cold (ROD-327). Reads `canonical_anime` by anilist_id:
-    /// AniList discovery hits are canonical-keyed with no provider binding, so the old
-    /// `getAnime(source, source_id)` read is wrong here. Back-fills nulls only, so it
-    /// never clobbers a field the fresh AniList hit already carried. `store` is resolved
-    /// by the controller (App) and passed in; this never reads App.
+    /// Backfill the [offset, offset+count) result rows from the canonical spine (ROD-327),
+    /// so a re-search renders rich (cover/synopsis from a prior visit) instead of cold.
+    /// Reads `canonical_anime` by anilist_id, not `getAnime(source, source_id)`: AniList
+    /// hits are canonical-keyed with no provider binding. Back-fills nulls only, so it
+    /// never clobbers a field the fresh hit already carries. `store` is resolved by the
+    /// controller (App); this never reads App.
     pub fn hydrateResultsFromStore(
         self: *SearchController,
         gpa: Allocator,
@@ -190,10 +189,9 @@ pub const SearchController = struct {
         // capacity, so it's one alloc amortized over the page.
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        // AniList discovery search returns the full enrichment field set (GQL_SEARCH is
-        // GQL_FIELDS), so each hit is a confirmed, fully-enriched answer: stamp it fresh
-        // (ROD-327) so the collapse to one pass is real and refresh-on-view doesn't
-        // re-fetch an already-current show on first open. Share one `now` across the page.
+        // AniList discovery search returns the full field set, so every hit is a
+        // confirmed, fully-enriched answer: stamp fresh (see upsertCanonicalOnly's doc
+        // for the gate contract). Share one `now` across the page.
         const now = Store.nowSecs();
         const end = @min(self.results.items.len, offset + count);
         var i = offset;

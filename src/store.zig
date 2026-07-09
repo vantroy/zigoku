@@ -877,13 +877,11 @@ pub const Store = struct {
     /// A caller passing a row with real per-track counts would break that: scope this to
     /// search hits.
     ///
-    /// `stamp_fresh` advances the ROD-182 freshness clock (same gate contract as
-    /// `upsertEnriched`): pass true ONLY when `anime` carries the full enrichment field set
-    /// from a confirmed answer, false otherwise. AniList discovery search returns the full
-    /// `GQL_FIELDS` (identical to the by-id refresh enrich), so its hits stamp fresh and
-    /// refresh-on-view leaves them alone until the TTL genuinely lapses. A partial-field
-    /// caller (the ROD-325 Discover feed, which nulls score/season) MUST pass false so the
-    /// gaps still draw a refresh.
+    /// `stamp_fresh` gates the freshness stamp (same contract as `upsertEnriched`, ROD-182):
+    /// pass true only when `anime` carries the full enrichment field set from a confirmed
+    /// answer. AniList discovery search returns the full `GQL_FIELDS`, so search hits stamp
+    /// fresh; the ROD-325 Discover feed nulls score/season and MUST pass false, or those
+    /// gaps never draw a refresh.
     pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, stamp_fresh: bool, now: i64, scratch: Allocator) Error!void {
         var rec = AnimeRecord.fromDomain("", anime, .sub);
         if (stamp_fresh) {
@@ -896,18 +894,16 @@ pub const Store = struct {
     /// Mint (or link) the provider binding row for a canonical entity (ROD-327): the
     /// tier-A resolver's write, once `provider.episodes()` confirms the provider stocks
     /// the show. `anilist_id` must already own a canonical row (search persisted it via
-    /// `upsertCanonicalOnly`); this creates the `(source, source_id)` binding, links
-    /// `canonical_id`, and reveals it when `visible`. Display columns resolve through
-    /// canonical (loadHistory/getAnime COALESCE), so the binding carries only identity
-    /// plus the NOT NULL `title`. `upsertAnime`'s ON CONFLICT preserves user state and
-    /// MAX-merges `history_visible`, so a re-resolve of an already-tracked show never
-    /// clobbers it.
+    /// `upsertCanonicalOnly`). Creates the `(source, source_id)` binding, links
+    /// `canonical_id`, reveals it when `visible`. Display columns resolve through canonical
+    /// (loadHistory/getAnime COALESCE), so the binding carries only identity plus the NOT
+    /// NULL `title`. `upsertAnime`'s ON CONFLICT preserves user state and MAX-merges
+    /// `history_visible`, so a re-resolve of an already-tracked show never clobbers it.
     ///
-    /// Returns whether a binding was written: `false` means no canonical row exists for
-    /// `anilist_id` (a search persist that silently failed), so the caller must NOT report
-    /// success (an Add would toast a lie; a Play would let a later `recordPlay` FK-fail).
-    /// It "can't happen" for a normal search hit (persist runs first, same UI thread), but
-    /// the write is best-effort, so the bool makes the no-op honest instead of invisible.
+    /// Returns false if no canonical row exists for `anilist_id` (persist ran out of order
+    /// or silently failed): the caller must not report success, since persist is
+    /// best-effort and a false "success" here means an Add toasts a lie or a later
+    /// `recordPlay` FK-fails.
     pub fn bindCanonical(self: *Store, source: []const u8, source_id: []const u8, anilist_id: i64, visible: bool, now: i64, scratch: Allocator) Error!bool {
         const canon = try self.getCanonicalByAnilistId(scratch, anilist_id) orelse {
             std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
@@ -3403,8 +3399,7 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
         .score = 89,
         .total_episodes = 28,
     };
-    // Search returns the full field set → stamp fresh (ROD-327), so refresh-on-view
-    // treats the searched show as current instead of re-fetching it on first open.
+    // Full field set → stamp fresh (see upsertCanonicalOnly's doc for the gate contract).
     try s.upsertCanonicalOnly(hit, true, 7000, arena);
     try testing.expectEqual(@as(?i64, 7000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 182255;"));
 

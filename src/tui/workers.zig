@@ -332,11 +332,11 @@ fn mergeStrList(live: *[]const []const u8, incoming: *[]const []const u8) void {
     }
 }
 
-/// Background task: run a discovery search on AniList (ROD-327) and post the results
-/// back to the UI thread. Discovery search is OFF the `SourceProvider` vtable (the
-/// crown-jewel split, ROD-324): it queries AniList directly, so hits are anilist_id-keyed
-/// canonical rows, not provider bindings. Binding a hit to a play provider is the
-/// resolver's job (the Play/Add tier-A path), never this fetch.
+/// Background task: run a discovery search on AniList (ROD-327) and post the results to
+/// the UI thread. Discovery search is OFF the `SourceProvider` vtable (ROD-324): it
+/// queries AniList directly, so hits are anilist_id-keyed canonical rows, not provider
+/// bindings. Binding a hit to a play provider is the resolver's job (the Play/Add
+/// tier-A path), never this fetch.
 pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, page: u32) void {
     // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
     // on the success path; the UI thread frees it there. On all error paths we free it
@@ -395,14 +395,14 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, pa
 
 /// Background task: tier-A resolve for add-to-watchlist (ROD-327). A Browse search hit
 /// is anilist_id-keyed; the play provider keys by the stringified mal_id (`candidate_id`).
-/// Probe `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
-/// the show, so the UI thread can mint the binding. Both a transport failure and an empty
-/// list collapse to `ok = false`: slice B writes no state on a miss (the unmatched terminal
-/// state is ROD-329), so both are the same "couldn't add" outcome.
+/// Probes `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
+/// the show, so the UI thread can mint the binding. A transport failure and an empty list
+/// both collapse to `ok = false` (no state written on a miss; ROD-329 owns the unmatched
+/// state), so both read as the same "couldn't add" outcome.
 ///
 /// `candidate_id` ownership transfers to the `resolve_add_result` event on a successful
 /// post (the UI thread frees it on either arm); freed here only if the post fails.
-/// `drain.finish()` runs last (mirrors episodesTask) so a drained barrier means this
+/// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
 /// worker can no longer touch loop/gpa.
 pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64, translation: domain.Translation, drain: *ThreadDrain) void {
     defer drain.finish();

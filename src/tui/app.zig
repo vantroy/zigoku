@@ -1928,24 +1928,22 @@ pub const App = struct {
                     self.list_top = 0;
                 }
                 const added = self.search.results.items.len - offset;
-                // ROD-327: AniList discovery hits arrive fully enriched, so Browse folds
-                // the old two-pass search-then-enrich into ONE pass, no fireEnrich here.
-                // Hydrate warms a re-search from the canonical spine; persist mirrors each
-                // hit as a canonical entity (no provider binding; that's the resolver's job).
+                // ROD-327: AniList hits arrive fully enriched, so no fireEnrich pass is
+                // needed. Hydrate warms from the canonical spine; persist mirrors each hit
+                // as a canonical entity only (binding to a play provider is the resolver's job).
                 self.search.hydrateResultsFromStore(self.gpa, self.store, offset, added);
                 self.search.persistResults(self.gpa, self.store, offset, added);
             },
 
             .resolve_add_result => |ev| {
-                // ROD-327: a tier-A add-resolve settled. The worker owns nothing after this;
-                // free the resolved id on both arms. Clear the in-flight guard so the next P
-                // can fire.
+                // ROD-327: tier-A add-resolve settled; free the id and clear the in-flight
+                // guard on both arms.
                 defer self.gpa.free(ev.source_id);
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
-                    // Resolver miss: the provider doesn't stock the show (or the probe
-                    // failed). No state written; the unmatched terminal state is ROD-329.
+                    // Resolver miss (provider doesn't stock it, or the probe failed): no
+                    // state written, the unmatched terminal state is ROD-329.
                     self.pushToast(.@"error", "couldn't add to watchlist", false);
                     return;
                 }
@@ -2141,12 +2139,10 @@ pub const App = struct {
                 }
                 self.gpa.free(ev.results);
                 self.gpa.free(ev.for_query);
-                // ROD-327: the second-pass enrich is dormant. Browse search is now a single
-                // AniList pass (see .search_done), so nothing spawns the enrich worker that
-                // posts this event. The arm stays only to drain the payload + join the (never
-                // spawned) thread cleanly; it deliberately does NOT persist (the canonical
-                // persist would assert on an id-less row). The machinery is excised in a
-                // follow-up.
+                // ROD-327: dormant. Browse search is now a single AniList pass (.search_done);
+                // nothing spawns the enrich worker that posts this event. This arm only drains
+                // the payload and joins the (never-spawned) thread; it deliberately does NOT
+                // persist, since the canonical persist would assert on an id-less row.
                 if (self.enrich_thread) |t| {
                     t.join();
                     self.enrich_thread = null;
@@ -2237,24 +2233,17 @@ pub const App = struct {
                 // the fetch's source at fire time.
                 const source = selection.currentDetailSourceName(self, provider);
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-                // ROD-327: a Browse tier-A resolve that reached here means the episode fetch
-                // (the existence probe) succeeded, so the play provider stocks this show.
-                // Mint the binding on the canonical spine BEFORE caching episodes: episode_cache
-                // carries an FK to anime(source, source_id), so the parent binding row must
-                // exist first (its absence is why the first-resolve cache write silently
-                // FK-failed). Bind and cache both key off `source` so the FK parent/child match.
-                // Hidden; recordPlay reveals it on the first actual play. pending_bind is set
-                // only for a resolving Browse fire and cleared at every fireEpisodesForId entry,
-                // so History/Discover opens never reach this.
+                // ROD-327: tier-A resolve write. Bind BEFORE caching: episode_cache has an FK
+                // to anime(source, source_id), so the parent binding row must exist first, or
+                // the cache write FK-fails. Hidden (`false`); recordPlay reveals it on first play.
                 if (self.pending_bind) |aid| {
                     self.pending_bind = null;
                     if (self.store) |st| {
                         var arena = std.heap.ArenaAllocator.init(self.gpa);
                         defer arena.deinit();
                         if (st.bindCanonical(source, ev.for_id, aid, false, Store.nowSecs(), arena.allocator())) |bound| {
-                            // A false bind (no canonical row) leaves this show unbindable; the
-                            // grid still renders from the event payload, but a later recordPlay
-                            // would FK-fail. Nothing to recover here beyond the store's own log.
+                            // A false bind leaves this show unbindable: the grid still renders
+                            // from the event payload, but a later recordPlay would FK-fail.
                             if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
                         } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
                     }
@@ -2458,8 +2447,8 @@ pub const App = struct {
         const q_copy = self.gpa.dupe(u8, q) catch return;
         self.search.loading = true;
         self.async_start_ms = self.now_ms;
-        // ROD-327: discovery search is off the SourceProvider vtable, so searchTask
-        // queries AniList directly, so no provider/translation is threaded here.
+        // ROD-327: discovery search is off the SourceProvider vtable; searchTask queries
+        // AniList directly, so no provider/translation is threaded here.
         self.search_thread = std.Thread.spawn(.{}, searchTask, .{
             loop, self.gpa, io, q_copy, page,
         }) catch {
@@ -2999,14 +2988,14 @@ pub const App = struct {
         t.detach();
     }
 
-    /// The tier-A resolution of a Browse selection (ROD-327). An AniList discovery hit is
-    /// anilist_id-keyed (`metaToAnime` sets `id` = stringified anilist_id), but a play
-    /// provider keys by the stringified mal_id, so swap it and carry the canonical id to
-    /// bind once the episode fetch (the existence probe) confirms the provider stocks it.
-    /// `.bind` is null for a row that is already provider-keyed (History/Discover-origin),
-    /// which fetches unchanged. Returns null for an AniList hit with no mal_id: it can't
-    /// tier-A resolve (the unmatched terminal state is ROD-329), so the caller toasts the
-    /// miss. `buf` backs the returned id and must outlive the fetch spawn (which dupes it).
+    /// Tier-A resolution of a Browse selection (ROD-327): swaps the AniList-keyed id
+    /// (`metaToAnime` sets `id` = stringified anilist_id) for the play provider's mal-keyed
+    /// id, carrying the anilist_id to bind once the episode fetch (the existence probe)
+    /// confirms the provider stocks it. `.bind` is null for an already provider-keyed row
+    /// (History/Discover-origin), which fetches unchanged. The function returns null for an
+    /// AniList hit with no mal_id (can't tier-A resolve; ROD-329 owns the unmatched state),
+    /// so the caller toasts the miss. `buf` backs the returned id and must outlive the fetch
+    /// spawn, which dupes it.
     const ResolveTarget = struct { id: []const u8, bind: ?i64 };
     fn browseResolveTarget(sel: Anime, buf: []u8) ?ResolveTarget {
         const aid = sel.anilist_id orelse return .{ .id = sel.id, .bind = null };
@@ -3042,18 +3031,17 @@ pub const App = struct {
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, target.id);
         if (in_flight) {
-            // Same provider id already fetching. Two distinct AniList entries can share a
-            // mal_id (duplicate/unmerged records), so still refresh the bind intent, else
-            // the in-flight fetch's episodes_done would bind the earlier entry's canonical
-            // id. The fetch itself is redundant (same id), so skip the respawn.
+            // Same provider id already fetching, so skip the respawn. But two AniList
+            // entries can share a mal_id (duplicate/unmerged records), so still refresh
+            // pending_bind, or the in-flight episodes_done would bind the wrong entry's id.
             self.pending_bind = target.bind;
             return;
         }
         self.fireEpisodesForId(loop, io, provider, target.id);
-        // fireEpisodesForId nulled pending_bind at entry; set the fresh bind (null for a
-        // non-hit) so only this fire's episodes_done can consume it. A synchronous cache
-        // hit posts no episodes_done, so this bind is orphaned; that is benign (a warm
-        // cache implies the binding already exists) and the next fire nulls it.
+        // fireEpisodesForId already nulled pending_bind at entry; set the fresh one so only
+        // this fire's episodes_done can consume it. A synchronous cache hit posts no
+        // episodes_done, so this bind goes unconsumed; that's benign (a warm cache means
+        // the binding already exists) and the next fire nulls it anyway.
         self.pending_bind = target.bind;
     }
 
@@ -3737,12 +3725,11 @@ pub const App = struct {
         return true; // P is consumed in Browse-list focus whether or not a row is selected
     }
 
-    /// Browse P (ROD-327): an AniList discovery hit is anilist_id-keyed, so it can't be
-    /// written as a play-provider binding until the provider is confirmed to stock it.
-    /// Tier-A resolve (async: probe the provider) and mint the binding on a hit; a hit
-    /// with no MAL id toasts the miss (ROD-329 owns the persisted unmatched state). A
-    /// row that is already provider-keyed (a future Discover cutover, ROD-325) falls
-    /// through to the direct synchronous add.
+    /// Browse P (ROD-327): dispatches Add through the same tier-A resolve as the episode
+    /// fetch (`browseResolveTarget`). An unresolved AniList hit fires the async probe and
+    /// mints the binding on success; a hit with no MAL id toasts the miss (ROD-329 owns
+    /// the unmatched state). An already provider-keyed row (a future Discover cutover,
+    /// ROD-325) falls through to the direct synchronous add.
     fn addSelectedFromBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, anime: Anime) void {
         var buf: [24]u8 = undefined;
         const target = browseResolveTarget(anime, &buf) orelse {
@@ -3757,16 +3744,15 @@ pub const App = struct {
         self.fireResolveAdd(loop, io, provider, target.id, bind);
     }
 
-    /// Spawn the detached tier-A add-resolve worker (ROD-327): probe `provider.episodes`
-    /// for `candidate_id`, then `.resolve_add_result` mints the binding + reveals on a hit
-    /// or toasts the miss. gpa-owns a copy of the candidate id (the event frees it).
-    /// Accounted via `add_resolve_drain` so teardown waits it out; best-effort, a failed
-    /// dupe/spawn drops the add.
+    /// Spawn the detached tier-A add-resolve worker (ROD-327): probes `provider.episodes`
+    /// for `candidate_id`; `.resolve_add_result` mints the binding and reveals on a hit, or
+    /// toasts the miss. gpa owns a copy of `candidate_id` (the event frees it). Accounted
+    /// via `add_resolve_drain` so teardown waits it out; best-effort, a failed dupe/spawn
+    /// drops the add.
     ///
-    /// Bounded to ONE in-flight probe via `add_resolving`: a mashed or held P must not fan
-    /// concurrent `provider.episodes` requests at the CDN, which short-window rate-scores
-    /// and 403s exactly that pattern (ROD-309). A second P (any show) while one resolves is
-    /// dropped; the user re-presses after the ~1s toast.
+    /// Bounded to one in-flight probe via `add_resolving` (see its field doc for why: the
+    /// ROD-309 CDN rate-scoring trap). A second P while one resolves is dropped; the user
+    /// re-presses after the toast.
     fn fireResolveAdd(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64) void {
         if (self.add_resolving) return;
         const gpa = self.gpa;
