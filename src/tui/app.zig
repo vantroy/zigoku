@@ -3026,6 +3026,10 @@ pub const App = struct {
         /// Already provider-keyed (History/Discover origin, or not an AniList hit): fetch
         /// `id` as-is, no binding.
         direct: []const u8,
+        /// Tier 0: this canonical is already bound on this provider (a prior resolve
+        /// persisted the row), so reuse the stored provider id. No probe, no search, no
+        /// re-bind. `anilist_id` is carried only for symmetry; the binding already exists.
+        bound: struct { id: []const u8, anilist_id: i64 },
         /// Tier A: the play provider keys its own catalog by a canonical id, so it handed
         /// back its opaque id (`canonicalKey`). The episode fetch confirms it stocks the
         /// show, then the binding is minted to `anilist_id`.
@@ -3036,20 +3040,27 @@ pub const App = struct {
         needs_search: i64,
     };
 
-    /// Classify a Browse selection into how it resolves to a play provider (ROD-328). An
-    /// unresolved AniList hit asks the provider for its own key: a hit is tier A, a null
-    /// falls to tier-C title search. Anything already provider-keyed (History/Discover, or
-    /// an anilist_id-less row) is `.direct`. `scratch` owns the tier-A id string returned
-    /// by `provider.canonicalKey`; the caller uses it before `scratch` dies (the fetch
-    /// spawn dupes it).
-    fn browseResolveTarget(provider: SourceProvider, sel: Anime, scratch: Allocator) ResolveVerdict {
+    /// Classify a Browse selection into how it resolves to a play provider (ROD-328).
+    /// Anything already provider-keyed (History/Discover, or an anilist_id-less row) is
+    /// `.direct`. For an unresolved AniList hit: tier 0 reuses an existing persisted binding
+    /// (the store short-circuit that keeps a re-searched tier-C show cheap on replay); else
+    /// tier A asks the provider for its own key; else tier C falls to a title search.
+    /// `scratch` owns any store-read or `canonicalKey` id string; the caller uses it before
+    /// `scratch` dies (the fetch spawn dupes it).
+    fn browseResolveTarget(provider: SourceProvider, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
         const aid = sel.anilist_id orelse return .{ .direct = sel.id };
         const aid_i64 = std.math.cast(i64, aid) orelse return .{ .direct = sel.id };
         var idbuf: [24]u8 = undefined;
         const aid_str = std.fmt.bufPrint(&idbuf, "{d}", .{aid}) catch return .{ .direct = sel.id };
         // A provider-keyed row (id != stringified anilist_id) fetches as-is.
         if (!std.mem.eql(u8, sel.id, aid_str)) return .{ .direct = sel.id };
-        // An unresolved AniList hit: tier-A key if the provider id-keys, else tier-C search.
+        // An unresolved AniList hit. Tier 0: an existing binding on this provider wins, so a
+        // re-resolve never re-runs the tier-A probe or the tier-C search.
+        if (store) |st| {
+            if (st.bindingSourceId(scratch, provider.name(), aid_i64) catch null) |sid|
+                return .{ .bound = .{ .id = sid, .anilist_id = aid_i64 } };
+        }
+        // Tier A: the provider's own key. Tier C: a title search.
         if (provider.canonicalKey(scratch, sel) catch null) |key|
             return .{ .tier_a = .{ .id = key, .anilist_id = aid_i64 } };
         return .{ .needs_search = aid_i64 };
@@ -3063,8 +3074,10 @@ pub const App = struct {
         const sel = selection.selectedAnime(self) orelse return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(provider, sel, arena.allocator())) {
+        switch (browseResolveTarget(provider, sel, self.store, arena.allocator())) {
             .direct => |id| self.fireEpisodesResolved(loop, io, provider, id, null),
+            // Tier 0: the binding already exists, so fetch by the stored id with no re-bind.
+            .bound => |b| self.fireEpisodesResolved(loop, io, provider, b.id, null),
             .tier_a => |t| self.fireEpisodesResolved(loop, io, provider, t.id, t.anilist_id),
             .needs_search => |aid| self.fireResolvePlaySearch(loop, io, provider, sel, aid),
         }
@@ -3805,11 +3818,33 @@ pub const App = struct {
     fn addSelectedFromBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, anime: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(provider, anime, arena.allocator())) {
+        switch (browseResolveTarget(provider, anime, self.store, arena.allocator())) {
             .direct => self.addToWatchlist(provider, anime),
+            // Tier 0: the binding already exists, so reveal it in place (no probe/search).
+            .bound => |b| self.revealBoundFromBrowse(provider, b.id, b.anilist_id),
             .tier_a => |t| self.fireResolveAdd(loop, io, provider, t.id, t.anilist_id),
             .needs_search => |aid| self.fireResolveAddSearch(loop, io, provider, anime, aid),
         }
+    }
+
+    /// Reveal an already-bound tier-0 hit synchronously (ROD-328): the binding exists from a
+    /// prior resolve, so Add just flips it visible via `bindCanonical` (idempotent, MAX-merges
+    /// `history_visible`), no probe or search. Mirrors the `.resolve_add_result` success arm.
+    fn revealBoundFromBrowse(self: *App, provider: SourceProvider, id: []const u8, anilist_id: i64) void {
+        const st = self.store orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const bound = st.bindCanonical(provider.name(), id, anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
+            log.debug("reveal bound (add) failed: {s}", .{@errorName(e)});
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return;
+        };
+        if (!bound) {
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return;
+        }
+        self.history_dirty = true;
+        self.pushToast(.success, "added to watchlist", false);
     }
 
     /// Fire the tier-C Add resolve worker (ROD-328): title-search the play provider for a

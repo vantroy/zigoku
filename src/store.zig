@@ -1379,6 +1379,25 @@ pub const Store = struct {
         };
     }
 
+    /// The persisted provider id for `anilist_id` on `source`, or null when this provider
+    /// has no binding for that canonical yet (ROD-328, tier 0). The resolver's short-circuit:
+    /// a Browse re-search of a show already bound on this provider reuses the stored id
+    /// instead of re-deriving (tier A) or re-searching the catalog (tier C, a wasted round
+    /// trip and the ROD-309 rate-scoring surface). One binding per (canonical, provider), so
+    /// `LIMIT 1` is exact. Uses `idx_anime_canonical`. Arena owns the returned string.
+    pub fn bindingSourceId(self: *Store, arena: Allocator, source: []const u8, anilist_id: i64) Error!?[]const u8 {
+        const stmt = try self.prepare(
+            \\SELECT source_id FROM anime
+            \\WHERE canonical_id = ? AND source = ?
+            \\LIMIT 1
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, anilist_id);
+        try bindText(stmt, 2, source);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try dupeText(arena, stmt, 0);
+    }
+
     /// (list_status, progress high-water, total episodes, still-airing) for one
     /// show, or null if it isn't tracked. `airing` folds the airing-status column
     /// via `domain.isStillAiring` (ROD-296). The minimal read the watch-state
@@ -3437,6 +3456,36 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
     try testing.expectEqualStrings("Sousou no Frieren", hist[0].title);
     try testing.expectEqual(@as(?i64, 52991), hist[0].mal_id);
     try testing.expectEqual(@as(?i64, 89), hist[0].score);
+}
+
+test "bindingSourceId returns an existing provider binding by canonical id, null otherwise (ROD-328 tier 0)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.upsertCanonicalOnly(.{
+        .id = "182255",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+    }, true, 7000, arena);
+
+    // No binding yet → null (the resolver falls through to tier A / tier C).
+    try testing.expect((try s.bindingSourceId(arena, "senshi", 182255)) == null);
+
+    // After a resolve persists the binding, the stored provider id comes back: the tier-0
+    // short-circuit that lets a re-searched hit skip the probe/search on replay.
+    try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena));
+    const sid = (try s.bindingSourceId(arena, "senshi", 182255)).?;
+    try testing.expectEqualStrings("52991", sid);
+
+    // Scoped to the provider: a different play source has its own binding space.
+    try testing.expect((try s.bindingSourceId(arena, "anipub", 182255)) == null);
+    // And to the canonical: an unbound anilist_id is still null.
+    try testing.expect((try s.bindingSourceId(arena, "senshi", 999999)) == null);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {
