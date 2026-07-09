@@ -870,6 +870,16 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
+    /// Persist a search hit as a canonical entity only, no binding row (ROD-326): writes
+    /// `canonical_anime`, never `anime` (the provider binding is the resolver's job,
+    /// ROD-328). `source` is unused by the canonical write; `.sub` only feeds `fromDomain`'s
+    /// `episodeCount`, which is 0 for a search hit, so neither placeholder reaches a column.
+    /// A caller passing a row with real per-track counts would break that: scope this to
+    /// search hits.
+    pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, scratch: Allocator) Error!void {
+        return self.upsertCanonical(AnimeRecord.fromDomain("", anime, .sub), scratch);
+    }
+
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and
     /// (ONLY when `stamp_fresh`) advance the enrichment freshness clock, then upsert
     /// (ROD-280).
@@ -3217,6 +3227,55 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
     try testing.expectEqualStrings("Resolved v2", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 500;")).?);
     try testing.expectEqualStrings("FINISHED", (try Q.text(arena, &s, "SELECT status FROM canonical_anime WHERE anilist_id = 500;")).?);
     try testing.expectEqual(@as(?i64, 12000), try Q.int(&s, "SELECT enrichment_fetched_at FROM canonical_anime WHERE anilist_id = 500;"));
+}
+
+test "upsertCanonicalOnly persists a search hit as a canonical entity with no binding row (ROD-326)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+        fn text(al: Allocator, st: *Store, sql: [*c]const u8) !?[]const u8 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            return dupeText(al, stmt, 0);
+        }
+    };
+
+    // A raw discovery-search hit: full AniList metadata, `id` = the stringified anilist_id.
+    // name != title_romaji on purpose, so the canonical title-heal below is observable.
+    const hit: domain.Anime = .{
+        .id = "182255",
+        .name = "Frieren Beyond Journeys End",
+        .title_romaji = "Sousou no Frieren",
+        .english_name = "Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+        .score = 89,
+        .season = .fall,
+        .genres = &.{ "Adventure", "Fantasy" },
+    };
+    try s.upsertCanonicalOnly(hit, arena);
+
+    // Canonical entity minted (title healed to romaji), carrying the hit's enrichment.
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM canonical_anime;"));
+    try testing.expectEqual(@as(?i64, 52991), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 182255;"));
+    try testing.expectEqual(@as(?i64, 89), try Q.int(&s, "SELECT score FROM canonical_anime WHERE anilist_id = 182255;"));
+    try testing.expectEqualStrings("Sousou no Frieren", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 182255;")).?);
+
+    // No binding row: canonical-only is the point. loadHistory needs a binding, stays empty.
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+    try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {
