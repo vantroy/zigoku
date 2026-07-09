@@ -794,6 +794,10 @@ pub const App = struct {
     /// accounted like `episode_drain` so teardown waits them out before loop/gpa/io die;
     /// each probes a play provider then posts `.resolve_add_result`.
     add_resolve_drain: workers.ThreadDrain = .{},
+    /// ROD-327: true while a tier-A add-resolve probe is in flight. Bounds Add to ONE probe
+    /// at a time so a mashed/held P can't fan concurrent requests at the provider CDN (the
+    /// ROD-309 rate-scoring trap). Set in `fireResolveAdd`, cleared in `.resolve_add_result`.
+    add_resolving: bool = false,
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
     /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
@@ -1934,23 +1938,33 @@ pub const App = struct {
 
             .resolve_add_result => |ev| {
                 // ROD-327: a tier-A add-resolve settled. The worker owns nothing after this;
-                // free the resolved id on both arms.
+                // free the resolved id on both arms. Clear the in-flight guard so the next P
+                // can fire.
                 defer self.gpa.free(ev.source_id);
                 self.async_start_ms = 0;
+                self.add_resolving = false;
                 if (!ev.ok) {
                     // Resolver miss: the provider doesn't stock the show (or the probe
                     // failed). No state written; the unmatched terminal state is ROD-329.
                     self.pushToast(.@"error", "couldn't add to watchlist", false);
                     return;
                 }
-                if (self.store) |st| {
-                    var arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer arena.deinit();
-                    st.bindCanonical(provider.name(), ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
-                        log.debug("bindCanonical (add) failed: {s}", .{@errorName(e)});
-                        self.pushToast(.@"error", "couldn't add to watchlist", false);
-                        return;
-                    };
+                // Bind + reveal. A thrown error, a null store, or a false return (no canonical
+                // row, so nothing was written) must all toast the miss, never a false success.
+                const st = self.store orelse {
+                    self.pushToast(.@"error", "couldn't add to watchlist", false);
+                    return;
+                };
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                const bound = st.bindCanonical(provider.name(), ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
+                    log.debug("bindCanonical (add) failed: {s}", .{@errorName(e)});
+                    self.pushToast(.@"error", "couldn't add to watchlist", false);
+                    return;
+                };
+                if (!bound) {
+                    self.pushToast(.@"error", "couldn't add to watchlist", false);
+                    return;
                 }
                 // P adds a row not yet in self.history, so flag a reload so it surfaces this
                 // session (mirrors addToWatchlist).
@@ -2223,21 +2237,29 @@ pub const App = struct {
                 // the fetch's source at fire time.
                 const source = selection.currentDetailSourceName(self, provider);
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-                self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
-                // ROD-327: a Browse tier-A resolve that reached here means the episode
-                // fetch (the existence probe) succeeded, so the play provider stocks this
-                // show. Mint the binding on the canonical spine so resume state and History
-                // key correctly. Hidden; recordPlay reveals it on the first actual play.
-                // pending_bind is set only for a resolving Browse fire and cleared at every
-                // fireEpisodesForId entry, so History/Discover opens never reach this.
+                // ROD-327: a Browse tier-A resolve that reached here means the episode fetch
+                // (the existence probe) succeeded, so the play provider stocks this show.
+                // Mint the binding on the canonical spine BEFORE caching episodes: episode_cache
+                // carries an FK to anime(source, source_id), so the parent binding row must
+                // exist first (its absence is why the first-resolve cache write silently
+                // FK-failed). Bind and cache both key off `source` so the FK parent/child match.
+                // Hidden; recordPlay reveals it on the first actual play. pending_bind is set
+                // only for a resolving Browse fire and cleared at every fireEpisodesForId entry,
+                // so History/Discover opens never reach this.
                 if (self.pending_bind) |aid| {
                     self.pending_bind = null;
                     if (self.store) |st| {
                         var arena = std.heap.ArenaAllocator.init(self.gpa);
                         defer arena.deinit();
-                        st.bindCanonical(provider.name(), ev.for_id, aid, false, Store.nowSecs(), arena.allocator()) catch |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
+                        if (st.bindCanonical(source, ev.for_id, aid, false, Store.nowSecs(), arena.allocator())) |bound| {
+                            // A false bind (no canonical row) leaves this show unbindable; the
+                            // grid still renders from the event payload, but a later recordPlay
+                            // would FK-fail. Nothing to recover here beyond the store's own log.
+                            if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
+                        } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
                     }
                 }
+                self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
             },
             .episodes_error => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -3019,10 +3041,19 @@ pub const App = struct {
         const in_flight = self.episodes.loading and
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, target.id);
-        if (in_flight) return;
+        if (in_flight) {
+            // Same provider id already fetching. Two distinct AniList entries can share a
+            // mal_id (duplicate/unmerged records), so still refresh the bind intent, else
+            // the in-flight fetch's episodes_done would bind the earlier entry's canonical
+            // id. The fetch itself is redundant (same id), so skip the respawn.
+            self.pending_bind = target.bind;
+            return;
+        }
         self.fireEpisodesForId(loop, io, provider, target.id);
         // fireEpisodesForId nulled pending_bind at entry; set the fresh bind (null for a
-        // non-hit) so only this fire's episodes_done can consume it.
+        // non-hit) so only this fire's episodes_done can consume it. A synchronous cache
+        // hit posts no episodes_done, so this bind is orphaned; that is benign (a warm
+        // cache implies the binding already exists) and the next fire nulls it.
         self.pending_bind = target.bind;
     }
 
@@ -3731,15 +3762,23 @@ pub const App = struct {
     /// or toasts the miss. gpa-owns a copy of the candidate id (the event frees it).
     /// Accounted via `add_resolve_drain` so teardown waits it out; best-effort, a failed
     /// dupe/spawn drops the add.
+    ///
+    /// Bounded to ONE in-flight probe via `add_resolving`: a mashed or held P must not fan
+    /// concurrent `provider.episodes` requests at the CDN, which short-window rate-scores
+    /// and 403s exactly that pattern (ROD-309). A second P (any show) while one resolves is
+    /// dropped; the user re-presses after the ~1s toast.
     fn fireResolveAdd(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64) void {
+        if (self.add_resolving) return;
         const gpa = self.gpa;
         const id = gpa.dupe(u8, candidate_id) catch return;
         self.async_start_ms = self.now_ms; // slow-path spinner while the probe runs
+        self.add_resolving = true;
         self.add_resolve_drain.begin();
         const t = std.Thread.spawn(.{}, workers.resolveAddTask, .{
             loop, gpa, io, provider, id, anilist_id, self.translation, &self.add_resolve_drain,
         }) catch {
             self.add_resolve_drain.finish(); // no worker will run, rebalance the count
+            self.add_resolving = false;
             gpa.free(id);
             return;
         };

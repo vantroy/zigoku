@@ -901,11 +901,17 @@ pub const Store = struct {
     /// canonical (loadHistory/getAnime COALESCE), so the binding carries only identity
     /// plus the NOT NULL `title`. `upsertAnime`'s ON CONFLICT preserves user state and
     /// MAX-merges `history_visible`, so a re-resolve of an already-tracked show never
-    /// clobbers it. A missing canonical is a logged no-op (can't happen for a search hit).
-    pub fn bindCanonical(self: *Store, source: []const u8, source_id: []const u8, anilist_id: i64, visible: bool, now: i64, scratch: Allocator) Error!void {
+    /// clobbers it.
+    ///
+    /// Returns whether a binding was written: `false` means no canonical row exists for
+    /// `anilist_id` (a search persist that silently failed), so the caller must NOT report
+    /// success (an Add would toast a lie; a Play would let a later `recordPlay` FK-fail).
+    /// It "can't happen" for a normal search hit (persist runs first, same UI thread), but
+    /// the write is best-effort, so the bool makes the no-op honest instead of invisible.
+    pub fn bindCanonical(self: *Store, source: []const u8, source_id: []const u8, anilist_id: i64, visible: bool, now: i64, scratch: Allocator) Error!bool {
         const canon = try self.getCanonicalByAnilistId(scratch, anilist_id) orelse {
             std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
-            return;
+            return false;
         };
         const rec: AnimeRecord = .{
             .source = source,
@@ -916,7 +922,8 @@ pub const Store = struct {
             .canonical_id = anilist_id,
             .history_visible = visible,
         };
-        return self.upsertAnime(rec, now, scratch);
+        try self.upsertAnime(rec, now, scratch);
+        return true;
     }
 
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and
@@ -3412,9 +3419,14 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
     // An unknown id reads null (the miss the resolver treats as "not canonical yet").
     try testing.expect((try s.getCanonicalByAnilistId(arena, 999999)) == null);
 
+    // Binding an id with no canonical row writes nothing and returns false (the honest
+    // no-op the resolver callers must not report as success).
+    try testing.expect(!(try s.bindCanonical("senshi", "404", 999999, true, 500, arena)));
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+
     // Tier-A resolve: senshi keys by the stringified mal_id. A first bind mints the
-    // binding hidden (a Play resolve; recordPlay reveals it later).
-    try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena);
+    // binding hidden (a Play resolve; recordPlay reveals it later) and returns true.
+    try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena));
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
     try testing.expectEqual(@as(?i64, 182255), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source='senshi' AND source_id='52991';"));
     try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='senshi' AND source_id='52991';"));
@@ -3423,7 +3435,7 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
 
     // A second bind that reveals (the Add path) surfaces one History row, enriched
     // through canonical (MAX-merged visibility), still a single binding row.
-    try s.bindCanonical("senshi", "52991", 182255, true, 2000, arena);
+    try testing.expect(try s.bindCanonical("senshi", "52991", 182255, true, 2000, arena));
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
     const hist = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), hist.len);
