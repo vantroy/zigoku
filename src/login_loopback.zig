@@ -1,39 +1,33 @@
 //! Zigoku — AniList OAuth login via a loopback listener (ROD-283, 2b).
 //!
-//! `zigoku login` (without `--paste`) drives this: mint a CSRF `state` nonce, open
-//! the browser at the authorize URL, and run a one-shot HTTP listener on
-//! 127.0.0.1:`login.PORT` (the app's registered redirect). The Implicit Grant
-//! returns the token in the URL *fragment* — never sent to a server — so the first
-//! hit gets an HTML+JS relay page that re-issues `location.hash` as
-//! `/callback?<query>`; the listener then verifies `state`, hands the query to
-//! `login.completeLogin` (the shared extract → verify → persist core), and renders
-//! the outcome to the browser tab and the terminal.
+//! `zigoku login` (without `--paste`) drives this: mint a CSRF `state` nonce, open the
+//! browser at the authorize URL, and run a one-shot HTTP listener on 127.0.0.1:`login.PORT`
+//! (the app's registered redirect). The Implicit Grant returns the token in the URL FRAGMENT
+//! (never sent to a server), so the first hit gets an HTML+JS relay page that re-issues
+//! `location.hash` as `/callback?<query>`; the listener verifies `state`, hands the query to
+//! `login.completeLogin` (the shared extract/verify/persist core), and renders the outcome.
 //!
-//! No *overall* timeout by design: it waits across connections for the browser to
-//! return (or the user Ctrl-Cs, or re-runs with `--paste`). Each individual
-//! connection *does* get a read deadline, so one silent/stalled socket can't wedge
-//! the serial accept loop. If the port can't be bound or the nonce can't be minted,
-//! it returns `error.LoopbackUnavailable` so the caller falls back to paste.
+//! No OVERALL timeout by design: it waits across connections for the browser to return (or
+//! the user Ctrl-Cs, or re-runs with `--paste`). Each individual connection does get a read
+//! deadline, so one stalled socket can't wedge the serial accept loop. A bind/nonce failure
+//! returns `error.LoopbackUnavailable` so the caller falls back to paste.
 //!
-//! ROD-286 (TUI connect): the CLI `run` blocks the calling thread, which the TUI
-//! can't afford — vaxis owns the terminal. So the accept-handling core is factored
-//! into `serveConn` (one connection → a `Served` verdict), which both `run` and the
-//! async path share, and the setup/accept/cancel steps are exposed as `begin` →
-//! `awaitConnect` → `requestCancel`: `begin` binds the port on the caller's thread
-//! (a bind failure is synchronous — it toasts, never a half-open modal), a worker
-//! runs `awaitConnect`, and the UI wakes a blocked `accept` for cancellation by
-//! dialing the port once (`requestCancel`) after setting the shared cancel flag —
-//! the documented `shutdown`/self-connect way to unblock `accept`, with no window
-//! where a real callback is dropped by a racing deadline.
+//! ROD-286 (TUI connect): the CLI `run` blocks its thread, which the TUI can't afford, so the
+//! accept-handling core is factored into `serveConn` (one connection → a `Served` verdict),
+//! shared by `run` and the async path, and setup/accept/cancel are exposed as `begin` →
+//! `awaitConnect` → `requestCancel`. `begin` binds the port on the caller's thread (a bind
+//! failure is synchronous, so it toasts rather than opening a half-open modal), a worker runs
+//! `awaitConnect`, and the UI wakes a blocked `accept` by dialing the port once after setting
+//! the cancel flag (the documented self-connect way to unblock `accept`), with no window where
+//! a real callback is dropped by a racing deadline.
 //!
-//! Threat note: `state` defends against a *guessed* forged callback — it does NOT
-//! hide the nonce from other local code. The URL (carrying `&state=`) rides in the
-//! browser's argv when we shell out to open it, so it's visible in `ps` to
-//! co-resident processes for the browser's lifetime — the known residual for a
-//! native app handing a system browser an OAuth URL (RFC 8252). Bounded to local
-//! attackers and to the seconds the listener is open; a non-issue on a single-user
-//! machine. Bind is IPv4 127.0.0.1 only; a host that maps `localhost` solely to
-//! `::1` can't reach it (rare — Happy Eyeballs falls back to IPv4).
+//! Threat note: `state` defends against a GUESSED forged callback; it does NOT hide the nonce
+//! from other local code. The URL (carrying `&state=`) rides in the browser's argv when we
+//! shell out to open it, so it's visible in `ps` to co-resident processes for the browser's
+//! lifetime, the known residual for a native app handing a system browser an OAuth URL
+//! (RFC 8252). Bounded to local attackers and to the seconds the listener is open; a non-issue
+//! on a single-user machine. Bind is IPv4 127.0.0.1 only; a host that maps `localhost` solely
+//! to `::1` can't reach it (rare; Happy Eyeballs falls back to IPv4).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -283,17 +277,16 @@ pub fn serveConn(io: Io, stream: *net.Stream, state: []const u8, arena: Allocato
 //
 // The CLI `run` above owns its whole flow on one blocking thread. The TUI can't
 // block the render thread, so it drives the same listener in three steps: `begin`
-// (main thread — bind + mint + build URL, so a bind failure is a synchronous toast
-// not a half-open modal), `awaitConnect` (a worker thread — the accept loop, ending
-// in a POD `ConnectOutcome` posted back to the UI), and `requestCancel` (main thread
-// — wake a blocked `accept` so the worker can observe a set cancel flag and bail).
+// (main thread: bind + mint + build URL, so a bind failure is a synchronous toast not a
+// half-open modal), `awaitConnect` (a worker thread: the accept loop, ending in a POD
+// `ConnectOutcome` posted back to the UI), and `requestCancel` (main thread: wake a blocked
+// `accept` so the worker can observe a set cancel flag and bail).
 
-/// A worker→UI-safe distillation of a connect attempt. POD (an `anyerror` is a plain
-/// error code, safe across the thread seam) so it ships by value in an event. `.ok`
-/// carries nothing: `completeLogin` already persisted auth.zon, so the UI reloads it
-/// to read the freshly-connected identity rather than marshalling a string across the
-/// seam. The failure arms mirror `login.LoginResult`; `.canceled` is the user hitting
-/// esc, `.accept_failed` a hard listener error (not a routine cancel wake).
+/// A worker→UI-safe distillation of a connect attempt. POD (an `anyerror` is a plain error
+/// code, safe across the thread seam) so it ships by value in an event. `.ok` carries
+/// nothing: `completeLogin` already persisted auth.zon, so the UI reloads it to read the
+/// freshly-connected identity rather than marshalling a string across the seam. The failure
+/// arms mirror `login.LoginResult`; `.canceled` is esc, `.accept_failed` a hard listener error.
 pub const ConnectOutcome = union(enum) {
     ok,
     no_token,

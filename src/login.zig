@@ -1,16 +1,14 @@
 //! Zigoku — AniList OAuth login capture (ROD-283).
 //!
-//! `zigoku login` walks the Implicit Grant capture by hand: print the authorize
-//! URL, take the redirected URL back on stdin (SSH-safe manual paste), pull the
-//! bearer token out of the `#access_token=` fragment, verify it with a live
-//! `Viewer` call, and persist identity + token to `auth.zon` (0600) via `auth.zig`.
+//! `zigoku login` walks the Implicit Grant capture by hand: print the authorize URL, take
+//! the redirected URL back on stdin (SSH-safe manual paste), pull the bearer token from the
+//! `#access_token=` fragment, verify it with a live `Viewer` call, and persist identity +
+//! token to `auth.zon` (0600) via `auth.zig`.
 //!
-//! The capture *core* — `completeLogin` — is deliberately I/O-and-prompt free and
-//! injects its clock, so slice 2b's loopback listener drives the exact same
-//! extract → verify → persist sequence by handing it the relayed query string.
-//! That shared core is what guarantees "verify before persist" for both paths
-//! from one place, rather than each caller re-remembering to check `Viewer` first.
-//! This paste path stays as the SSH-safe / headless fallback.
+//! The capture CORE, `completeLogin`, is deliberately I/O-and-prompt free and injects its
+//! clock, so slice 2b's loopback listener drives the exact same extract/verify/persist
+//! sequence by handing it the relayed query string. That shared core guarantees "verify
+//! before persist" for both paths from one place. This paste path stays the SSH-safe fallback.
 
 const std = @import("std");
 const Io = std.Io;
@@ -195,14 +193,13 @@ fn fetchViewer(arena: Allocator, io: Io, token: []const u8) !?Viewer {
     return deadline.withDeadline(io, .fromSeconds(VIEWER_DEADLINE_S), fetchViewerOnce, .{ arena, io, token });
 }
 
-/// The un-bounded verify POST, run as a cancelable unit of concurrency by
-/// `fetchViewer`'s `withDeadline` (ROD-262 idiom): it owns `client` (defer deinit), so
-/// the deadline's cancel turns the blocked recv into `error.Canceled` and this frame
-/// unwinds — freeing the client — rather than leaking it. Transport failures propagate;
-/// an unparseable body surfaces as `error.BadJson`; a parsed-but-viewerless body
-/// (bad token) returns null. Status code is intentionally not gated on: AniList
-/// answers an invalid token with HTTP 400 *and* a JSON error body, so the parse
-/// outcome — not the status — is the reliable "is this token good" signal.
+/// The un-bounded verify POST, run as a cancelable unit by `fetchViewer`'s `withDeadline`
+/// (ROD-262): it owns `client` (defer deinit), so the deadline's cancel turns the blocked
+/// recv into `error.Canceled` and this frame unwinds, freeing the client rather than leaking
+/// it. Transport failures propagate; an unparseable body surfaces as `error.BadJson`; a
+/// parsed-but-viewerless body (bad token) returns null. Status is intentionally NOT gated on:
+/// AniList answers an invalid token with HTTP 400 AND a JSON error body, so the parse outcome,
+/// not the status, is the reliable "is this token good" signal.
 fn fetchViewerOnce(arena: Allocator, io: Io, token: []const u8) !?Viewer {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();

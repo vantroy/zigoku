@@ -2,23 +2,20 @@
 //!
 //! Two directions over one snapshot:
 //!
-//!   * **Push** (ROD-284, `pushAll`): local `list_status`/`progress` → AniList via
-//!     `SaveMediaListEntry`. Delta-only — `Store.loadDirtyForSync` hands back just
-//!     the rows whose pair drifted from the last-synced snapshot; each landed push
-//!     advances that snapshot (`Store.markSynced`) so the row reads clean again.
+//!   * Push (ROD-284, `pushAll`): local `list_status`/`progress` → AniList via
+//!     `SaveMediaListEntry`. Delta-only: `Store.loadDirtyForSync` returns just the rows
+//!     whose pair drifted from the last-synced snapshot, and each landed push advances that
+//!     snapshot (`Store.markSynced`) so the row reads clean again.
 //!
-//!   * **Pull** (ROD-285, `pullAll`): AniList `MediaListCollection` → local, via a
-//!     3-way merge. The snapshot (`synced_status`/`synced_progress`) is the common
-//!     ancestor; `reconcile` merges it against local and remote per row (progress =
-//!     max, status local-authoritative on a true conflict) and re-baselines the
-//!     snapshot to what AniList now holds — so any locally-ahead value stays put and
-//!     the next push carries it back up. The two directions compose to convergence.
+//!   * Pull (ROD-285, `pullAll`): AniList `MediaListCollection` → local via a 3-way merge.
+//!     The snapshot (`synced_status`/`synced_progress`) is the common ancestor; `reconcile`
+//!     merges it against local and remote per row (progress = max, status local-authoritative
+//!     on a true conflict) and re-baselines the snapshot to what AniList now holds, so a
+//!     locally-ahead value stays put and the next push carries it up. The two compose to
+//!     convergence.
 //!
-//! Entry point today is `zigoku sync` (main.zig), which runs push then pull: the
-//! feature is config-file-only and invisible in the TUI until ROD-286 wires a
-//! Settings trigger onto these same engines. Both `pushAll` and `pullAll` are
-//! written worker-friendly (they touch only the passed store, io, and token) so 286
-//! can call them from a `workers.zig` background task with no reshaping.
+//! Both engines are worker-friendly (they touch only the passed store, io, and token), so
+//! ROD-286's Settings trigger calls them from a `workers.zig` task with no reshaping.
 
 const std = @import("std");
 const Io = std.Io;
@@ -254,17 +251,17 @@ const Pair = struct { status: domain.ListStatus, progress: i64 };
 /// local-authoritative (for the report).
 const Merged = struct { status: domain.ListStatus, progress: i64, status_conflict: bool = false };
 
-/// The pure 3-way merge (ROD-285). `base` is the last-synced snapshot (the common
-/// ancestor; null = never synced, a first-contact bootstrap), `local` the current
-/// local pair, `remote` what AniList holds now. Field-wise:
-///   * progress — `max`. A watched-count never decreases, so whoever is ahead has
-///     seen more; this is non-lossy and sidesteps a progress conflict entirely.
-///   * status — 3-way: adopt the remote status only where local hasn't diverged from
-///     the ancestor; on a true conflict (both moved, differently) keep local and
-///     flag it. With no ancestor, an untouched local reads as `planning`, so a real
-///     remote status is adopted while a deliberately-set local status still wins.
-/// The caller re-baselines the snapshot to `remote` after applying, so a kept-local
-/// value (conflict, or a higher local progress) leaves the row dirty for the push.
+/// The pure 3-way merge (ROD-285). `base` is the last-synced snapshot (the common ancestor;
+/// null = never synced, a first-contact bootstrap), `local` the current local pair, `remote`
+/// what AniList holds now. Field-wise:
+///   * progress: `max`. A watched-count never decreases, so whoever is ahead has seen more;
+///     non-lossy, and it sidesteps a progress conflict entirely.
+///   * status: 3-way. Adopt the remote status only where local hasn't diverged from the
+///     ancestor; on a true conflict (both moved, differently) keep local and flag it. With
+///     no ancestor, an untouched local reads as `planning`, so a real remote status is
+///     adopted while a deliberately-set local status still wins.
+/// The caller re-baselines the snapshot to `remote` after applying, so a kept-local value
+/// (conflict, or a higher local progress) leaves the row dirty for the push.
 fn reconcile(base: ?Pair, local: Pair, remote: Pair) Merged {
     const merged_progress = @max(local.progress, remote.progress);
 

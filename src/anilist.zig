@@ -182,16 +182,15 @@ const MediaResp = struct {
 // standalone `apply(show, meta)` helper would hand back a struct pointing into
 // that soon-dead arena — a UAF trap — so there deliberately isn't one.
 
-/// The three-state enrich contract (ROD-278). Callers that stamp an enrichment
-/// freshness clock (the refresh-on-view path) MUST distinguish a confirmed answer
-/// from a failed fetch: only a confirmed answer may advance the clock.
-///   * `Metadata`        — a confirmed match.            → stamp fresh
-///   * `null`            — a *confirmed* no-match: AniList was reached and
-///                         definitively returned nothing (no such id, no search
-///                         hit, or nothing to look up). → stamp fresh (negative cache)
-///   * `error.NoAnswer`  — no confirmed answer: transport error, timeout, non-200,
-///                         over-cap body, a malformed 200, or a `{"data":null}`
-///                         GraphQL-level error. → DON'T stamp; retry on next view.
+/// The three-state enrich contract (ROD-278). Callers that stamp an enrichment freshness
+/// clock (the refresh-on-view path) MUST distinguish a confirmed answer from a failed fetch:
+/// only a confirmed answer may advance the clock.
+///   * `Metadata`:       a confirmed match.            → stamp fresh
+///   * `null`:           a CONFIRMED no-match: AniList was reached and definitively returned
+///                       nothing (no such id, no search hit). → stamp fresh (negative cache)
+///   * `error.NoAnswer`: no confirmed answer: transport error, timeout, non-200, over-cap
+///                       body, a malformed 200, or a `{"data":null}` GraphQL error. → DON'T
+///                       stamp; retry on next view.
 /// Value (incl. `null`) means "AniList answered"; the error arm means "it didn't."
 pub const EnrichError = error{NoAnswer} || Allocator.Error;
 
@@ -258,22 +257,16 @@ fn classifyBySearch(arena: Allocator, show: domain.Anime, raw: []const u8) Enric
     return try mediaToMeta(arena, best);
 }
 
-/// Batch-enrich a page of Discover cards in ONE AniList round trip (ROD-247).
-/// `ids` are AniList media ids the caller mined from cover thumbs; cards without
-/// one are filtered out upstream. Returns an arena-owned `Metadata` per returned
-/// media, each tagged with its `anilist_id` (via `mediaToMeta`) so the caller can
-/// join results back to cards by id — AniList does not guarantee response order
-/// matches `ids`.
+/// Batch-enrich a page of Discover cards in ONE AniList round trip (ROD-247). `ids` are
+/// AniList media ids the caller mined from cover thumbs (cards without one are filtered
+/// upstream). Returns an arena-owned `Metadata` per returned media, each tagged with its
+/// `anilist_id` (via `mediaToMeta`) so the caller can join results back by id, since AniList
+/// doesn't guarantee response order matches `ids`.
 ///
-/// Same three-state contract as `enrich` (ROD-278), so the caller can gate a
-/// freshness stamp on whether AniList actually answered:
-///   * a non-empty (or empty) slice — AniList was REACHED: the page hydrates from
-///     the returned media; an empty slice is a confirmed "no matches for these ids"
-///     (or nothing to fetch — `ids.len == 0`). The caller may stamp fresh.
-///   * `error.NoAnswer` — a transport/HTTP/over-cap/timeout miss or a malformed 200
-///     (postGql returned null, or the body wouldn't parse). The whole page degrades
-///     to `[--]` AND the caller must NOT stamp — a failed batch fetch would otherwise
-///     burn the freshness clock on a page of un-enriched cards.
+/// Same three-state contract as `enrich` (ROD-278): a returned slice (empty or not) means
+/// AniList was REACHED and the caller may stamp fresh (an empty slice is a confirmed "no
+/// matches"); `error.NoAnswer` is a transport/HTTP/malformed miss where the page degrades to
+/// `[--]` and the caller must NOT stamp, or a failed fetch burns the clock on un-enriched cards.
 pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]const Metadata {
     if (ids.len == 0) return &.{};
 
@@ -287,16 +280,14 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     }
     try ids_buf.append(arena, ']');
 
-    // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50:
-    // the caller feeds at most one feed page (popular_page_size = 30 in source.zig), so
-    // ids.len ≤ 50 holds today. If the feed page size is ever raised past 50, AniList
-    // 400s the whole query → postGql returns null → error.NoAnswer → the page degrades
-    // to `[--]` and stays un-stamped. Chunk the ids (or clamp perPage) before that line.
+    // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50: the
+    // caller feeds at most one feed page (popular_page_size = 30), so ids.len ≤ 50 holds. If
+    // the page size is ever raised past 50, AniList 400s the query, postGql returns null,
+    // error.NoAnswer, and the page degrades to `[--]` un-stamped. Chunk the ids first.
     //
-    // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format
-    // string — it contains `startDate{year}`, whose braces the format parser would
-    // read as a `{year}` placeholder ("too few arguments"). As an arg its contents
-    // are data, not format syntax.
+    // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format string:
+    // it contains `startDate{year}`, whose braces the format parser would read as a `{year}`
+    // placeholder. As an arg its contents are data, not format syntax.
     const query = try std.fmt.allocPrint(
         arena,
         "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{{s}}}}}}}",
@@ -313,15 +304,14 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     return pageToMetas(arena, raw);
 }
 
-/// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split
-/// from `enrichBatch` so the mapping is unit-testable without a live POST (same
-/// seam as `mediaToMeta`). Arena-borrowed slices; the worker deep-copies to GPA.
+/// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split from
+/// `enrichBatch` so the mapping is unit-testable without a live POST. Arena-borrowed slices;
+/// the worker deep-copies to GPA.
 ///
-/// Classifies `data == null` the same way `classifyById`/`classifyBySearch` do
-/// (ROD-278): a `{"data":null}` body is a GraphQL-level execution error (a 200 with
-/// no data), NOT a confirmed-empty page — return `error.NoAnswer` so `enrichBatch`
-/// reports "no answer" and the caller leaves the page un-stamped. A parsed page with
-/// zero media IS a confirmed empty answer and returns an empty slice.
+/// Classifies `data == null` like `classifyById`/`classifyBySearch` (ROD-278): a
+/// `{"data":null}` body is a GraphQL execution error (a 200 with no data), NOT a
+/// confirmed-empty page, so return `error.NoAnswer` and the caller leaves it un-stamped. A
+/// parsed page with zero media IS a confirmed empty answer and returns an empty slice.
 fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
     // A malformed 200 (unparseable body) is a failed answer, not an empty page —
     // error, same as classifyById/classifyBySearch, so pageToMetas honors the
@@ -342,16 +332,15 @@ fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
 /// `postGql`.
 pub const HttpResult = struct { status: std.http.Status, body: []const u8 };
 
-/// One GraphQL POST to AniList. `bearer`, when present, rides as an
-/// `Authorization: Bearer` header — null for the unauthenticated enrichment
-/// queries, set for the authed push mutations (ROD-284). Returns the raw {status,
-/// body}: the status check is deliberately the caller's, because enrichment wants
-/// "non-200 → null" while the push branches on 429/401 vs. success.
+/// One GraphQL POST to AniList. `bearer`, when present, rides as an `Authorization: Bearer`
+/// header (null for the unauthenticated enrichment queries, set for the authed push
+/// mutations, ROD-284). Returns the raw {status, body}: the status check is deliberately the
+/// caller's, because enrichment wants "non-200 → null" while the push branches on
+/// 429/401 vs. success.
 ///
-/// One POST, run as a cancelable unit of concurrency by `withDeadline` (ROD-262).
-/// Kept `!`-returning so the deadline race can tell a real result from a timeout:
-/// on a stalled fetch the deadline's cancel turns the blocked recv into
-/// error.Canceled, so this frame unwinds — freeing `client` — instead of hanging.
+/// Run as a cancelable unit by `withDeadline` (ROD-262). Kept `!`-returning so the deadline
+/// race can tell a real result from a timeout: on a stalled fetch the cancel turns the
+/// blocked recv into error.Canceled, so this frame unwinds and frees `client` instead of hanging.
 fn fetchGql(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) !HttpResult {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
@@ -531,17 +520,15 @@ pub fn fromAniListStatus(s: []const u8) ?domain.ListStatus {
 /// `PullFailed`.
 pub const PullError = error{ RateLimited, Unauthorized, PullFailed } || Allocator.Error;
 
-/// Upper bound on a pulled `progress` (ROD-285 hardening). AniList `progress` is an
-/// episode count — a few thousand at the extreme (One Piece is ~1100). But it's an
-/// UNTRUSTED external integer: a buggy/hostile API, a MITM, or the user's own
-/// devtools-edited account could return an absurd value that flows unchecked into the
-/// `progress` column and then into `render.drawProgressBar`'s `progress * bar_w`
-/// arithmetic, where a near-i64-max value overflows and panics (ReleaseSafe keeps the
-/// check on). Clamping at this ingestion boundary bounds the value before it can be
-/// persisted — generous enough (100k) that no real list is touched, small enough that
-/// `progress * bar_w` can never overflow. Negatives clamp to 0 (a negative episode
-/// count is meaningless). Belt to render.zig's suspenders — defend at the trust
-/// boundary AND at the use site.
+/// Upper bound on a pulled `progress` (ROD-285 hardening). AniList `progress` is an episode
+/// count (a few thousand at the extreme; One Piece is ~1100), but it's an UNTRUSTED external
+/// integer: a buggy/hostile API, a MITM, or a devtools-edited account could return an absurd
+/// value that flows unchecked into the `progress` column and then into
+/// `render.drawProgressBar`'s `progress * bar_w`, where a near-i64-max value overflows and
+/// panics (ReleaseSafe keeps the check on). Clamping at this ingestion boundary bounds the
+/// value before it can be persisted: generous (100k, no real list touched) yet small enough
+/// that `progress * bar_w` can't overflow. Negatives clamp to 0. A belt to render.zig's
+/// suspenders: defend at the trust boundary AND the use site.
 const MAX_SANE_PROGRESS: i64 = 100_000;
 
 fn clampProgress(p: i64) i64 {
@@ -560,17 +547,15 @@ comptime {
 }
 
 /// Pull the user's whole anime list from AniList in one round trip (ROD-285).
-/// `MediaListCollection` is NOT paginated — it returns every list (status lists +
-/// any custom lists) in a single response — so one POST covers the account.
-/// `bearer` is the OAuth access token; `user_id` is the AniList id the token was
-/// minted for (cached in auth.zon at login — AniList doesn't infer it from the
-/// token). Entries are deduped by `media_id` (a show in a custom list appears under
-/// both its status list and the custom one, carrying identical entry data).
+/// `MediaListCollection` is NOT paginated (it returns every list, status + custom, in one
+/// response), so one POST covers the account. `bearer` is the OAuth access token; `user_id`
+/// is the AniList id the token was minted for (cached in auth.zon at login; AniList doesn't
+/// infer it from the token). Entries are deduped by `media_id` (a show in a custom list
+/// appears under both its status list and the custom one with identical data).
 ///
-/// The response rides `fetchGql`'s 2 MB fixed cap. Each entry is three scalar fields
-/// (~45 bytes of JSON), so that holds tens of thousands of entries — well past any
-/// real list. A pathologically huge one overflows the cap → the fetch errors →
-/// `error.PullFailed`, which the engine reports as a failed pull, not a crash.
+/// The response rides `fetchGql`'s 2 MB cap. Each entry is ~45 bytes of JSON, so that holds
+/// tens of thousands of entries; a pathologically huge list overflows the cap, the fetch
+/// errors, and `error.PullFailed` is reported as a failed pull, not a crash.
 pub fn mediaListCollection(arena: Allocator, io: Io, bearer: []const u8, user_id: i64) PullError![]const PulledEntry {
     // `userId` is an integer, JSON-safe interpolated as a variable value on the same
     // trust basis as saveMediaListEntry's `mediaId`.
