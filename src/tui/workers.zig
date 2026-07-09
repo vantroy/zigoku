@@ -432,14 +432,14 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// with no MAL id) is resolved by searching the provider's OWN catalog by the canonical
 /// title and fuzzy-matching (`resolver.bestProviderMatch`, the STRONG canonical→provider
 /// direction). A confident match yields the provider's opaque id; no match or a failed
-/// search both collapse to `ok = false` (unmatched, ROD-329). One search call: a catalog
-/// hit already confirms the provider stocks the show, so no episode probe here (the Play
-/// path's own episode fetch confirms + caches downstream).
+/// search both collapse to `ok = false` (unmatched, ROD-329). The Add path (`for_play` false)
+/// then probes `episodes` to confirm the match has playable episodes, the same bar tier-A Add
+/// holds; Play skips that probe because its own downstream episode fetch is the confirmation.
 ///
 /// `canonical` is a gpa-owned deep copy (freed here) so it outlives the caller's return
-/// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into
-/// gpa and transferred to the posted event
-/// (the UI thread frees it); `for_play` selects `.resolve_play_target` vs `.resolve_add_result`.
+/// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into gpa
+/// and transferred to the posted event (the UI thread frees it); `for_play` selects
+/// `.resolve_play_target` vs `.resolve_add_result`.
 /// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
 /// worker can no longer touch loop/gpa.
 pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
@@ -460,7 +460,19 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: Sour
             break :blk null;
         };
         const idx = resolver.bestProviderMatch(canonical, results) orelse break :blk null;
-        break :blk gpa.dupe(u8, results[idx].id) catch null;
+        const matched_id = results[idx].id;
+        // Add confirms the match actually has playable episodes (parity with tier-A's
+        // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
+        // its own downstream episode fetch is the confirmation. Sequential after the search, so
+        // still one provider request at a time (ROD-309).
+        if (!for_play) {
+            const eps = provider.episodes(arena.allocator(), io, matched_id, translation) catch |e| {
+                log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
+                break :blk null;
+            };
+            if (eps.len == 0) break :blk null;
+        }
+        break :blk gpa.dupe(u8, matched_id) catch null;
     };
 
     const ok = resolved != null;

@@ -1946,9 +1946,9 @@ pub const App = struct {
             },
 
             .resolve_add_result => |ev| {
-                // ROD-327: tier-A add-resolve settled; free the id and clear the in-flight
-                // guard on both arms.
-                defer self.gpa.free(ev.source_id);
+                // ROD-327/328: add-resolve settled; free the id (a tier-C miss carries an
+                // empty, non-owned slice) and clear the in-flight guard on both arms.
+                defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
@@ -3019,7 +3019,7 @@ pub const App = struct {
     /// How a Browse selection resolves to a playable provider id (ROD-328, generalizing
     /// ROD-327's inline tier-A into the provider-agnostic resolver). An unresolved AniList
     /// hit is marked by `id == stringified anilist_id` (`metaToAnime`'s convention).
-    const ResolveVerdict = union(enum) {
+    pub const ResolveVerdict = union(enum) {
         /// Already provider-keyed (History/Discover origin, or not an AniList hit): fetch
         /// `id` as-is, no binding.
         direct: []const u8,
@@ -3044,7 +3044,7 @@ pub const App = struct {
     /// tier A asks the provider for its own key; else tier C falls to a title search.
     /// `scratch` owns any store-read or `canonicalKey` id string; the caller uses it before
     /// `scratch` dies (the fetch spawn dupes it).
-    fn browseResolveTarget(provider: SourceProvider, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
+    pub fn browseResolveTarget(provider: SourceProvider, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
         const aid = sel.anilist_id orelse return .{ .direct = sel.id };
         const aid_i64 = std.math.cast(i64, aid) orelse return .{ .direct = sel.id };
         var idbuf: [24]u8 = undefined;

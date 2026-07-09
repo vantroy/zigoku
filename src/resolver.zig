@@ -78,11 +78,8 @@ fn candidateScore(canonical: Anime, cand: Anime) i32 {
     }
     if (score < 0) return score; // no title overlap → reject before the tie-breakers
 
-    // Episode-count agreement. Known = the canonical's authoritative total; candidate =
-    // the provider's listed count (its total, or the larger per-track count). Unlike
-    // anilist.candidateScore there is NO hard impossible-reject: a provider legitimately
-    // lists fewer episodes than the canonical total for a still-airing or partial season,
-    // so a large gap is only a mild penalty, not a veto.
+    // Episode-count agreement. Known = the canonical's authoritative total; candidate = the
+    // provider's listed count (its total, or the larger per-track count).
     const known_eps = canonical.total_episodes orelse 0;
     const cand_eps = candidateEpisodes(cand);
     if (known_eps > 0 and cand_eps > 0) {
@@ -93,6 +90,14 @@ fn candidateScore(canonical: Anime, cand: Anime) i32 {
             score += 120;
         } else if (diff <= 3) {
             score += 60;
+        } else if (!domain.isStillAiring(canonical.status) and cand_eps + 2 < known_eps) {
+            // A SETTLED canonical (FINISHED/CANCELLED, so its total is authoritative) whose
+            // candidate lists far fewer episodes is a different, smaller work sharing the
+            // title: a movie, OVA, or recap, not the series. Hard-reject (the anilist matcher's
+            // veto, restored) so a lone exact-title hit cannot bind it. A still-airing canonical
+            // legitimately lists fewer (not all episodes exist yet), so the veto is gated on
+            // settled status.
+            return -4000;
         } else {
             score -= 120;
         }
@@ -173,6 +178,40 @@ test "bestProviderMatch reconciles a Season-N title form against the canonical" 
     };
     const idx = bestProviderMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
     try std.testing.expectEqualStrings("hit", candidates[idx].id);
+}
+
+test "bestProviderMatch rejects a lone same-title different work by the settled-canonical episode veto" {
+    // A FINISHED 25-ep series whose ONLY catalog hit shares the exact title but is the 1-ep
+    // movie: an exact-title score alone would clear the floor (no rival to trip the margin
+    // guard), so without the episode veto this would silently bind the movie to the series.
+    const canonical: Anime = .{ .id = "1", .name = "Given", .anilist_id = 1, .total_episodes = 25, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "movie", .name = "Given", .total_episodes = 1 },
+    };
+    try std.testing.expect(bestProviderMatch(canonical, &candidates) == null);
+}
+
+test "bestProviderMatch still picks the series when both it and its movie are in the catalog" {
+    // With the real series present, the episode agreement (+180) plus the movie's veto lets
+    // the series win decisively; the veto never suppresses a genuine match.
+    const canonical: Anime = .{ .id = "1", .name = "Given", .anilist_id = 1, .total_episodes = 11, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "movie", .name = "Given", .total_episodes = 1 },
+        .{ .id = "series", .name = "Given", .total_episodes = 11 },
+    };
+    const idx = bestProviderMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("series", candidates[idx].id);
+}
+
+test "bestProviderMatch spares a still-airing canonical whose provider lists fewer episodes" {
+    // A RELEASING canonical legitimately has a partial provider listing (not all episodes
+    // exist yet), so the settled-only veto must NOT fire: the match still lands.
+    const canonical: Anime = .{ .id = "1", .name = "One Piece", .anilist_id = 1, .total_episodes = 1100, .status = "RELEASING" };
+    const candidates = [_]Anime{
+        .{ .id = "op", .name = "One Piece", .total_episodes = 1050 },
+    };
+    const idx = bestProviderMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("op", candidates[idx].id);
 }
 
 test "bestProviderMatch returns null on an empty catalog page" {

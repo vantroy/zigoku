@@ -3510,6 +3510,78 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
 }
 
+// browseResolveTarget is the classifier ROD-328 adds: it decides which tier fires for a
+// Browse selection. These pin each verdict directly (the downstream event/handler tests
+// prove the tails, not the dispatch).
+test "browseResolveTarget: a provider-keyed row is .direct (ROD-328)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    // id != stringified anilist_id → not an unresolved AniList hit, fetch as-is.
+    const sel: Anime = .{ .id = "52991", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(dummyProvider(), sel, null, arena_inst.allocator())) {
+        .direct => |id| try testing.expectEqualStrings("52991", id),
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: an AniList hit with a mal_id is .tier_a (ROD-328)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // id == stringified anilist_id (an unresolved hit), mal_id present, no binding yet →
+    // the provider's canonicalKey derives its id.
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+        .tier_a => |t| {
+            try testing.expectEqualStrings("52991", t.id);
+            try testing.expectEqual(@as(i64, 154587), t.anilist_id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: an AniList hit with no mal_id is .needs_search (ROD-328)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // No mal_id → canonicalKey returns null → tier-C title search.
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 };
+    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+        .needs_search => |aid| try testing.expectEqual(@as(i64, 154587), aid),
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: an existing binding is tier 0 and wins over tier A (ROD-328)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // Seed a persisted binding at a DIFFERENT id than tier-A would derive (52991), so the
+    // verdict proves tier 0 short-circuits ahead of canonicalKey rather than coinciding.
+    try testing.expect(try st.bindCanonical(dummyProvider().name(), "99999", 154587, false, 1000, arena));
+
+    // An AniList hit that is ALSO tier-A eligible (carries a mal_id): tier 0 must still win.
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("99999", b.id); // the stored binding, not tier-A's 52991
+            try testing.expectEqual(@as(i64, 154587), b.anilist_id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
 test "browse j/k navigates results list" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
