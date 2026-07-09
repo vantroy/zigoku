@@ -1383,12 +1383,19 @@ pub const Store = struct {
     /// has no binding for that canonical yet (ROD-328, tier 0). The resolver's short-circuit:
     /// a Browse re-search of a show already bound on this provider reuses the stored id
     /// instead of re-deriving (tier A) or re-searching the catalog (tier C, a wasted round
-    /// trip and the ROD-309 rate-scoring surface). One binding per (canonical, provider), so
-    /// `LIMIT 1` is exact. Uses `idx_anime_canonical`. Arena owns the returned string.
+    /// trip and the ROD-309 rate-scoring surface).
+    ///
+    /// A canonical can carry MORE than one binding on one provider (a MAL multi-cour split
+    /// that AniList merges: N mal-keyed senshi rows, one anilist_id; the ROD-313 collapse
+    /// case), so this is NOT a unique lookup. It picks the SAME representative loadHistory
+    /// surfaces (`ORDER BY last_watched_at DESC NULLS LAST, progress DESC, rowid`), so tier 0
+    /// replays the cour the user is actually watching, deterministically. Uses
+    /// `idx_anime_canonical`. Arena owns the returned string.
     pub fn bindingSourceId(self: *Store, arena: Allocator, source: []const u8, anilist_id: i64) Error!?[]const u8 {
         const stmt = try self.prepare(
             \\SELECT source_id FROM anime
             \\WHERE canonical_id = ? AND source = ?
+            \\ORDER BY last_watched_at DESC NULLS LAST, progress DESC, rowid
             \\LIMIT 1
         );
         defer _ = c.sqlite3_finalize(stmt);
@@ -3485,6 +3492,44 @@ test "bindingSourceId returns an existing provider binding by canonical id, null
     try testing.expect((try s.bindingSourceId(arena, "anipub", 182255)) == null);
     // And to the canonical: an unbound anilist_id is still null.
     try testing.expect((try s.bindingSourceId(arena, "senshi", 999999)) == null);
+}
+
+test "bindingSourceId picks loadHistory's representative when a canonical has several bindings on one provider (ROD-328)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A MAL multi-cour split AniList merges: two senshi bindings, one canonical (the ROD-313
+    // case). tier-0 must NOT pick arbitrarily; it reuses the same representative loadHistory
+    // surfaces: most-recently-watched first, so the cour the user is actively on wins even
+    // when the other has more raw progress.
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (901, 'Spice and Wolf');");
+    try s.upsertAnime(.{
+        .source = "senshi",
+        .source_id = "cour1",
+        .title = "Spice and Wolf",
+        .anilist_id = 901,
+        .canonical_id = 901,
+        .progress = 8,
+        .last_watched_at = 1000,
+        .history_visible = true,
+    }, 1000, arena);
+    try s.upsertAnime(.{
+        .source = "senshi",
+        .source_id = "cour2",
+        .title = "Spice and Wolf",
+        .anilist_id = 901,
+        .canonical_id = 901,
+        .progress = 2,
+        .last_watched_at = 5000,
+        .history_visible = true,
+    }, 1001, arena);
+
+    // cour2 was watched more recently (5000 > 1000), so it is the representative despite
+    // cour1's higher progress: last_watched_at is the primary sort, progress only a tiebreak.
+    try testing.expectEqualStrings("cour2", (try s.bindingSourceId(arena, "senshi", 901)).?);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {
