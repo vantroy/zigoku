@@ -15,7 +15,7 @@
 //!     convergence.
 //!
 //! Both engines are worker-friendly (they touch only the passed store, io, and token), so
-//! ROD-286's Settings trigger calls them from a `workers.zig` task with no reshaping.
+//! ROD-286's Settings-gated sync rail calls them from a `workers.zig` task with no reshaping.
 
 const std = @import("std");
 const Io = std.Io;
