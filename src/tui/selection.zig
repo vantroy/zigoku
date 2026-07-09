@@ -1,21 +1,16 @@
 //! Current-selection resolution (ROD-277), carved out of app.zig.
 //!
-//! One closed, side-effect-free concern: given the current navigation state,
-//! resolve *which* anime/record is focused across Browse / History / Discover /
-//! Detail, and format the derived display strings (the top-bar season chip, the
-//! detail meta-rail fields) into App-owned scratch buffers. Every function here
-//! is a pure read of App state plus at most one read-only `store.getAnime`; none
-//! spawn work, write the store, or touch toast/undo — that transport stays on
-//! App. The App methods that used to live here are now one-line forwards into
-//! this module. Like the per-view passes (view/*.zig), the functions here thread
-//! `*App` rather than owning state — they are not App-independent the way the
-//! CoverState/SettingsState subsystem carves are; only the two type re-exports
-//! below (DetailRenderInfo, MetaField) match that re-export idiom.
+//! One closed, side-effect-free concern: given the current navigation state, resolve WHICH
+//! anime/record is focused across Browse / History / Discover / Detail, and format the
+//! derived display strings (the top-bar season chip, the detail meta-rail fields) into
+//! App-owned scratch. Every function is a pure read of App state plus at most one read-only
+//! `store.getAnime`; none spawn work, write the store, or touch toast/undo. Functions thread
+//! `*App` rather than owning state.
 //!
 //! Lifetime note: the formatters write into `chip_buf` / `detail_meta_buf` /
-//! `detail_meta_fields`, which are App-owned precisely because vaxis cells hold a
-//! *slice* into the text and the frame isn't emitted until after the pass returns
-//! (the ROD-141 lifetime trap). They must not be moved to stack locals here.
+//! `detail_meta_fields`, which are App-owned precisely because vaxis cells hold a SLICE into
+//! the text and the frame isn't emitted until after the pass returns (the ROD-141 trap).
+//! They must not be moved to stack locals here.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -55,18 +50,15 @@ pub fn cellPx(self: *const App) [2]u16 {
     return .{ self.term_x_pixel / self.term_cols, self.term_y_pixel / self.term_rows };
 }
 
-/// ROD-186: the top-bar season/year chip text (e.g. "冬 2024"), formatted into
-/// the App-owned `chip_buf`. It MUST be App-owned, not a stack local: vaxis
-/// cells hold a *slice* into the segment text and the frame isn't emitted until
-/// after this returns (the same lifetime trap as the detail chip, ROD-141).
-/// Returns "" when no chip should render.
+/// ROD-186: the top-bar season/year chip text (e.g. "冬 2024"), formatted into App-owned
+/// `chip_buf` (not a stack local, the ROD-141 lifetime trap). Returns "" when no chip
+/// should render.
 ///
-/// Content rule (Rod): show the currently selected show's season+year when a
-/// row is selected and both are known; otherwise the current real-world cour
-/// from the system clock. The detail zoom is the exception — it is committed to
-/// one show, so it shows only that show's season with no cour fallback (an
-/// unenriched show shows no chip, never a misleading season). Settings has no
-/// show context (per the header layout) and shows no chip.
+/// Content rule: show the selected show's season+year when a row is selected and both are
+/// known; otherwise the current real-world cour from the system clock. The detail zoom is
+/// the exception: committed to one show, it shows only that show's season with no cour
+/// fallback (an unenriched show shows no chip, never a misleading season). Settings has no
+/// show context and shows no chip.
 pub fn topBarSeasonChip(self: *App) []const u8 {
     switch (self.active_view) {
         .settings => return "",
@@ -259,15 +251,13 @@ fn renderedDetailAnime(self: *const App) ?Anime {
     };
 }
 
-/// The show whose cover should be synced from the current navigation state.
-/// When a preview/detail pane is on-screen alongside the list, this is the
-/// list cursor, so the cover tracks the cursor like the cheap synchronous
-/// fields already do via renderedDetailAnime:
+/// The show whose cover should be synced from the current navigation state. When a
+/// preview/detail pane is on-screen alongside the list, this is the list cursor, so the
+/// cover tracks the cursor like the cheap synchronous fields do via renderedDetailAnime:
 ///   - split browse (cols >= 60, list pane active): the results cursor;
 ///   - two-pane history (cols >= pane_split_min, ROD-170): the focused record.
-/// Everywhere else it defers to currentDetailAnime's "actively-focused show"
-/// contract, which is load-bearing for play/cache/stale-check paths and must
-/// not shift (ROD-156).
+/// Everywhere else it defers to currentDetailAnime's "actively-focused show" contract,
+/// which play/cache/stale-check paths depend on and must not shift (ROD-156).
 pub fn detailSyncTarget(self: *const App) ?Anime {
     if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
         return selectedAnime(self);
@@ -360,16 +350,13 @@ pub const MetaField = struct {
     rail_only: bool = false,
 };
 
-/// The ordered detail-metadata fields (ROD-260), highest-priority first so a
-/// height-starved rail sheds from the bottom (Episodes, emitted first, never
-/// drops). Phase 1 ships the enrichment that survives to the store: Episodes
-/// (always) and Format (the persisted `kind`) — no network, no schema change.
-/// The AniList-enrichment follow-up slots studios/source/duration between
-/// Format and the tail (and a rail-only rank) once those fields are fetched
-/// and persisted; because both renderers iterate the list generically, that
-/// lands here as data only — no renderer change. A field is emitted only when
-/// it has a value (§9.1: no empty segment, no orphan `·`, no bare rail row);
-/// Episodes is the floor, degrading to a dim "?" so neither form renders empty.
+/// The ordered detail-metadata fields (ROD-260), highest-priority first so a height-starved
+/// rail sheds from the bottom (Episodes, emitted first, never drops). Ships the enrichment
+/// that survives to the store: Episodes (always) and Format (the persisted `kind`). Both
+/// renderers iterate the list generically, so later fields (studios/source/duration/rank)
+/// land here as data only, no renderer change. A field is emitted only when it has a value
+/// (§9.1: no empty segment, no orphan `·`, no bare rail row); Episodes is the floor,
+/// degrading to a dim "?" so neither form renders empty.
 pub fn detailMetaFields(self: *App) []const MetaField {
     return detailMetaFieldsFor(self, renderedDetailAnime(self));
 }
@@ -523,18 +510,15 @@ fn historyDetailRecord(self: *App) ?AnimeRecord {
     return null;
 }
 
-/// Resolve the record that seeds the detail grid's §4.6 watched-dim + resume
-/// cursor, for EITHER detail origin (ROD-163). History-origin reuses the
-/// in-memory history record (slices live in `self.history`); browse-origin
-/// reads the show's stored row so a Browse-opened show dims its already-watched
-/// episodes exactly as a History-opened one does — the asymmetry ROD-131 left.
-/// `arena` backs the browse-origin store read, so the returned record is valid
-/// only until the caller frees the arena: seed synchronously. Null when there's
-/// no detail show or no stored row (an unwatched show → nothing to dim).
-/// `source` is optional for the browse path only: history-origin never needs it
-/// (the in-memory record carries its own), and a null source can't key a store
-/// read, so we return null explicitly rather than query with an empty string —
-/// a silent masked miss.
+/// Resolve the record that seeds the detail grid's §4.6 watched-dim + resume cursor, for
+/// EITHER detail origin (ROD-163). History-origin reuses the in-memory history record;
+/// browse-origin reads the show's stored row so a Browse-opened show dims its watched
+/// episodes exactly as a History-opened one does (the asymmetry ROD-131 left). `arena` backs
+/// the browse-origin store read, so the returned record is valid only until the arena is
+/// freed: seed synchronously. Null when there's no detail show or no stored row. `source` is
+/// optional for the browse path only (history-origin carries its own); a null source can't
+/// key a store read, so we return null explicitly rather than query with an empty string (a
+/// silent masked miss).
 pub fn detailSeedRecord(self: *App, arena: Allocator, source: ?[]const u8, source_id: []const u8) ?AnimeRecord {
     if (historyDetailRecord(self)) |rec| return rec;
     const st = self.store orelse return null;

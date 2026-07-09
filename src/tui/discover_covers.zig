@@ -1,21 +1,18 @@
 //! Zigoku — Discover grid multi-cover coordinator (ROD-243).
 //!
-//! The single-cover `CoverState` renders ONE poster; the Discover grid shows many
-//! at once. This owns a URL-keyed pool of cover slots — each with its own decoded
-//! pixels, Kitty image, and failure cooldown — plus the PURE logic that decides
-//! which visible cards to fetch (`FetchPlan`) and which off-screen slots to evict
-//! (`planEvictions`). It shares App's mutex-guarded `CoverCaches`, so a cover
-//! fetched in Browse is reused here for free, and — like every subsystem in the
-//! controller/subsystem split — is driven through explicit dependencies; it never
-//! reaches into App or navigation state.
+//! The single-cover `CoverState` renders ONE poster; the Discover grid shows many at once.
+//! This owns a URL-keyed pool of cover slots (each with its own decoded pixels, Kitty image,
+//! and failure cooldown) plus the PURE logic deciding which visible cards to fetch
+//! (`FetchPlan`) and which off-screen slots to evict (`planEvictions`). It shares App's
+//! mutex-guarded `CoverCaches`, so a cover fetched in Browse is reused here for free, and it
+//! never reaches into App.
 //!
-//! Phase boundary (ROD-243): this cut is the data shape, the pure decision core,
-//! and the per-slot pixel/image lifecycle — NO threads, NO rendering. The
-//! serialized fetch worker, the events, and the geometry-aware pump live in
-//! app.zig (next chunk); the transmit/half-block render pass lives in
-//! view/discover.zig. Storage is a bounded `ArrayListUnmanaged` with linear lookup
-//! — matching `util/lru.zig`'s array style (the codebase keeps no std hashmaps) and
-//! the small pool size (a couple grid pages; capacity is ROD-241).
+//! Phase boundary (ROD-243): this cut is the data shape, the pure decision core, and the
+//! per-slot pixel/image lifecycle, with NO threads and NO rendering. The fetch worker, the
+//! events, and the geometry-aware pump live in app.zig; the transmit/half-block render pass
+//! lives in view/discover.zig. Storage is a bounded `ArrayListUnmanaged` with linear lookup,
+//! matching `util/lru.zig`'s array style (the codebase keeps no std hashmaps) and the small
+//! pool size (capacity is ROD-241).
 
 const std = @import("std");
 const vaxis = @import("vaxis");

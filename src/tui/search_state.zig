@@ -1,29 +1,20 @@
 //! Zigoku — search + enrich controller subsystem (ROD-219).
 //!
-//! The fifth cut of the controller/subsystem split (after ROD-160's CoverState,
-//! ROD-161's SettingsState, ROD-162's PlaybackSession, and ROD-180's
-//! EpisodeState). Owns the *record* of the catalogue-search lifecycle: the query
-//! buffer, the accumulated results, the loaded-page count, the in-flight flag,
-//! and the queued follow-up enrichment request. The pure helpers (clear / hydrate
-//! / persist) and the query-edit key handler take explicit dependencies
-//! (`gpa`/`store`/`source`/`translation`) and report a `KeyResult` verdict — this
-//! struct never reaches back into App or navigation state.
+//! Owns the RECORD of the catalogue-search lifecycle: the query buffer, the accumulated
+//! results, the loaded-page count, the in-flight flag, and the queued follow-up enrichment.
+//! The pure helpers (clear / hydrate / persist) and the query-edit key handler take explicit
+//! dependencies (`gpa`/`store`/`source`/`translation`) and report a `KeyResult` verdict; this
+//! struct never reaches back into App.
 //!
-//! Where the boundary sits (mirroring EpisodeState / PlaybackSession): this
-//! struct owns the search *record*, not the *transport*. The worker threads (`search_thread`,
-//! `enrich_thread` — the handles run() joins on teardown), the shared slow-path
-//! timer (`async_start_ms`), and the search debounce timer stay on App. App
-//! owns the thread spawns — via `fireSearch` / `fireEnrich` and tick's
-//! `.search_done` / `.search_enriched` arms — and resolves the source name +
-//! translation from navigation state, passing those primitives in here. Mode/nav
-//! transitions (`input_mode`, the list cursor, the history filter) are
-//! *projections* App applies from the `onKey` verdict — the SettingsState
-//! keystone. Embed by value (`search: SearchController = .{}`); no back-reference,
-//! no `@fieldParentPtr`.
+//! Boundary (mirroring EpisodeState): this struct owns the search record, not the transport.
+//! The worker threads (`search_thread`/`enrich_thread`, joined on teardown), the shared
+//! slow-path timer (`async_start_ms`), and the search debounce stay on App. App owns the
+//! thread spawns and resolves source/translation from nav state. Mode/nav transitions
+//! (`input_mode`, the list cursor, the history filter) are PROJECTIONS App applies from the
+//! `onKey` verdict. Embed by value; no `@fieldParentPtr`.
 //!
-//! The views (`view/browse.zig`, `view/chrome.zig`) render this state through
-//! `self.search.*`; `SearchController` is re-exported from app.zig so existing
-//! `app_mod.*` references keep resolving.
+//! The views (`view/browse.zig`, `view/chrome.zig`) render this; `SearchController` is
+//! re-exported from app.zig.
 
 const std = @import("std");
 const vaxis = @import("vaxis");

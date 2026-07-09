@@ -105,15 +105,12 @@ pub const Event = union(enum) {
         window: source_mod.PopularWindow,
         answered: bool,
     },
-    /// A whole Discover feed page batch-enriched from AniList in one fetch
-    /// (ROD-247) — score + genres + season, the card signals the popular feed
-    /// nulls. `results` is gpa-allocated (each Anime's strings owned); App merges
-    /// each into `window`'s slot by id and takes ownership (orphans freed). Distinct
-    /// from `discover_enriched` (the per-card zoom path) so the page batch and a
-    /// zoom enrich never share a thread handle or block each other. `answered`
-    /// (ROD-278): false when the batch fetch hit a transport failure — the handler
-    /// then persists the slot WITHOUT stamping freshness, so a failed page fetch
-    /// doesn't burn the clock on un-enriched cards. A reached-but-empty page is true.
+    /// A whole Discover feed page batch-enriched from AniList in one fetch (ROD-247): score
+    /// + genres + season, the fields the popular feed nulls. `results` is gpa-allocated; App
+    /// merges each into `window`'s slot by id and takes ownership (orphans freed). Distinct
+    /// from `discover_enriched` (the per-card zoom) so batch and zoom never share a thread
+    /// handle. `answered` (ROD-278): false on a transport failure, so the handler persists
+    /// the slot WITHOUT stamping freshness; a reached-but-empty page is true.
     discover_batch_enriched: struct {
         results: []Anime,
         window: source_mod.PopularWindow,
@@ -130,14 +127,12 @@ pub const Event = union(enum) {
         offset: usize,
         answered: bool,
     },
-    /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned
-    /// identity stub filled with fresh AniList metadata (or unchanged on a miss);
-    /// `source` is gpa-owned. `answered` (ROD-278) is true when AniList returned a
-    /// confirmed answer — a match or a confirmed no-match — and false on a transport
-    /// failure: the handler stamps the freshness columns + persists ONLY when
-    /// `answered`, so a failed fetch doesn't advance the freshness clock. On a
-    /// confirmed answer the handler persists (upsert stamps freshness + overwrites
-    /// drift fields via COALESCE) and flags a history reload. Both fields freed here.
+    /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned identity
+    /// stub filled with fresh AniList metadata (or unchanged on a miss); `source` is
+    /// gpa-owned. `answered` (ROD-278) is true on a confirmed answer (match or confirmed
+    /// no-match), false on transport failure: the handler stamps freshness + persists ONLY
+    /// when `answered`. On a confirmed answer it persists (upsert stamps + COALESCE-overwrites
+    /// drift) and flags a history reload. Both fields freed here.
     enrichment_refreshed: struct {
         result: Anime,
         source: []const u8,

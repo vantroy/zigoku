@@ -1,21 +1,15 @@
 //! Zigoku — episode cache + detail-grid subsystem (ROD-180).
 //!
-//! The fourth cut of the controller/subsystem split (after ROD-160's CoverState,
-//! ROD-161's SettingsState, and ROD-162's PlaybackSession). Owns the *record* of
-//! the detail pane's episode list — the fetched episodes, the show they belong
-//! to, the grid cursor, the watched high-water mark — plus the two-tier episode
-//! cache (hot LRU mirror + DB, ROD-130). Driven purely through explicit
-//! dependencies (`gpa`/`store`/`source`/`translation`/`status`); it never reaches
-//! back into App or navigation state.
+//! Owns the RECORD of the detail pane's episode list (the fetched episodes, the show they
+//! belong to, the grid cursor, the watched high-water) plus the two-tier episode cache (hot
+//! LRU mirror + DB, ROD-130). Driven purely through explicit dependencies
+//! (`gpa`/`store`/`source`/`translation`/`status`); it never reaches back into App.
 //!
-//! Where the boundary sits (mirroring PlaybackSession's): this struct owns the episode
-//! *record + cache*, not the *transport*. `episode_drain` (the barrier run()
-//! drains on teardown) and `async_start_ms` (the shared slow-path timer, not
-//! episode-scoped) stay on App. The controller (`tick`'s episode-event handlers +
-//! `fireEpisodes`/`fireEpisodesForId`) resolves the source name, status, and any
-//! history record from navigation state and passes those primitives in here; it
-//! owns the thread spawn and the async-timer reset itself. Embed by value
-//! (`episodes: EpisodeState = .{}`); no back-reference, no `@fieldParentPtr`.
+//! Boundary (mirroring PlaybackSession): this struct owns the episode record + cache, not
+//! the transport. `episode_drain` (the teardown barrier) and `async_start_ms` (the shared
+//! slow-path timer) stay on App. The controller resolves source/status/history from nav
+//! state and passes them in, and owns the thread spawn and async-timer reset. Embed by
+//! value; no `@fieldParentPtr`.
 
 const std = @import("std");
 const domain = @import("../domain.zig");
@@ -135,14 +129,12 @@ pub const EpisodeState = struct {
         }
     }
 
-    /// Install a cache-sourced episode list as the live detail state (ROD-130):
-    /// no thread, no loading spinner. `id` and `view` are both GPA-owned;
-    /// ownership transfers to `for_id` / `results`. Infallible by contract — the
-    /// caller pre-allocates both, so a hit can never leave `results` set with a
-    /// null `for_id` (which would silently block playback). Mirrors the
-    /// state the controller's `episodes_done` handler leaves behind so the two
-    /// write sites stay consistent; `history_rec` (resolved by the controller from
-    /// nav state) seeds the history cursor exactly as that handler does.
+    /// Install a cache-sourced episode list as the live detail state (ROD-130): no thread,
+    /// no spinner. `id`/`view` are GPA-owned; ownership transfers to `for_id`/`results`.
+    /// Infallible by contract (the caller pre-allocates both), so a hit can never leave
+    /// `results` set with a null `for_id`, which would silently block playback. Mirrors the
+    /// state the `episodes_done` handler leaves so the two write sites stay consistent;
+    /// `history_rec` (resolved by the controller) seeds the history cursor.
     fn applyCached(
         self: *EpisodeState,
         store: ?*Store,
