@@ -161,12 +161,11 @@ fn positionWatcher(io: Io, socket_path: []const u8, callback: PositionCallback) 
 
 /// Launch mpv on `link` and block until it exits.
 ///
-/// `mpv_path` is the mpv binary to exec — an absolute path, or a bare `"mpv"`
-/// to resolve via `$PATH` (ROD-85 config). `title` becomes mpv's window/OSD
-/// title. `start_seconds` is the resume offset. When `position_callback` is
-/// present, a watcher thread observes mpv's unix socket IPC and reports live
-/// time-pos/duration updates until mpv exits. When `skip` is present, its Lua
-/// script + opts are loaded so mpv auto-skips the OP/ED (ROD-83).
+/// `mpv_path` is the mpv binary to exec (an absolute path, or a bare `"mpv"` to resolve via
+/// `$PATH`, ROD-85 config). `title` becomes mpv's window/OSD title. `start_seconds` is the
+/// resume offset. When `position_callback` is present, a watcher thread observes mpv's unix
+/// socket IPC and reports live time-pos/duration updates until mpv exits. When `skip` is
+/// present, its Lua script + opts are loaded so mpv auto-skips the OP/ED (ROD-83).
 pub fn play(
     arena: std.mem.Allocator,
     io: Io,
@@ -195,35 +194,32 @@ pub fn play(
         try argv.append(arena, try std.fmt.allocPrint(arena, "--http-header-fields-append=Referer: {s}", .{r}));
     }
     if (link.user_agent) |ua| {
-        // mpv's ffmpeg HTTP path otherwise sends its default `Lavf/*` User-Agent,
-        // which the CDN's Cloudflare edge flags as a bot and 403s intermittently
-        // (ROD-309). The provider sets this to the same browser UA its resolver used
-        // to pass CF, so the whole HLS chain looks like the client that resolved it.
-        // Dedicated `--user-agent` (not header-fields-append) so it REPLACES the
-        // default rather than sending two conflicting UA headers. Same untrusted-bytes
-        // contract as Referer: cleanArg-vetted upstream, no CR/LF header injection.
+        // mpv's ffmpeg HTTP path otherwise sends its default `Lavf/*` User-Agent, which the
+        // CDN's Cloudflare edge flags as a bot and 403s intermittently (ROD-309). The provider
+        // sets this to the same browser UA its resolver used to pass CF, so the whole HLS chain
+        // looks like the client that resolved it. Dedicated `--user-agent` (not
+        // header-fields-append) so it REPLACES the default rather than sending two conflicting
+        // UA headers. Same untrusted-bytes contract as Referer: cleanArg-vetted upstream, no
+        // CR/LF header injection.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--user-agent={s}", .{ua}));
     }
     if (std.mem.startsWith(u8, link.url, "http")) {
-        // Be a gentler HTTP client so the CDN's Cloudflare bot/rate scoring stops
-        // sampling us into an intermittent 403 (ROD-309). `multiple_requests=1`: keep
-        // the TCP/TLS connection alive across the HLS chain instead of ffmpeg's default
-        // `Connection: close`, which otherwise opens a fresh handshake per segment —
-        // hundreds an episode, the exact burst that spikes a per-IP rate score. `icy=0`:
-        // drop the `Icy-MetaData: 1` SHOUTcast header ffmpeg sends by default, a pure
-        // non-browser tell no real player emits for HLS. Constant literal, protocol-layer
-        // options only (guarded to http(s) urls), no untrusted data in the argv.
+        // Be a gentler HTTP client so the CDN's Cloudflare bot/rate scoring stops sampling us
+        // into an intermittent 403 (ROD-309). `multiple_requests=1`: keep the TCP/TLS
+        // connection alive across the HLS chain instead of ffmpeg's default `Connection: close`,
+        // which otherwise opens a fresh handshake per segment (hundreds an episode, the burst
+        // that spikes a per-IP rate score). `icy=0`: drop the `Icy-MetaData: 1` SHOUTcast header
+        // ffmpeg sends by default, a non-browser tell no real player emits for HLS. Constant
+        // literal, protocol-layer options only (guarded to http(s) urls), no untrusted data.
         try argv.append(arena, "--stream-lavf-o=multiple_requests=1,icy=0");
     }
     if (link.cloaked_segments) {
-        // The stream's HLS segments use a disguised extension (senshi serves `.ts`
-        // as `.jpg`; ROD-301). ffmpeg's HLS demuxer gates on a segment-extension
-        // allowlist a stock build limits to real media extensions; `ALL` lifts it
-        // for the (https-only, provider-vetted) playlist. Defense-in-depth, not
-        // strictly required on every player: current mpv (v0.41) disables that gate
-        // itself via a compat shim, so segments play with or without this — but raw
-        // ffmpeg and mpv builds lacking the shim DO enforce it, so we set it. Constant
-        // literal, no untrusted data in the argv.
+        // The stream's HLS segments use a disguised extension (senshi serves `.ts` as `.jpg`;
+        // ROD-301). ffmpeg's HLS demuxer gates on a segment-extension allowlist a stock build
+        // limits to real media extensions; `ALL` lifts it for the (https-only, provider-vetted)
+        // playlist. Defense-in-depth: current mpv (v0.41) disables that gate itself via a compat
+        // shim, so segments play with or without this, but raw ffmpeg and mpv builds lacking the
+        // shim DO enforce it, so we set it. Constant literal, no untrusted data in the argv.
         try argv.append(arena, "--demuxer-lavf-o=allowed_extensions=ALL");
     }
     try argv.append(arena, try std.fmt.allocPrint(arena, "--force-media-title={s}", .{title}));

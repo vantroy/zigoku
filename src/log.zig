@@ -1,42 +1,35 @@
 //! Zigoku — logging policy (ROD-88).
 //!
-//! Zigoku has two output modes with opposite needs. The CLI owns the terminal
-//! and can write diagnostics straight to stderr. The TUI *renders* into that same
-//! terminal, so any stray `std.log` line would punch a hole in the frame — its
-//! diagnostics have to go to a file instead.
+//! Zigoku has two output modes with opposite needs. The CLI owns the terminal and can write
+//! diagnostics straight to stderr. The TUI RENDERS into that same terminal, so any stray
+//! `std.log` line would punch a hole in the frame; its diagnostics have to go to a file.
 //!
-//! This module is the single place that policy lives. Call sites keep using the
-//! plain `std.log.{debug,info,warn,err}` idiom; `logFn` (installed via
-//! `std_options` in `main.zig`, the exe's compilation root) decides *where* the
-//! bytes land and *whether* a debug line is emitted at all.
+//! This module is the single place that policy lives. Call sites keep using the plain
+//! `std.log.{debug,info,warn,err}` idiom; `logFn` (installed via `std_options` in `main.zig`)
+//! decides WHERE the bytes land and WHETHER a debug line is emitted at all.
 //!
 //! Two deliberate choices:
-//!   * `std_options.log_level` is pinned to `.debug` in every build mode, and the
-//!     `--debug` / `ZIGOKU_DEBUG` toggle is a **runtime** gate here. The usual
-//!     trick — letting the comptime log level drop `.debug` in release — would
-//!     make `--debug` silently do nothing in the shipped ReleaseSafe binary,
-//!     which is exactly when a user reaches for it.
-//!   * Writes go through libc (`O_APPEND` for the file, fd 2 for stderr) rather
-//!     than a `std.Io.Writer`: `logFn` has no `io` handle. For a regular file
-//!     `O_APPEND` makes each write's seek-to-end + write atomic (POSIX), so
-//!     concurrent worker-thread lines don't interleave — no lock needed.
+//!   * `std_options.log_level` is pinned to `.debug` in every build mode, and the `--debug` /
+//!     `ZIGOKU_DEBUG` toggle is a RUNTIME gate here. The usual comptime-drop trick would make
+//!     `--debug` silently do nothing in the shipped ReleaseSafe binary, exactly when a user
+//!     reaches for it.
+//!   * Writes go through libc (`O_APPEND` for the file, fd 2 for stderr), not a
+//!     `std.Io.Writer`: `logFn` has no `io` handle. `O_APPEND` makes each write's seek-to-end
+//!     + write atomic (POSIX), so concurrent worker-thread lines don't interleave, no lock.
 
 const std = @import("std");
 
-// Declared directly rather than via `@cImport`: glibc's `fcntl.h` wraps `open`
-// in fortify inlines that fail Zig's translate-c under `__OPTIMIZE__` (the
-// ReleaseSafe build), and the std.Io migration removed `std.posix.{open,write,
-// close}`. Plain libc symbols sidestep both. Flag values come from `std.posix.O`
-// so they stay correct per target.
+// Declared directly rather than via `@cImport`: glibc's `fcntl.h` wraps `open` in fortify
+// inlines that fail Zig's translate-c under `__OPTIMIZE__` (the ReleaseSafe build), and the
+// std.Io migration removed `std.posix.{open,write,close}`. Plain libc symbols sidestep both.
+// Flag values come from `std.posix.O` so they stay correct per target.
 //
-// `open` MUST be declared variadic (`...`), matching C's real `int open(const
-// char *, int, ...)`. The `mode` arg is a vararg — and the Apple ARM64 ABI passes
-// varargs on the stack while named args go in registers. Declaring `open` with a
-// fixed `mode` parameter puts it in a register, so libSystem reads garbage off
-// the stack and O_CREAT files get junk permissions (ROD-149: the macOS CI job
-// caught this). It's benign on Linux/x86-64 only because that ABI passes both the
-// same way. Pass `mode` as a typed value at the call site so vararg lowering is
-// correct per target.
+// `open` MUST be declared variadic (`...`), matching C's `int open(const char *, int, ...)`.
+// The `mode` arg is a vararg, and the Apple ARM64 ABI passes varargs on the stack while named
+// args go in registers. Declaring `open` with a fixed `mode` parameter puts it in a register,
+// so libSystem reads garbage off the stack and O_CREAT files get junk permissions (ROD-149:
+// the macOS CI job caught this). Benign on Linux/x86-64 only because that ABI passes both the
+// same way. Pass `mode` as a typed value at the call site so vararg lowering is correct.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;

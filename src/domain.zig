@@ -1,11 +1,11 @@
 //! Zigoku — core domain types.
 //!
-//! These are the vocabulary the whole app speaks: a show in the catalog, an
-//! episode, a resolved stream. They are deliberately *source-agnostic* — nothing
-//! here knows AllAnime exists. A provider (see `source.zig`) fills these in; the
-//! rest of the app depends only on these shapes, never on where they came from.
-//! That indirection is the whole defensive play: when a stream site rots and
-//! dies (2026 is a graveyard for them), we swap one provider file, not this.
+//! These are the vocabulary the whole app speaks: a show in the catalog, an episode, a
+//! resolved stream. They are deliberately SOURCE-AGNOSTIC: nothing here knows which provider
+//! exists. A provider (see `source.zig`) fills these in; the rest of the app depends only on
+//! these shapes, never on where they came from. That indirection is the whole defensive play:
+//! when a stream site rots and dies (2026 is a graveyard for them), we swap one provider file,
+//! not this.
 
 const std = @import("std");
 
@@ -104,24 +104,21 @@ pub const ListStatus = enum {
     };
 };
 
-/// Whether a show's episode count is still provisional — i.e. `total_episodes`
-/// may be the aired-so-far count, not the real finale, so it's unsafe to
-/// auto-complete against (ROD-296). `ListStatus.afterPlay` gates auto-completion
-/// on this: a mid-broadcast show isn't marked done the moment you catch up.
+/// Whether a show's episode count is still provisional, i.e. `total_episodes` may be the
+/// aired-so-far count, not the real finale, so it's unsafe to auto-complete against
+/// (ROD-296). `ListStatus.afterPlay` gates auto-completion on this: a mid-broadcast show
+/// isn't marked done the moment you catch up.
 ///
-/// Deliberately a *denylist*: only `FINISHED`/`CANCELLED` (AniList
-/// `MediaStatus`) are settled — a finished season's total IS its finale, and a
-/// cancelled show's last-aired count is all there'll ever be. EVERYTHING else is
-/// "still airing" for completion purposes:
-///   - `RELEASING` / AllAnime `ongoing` — the obvious weekly case.
-///   - `HIATUS` — split-cour break; the show WILL resume, `total` is only cour-1.
-///   - `NOT_YET_RELEASED` — no episodes yet (progress 0 anyway; harmless).
-///   - null / empty / unknown — never trust a total we can't classify; a
-///     not-yet-enriched or future AniList status defaults to safe.
-/// Vocab matches `detail.statusChipFor` (case-insensitive). `status` self-heals
-/// via the non-null COALESCE on enrich (`FINISHED` overwrites `RELEASING`) — the
-/// reason we gate on it and not the `next_airing_episode` proxy, which that same
-/// upsert can never null back out once set.
+/// Deliberately a DENYLIST: only `FINISHED`/`CANCELLED` are settled (a finished season's
+/// total IS its finale; a cancelled show's last-aired count is all there'll ever be).
+/// EVERYTHING else is "still airing" for completion:
+///   - `RELEASING` / AllAnime `ongoing`: the obvious weekly case.
+///   - `HIATUS`: split-cour break; the show WILL resume, `total` is only cour-1.
+///   - `NOT_YET_RELEASED`: no episodes yet (progress 0 anyway; harmless).
+///   - null / empty / unknown: never trust a total we can't classify.
+/// Vocab matches `detail.statusChipFor` (case-insensitive). `status` self-heals via the
+/// non-null COALESCE on enrich (`FINISHED` overwrites `RELEASING`), which is why we gate on
+/// it and not the `next_airing_episode` proxy, which that same upsert can never null back out.
 pub fn isStillAiring(status: ?[]const u8) bool {
     const s = status orelse return true;
     if (std.ascii.eqlIgnoreCase(s, "FINISHED")) return false;
@@ -226,13 +223,12 @@ pub const Date = struct {
 
 /// One show in the catalog.
 ///
-/// Only `id` and `name` are guaranteed. `id` is the *provider's* opaque show
-/// handle (for AllAnime, its Mongo `_id`) — the single thing `episodes()` and
-/// `resolve()` need, so it must round-trip untouched. Everything else is
-/// best-effort metadata: AllAnime fills the episode counts; the richer fields
-/// (description, genres, cover art, score, MAL/AniList ids) stay empty until the
-/// AniList enrichment layer lands (M3/M4/M5). An optional being `null` means
-/// "this source didn't tell us," not "doesn't exist."
+/// Only `id` and `name` are guaranteed. `id` is the PROVIDER's opaque show handle, the
+/// single thing `episodes()` and `resolve()` need, so it must round-trip untouched.
+/// Everything else is best-effort metadata: the provider fills the episode counts; the
+/// richer fields (description, genres, cover, score, MAL/AniList ids) stay empty until
+/// AniList enrichment lands. An optional being `null` means "this source didn't tell us,"
+/// not "doesn't exist."
 pub const Anime = struct {
     /// Provider-opaque show id. Downstream calls depend on this being verbatim.
     id: []const u8,
@@ -365,15 +361,13 @@ pub fn preferredTitle(
 /// script form (which alone renders italic per §1.3).
 pub const TitleRow = struct { text: []const u8, native: bool };
 
-/// The alt-title rows to render beneath `primary`, in `romaji → english → native`
-/// order, each skipped when empty, byte-equal to `primary`, OR byte-equal to an
-/// alt already emitted (ROD-205, §9.1a). This generalizes ROD-231's partial
-/// de-dupe (which only checked the English alt against romaji) into a symmetric
-/// rule against whichever form actually resolved as primary — so a fallback
-/// (e.g. `english` with a null `english_name` resolving to romaji) never
-/// duplicates its target into an alt row. The `n >= out.len` guard bounds the
-/// write by construction (not by caller convention): even a `primary` matching
-/// none of the three forms can never overrun `out`.
+/// The alt-title rows to render beneath `primary`, in `romaji → english → native` order,
+/// each skipped when empty, byte-equal to `primary`, OR byte-equal to an alt already emitted
+/// (ROD-205, §9.1a). This generalizes ROD-231's partial de-dupe (English vs romaji only)
+/// into a symmetric rule against whichever form resolved as primary, so a fallback (e.g.
+/// `english` with a null `english_name` resolving to romaji) never duplicates its target
+/// into an alt row. The `n >= out.len` guard bounds the write by construction, so even a
+/// `primary` matching none of the three forms can never overrun `out`.
 pub fn altTitles(
     romaji: []const u8,
     english: ?[]const u8,
