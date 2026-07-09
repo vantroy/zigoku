@@ -144,13 +144,12 @@ test "withDeadline: no double-fetch and no unbounded wait when the timer arm can
     // on a dead socket), and invoke `func` exactly ONCE (the pre-fix code re-invoked
     // it inline, a second request for one logical call).
     //
-    // ROD-281: this test deliberately drives withDeadline's timer-unavailable
-    // fallback, whose `log.warn` (deadline.zig:62) is a real production signal but
-    // pure noise here — it's the expected, asserted path. The test binary roots at
-    // root.zig (no std_options), so it runs std's default logFn, which honours
-    // std.testing.log_level; raise it to `.err` for this test so the by-design warn
-    // doesn't clutter `zig build test` output. Saved/restored so no other test is
-    // affected.
+    // ROD-281: this test deliberately drives withDeadline's timer-unavailable fallback,
+    // whose `log.warn` is a real production signal but pure noise here (the expected, asserted
+    // path). The test binary roots at root.zig (no std_options), so it runs std's default
+    // logFn, which honours std.testing.log_level; raise it to `.err` for this test so the
+    // by-design warn doesn't clutter `zig build test` output. Saved/restored so no other test
+    // is affected.
     const prev_log_level = std.testing.log_level;
     std.testing.log_level = .err;
     defer std.testing.log_level = prev_log_level;
