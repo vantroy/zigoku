@@ -1,16 +1,14 @@
 //! AniSkip — intro/outro auto-skip for the mpv playback path (ROD-83).
 //!
-//! AniSkip is a community database of opening/ending timestamps keyed on a
-//! MyAnimeList id. We fetch the intervals for one episode, drop a tiny Lua script
-//! into the cache dir, and hand mpv `--script` + `--script-opts` so it seeks past
-//! the OP/ED on its own. Everything here is best-effort: any failure (no MAL id,
-//! network down, empty data, unwritable cache) collapses to "no skip" and the
-//! episode plays normally. The user never sees an error.
+//! AniSkip is a community database of opening/ending timestamps keyed on a MyAnimeList id. We
+//! fetch the intervals for one episode, drop a tiny Lua script into the cache dir, and hand
+//! mpv `--script` + `--script-opts` so it seeks past the OP/ED on its own. Best-effort: any
+//! failure (no MAL id, network down, empty data, unwritable cache) collapses to "no skip" and
+//! the episode plays normally, with no error shown.
 //!
-//! The MAL id comes from AniList enrichment when available (`domain.Anime.mal_id`)
-//! and falls back to Jikan (ROD-82). In the TUI these network calls run on the
-//! playback worker thread, never the UI thread; the CLI calls them inline on its
-//! already-blocking main thread.
+//! The MAL id comes from AniList enrichment (`domain.Anime.mal_id`) and falls back to Jikan
+//! (ROD-82). In the TUI these network calls run on the playback worker thread, never the UI
+//! thread; the CLI calls them inline on its already-blocking main thread.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -181,16 +179,15 @@ pub fn prepare(
 
 // ── Lua script provisioning ────────────────────────────────────────────────────
 
-/// The mpv user-script. Reads the OP/ED window from `--script-opts` and seeks
-/// past whichever segment the current `time-pos` falls inside. `-1` disables a
-/// segment; `mode` gates intro vs outro.
+/// The mpv user-script. Reads the OP/ED window from `--script-opts` and seeks past whichever
+/// segment the current `time-pos` falls inside. `-1` disables a segment; `mode` gates intro
+/// vs outro.
 ///
-/// UX (design): announce the skip *before* cutting so the jump reads as
-/// intentional, not a glitch. `skip_section` shows a calm OSD line, then seeks a
-/// beat later. The `skipped` flags debounce the high-frequency time-pos observer
-/// so the deferred seek fires exactly once per segment; `file-loaded` resets them
-/// in case episodes are ever chained in one mpv process. To restyle the toast
-/// (dim/top-left), prefix the label with ASS tags, e.g. `{\an7\fs18\alpha&H80&}`.
+/// UX: announce the skip BEFORE cutting so the jump reads as intentional, not a glitch
+/// (`skip_section` shows a calm OSD line, then seeks a beat later). The `skipped` flags
+/// debounce the high-frequency time-pos observer so the deferred seek fires exactly once per
+/// segment; `file-loaded` resets them in case episodes are ever chained in one mpv process. To
+/// restyle the toast (dim/top-left), prefix the label with ASS tags, e.g. `{\an7\fs18\alpha&H80&}`.
 const LUA_SCRIPT =
     \\local opts = require("mp.options")
     \\local o = { op_start = -1, op_end = -1, ed_start = -1, ed_end = -1, mode = "both" }

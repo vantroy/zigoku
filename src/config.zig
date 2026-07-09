@@ -1,14 +1,12 @@
 //! Zigoku — user config (ROD-85).
 //!
-//! One ZON file at `$XDG_CONFIG_HOME/zigoku/config.zon` (→ `~/.config/zigoku`)
-//! holds the handful of knobs that used to be hardcoded: the mpv binary, the
-//! sub/dub default, stream quality, resume rewind, AniSkip mode, and the image
-//! protocol + chrome toggles the TUI reads.
+//! One ZON file at `$XDG_CONFIG_HOME/zigoku/config.zon` (→ `~/.config/zigoku`) holds the
+//! handful of knobs that used to be hardcoded: the mpv binary, the sub/dub default, stream
+//! quality, resume rewind, AniSkip mode, and the image protocol + chrome toggles the TUI reads.
 //!
-//! Loading is *total*: a missing, unreadable, or malformed file is never an
-//! error — it yields the defaults below — so a corrupt config can never wedge
-//! startup. `save` does surface errors; ROD-86 wires the Settings tab to mutate
-//! a live `Config` and write it back on exit.
+//! Loading is TOTAL: a missing, unreadable, or malformed file is never an error (it yields
+//! the defaults below), so a corrupt config can't wedge startup. `save` surfaces errors;
+//! ROD-86 wires the Settings tab to mutate a live `Config` and write it back on exit.
 
 const std = @import("std");
 const Io = std.Io;
@@ -46,14 +44,13 @@ pub const Config = struct {
     /// thread storm.
     discover_cover_concurrency: u32 = 4,
 
-    /// Master switch for the AniList sync side-rail (ROD-286). Off = every sync
-    /// entry point no-ops: the action-triggered flush (ROD-291), the pull-on-launch
-    /// (ROD-293), and the connect bootstrap (ROD-292) all check this before they arm
-    /// or spawn, so a user who connected an account but wants sync paused gets a
-    /// completely inert rail — no background threads, no whispers — while the token
-    /// stays put. Defaults on: a fresh connect is expected to sync. The Settings
-    /// "sync" toggle writes this; `hasAniList()` (a token) is orthogonal — this gates
-    /// *whether* to sync, the token gates *whether we can*.
+    /// Master switch for the AniList sync side-rail (ROD-286). Off = every sync entry point
+    /// no-ops: the action-triggered flush (ROD-291), the pull-on-launch (ROD-293), and the
+    /// connect bootstrap (ROD-292) all check this before they arm or spawn, so a user who
+    /// connected an account but wants sync paused gets a completely inert rail (no background
+    /// threads, no whispers) while the token stays put. Defaults on. The Settings "sync" toggle
+    /// writes this; `hasAniList()` (a token) is orthogonal: this gates WHETHER to sync, the
+    /// token gates WHETHER we can.
     anilist_sync_enabled: bool = true,
 
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything

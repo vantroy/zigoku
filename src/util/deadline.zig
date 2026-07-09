@@ -1,12 +1,11 @@
-//! Wall-clock deadline for an otherwise-unbounded operation (ROD-153, generalized
-//! to a shared util in ROD-262). `std` exposes no per-read socket timeout, so a
-//! reachable-but-silent host can hang a fetch forever. `withDeadline` races the
-//! operation against a timer on a separate unit of concurrency and cancels
-//! whichever loses, turning an unbounded hang into a bounded `error.Timeout`.
+//! Wall-clock deadline for an otherwise-unbounded operation (ROD-153, generalized to a
+//! shared util in ROD-262). `std` exposes no per-read socket timeout, so a reachable-but-
+//! silent host can hang a fetch forever. `withDeadline` races the operation against a timer
+//! on a separate unit of concurrency and cancels whichever loses, turning an unbounded hang
+//! into a bounded `error.Timeout`.
 //!
-//! Provider-agnostic: the AllAnime long-tail GET (ROD-153) and every AniList
-//! enrichment POST (ROD-262) both route their fetch through this. The deadline
-//! *value* stays each provider's own policy — this module owns only the race.
+//! Provider-agnostic: the long-tail GET and every AniList enrichment POST route through this.
+//! The deadline VALUE stays each provider's own policy; this module owns only the race.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,14 +21,12 @@ pub fn DeadlinePayload(comptime Func: type) type {
     return @typeInfo(@typeInfo(Func).@"fn".return_type.?).error_union.payload;
 }
 
-/// Run `func(args...)`, but abort it if it outlives `deadline`. std offers no
-/// per-read deadline on a socket, so we race the operation against a timer on a
-/// separate unit of concurrency and cancel whichever loses. If the timer wins,
-/// the operation's next cancelation point — the blocked `recv`, which the
-/// Threaded backend interrupts with a signal — returns `error.Canceled`, the
-/// task unwinds (freeing its connection), and we surface `error.Timeout`. If
-/// the runtime can't hand us concurrency (single-threaded build), fall back to
-/// running inline, unbounded — correct, just without the wall-clock ceiling.
+/// Run `func(args...)`, but abort it if it outlives `deadline`. Races the operation against a
+/// timer on a separate unit of concurrency and cancels whichever loses. If the timer wins,
+/// the operation's next cancelation point (the blocked `recv`, which the Threaded backend
+/// interrupts with a signal) returns `error.Canceled`, the task unwinds (freeing its
+/// connection), and we surface `error.Timeout`. If the runtime can't hand us concurrency
+/// (single-threaded build), fall back to running inline, unbounded.
 pub fn withDeadline(
     io: Io,
     deadline: Io.Duration,
@@ -49,16 +46,14 @@ pub fn withDeadline(
         return @call(.auto, func, args);
     };
     sel.concurrent(.timed_out, sleepTimer, .{ io, deadline }) catch {
-        // Timer didn't arm (OOM — the op arm above already proved concurrency was
-        // available, so the op is *in flight*). We now have no deadline. Two wrong
-        // ways out: the old code cancelled the op and re-invoked `func` — a SECOND
-        // request for one logical call (ROD-264 #2); simply awaiting the op instead
-        // trades that for an *unbounded* hang on a dead socket. That hang also leaks
-        // the caller's concurrency accounting — a worker that never returns never
-        // runs its `defer`s, and a caller-side cap that reads that count then stays
-        // tripped (ROD-264 #1/#3). Do neither: cancel the in-flight op (its blocked
-        // recv is interrupted, so this returns promptly) and surface error.Timeout —
-        // the same bounded outcome as a real timeout, which every caller handles.
+        // Timer didn't arm (OOM; the op arm above already proved concurrency, so the op is
+        // IN FLIGHT). We now have no deadline. Two wrong ways out: the old code cancelled the
+        // op and re-invoked `func`, a SECOND request for one logical call (ROD-264 #2);
+        // simply awaiting the op trades that for an UNBOUNDED hang on a dead socket, which
+        // also leaks the caller's concurrency accounting (a worker that never returns never
+        // runs its `defer`s, so a caller-side cap stays tripped; ROD-264 #1/#3). Do neither:
+        // cancel the in-flight op (its blocked recv is interrupted, so this returns promptly)
+        // and surface error.Timeout, the same bounded outcome as a real timeout.
         log.warn("deadline timer unavailable — cancelling operation, surfacing timeout", .{});
         while (sel.cancel()) |_| {}
         return error.Timeout;
@@ -67,23 +62,20 @@ pub fn withDeadline(
         while (sel.cancel()) |_| {}
         return error.Timeout;
     };
-    // await pulled the winner; cancel() requests + joins every loser (looped
-    // until null so each task's *frame* is reclaimed), so by return the canceled
-    // operation has fully unwound — no borrowed state outlives this frame.
+    // await pulled the winner; cancel() requests + joins every loser (looped until null so
+    // each task's frame is reclaimed), so by return the canceled op has fully unwound.
     //
-    // KNOWN RESIDUAL (ROD-265): cancel() hands back each drained loser's outcome so a
-    // caller can free any resource it *returned* — that is why std exposes this
-    // loop-returning variant alongside `cancelDiscard` (see Io.Select.cancel). We drop
-    // it with `|_|`. Harmless for the timer arm (`.timed_out` is void) and for an op
-    // interrupted at its `recv` (`.done` holds `error.Canceled` — no resource). But if
-    // the timer wins the await in the µs after the op clears its last cancel point and
-    // is in its return tail, cancel() drains a `.done` holding a *live* payload we then
-    // leak. Arena-backed callers (allanime, anilist) reclaim it at request scope; a
+    // KNOWN RESIDUAL (ROD-265): cancel() hands back each drained loser's outcome so a caller
+    // can free any resource it RETURNED (why std exposes this loop-returning variant alongside
+    // `cancelDiscard`). We drop it with `|_|`. Harmless for the timer arm (`.timed_out` is
+    // void) and for an op interrupted at its `recv` (`.done` holds `error.Canceled`, no
+    // resource). But if the timer wins the await in the µs after the op clears its last cancel
+    // point and is in its return tail, cancel() drains a `.done` holding a LIVE payload we
+    // then leak. Arena-backed callers (allanime, anilist) reclaim it at request scope; a
     // gpa-backed caller (cover fetch) leaks it for the process lifetime. Left as-is: the
-    // window needs the op to *succeed* within µs of the deadline, it leaks one payload
-    // per hit, and freeing it generically would need a caller-supplied finalizer or a
-    // "return the late success" contract change — more machinery than a sub-µs leak of
-    // one payload earns.
+    // window needs the op to SUCCEED within µs of the deadline, it leaks one payload per hit,
+    // and freeing it generically would need a caller-supplied finalizer or a contract change,
+    // more machinery than a sub-µs leak of one payload earns.
     while (sel.cancel()) |_| {}
     return switch (first) {
         .done => |r| r,

@@ -131,10 +131,9 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ROD-284: `zigoku sync` pushes local watch-state to a connected AniList account
-    // (SaveMediaListEntry) and exits. Like `login`, a subcommand intercepted before
-    // the positional is read as a search query, and config-file-only — nothing in
-    // the TUI surfaces it until ROD-286 wires a Settings trigger onto the same
-    // engine. Delta-only: a run with nothing changed says so and does nothing.
+    // (SaveMediaListEntry) and exits. Like `login`, a subcommand intercepted before the
+    // positional is read as a search query. Delta-only: a run with nothing changed says so
+    // and does nothing. (ROD-286 added the in-TUI sync surface; this CLI path remains.)
     if (isSyncCommand(args)) {
         try runSync(arena, io, out);
         try out.flush();

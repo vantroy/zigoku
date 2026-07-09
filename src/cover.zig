@@ -4,16 +4,11 @@ const limits = @import("decode_limits.zig");
 
 const Allocator = std.mem.Allocator;
 
-// ── decode-path history (ROD-110) ────────────────────────────────────────────
-// The original cover pipeline decoded with `zigimg` and had to *gate the real
-// decode/render path out of Debug builds*, because Zig 0.16 blew up codegenning
-// the exe when that path was live in Debug. ReleaseSafe carried the real path.
-//
-// That gate is GONE. Commit 11112d5 replaced the decode path with `stb_image`
-// (C, via `src/c/stb_image_impl.c`), which sidesteps the codegen blowup — Debug,
-// ReleaseSafe and `zig build test` now all run the same real decode. There is no
-// longer a build-mode `if` around decoding; if you ever reintroduce a Zig-native
-// decoder, re-verify Debug codegen before trusting it.
+// ── decode path (ROD-110) ────────────────────────────────────────────
+// Decoding runs the same real path in Debug, ReleaseSafe and `zig build test`: commit
+// 11112d5 moved it to `stb_image` (C, via `src/c/stb_image_impl.c`), which sidesteps the
+// Zig 0.16 Debug-codegen blowup that once forced a build-mode gate around the decode. If you
+// ever reintroduce a Zig-native decoder, re-verify Debug codegen before trusting it.
 
 extern fn stbi_load_from_memory(
     buffer: [*c]const u8,
@@ -60,16 +55,14 @@ pub fn isWebp(encoded: []const u8) bool {
         std.mem.eql(u8, encoded[8..12], "WEBP");
 }
 
-/// Upper bound on decoded image dimensions, enforced before the C decoders
-/// allocate. Both libwebp (WebPDecodeRGBA) and stb size their pixel buffer from
-/// the image's *header-declared* width/height *before* validating that the
-/// compressed payload holds that many pixels — so a tiny hostile file can
-/// otherwise force a huge allocation (a ~40-byte WebP can legally claim
-/// 16383×16383 → ~1 GiB). This is a decoder-level backstop; callers that know
-/// their domain (cover art is far smaller) still apply a tighter policy cap on
-/// top (see src/tui/workers.zig). Kept generous so it never rejects a real
-/// image. The stb path enforces the same ceiling via STBI_MAX_DIMENSIONS, which
-/// build.zig derives from this same value (src/decode_limits.zig).
+/// Upper bound on decoded image dimensions, enforced before the C decoders allocate. Both
+/// libwebp (WebPDecodeRGBA) and stb size their pixel buffer from the image's HEADER-declared
+/// width/height BEFORE validating that the compressed payload holds that many pixels, so a
+/// tiny hostile file can otherwise force a huge allocation (a ~40-byte WebP can legally claim
+/// 16383×16383 → ~1 GiB). This is a decoder-level backstop; callers that know their domain
+/// (cover art is far smaller) apply a tighter policy cap on top (workers.zig). Kept generous
+/// so it never rejects a real image. The stb path enforces the same ceiling via
+/// STBI_MAX_DIMENSIONS, which build.zig derives from this value (src/decode_limits.zig).
 pub const max_decode_dimension = limits.max_dimension;
 
 fn withinDecodeBounds(dims: Dimensions) bool {

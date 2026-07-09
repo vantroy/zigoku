@@ -1,21 +1,19 @@
 //! Zigoku — platform base-directory resolution (ROD-89).
 //!
-//! Single source of truth for *where* Zigoku keeps its files. Folds together the
-//! four near-identical resolvers that grew independently — data (`store`), config
-//! (`config`), cache (`aniskip`), and the runtime/socket dir (`player`) — so the
-//! XDG precedence, the macOS conventions, and the Windows stance all live in one
-//! place instead of being re-derived (and drifting) per subsystem.
+//! Single source of truth for WHERE Zigoku keeps its files. Folds together the four
+//! near-identical resolvers that grew independently (data, config, cache, runtime/socket dir)
+//! so the XDG precedence, the macOS conventions, and the Windows stance live in one place
+//! instead of being re-derived (and drifting) per subsystem.
 //!
-//! Every resolver returns a caller-owned `{base}/zigoku` subdirectory allocated
-//! from the passed allocator. None of them create the directory — call
-//! `ensureDir` for that. Dir creation is deliberately `io`-free (raw `mkdir`) so
-//! resolvers that run before the event loop exists (`Store.open`) can still make
-//! their directories.
+//! Every resolver returns a caller-owned `{base}/zigoku` subdirectory from the passed
+//! allocator. None create the directory (call `ensureDir`). Dir creation is deliberately
+//! `io`-free (raw `mkdir`) so resolvers that run before the event loop exists (`Store.open`)
+//! can still make their directories.
 //!
-//! * **Linux** honors the XDG base-directory spec.
-//! * **macOS** uses the Apple conventions (`~/Library/...`).
-//! * **Windows** is an explicit `error.Unsupported` stub — the binary exits with
-//!   a clear message rather than scattering files somewhere surprising.
+//!   * Linux honors the XDG base-directory spec.
+//!   * macOS uses the Apple conventions (`~/Library/...`).
+//!   * Windows is an explicit `error.Unsupported` stub (a clear message rather than
+//!     scattering files somewhere surprising).
 
 const std = @import("std");
 const builtin = @import("builtin");
