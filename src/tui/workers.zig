@@ -5,6 +5,7 @@ const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
 const store_mod = @import("../store.zig");
 const anilist = @import("../anilist.zig");
+const resolver = @import("../resolver.zig");
 const cover_mod = @import("../cover.zig");
 const player_mod = @import("../player.zig");
 const aniskip = @import("../aniskip.zig");
@@ -423,6 +424,53 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
     } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         gpa.free(candidate_id);
+    };
+}
+
+/// Background task: tier-C binding resolve (ROD-328). A Browse search hit whose play
+/// provider does NOT id-key on a canonical (`canonicalKey` returned null, e.g. a canonical
+/// with no MAL id) is resolved by searching the provider's OWN catalog by the canonical
+/// title and fuzzy-matching (`resolver.bestProviderMatch`, the STRONG canonical→provider
+/// direction). A confident match yields the provider's opaque id; no match or a failed
+/// search both collapse to `ok = false` (unmatched, ROD-329). One search call: a catalog
+/// hit already confirms the provider stocks the show, so no episode probe here (the Play
+/// path's own episode fetch confirms + caches downstream).
+///
+/// `canonical` is a gpa-owned deep copy (freed here) so it outlives the fireResolveSearch
+/// return. On a hit the matched id is duped into gpa and transferred to the posted event
+/// (the UI thread frees it); `for_play` selects `.resolve_play_target` vs `.resolve_add_result`.
+/// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
+/// worker can no longer touch loop/gpa.
+pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
+    defer drain.finish();
+    defer freeOwnedAnime(gpa, canonical);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const resolved: ?[]const u8 = blk: {
+        if (canonical.name.len == 0) break :blk null; // no title to search by
+        const opts: source_mod.SearchOptions = .{
+            .translation = translation,
+            .limit = source_mod.search_page_size,
+            .page = 1,
+        };
+        const results = provider.search(arena.allocator(), io, canonical.name, opts) catch |e| {
+            log.debug("resolve-search failed: {s}", .{@errorName(e)});
+            break :blk null;
+        };
+        const idx = resolver.bestProviderMatch(canonical, results) orelse break :blk null;
+        break :blk gpa.dupe(u8, results[idx].id) catch null;
+    };
+
+    const ok = resolved != null;
+    const source_id: []const u8 = resolved orelse &.{};
+    const posted = if (for_play)
+        loop.postEvent(.{ .resolve_play_target = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id } })
+    else
+        loop.postEvent(.{ .resolve_add_result = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id } });
+    posted catch |pe| {
+        log.debug("postEvent failed: {s}", .{@errorName(pe)});
+        if (resolved) |r| gpa.free(r);
     };
 }
 

@@ -80,8 +80,23 @@ pub const SourceProvider = struct {
         /// false, and the app hides the Discover view for it until a per-provider
         /// Discover is built. AllAnime's `queryPopular` feed is the reference → true.
         supportsDiscover: *const fn (ptr: *anyopaque) bool,
-        /// Search the catalog; return shows ranked best-match-first.
+        /// Search this provider's OWN catalog; return shows ranked best-match-first.
+        /// ROD-328: this is the resolver's per-provider CATALOG primitive: the tier-C
+        /// binding path (fuzzy-match a known canonical title against the provider's own
+        /// library to recover its opaque id). It is NOT user-facing discovery search:
+        /// that moved to AniList, off this vtable (see `anilist.search`). Do not re-wire
+        /// the browse/search UI back onto this. Its only caller is the resolver, and it
+        /// is the sole way to bind a provider that can't tier-A (`canonicalKey` returns
+        /// null: obscure/old shows, specialist catalogs).
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
+        /// Tier-A binding key (ROD-328): if this provider keys its own catalog by a
+        /// canonical id (senshi's show id IS the stringified MAL id), return that
+        /// provider-opaque id for `canonical`, else null. PURE key derivation, no
+        /// network; the caller confirms the provider actually stocks the id via
+        /// `episodes`. A null return means "I do not id-key on a canonical" (the
+        /// resolver falls to tier-C `search`), NOT "not stocked". The returned string is
+        /// owned by `arena`.
+        canonicalKey: *const fn (ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8,
         /// Fetch one page of the source's popularity-ranked feed for `opts.window`,
         /// in the server's rank order (NOT re-sorted — rank == array position).
         /// A distinct persisted query from `search` (ROD-239).
@@ -111,6 +126,9 @@ pub const SourceProvider = struct {
     }
     pub fn search(self: SourceProvider, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime {
         return self.vtable.search(self.ptr, arena, io, query, opts);
+    }
+    pub fn canonicalKey(self: SourceProvider, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
+        return self.vtable.canonicalKey(self.ptr, arena, canonical);
     }
     pub fn popular(self: SourceProvider, arena: Allocator, io: Io, opts: PopularOptions) anyerror![]domain.Anime {
         return self.vtable.popular(self.ptr, arena, io, opts);

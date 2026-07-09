@@ -14,6 +14,7 @@ pub const source = @import("source.zig");
 pub const player = @import("player.zig");
 pub const store = @import("store.zig");
 pub const anilist = @import("anilist.zig");
+pub const resolver = @import("resolver.zig");
 pub const jikan = @import("providers/jikan.zig");
 pub const aniskip = @import("aniskip.zig");
 pub const config = @import("config.zig");
@@ -99,6 +100,7 @@ test {
     _ = player;
     _ = store;
     _ = anilist;
+    _ = resolver;
     _ = jikan;
     _ = aniskip;
     _ = config;

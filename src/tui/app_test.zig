@@ -46,6 +46,12 @@ fn sampleHistory() [3]AnimeRecord {
 fn dummySearchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
     return &.{};
 }
+// Mal-keyed like senshi (the dummy's `name()` is "allanime", but its id model is the
+// tier-A one the resolver tests drive): a canonical with a MAL id keys for free, else null.
+fn dummyCanonicalKeyFn(_: *anyopaque, arena: Allocator, canonical: Anime) anyerror!?[]const u8 {
+    const mal = canonical.mal_id orelse return null;
+    return try std.fmt.allocPrint(arena, "{d}", .{mal});
+}
 fn dummyEpisodesFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
     return &.{};
 }
@@ -80,6 +86,7 @@ const dummy_vtable: SourceProvider.VTable = .{
     .displayName = dummyDisplayNameFn,
     .supportsDiscover = dummySupportsDiscoverFn,
     .search = dummySearchFn,
+    .canonicalKey = dummyCanonicalKeyFn,
     .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
@@ -116,6 +123,10 @@ const GateProvider = struct {
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
+    fn canonicalKeyFn(_: *anyopaque, arena: Allocator, canonical: Anime) anyerror!?[]const u8 {
+        const mal = canonical.mal_id orelse return null;
+        return try std.fmt.allocPrint(arena, "{d}", .{mal});
+    }
     fn popularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
         return &.{};
     }
@@ -131,6 +142,7 @@ const GateProvider = struct {
         .displayName = displayNameFn,
         .supportsDiscover = supportsDiscoverFn,
         .search = searchFn,
+        .canonicalKey = canonicalKeyFn,
         .popular = popularFn,
         .episodes = episodesFn,
         .resolve = resolveFn,
@@ -178,6 +190,10 @@ fn testTick(app: *App, event: Event) !void {
     // defensively — same contract as discover_cover_drain — so a future test that
     // drives the firing path can't strand a worker on a torn-down loop.
     app.enrich_refresh_drain.drain();
+    // ROD-327/328 resolve workers (Add probe + Play/Add tier-C search) detach too; drained
+    // defensively so a future test driving the spawn path can't strand one on a torn-down loop.
+    app.add_resolve_drain.drain();
+    app.play_resolve_drain.drain();
     if (app.enrich_thread) |t| {
         t.join();
         app.enrich_thread = null;
@@ -224,6 +240,7 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
         .cover_error => |id| alloc.free(id),
         .episodes_error => |e| alloc.free(e.for_id),
         .resolve_add_result => |d| alloc.free(d.source_id),
+        .resolve_play_target => |d| if (d.source_id.len > 0) alloc.free(d.source_id),
         .enrichment_refreshed => |d| {
             freeOwnedAnime(alloc, d.result);
             alloc.free(d.source);
@@ -3457,6 +3474,44 @@ test "resolve_add_result on a miss toasts the failure and writes no state (ROD-3
     try testing.expect(!app.history_dirty);
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
     try testing.expect((try st.getAnime(arena, "allanime", "52991")) == null); // no state
+}
+
+test "resolve_play_target on a hit arms the bind + fires the episode fetch; clears the guard (ROD-328)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
+    defer app.episodes.freeResults(std.testing.allocator); // fireEpisodesForId dupes for_id/source
+
+    // The tier-C search resolved the provider id; the handler fires the episode fetch (which
+    // binds on episodes_done) and arms pending_bind. dummyProvider.episodes returns empty, so
+    // testTick drains the spawned worker's episodes_done without minting the binding here;
+    // pending_bind stays armed for the fetch, which is exactly the handoff we assert.
+    const sid = try std.testing.allocator.dupe(u8, "52991");
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
+
+    try testing.expect(!app.play_resolving);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind); // armed for the episode fetch
+    try testing.expect(app.episodes.for_id != null); // the fetch fired
+    try testing.expectEqualStrings("52991", app.episodes.for_id.?);
+}
+
+test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-328)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.play_resolving = true;
+
+    // A miss carries an empty source_id (no provider match); the handler frees nothing and
+    // must not fire an episode fetch or arm a bind: the unmatched dead-end (ROD-329).
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "" } });
+
+    try testing.expect(!app.play_resolving);
+    try testing.expect(app.pending_bind == null);
+    try testing.expect(app.episodes.for_id == null);
+    try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
 }
 
 test "browse j/k navigates results list" {
