@@ -143,15 +143,17 @@ pub const SearchController = struct {
         self.results = .empty;
     }
 
-    /// Backfill the [offset, offset+count) result rows from the local store, so a
-    /// fresh page renders rich (cover / synopsis / ids cached from a prior visit)
-    /// instead of waiting on enrichment. `store` / `source_name` are resolved by
-    /// the controller (App) from nav state and passed in — this never reads App.
+    /// Backfill the [offset, offset+count) result rows from the canonical spine, so a
+    /// re-search of the same query renders rich (cover / synopsis cached from a prior
+    /// visit) instead of looking cold (ROD-327). Reads `canonical_anime` by anilist_id:
+    /// AniList discovery hits are canonical-keyed with no provider binding, so the old
+    /// `getAnime(source, source_id)` read is wrong here. Back-fills nulls only, so it
+    /// never clobbers a field the fresh AniList hit already carried. `store` is resolved
+    /// by the controller (App) and passed in; this never reads App.
     pub fn hydrateResultsFromStore(
         self: *SearchController,
         gpa: Allocator,
         store: ?*Store,
-        source_name: []const u8,
         offset: usize,
         count: usize,
     ) void {
@@ -162,41 +164,36 @@ pub const SearchController = struct {
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            const source_id = self.results.items[i].id;
-            const rec = st.getAnime(arena.allocator(), source_name, source_id) catch null orelse continue;
+            const aid = self.results.items[i].anilist_id orelse continue;
+            const key = std.math.cast(i64, aid) orelse continue;
+            const rec = st.getCanonicalByAnilistId(arena.allocator(), key) catch null orelse continue;
             hydrateAnimeFromRecord(gpa, &self.results.items[i], rec);
+            _ = arena.reset(.retain_capacity);
         }
     }
 
-    /// Mirror the [offset, offset+count) result rows into the store as cached
-    /// catalogue records. Best-effort: a write failure never disrupts search.
-    /// `store` / `source_name` / `translation` are resolved by the controller and
-    /// passed in — this never reads App.
+    /// Mirror the [offset, offset+count) result rows into the canonical spine (ROD-327):
+    /// AniList discovery hits persist as canonical entities, never as provider bindings
+    /// (binding a hit to a play provider is the resolver's job). Best-effort: a write
+    /// failure never disrupts search. `store` is resolved by the controller and passed
+    /// in; this never reads App.
     pub fn persistResults(
         self: *SearchController,
         gpa: Allocator,
         store: ?*Store,
-        source_name: []const u8,
-        translation: domain.Translation,
         offset: usize,
         count: usize,
-        visible: bool,
-        stamp_fresh: bool,
     ) void {
         const st = store orelse return;
-        // Scratch arena for the per-row genres-blob join (reset each iteration so
-        // it can't grow across a whole search page). Reset-retaining keeps the
-        // backing capacity, so it's one alloc amortized over the page.
+        // Scratch arena for the per-row genres/studios-blob join (reset each iteration so
+        // it can't grow across a whole search page). Reset-retaining keeps the backing
+        // capacity, so it's one alloc amortized over the page.
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
-        const now = Store.nowSecs();
         const end = @min(self.results.items.len, offset + count);
         var i = offset;
         while (i < end) : (i += 1) {
-            // ROD-280: history_visible + the freshness-stamp gate live in
-            // Store.upsertEnriched (see its doc for the gate contract). `stamp_fresh`
-            // is false on the raw .search_done persist and on a failed enrich.
-            st.upsertEnriched(source_name, self.results.items[i], translation, visible, stamp_fresh, now, arena.allocator()) catch |e| log.debug("upsertAnime failed: {s}", .{@errorName(e)});
+            st.upsertCanonicalOnly(self.results.items[i], arena.allocator()) catch |e| log.debug("upsertCanonicalOnly failed: {s}", .{@errorName(e)});
             _ = arena.reset(.retain_capacity);
         }
     }

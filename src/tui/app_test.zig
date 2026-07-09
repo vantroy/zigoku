@@ -1136,49 +1136,6 @@ test "enrichment_refreshed with answered=false skips the stamp and the persist (
     try testing.expect(!app.history_dirty);
 }
 
-test "search_enriched with answered=false caches content but skips the freshness stamp (ROD-278)" {
-    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-    var st = try store_mod.Store.openMemory();
-    defer st.close();
-
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    app.store = &st;
-    app.active_view = .browse;
-    app.search.len = 7;
-    @memcpy(app.search.query[0..7], "frieren");
-
-    // A live search result the enrich persist will cache.
-    try app.search.results.ensureTotalCapacity(testing.allocator, 1);
-    app.search.results.appendAssumeCapacity(.{
-        .id = try testing.allocator.dupe(u8, "id1"),
-        .name = try testing.allocator.dupe(u8, "Frieren"),
-        .eps_sub = 28,
-    });
-
-    // The enrich worker reached no answer (transport failure): the page comes back
-    // unchanged and the event carries answered=false.
-    const query_copy = try testing.allocator.dupe(u8, "frieren");
-    const results = try testing.allocator.alloc(Anime, 1);
-    results[0] = .{
-        .id = try testing.allocator.dupe(u8, "id1"),
-        .name = try testing.allocator.dupe(u8, "Frieren"),
-        .eps_sub = 28,
-    };
-    try testTick(&app, .{ .search_enriched = .{ .results = results, .for_query = query_copy, .offset = 0, .answered = false } });
-
-    // The row was cached (persistResults ran) but NOT stamped fresh — the fix: a
-    // failed enrich leaves the row stale so refresh-on-view retries.
-    const rec = (try st.getAnime(arena, "allanime", "id1")).?;
-    try testing.expect(rec.enrichment_fetched_at == null);
-    try testing.expect(rec.enrichment_fieldset_version == null);
-
-    for (app.search.results.items) |r| freeOwnedAnime(testing.allocator, r);
-    app.search.results.deinit(testing.allocator);
-}
-
 test "discover_batch_enriched with answered=false caches the slot but skips the freshness stamp (ROD-278)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();

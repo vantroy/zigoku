@@ -880,6 +880,32 @@ pub const Store = struct {
         return self.upsertCanonical(AnimeRecord.fromDomain("", anime, .sub), scratch);
     }
 
+    /// Mint (or link) the provider binding row for a canonical entity (ROD-327): the
+    /// tier-A resolver's write, once `provider.episodes()` confirms the provider stocks
+    /// the show. `anilist_id` must already own a canonical row (search persisted it via
+    /// `upsertCanonicalOnly`); this creates the `(source, source_id)` binding, links
+    /// `canonical_id`, and reveals it when `visible`. Display columns resolve through
+    /// canonical (loadHistory/getAnime COALESCE), so the binding carries only identity
+    /// plus the NOT NULL `title`. `upsertAnime`'s ON CONFLICT preserves user state and
+    /// MAX-merges `history_visible`, so a re-resolve of an already-tracked show never
+    /// clobbers it. A missing canonical is a logged no-op (can't happen for a search hit).
+    pub fn bindCanonical(self: *Store, source: []const u8, source_id: []const u8, anilist_id: i64, visible: bool, now: i64, scratch: Allocator) Error!void {
+        const canon = try self.getCanonicalByAnilistId(scratch, anilist_id) orelse {
+            std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
+            return;
+        };
+        const rec: AnimeRecord = .{
+            .source = source,
+            .source_id = source_id,
+            .title = canon.title,
+            .mal_id = canon.mal_id,
+            .anilist_id = anilist_id,
+            .canonical_id = anilist_id,
+            .history_visible = visible,
+        };
+        return self.upsertAnime(rec, now, scratch);
+    }
+
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and
     /// (ONLY when `stamp_fresh`) advance the enrichment freshness clock, then upsert
     /// (ROD-280).
@@ -1282,6 +1308,58 @@ pub const Store = struct {
             .next_airing_at = colOptI64(stmt, 35),
             .next_airing_episode = colOptI64(stmt, 36),
             .country = try dupeText(arena, stmt, 37),
+        };
+    }
+
+    /// Read the canonical entity for `anilist_id` as an `AnimeRecord` (ROD-327): the
+    /// hydrate reader for AniList search hits, which are anilist_id-keyed with no
+    /// binding row (`upsertCanonicalOnly`). `source` is empty and `source_id` is the
+    /// stringified anilist_id: this is a canonical entity, not a provider binding, so
+    /// user-state columns take their record defaults (canonical carries none).
+    pub fn getCanonicalByAnilistId(self: *Store, arena: Allocator, anilist_id: i64) Error!?AnimeRecord {
+        const sql =
+            \\SELECT title, title_english, mal_id, cover_url, year, status, description,
+            \\    score, total_episodes, season, native_name, kind, start_year, start_month,
+            \\    start_day, genres, enrichment_fetched_at, enrichment_fieldset_version,
+            \\    studios, duration, source_material, rank, rank_type, rank_year,
+            \\    next_airing_at, next_airing_episode, country
+            \\FROM canonical_anime WHERE anilist_id = ?
+        ;
+        const stmt = try self.prepare(sql);
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, anilist_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return .{
+            .source = "",
+            .source_id = try std.fmt.allocPrint(arena, "{d}", .{anilist_id}),
+            .title = try dupeText(arena, stmt, 0) orelse "",
+            .title_english = try dupeText(arena, stmt, 1),
+            .mal_id = colOptI64(stmt, 2),
+            .anilist_id = anilist_id,
+            .cover_url = try dupeText(arena, stmt, 3),
+            .year = colOptI64(stmt, 4),
+            .status = try dupeText(arena, stmt, 5),
+            .description = try dupeText(arena, stmt, 6),
+            .score = colOptI64(stmt, 7),
+            .total_episodes = colOptI64(stmt, 8),
+            .season = try dupeText(arena, stmt, 9),
+            .native_name = try dupeText(arena, stmt, 10),
+            .kind = try dupeText(arena, stmt, 11),
+            .start_year = colOptI64(stmt, 12),
+            .start_month = colOptI64(stmt, 13),
+            .start_day = colOptI64(stmt, 14),
+            .genres = try dupeStrBlob(arena, stmt, 15),
+            .enrichment_fetched_at = colOptI64(stmt, 16),
+            .enrichment_fieldset_version = colOptI64(stmt, 17),
+            .studios = try dupeStrBlob(arena, stmt, 18),
+            .duration = colOptI64(stmt, 19),
+            .source_material = try dupeText(arena, stmt, 20),
+            .rank = colOptI64(stmt, 21),
+            .rank_type = try dupeText(arena, stmt, 22),
+            .rank_year = colOptI64(stmt, 23),
+            .next_airing_at = colOptI64(stmt, 24),
+            .next_airing_episode = colOptI64(stmt, 25),
+            .country = try dupeText(arena, stmt, 26),
         };
     }
 
@@ -3276,6 +3354,65 @@ test "upsertCanonicalOnly persists a search hit as a canonical entity with no bi
     // No binding row: canonical-only is the point. loadHistory needs a binding, stays empty.
     try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
     try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
+}
+
+test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked binding (ROD-327)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+
+    // Persist a search hit as canonical-only (the ROD-326 search-persist path).
+    const hit: domain.Anime = .{
+        .id = "182255",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+        .score = 89,
+        .total_episodes = 28,
+    };
+    try s.upsertCanonicalOnly(hit, arena);
+
+    // The hydrate reader returns the entity keyed by anilist_id, no binding needed.
+    const canon = (try s.getCanonicalByAnilistId(arena, 182255)).?;
+    try testing.expectEqualStrings("Sousou no Frieren", canon.title);
+    try testing.expectEqual(@as(?i64, 52991), canon.mal_id);
+    try testing.expectEqual(@as(?i64, 182255), canon.anilist_id);
+    try testing.expectEqual(@as(?i64, 89), canon.score);
+    try testing.expectEqual(@as(?i64, 28), canon.total_episodes);
+    // An unknown id reads null (the miss the resolver treats as "not canonical yet").
+    try testing.expect((try s.getCanonicalByAnilistId(arena, 999999)) == null);
+
+    // Tier-A resolve: senshi keys by the stringified mal_id. A first bind mints the
+    // binding hidden (a Play resolve; recordPlay reveals it later).
+    try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena);
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+    try testing.expectEqual(@as(?i64, 182255), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source='senshi' AND source_id='52991';"));
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='senshi' AND source_id='52991';"));
+    // Hidden binding stays out of History; the join still resolves title via canonical.
+    try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
+
+    // A second bind that reveals (the Add path) surfaces one History row, enriched
+    // through canonical (MAX-merged visibility), still a single binding row.
+    try s.bindCanonical("senshi", "52991", 182255, true, 2000, arena);
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+    const hist = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), hist.len);
+    try testing.expectEqualStrings("Sousou no Frieren", hist[0].title);
+    try testing.expectEqual(@as(?i64, 52991), hist[0].mal_id);
+    try testing.expectEqual(@as(?i64, 89), hist[0].score);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {

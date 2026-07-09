@@ -191,3 +191,48 @@ test "drawBrowseList renders the primary title under title_language (ROD-205)" {
     drawBrowseList(&app, scratch, win, 12, 60);
     try t.expectEqualStrings("F", win.readCell(2, 0).?.char.grapheme); // "Frieren: Beyond…"
 }
+
+test "drawBrowseList shows the track-agnostic total for a zero-per-track AniList hit (ROD-327)" {
+    const t = std.testing;
+    var app: App = .{};
+    app.gpa = t.allocator;
+    defer app.search.results.deinit(t.allocator);
+    // An AniList discovery hit: no per-track counts (senshi splits sub/dub; AniList
+    // reports a single total), a populated total_episodes. The list must show the total,
+    // never a false "0 sub".
+    try app.search.results.append(t.allocator, .{
+        .id = "182255",
+        .name = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .eps_sub = 0,
+        .eps_dub = 0,
+        .total_episodes = 28,
+    });
+    app.search.len = 1;
+    app.translation = .sub;
+    app.config.title_language = "romaji";
+
+    const scratch = try t.allocator.create(RenderScratch);
+    defer t.allocator.destroy(scratch);
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 12, .cols = 80, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 80, .height = 12, .screen = &screen };
+
+    drawBrowseList(&app, scratch, win, 12, 80);
+
+    // Scan row 0 into an ASCII buffer (title + score + eps zone are all ASCII here).
+    var buf: [80]u8 = undefined;
+    var n: usize = 0;
+    var col: u16 = 0;
+    while (col < 80) : (col += 1) {
+        const cell = win.readCell(col, 0) orelse continue;
+        const g = cell.char.grapheme;
+        if (g.len == 1 and n < buf.len) {
+            buf[n] = g[0];
+            n += 1;
+        }
+    }
+    const row0 = buf[0..n];
+    try t.expect(std.mem.indexOf(u8, row0, "28 ep") != null);
+    try t.expect(std.mem.indexOf(u8, row0, "0 sub") == null);
+}
