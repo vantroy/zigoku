@@ -1,27 +1,22 @@
-//! senshi.live — a `SourceProvider` that replaces the captcha-walled AllAnime
-//! (ROD-301; the wall is documented in ROD-300: AllAnime bolted a Cloudflare
-//! Turnstile gate onto source resolution, which a headless CLI can't pass).
+//! senshi.live — a `SourceProvider` that replaces the captcha-walled AllAnime (ROD-301;
+//! AllAnime bolted a Cloudflare Turnstile gate onto source resolution that a headless CLI
+//! can't pass, ROD-300).
 //!
-//! senshi is a night-and-day simpler source than AllAnime: plain REST JSON on one
-//! origin, no persisted-query hashes, no AES-GCM `tobeparsed` blob, no `--<hex>`
-//! provider deciphering, and — verified live — no captcha and no `cf_clearance`
-//! cookie required from a raw HTTP client. Everything is keyed by the show's
-//! **MyAnimeList id**, which doubles as our AniSkip key for free.
+//! senshi is far simpler than AllAnime: plain REST JSON on one origin, no persisted-query
+//! hashes, no AES-GCM blob, no provider deciphering, and (verified live) no captcha or
+//! `cf_clearance` cookie from a raw HTTP client. Everything is keyed by the show's
+//! MyAnimeList id, which doubles as our AniSkip key for free.
 //!
-//! The API surface we ride (reversed on ROD-300/301):
+//! The API surface (reversed on ROD-300/301):
 //!   * search / browse → POST /anime/filter  {searchTerm, sortBy, page, limit, …}
 //!   * episode list    → GET  /episodes/{mal_id}
 //!   * stream resolve  → GET  /episode-embeds/{mal_id}/{ep}
 //!   * cover art       → /posters/{mal_id}.webp
 //!
-//! Like AllAnime, every site-specific fact is quarantined here behind the
-//! `source.SourceProvider` vtable. When senshi dies too: replace this file.
-//!
-//! Discover is OFF for senshi: it has no time-windowed popularity feed (its
-//! /anime/trending is a ~7-item hot list, not a paginated windowed grid), so
-//! `supportsDiscover()` returns false and `popular()` is an inert stub — the app
-//! hides the Discover view until a per-provider Discover is built. The m3u8/quality
-//! machinery still to be lifted out of allanime.zig into a shared module is ROD-302.
+//! Every site-specific fact is quarantined here behind the `source.SourceProvider` vtable.
+//! Discover is OFF: senshi has no time-windowed popularity feed (its /anime/trending is a
+//! ~7-item hot list), so `supportsDiscover()` is false and `popular()` is an inert stub.
+//! Lifting the m3u8/quality machinery out of allanime.zig into a shared module is ROD-302.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -268,11 +263,10 @@ pub const Senshi = struct {
     /// Parse the /episodes array into numerically-sorted episode labels. Pure over
     /// the response bytes so it's unit-testable without the network.
     ///
-    /// Drops a phantom "episode 0": senshi lists a prologue slot at ep_id 0 for some
-    /// shows (e.g. Uma Musume: Cinderella Gray's "Gray Phantom"), but its own
-    /// /episode-embeds endpoint rejects 0 with 400 "Invalid episode number" — it is
-    /// never playable, so offering it only lets a user pick a stream that can't
-    /// resolve, which surfaces as a bare "returned an error" toast (ROD-301).
+    /// Drops a phantom "episode 0": senshi lists a prologue slot at ep_id 0 for some shows,
+    /// but its own /episode-embeds endpoint rejects 0 with 400 "Invalid episode number", so
+    /// it is never playable; offering it only lets a user pick a stream that can't resolve,
+    /// surfacing as a bare "returned an error" toast (ROD-301).
     fn parseEpisodes(arena: Allocator, raw: []const u8) ![]domain.EpisodeNumber {
         const parsed = try std.json.parseFromSlice([]SEp, arena, raw, .{ .ignore_unknown_fields = true });
         var eps: std.ArrayList(domain.EpisodeNumber) = .empty;
@@ -317,14 +311,13 @@ pub const Senshi = struct {
         // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
         // controls that could smuggle a second mpv option or header).
         if (!domain.isAbsoluteUrl(stream) or !cleanArg(stream)) return error.BadStreamUrl;
-        // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv
-        // echoes the referer on the whole HLS chain (master → variant → segments) via
-        // --http-header-fields. `user_agent`: present the same browser UA the resolver
-        // used — part of not tripping the CDN's bot/rate scoring, which intermittently
-        // 403s ffmpeg's scraper-shaped default requests (the player also sends keep-alive
-        // + drops the Icy-MetaData tell; ROD-309). `cloaked_segments`: senshi serves its
-        // `.ts` segments as `.jpg`, so the player must relax ffmpeg's HLS segment-
-        // extension gate or nothing plays.
+        // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv echoes
+        // the referer on the whole HLS chain (master/variant/segments) via
+        // --http-header-fields. `user_agent`: the same browser UA the resolver used, part of
+        // not tripping the CDN's bot/rate scoring that 403s ffmpeg's default requests (the
+        // player also sends keep-alive + drops the Icy-MetaData tell; ROD-309).
+        // `cloaked_segments`: senshi serves its `.ts` segments as `.jpg`, so the player must
+        // relax ffmpeg's HLS segment-extension gate or nothing plays.
         return .{
             .url = stream,
             .referer = STREAM_REFERER,

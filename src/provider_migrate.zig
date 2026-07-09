@@ -1,17 +1,16 @@
 //! Zigoku — one-time provider-cutover backfill (ROD-308).
 //!
-//! The v12 schema migration (store.zig) re-keys allanime rows that already carry a
-//! `mal_id` onto senshi offline. This closes the gap for rows enriched BEFORE `idMal`
-//! joined the enrichment fieldset: they hold an `anilist_id` but no `mal_id`, so the
-//! offline re-key skips them. Here we resolve `anilist_id -> idMal` over the network
-//! (public, unauthed `enrichBatch` — works for every user, not just linked accounts),
-//! stamp the `mal_id`, then run the SAME re-key to move them onto senshi — widening
-//! the cutover from ~37% to ~83% of a real watchlist.
+//! The v12 schema migration (store.zig) re-keys allanime rows that already carry a `mal_id`
+//! onto senshi offline. This closes the gap for rows enriched BEFORE `idMal` joined the
+//! enrichment fieldset: they hold an `anilist_id` but no `mal_id`, so the offline re-key
+//! skips them. Here we resolve `anilist_id -> idMal` over the network (public, unauthed
+//! `enrichBatch`), stamp the `mal_id`, then run the SAME re-key onto senshi, widening the
+//! cutover from ~37% to ~83% of a real watchlist.
 //!
-//! Best-effort and one-shot: gated by an `app_meta` marker so it runs once. A network
-//! miss mid-run banks what landed and retries next launch (the `mal_id`-present
-//! predicate self-excludes what already resolved), never stamping the marker until a
-//! clean pass. Only a store/allocation fault propagates to the (best-effort) caller.
+//! Best-effort and one-shot: an `app_meta` marker runs it once. A network miss mid-run banks
+//! what landed and retries next launch (the `mal_id`-present predicate self-excludes what
+//! resolved), stamping the marker only on a clean pass. Only a store/allocation fault
+//! propagates to the (best-effort) caller.
 
 const std = @import("std");
 const anilist = @import("anilist.zig");

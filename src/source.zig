@@ -1,15 +1,14 @@
 //! Zigoku — the `SourceProvider` interface.
 //!
-//! THE seam. The entire defensive architecture is one idea: the app talks only
-//! to this vtable, never to a concrete site. When AllAnime dies, you write a new
-//! struct satisfying this interface and change one line of wiring — the app
-//! upstream of here never learns the source changed.
+//! THE seam. The entire defensive architecture is one idea: the app talks only to this
+//! vtable, never to a concrete site. When a provider dies, you write a new struct satisfying
+//! this interface and change one line of wiring; the app upstream never learns the source
+//! changed.
 //!
-//! Implemented as Zig's idiomatic "fat pointer" interface: a type-erased
-//! `*anyopaque` self paired with a `*const VTable` of function pointers. A
-//! concrete provider exposes a `provider()` that packs itself into one of these.
-//! (Contrast with `comptime`/generic interfaces: a vtable lets us hold *any*
-//! provider behind one runtime value — necessary the moment we have more than one.)
+//! Implemented as Zig's idiomatic "fat pointer" interface: a type-erased `*anyopaque` self
+//! paired with a `*const VTable` of function pointers, and each provider exposes a
+//! `provider()` that packs itself into one. (A vtable, not a comptime/generic interface, so
+//! one runtime value can hold ANY provider, necessary the moment we have more than one.)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,14 +49,12 @@ pub const PopularOptions = struct {
     page: u32 = 1,
 };
 
-/// A resolved, fetchable cover request (ROD-267). A provider turns a stored cover
-/// ref — which may be a provider-relative path, since some sources serve covers as
-/// a bare `mcovers/…` with no host — into an absolute URL plus whatever headers its
-/// cover CDN gates on. `url` is owned by the allocator passed to `coverRequest`
-/// (the caller frees it); `referer`/`user_agent` are static or null and must NOT be
-/// freed. A null header means "don't send it". This is the seam that keeps the
-/// cover-CDN host behind the provider: the app fetches an opaque URL and never
-/// learns which host served it.
+/// A resolved, fetchable cover request (ROD-267). A provider turns a stored cover ref (which
+/// may be a provider-relative `mcovers/…` path with no host) into an absolute URL plus
+/// whatever headers its cover CDN gates on. `url` is owned by the allocator passed to
+/// `coverRequest` (caller frees); `referer`/`user_agent` are static or null and must NOT be
+/// freed (a null header means "don't send it"). This is the seam that keeps the cover-CDN
+/// host behind the provider: the app fetches an opaque URL and never learns which host served it.
 pub const CoverRequest = struct {
     url: []const u8,
     referer: ?[]const u8 = null,
