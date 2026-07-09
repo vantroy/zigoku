@@ -4,7 +4,7 @@
 //! results, the loaded-page count, the in-flight flag, and the queued follow-up enrichment.
 //! The pure helpers (clear / hydrate / persist) and the query-edit key handler take explicit
 //! dependencies (`gpa`/`store`/`source`/`translation`) and report a `KeyResult` verdict; this
-//! struct never reaches back into App or navigation state.
+//! struct never reaches back into App.
 //!
 //! Boundary (mirroring EpisodeState): this struct owns the search record, not the transport.
 //! The worker threads (`search_thread`/`enrich_thread`, joined on teardown), the shared
