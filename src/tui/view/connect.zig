@@ -1,16 +1,13 @@
 //! Zigoku — AniList connect modal (ROD-286).
 //!
 //! A captured overlay drawn on top of Settings while the in-TUI OAuth flow runs
-//! (`App.connect != null`). Borderless by design (DESIGN.md §3.1 — box-drawing is
-//! never pane/overlay chrome here): the float is a `bg.elevated` panel, the same
-//! elevation signal toasts use, with no box drawn around it. It shows the authorize
-//! URL (the browser was opened for the user; this is the fallback + the thing `[c]`
-//! copies), a live "waiting" spinner, and the two keys the modal owns — `c` copy,
-//! `esc` cancel. Below `min_w`/`min_h` the panel itself won't read as legible chrome,
-//! so `draw` falls back to one bare line instead of drawing nothing (see
-//! `drawCrampedFallback`). Pure render: the accept-loop worker, the clipboard write,
-//! and teardown all live in app.zig / login_loopback.zig; this module only reads
-//! `App.connect` and paints it.
+//! (`App.connect != null`). Borderless by design (DESIGN.md §3.1: box-drawing is never
+//! pane/overlay chrome here), a `bg.elevated` panel like toasts use. It shows the authorize
+//! URL (the fallback if the browser didn't open, and what `[c]` copies), a "waiting"
+//! spinner, and the two keys it owns (`c` copy, `esc` cancel). Below `min_w`/`min_h` it
+//! falls back to one bare line (`drawCrampedFallback`). Pure render: the accept-loop worker,
+//! clipboard write, and teardown live in app.zig / login_loopback.zig; this only reads and
+//! paints `App.connect`.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -25,15 +22,12 @@ const centerText = render.centerText;
 const centerKeyHint = render.centerKeyHint;
 const drawWrappedText = render.drawWrappedText;
 
-/// Fixed modal height: 1 row top pad + title + blank + instruction + blank + fallback
-/// caption + URL band (1 top-pad row + up to 3 URL lines) + blank + status + blank +
-/// paste hint + blank + 2 key-hint lines, plus whatever's left over at the bottom as
-/// pad. The paste-hint row's blank neighbours are reserved unconditionally — even
-/// hidden (< `paste_hint_s`) it keeps its padded slot, so the hint doesn't shift the
-/// rows below it into place the instant it appears (§3.1: divided by whitespace, not
-/// a rule, but the whitespace still has to be *there* to divide with). Clipped by the
-/// child window on a short terminal — see `min_h` for the floor below which this stops
-/// being legible at all and `drawCrampedFallback` takes over.
+/// Fixed modal height: top pad + title + instruction + fallback caption + URL band (up to 3
+/// lines) + status + paste hint + 2 key-hint lines, each divided by blank rows. The paste
+/// hint's blank neighbours are reserved unconditionally: even hidden it keeps its padded
+/// slot, so the hint doesn't shift the rows below it the instant it appears (§3.1: divided
+/// by whitespace, which still has to be THERE to divide with). Clipped by the child window
+/// on a short terminal; below `min_h`, `drawCrampedFallback` takes over.
 const box_h: u16 = 19;
 /// Preferred modal width, capped to the terminal with a 2-col margin each side.
 const box_w_pref: u16 = 68;
@@ -116,14 +110,12 @@ pub fn draw(self: *App, win: vaxis.Window, w: u16, h: u16) void {
         0;
     drawStatus(self, box, 11, bw, cs, elapsed_s);
 
-    // Escape-hatch hint, in its own padded slot (row 12 blank, row 13 the hint, row 14
-    // blank) reserved whether or not it's showing — the rows below it don't shift into
-    // place the instant it appears. Only past `paste_hint_s` does a possibly-stuck
-    // (remote/SSH) user get pointed at the terminal fallback. `warn` (amber), not
-    // `fg2`/`fg3` — this is an attention signal, not body text, and it must not read as
-    // the same register as the caption two paragraphs up. Not `hot`: the spinner above
-    // already escalates to `hot` past `slow_wait_s`, and the two would compete for the
-    // "most urgent thing here" read. Plain weight, no italic — `warn` alone carries it.
+    // Escape-hatch hint in its own padded slot (rows 12/13/14 reserved whether or not it
+    // shows, so rows below don't shift when it appears). Only past `paste_hint_s` does a
+    // possibly-stuck (remote/SSH) user get pointed at the terminal fallback. `warn` (amber),
+    // not `fg2`/`fg3`: an attention signal, not body text, and it must not read as the
+    // caption's register. Not `hot`: the spinner already escalates to `hot` past
+    // `slow_wait_s`, and the two would compete for the "most urgent" read. Plain weight.
     if (elapsed_s >= paste_hint_s) {
         centerText(box, 13, bw, "no callback? run  zigoku login --paste  in a terminal", self.s(self.palette.warn, .{ .bg = bg }));
     }

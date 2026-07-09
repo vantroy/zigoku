@@ -23,42 +23,36 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Loop = event_mod.Loop;
 
-/// Fire-and-forget worker accounting (ROD-179). Lets the main loop spawn a
-/// background worker without synchronously joining a prior one: the superseded
-/// worker is *detached* and runs to completion on its own (its stale result is
-/// keep-checked and dropped on arrival), while a teardown barrier still
-/// guarantees every outstanding worker has finished before the shared state it
-/// borrows — the event loop, the gpa, the io — is torn down.
+/// Fire-and-forget worker accounting (ROD-179): spawn a background worker without
+/// synchronously joining a prior one. The superseded worker is detached and runs to
+/// completion on its own (its stale result is keep-checked and dropped on arrival),
+/// while a teardown barrier still guarantees every outstanding worker finished before
+/// the shared state it borrows (the event loop, the gpa, the io) is torn down.
 ///
 /// Contract:
-///   - `begin()` on the spawning thread, immediately *before* each spawn, so the
-///     count is already raised when the new thread may start. On a spawn
-///     failure, pair it with `finish()` to rebalance.
-///   - the worker calls `finish()` as its last action (via `defer`), after its
-///     final `postEvent` returns — so once `drain()` unblocks, no worker can
-///     still touch the loop/gpa/io.
+///   - `begin()` on the spawning thread immediately BEFORE each spawn, so the count is
+///     raised before the new thread can start. On spawn failure, pair with `finish()`.
+///   - the worker calls `finish()` as its last action (via `defer`), after its final
+///     `postEvent` returns, so once `drain()` unblocks no worker can still touch the
+///     loop/gpa/io.
 ///   - `drain()` once, on teardown: blocks until every begun worker finished.
 ///
-/// Just an atomic counter: this std's `Thread` is `spawn/join/detach/yield`
-/// only — the blocking sync primitives (Mutex/Condition/Futex) moved to
-/// `std.Io`, and these are raw OS threads, not io tasks. `begin`/`finish` are
-/// lock-free fetch-add/sub. `drain()` spins, but `yield()` hands the core to a
-/// worker so it can finish, it runs once on teardown only (never the hot path),
-/// and it's bounded by the in-flight fetch's wall-clock deadline (ROD-153).
+/// Just an atomic counter: this std's `Thread` is spawn/join/detach/yield only (the
+/// blocking primitives moved to `std.Io`), so `begin`/`finish` are lock-free fetch
+/// add/sub and `drain()` spins with `yield()`. It runs once on teardown, never the hot
+/// path, and is bounded by the in-flight fetch's deadline (ROD-153).
 ///
-/// Intentionally does NOT cap the worker count: the episode-prefetch debounce
-/// (ROD-156) keeps superseding fires rare and each fetch is deadline-bounded
-/// (ROD-153), so the outstanding set stays small in practice. A hard cap would
-/// be backpressure policy, not a safety requirement — so where a caller *does*
-/// want one (the Discover fan-out, which can storm), it reads `inflight` against
-/// its own soft cap at the spawn site and drops past it (`discoverPoolSaturated`,
-/// ROD-264 #3), rather than this shared primitive imposing a single global limit.
+/// Intentionally uncapped: the episode-prefetch debounce (ROD-156) keeps superseding
+/// fires rare and each fetch is deadline-bounded, so the outstanding set stays small. A
+/// cap would be backpressure policy, not safety, so a caller that wants one (the Discover
+/// fan-out) reads `inflight` against its own soft cap at the spawn site (ROD-264) instead
+/// of this primitive imposing a global limit.
 ///
-/// `drain()` assumes the event queue keeps draining: a worker's final
-/// `postEvent` blocks if the bounded queue is full, and during teardown the main
-/// loop has stopped popping — so a saturated queue could wedge the drain. This is
-/// a pre-existing, low-probability teardown hazard shared by every worker join in
-/// run(); hardening it (pump the queue while draining) is a separate follow-up.
+/// `drain()` assumes the event queue keeps draining: a worker's final `postEvent` blocks
+/// if the bounded queue is full, and during teardown the main loop has stopped popping,
+/// so a saturated queue could wedge the drain. A pre-existing low-probability teardown
+/// hazard shared by every worker join in run(); pumping the queue while draining is a
+/// separate follow-up.
 pub const ThreadDrain = struct {
     inflight: std.atomic.Value(usize) = .init(0),
 
@@ -97,19 +91,17 @@ pub const max_cover_raw_cache_bytes = 32 * 1024 * 1024;
 pub const max_cover_decoded_cache_bytes = 48 * 1024 * 1024;
 
 /// Shared, mutex-guarded cover caches (ROD-243). Hoisted out of `CoverState` so the
-/// single-cover path and the Discover grid both fetch against the *same* URL-keyed
-/// LRUs — a cover fetched in Browse is reused by Discover (and vice-versa) for free.
+/// single-cover path and the Discover grid fetch against the SAME URL-keyed LRUs, so a
+/// cover fetched in Browse is reused by Discover for free.
 ///
-/// The mutex is what makes these previously one-at-a-time caches safe under N
-/// concurrent cover workers. Before ROD-243 the only safety came from
-/// `cover_state.zig` joining the prior thread before spawning the next, so exactly
-/// one worker ever touched the caches; the grid breaks that invariant.
+/// The mutex is what makes these caches safe under N concurrent cover workers; before
+/// ROD-243 safety came only from `cover_state.zig` joining the prior thread before
+/// spawning the next, and the grid breaks that.
 ///
-/// Lock discipline (implemented in `loadCoverPixels`): every dupe of a slice that
-/// lives in — or was just inserted into — a cache happens while `mu` is held;
-/// `decodeCoverBody` and the network fetch run *unlocked* so a slow decode/fetch
-/// never stalls another worker. Note `LruCache.get` is itself a writer (it promotes
-/// the hit to most-recent), so even a pure lookup must hold the lock.
+/// Lock discipline (in `loadCoverPixels`): every dupe of a slice that lives in or was
+/// just inserted into a cache happens while `mu` is held; `decodeCoverBody` and the
+/// network fetch run UNLOCKED so a slow decode never stalls another worker. `LruCache.get`
+/// is itself a writer (it promotes the hit), so even a pure lookup must hold the lock.
 pub const CoverCaches = struct {
     mu: std.Io.Mutex = .init,
     raw: RawCoverCache = .{},
@@ -256,16 +248,15 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     }
 }
 
-/// Merge an enriched copy into the live card, filling ONLY the fields the live card
-/// still lacks (live wins) — the concurrency-safe replacement for `live.* = incoming`
-/// (ROD-247). The Discover slot now has two concurrent enrichers (the page batch and
-/// the per-card zoom); a full overwrite from either's fire-time snapshot would clobber
-/// fields the other already filled (zoom lands → batch's score reverts to `[--]`, or
-/// batch lands → zoom's synopsis blanks). Fill-if-null mirrors `applyMetadata`'s
-/// "existing wins" rule, so arrival order no longer matters and no enrichment is lost.
-/// Ownership: adopted fields transfer out of `incoming` (nulled so they aren't freed);
-/// everything `incoming` still holds — including its id/name (live keeps its own) — is
-/// freed here. `live`'s id/name/view_count/eps always win (never touched).
+/// Merge an enriched copy into the live card, filling ONLY the fields the live card still
+/// lacks (live wins): the concurrency-safe replacement for `live.* = incoming` (ROD-247).
+/// The Discover slot has two concurrent enrichers (page batch + per-card zoom); a full
+/// overwrite from either's fire-time snapshot would clobber fields the other already
+/// filled (zoom lands, batch's score reverts to `[--]`; or batch lands, zoom's synopsis
+/// blanks). Fill-if-null mirrors `applyMetadata`'s "existing wins", so arrival order is
+/// irrelevant and no enrichment is lost. Ownership: adopted fields transfer out of
+/// `incoming` (nulled so they aren't freed); everything else it holds (including its
+/// id/name, live keeps its own) is freed here. `live`'s id/name/view_count/eps win.
 pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
     mergeOptText(&live.english_name, &incoming.english_name);
     mergeOptText(&live.title_romaji, &incoming.title_romaji);
@@ -499,15 +490,12 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.country == null) a.country = dupeOptText(gpa, meta.country) catch a.country;
 }
 
-/// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`,
-/// taking gpa-owned copies so they ride `freeOwnedAnime`. The record→Anime
-/// sibling of `applyMetadata` (meta→Anime): both back-fill only nulls, so a
-/// stored value never clobbers a fresher one already on the row. Pure — operates
-/// on the passed row + record and touches no controller state. Shared by the
-/// search-page hydrate (`SearchController.hydrateResultsFromStore`) and the
-/// Discover-feed hydrate (`DiscoverState.hydrateSlotFromStore`, ROD-268), so a
-/// card whose provider thumb carries no mineable AniList id still enriches
-/// deterministically by the id a past match already stored.
+/// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`, taking
+/// gpa-owned copies so they ride `freeOwnedAnime`. The record->Anime sibling of
+/// `applyMetadata`: both back-fill only nulls, so a stored value never clobbers a fresher
+/// one already on the row. Pure. Shared by the search-page and Discover-feed hydrates
+/// (ROD-268), so a card whose provider thumb carries no mineable AniList id still
+/// enriches by the id a past match stored.
 pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRecord) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, rec.title_english) catch a.english_name;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, rec.native_name) catch a.native_name;
@@ -580,20 +568,19 @@ pub fn enrichTask(
     posted = true;
 }
 
-/// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read
-/// stale (`Store.enrichmentStale`), so re-pull AniList metadata and post it for the
-/// UI thread to persist + reload. `stub` is a gpa-owned identity record
-/// (id/name/english_name/anilist_id) the caller built from the stored row — blank
-/// beyond identity, so `applyMetadata`'s fill-if-null fills every field from `meta`
-/// and the store's upsert COALESCE then overwrites stored content with the fresh
-/// values (keeping stored values where AniList returned null): a content refresh
-/// with no in-memory overwrite-merge. `stub` and `source` are gpa-owned; ownership
-/// transfers to the `enrichment_refreshed` event, or both are freed here on a post
-/// failure. Miss contract, split by ROD-278: a *confirmed* no-match posts `stub`
-/// UNCHANGED with `answered = true` — the handler stamps it fresh, a negative cache
-/// that stops re-hammering AniList until the TTL lapses. A transport failure (no
-/// answer reached) posts `stub` UNCHANGED with `answered = false` — the handler
-/// skips the stamp so the next view retries instead of burning the freshness clock.
+/// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read stale, so
+/// re-pull AniList metadata and post it for the UI thread to persist + reload. `stub` is a
+/// gpa-owned identity record (id/name/english_name/anilist_id) blank beyond identity, so
+/// `applyMetadata`'s fill-if-null fills every field from `meta` and the upsert COALESCE
+/// overwrites stored content with the fresh values: a content refresh with no in-memory
+/// merge. `stub`/`source` are gpa-owned; ownership transfers to the `enrichment_refreshed`
+/// event, or both are freed here on a post failure.
+///
+/// Miss contract (ROD-278): a CONFIRMED no-match posts `stub` unchanged with
+/// `answered = true`, and the handler stamps it fresh (a negative cache that stops
+/// re-hammering AniList until the TTL lapses). A transport failure (no answer reached)
+/// posts `answered = false`, and the handler skips the stamp so the next view retries
+/// instead of burning the freshness clock.
 pub fn refreshEnrichTask(
     loop: *Loop,
     gpa: Allocator,
@@ -650,18 +637,16 @@ pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime,
     };
 }
 
-/// Batch-enrich a whole Discover feed page from AniList in ONE fetch (ROD-247):
-/// score + genres + season, the card signals the popular feed nulls. `stubs` are
-/// gpa-owned copies of the page's cards (the caller filtered to those with a
-/// mineable anilist_id); ownership transfers to the discover_batch_enriched event
-/// on success, or is freed here on a post failure — the same contract as
-/// `enrichTask`. `window` routes the merge to the right per-window slot.
+/// Batch-enrich a whole Discover feed page from AniList in ONE fetch (ROD-247): score +
+/// genres + season, the fields the popular feed nulls. `stubs` are gpa-owned copies of
+/// the page's cards (caller filtered to those with a mineable anilist_id); ownership
+/// transfers to the discover_batch_enriched event on success, or is freed here on a post
+/// failure (same contract as `enrichTask`). `window` routes the merge to the right slot.
 ///
 /// One arena feeds N shows: every enriched field is deep-copied into GPA by
-/// `applyMetadata` while the arena is still live, so nothing aliases the parse
-/// arena after teardown. The genres/description slices are arena-borrowed — this
-/// is the UAF trap, and the ordering (copy in the loop, `defer arena.deinit()`)
-/// is what defuses it.
+/// `applyMetadata` while the arena is still live, so nothing aliases the parse arena after
+/// teardown. The genres/description slices are arena-borrowed: this is the UAF trap, and
+/// the ordering (copy in the loop, `defer arena.deinit()`) is what defuses it.
 pub fn discoverBatchEnrichTask(
     loop: *Loop,
     gpa: Allocator,
@@ -728,27 +713,24 @@ pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Background task: reconcile with AniList then flush local changes up (ROD-291). The
-/// action-sync coordinator arms a debounce on a local mutation; when it elapses, .tick
-/// spawns this off the render thread. Runs **pull-then-push**, the same order as the CLI
-/// `zigoku sync` (main.zig `runSync`): `pullAll` reconciles first (3-way merge, progress
-/// = max) so a value that moved further ahead on another surface is adopted locally
-/// before the push, instead of the push blind-lowering it — the pull-before-push
-/// discipline ROD-285 relies on, now applied to the action path too. Both engines are
-/// total (every outcome lands in a summary, never an error). The push is skipped only
-/// when the pull already hit a wall the push would hit too (401 / 429 / store error).
+/// Background task: reconcile with AniList then flush local changes up (ROD-291). Armed by
+/// a debounce on a local mutation; .tick spawns it off the render thread when the debounce
+/// elapses. Runs PULL-THEN-PUSH, the same order as the CLI `zigoku sync`: `pullAll`
+/// reconciles first (3-way merge, progress = max) so a value that moved further ahead on
+/// another surface is adopted locally before the push, instead of the push blind-lowering
+/// it (the ROD-285 pull-before-push discipline, now on the action path too). Both engines
+/// are total (every outcome lands in a summary, never an error). The push is skipped only
+/// when the pull already hit a wall the push would too (401 / 429 / store error).
 ///
-/// `pull_only` (ROD-293) suppresses the push entirely: the launch pull-refresh runs one
-/// `MediaListCollection` round trip to adopt edits made on other devices, but leaves the
-/// paced (2 s/row) push to the action flush and the quit flush — a fast, read-only launch
-/// path that never storms the wire. It rides the same `.sync_flushed` event with
-/// `pushed = 0`, so the handler emits no ↑ line — just the ambient `↓ N from AniList`
-/// whisper (and a history reload) when the reconcile actually changed local rows.
+/// `pull_only` (ROD-293) suppresses the push: the launch pull-refresh runs one
+/// `MediaListCollection` round trip to adopt other-device edits but leaves the paced push
+/// to the action and quit flushes. It rides the same `.sync_flushed` event with
+/// `pushed = 0`, so the handler emits no ↑ line, just the ambient `↓ N from AniList`
+/// whisper (and a history reload) when the reconcile changed local rows.
 ///
-/// `credentials` is passed by value — its slices live in run()'s session auth arena.
-/// `inflight` is cleared here in a defer so a failed `postEvent` (queue torn down at
-/// quit) can't latch the one-flush gate on. A dropped or failed flush self-heals:
-/// unpushed rows stay dirty for the next flush.
+/// `credentials` is by value (slices live in run()'s session auth arena). `inflight` is
+/// cleared in a defer so a failed `postEvent` at quit can't latch the one-flush gate on. A
+/// dropped flush self-heals: unpushed rows stay dirty for the next.
 pub fn syncFlushTask(
     loop: *Loop,
     gpa: Allocator,
@@ -787,27 +769,24 @@ pub fn syncFlushTask(
 /// nothing against a one-time quit. ROD-294.
 const quit_poll_ms: u64 = 5;
 
-/// ROD-294: bounded best-effort push on quit — the mirror of `syncFlushTask`'s launch
-/// pull at the far end of the session. Called synchronously from run()'s fast-exit path,
-/// AFTER the terminal is restored and BEFORE `_exit`: if rows are still dirty, land as
-/// many as `deadline_ms` allows so a push that failed mid-session (offline, a dropped
-/// 429) doesn't wait for the next launch. Posts NO event — a pure store+network call
-/// that never touches the loop or tty, so it sidesteps the ROD-179/232 event-queue wedge
-/// that retired the graceful drain.
+/// ROD-294: bounded best-effort push on quit, the mirror of the launch pull at the far end
+/// of the session. Called synchronously from run()'s fast-exit path, AFTER the terminal is
+/// restored and BEFORE `_exit`: if rows are still dirty, land as many as `deadline_ms`
+/// allows so a push that failed mid-session (offline, a dropped 429) doesn't wait for the
+/// next launch. Posts NO event, a pure store+network call that never touches the loop or
+/// tty, so it sidesteps the ROD-179/232 event-queue wedge that retired the graceful drain.
 ///
-/// Runs the push on its OWN thread and bounds the WAIT with a libc-`nanosleep` poll loop,
-/// deliberately NOT `withDeadline`: withDeadline arms its timer on the same `Io` thread
-/// pool the push competes for, so under pool starvation (OS thread exhaustion) it runs
-/// the op inline with NO deadline (deadline.zig:43) — and this call sits one line before
-/// the ROD-232 `_exit`, where an unbounded op on a silent socket is exactly the quit-hang
-/// ROD-232 exists to kill. `nanosleep` is a direct libc syscall (the app links libc),
-/// independent of the pool, so the quit thread ALWAYS returns by the deadline no matter
-/// what the push thread is doing — a stalled or starved push is abandoned to `_exit` like
-/// every other ROD-232 worker. Best-effort: whatever doesn't land stays dirty and
-/// re-flushes next launch (`sync.pushAll` stamps each row as it lands, so a cut-short run
-/// leaves a consistent partial — proven by sync.zig's "401 mid-run" test). The caller has
-/// already checked we're connected and that no sync worker (pull or push) is inflight —
-/// the quit push must never run alongside a pull (ROD-285 ordering).
+/// Runs the push on its OWN thread and bounds the WAIT with a libc-`nanosleep` poll,
+/// deliberately NOT `withDeadline`: withDeadline arms its timer on the same `Io` pool the
+/// push competes for, so under pool starvation it runs the op inline with NO deadline
+/// (deadline.zig), and this sits one line before `_exit`, where an unbounded op on a silent
+/// socket is exactly the quit-hang ROD-232 kills. `nanosleep` is a direct libc syscall,
+/// independent of the pool, so the quit thread ALWAYS returns by the deadline no matter what
+/// the push thread does; a stalled push is abandoned to `_exit` like any ROD-232 worker.
+/// Best-effort: whatever doesn't land stays dirty and re-flushes next launch (`sync.pushAll`
+/// stamps each row as it lands, so a cut-short run leaves a consistent partial). The caller
+/// has already checked we're connected and no sync worker is inflight: the quit push must
+/// never run alongside a pull (ROD-285 ordering).
 pub fn pushOnQuit(
     gpa: Allocator,
     io: std.Io,
@@ -829,16 +808,15 @@ pub fn pushOnQuit(
         return;
     };
     // Wait for the push to land, up to the deadline, waking every `quit_poll_ms` for an
-    // early exit. Bound the loop on a MONOTONIC WALL CLOCK, not an iteration count:
-    // `nanosleep` returns early on any delivered signal, and this process keeps a live
-    // SIGWINCH handler through quit (vaxis installs it process-wide and it is never reset),
-    // so a fixed poll count would let a terminal-resize storm mid-quit collapse the whole
-    // budget to milliseconds. Re-reading the clock each pass makes a cut-short sleep
-    // harmless — we just loop and sleep again — so the push reliably gets its full window
-    // while quit stays capped.
+    // early exit. Bound on a MONOTONIC WALL CLOCK, not an iteration count: `nanosleep`
+    // returns early on any delivered signal, and this process keeps a live SIGWINCH handler
+    // through quit (vaxis installs it process-wide, never reset), so a fixed poll count
+    // would let a resize storm mid-quit collapse the budget to milliseconds. Re-reading the
+    // clock each pass makes a cut-short sleep harmless (just loop and sleep again), so the
+    // push gets its full window while quit stays capped.
     //
-    // `deadline_ms` is validated (not asserted): a non-positive/oversized value skips the
-    // wait rather than trap or wrap — the assert form was compiled out in Release. The
+    // `deadline_ms` is validated, not asserted: a non-positive/oversized value skips the
+    // wait rather than trap or wrap (the assert form was compiled out in Release). The
     // multiply saturates so an oversized deadline can't overflow to a garbage budget.
     const ms = std.math.cast(u64, deadline_ms) orelse return;
     const budget_ns: u64 = ms *| std.time.ns_per_ms;
@@ -1217,14 +1195,13 @@ fn readCoverDisk(gpa: Allocator, io: std.Io, url: []const u8) ?[]u8 {
     return reader.interface.allocRemaining(gpa, std.Io.Limit.limited(max_cover_encoded_bytes)) catch null;
 }
 
-/// Per-write nonce for the disk-cache temp file (ROD-243). With concurrent cover
-/// workers, two threads — or a second app instance — can persist the SAME url at
-/// once; a fixed `<path>.tmp` would let them interleave writes into one temp file
-/// and then rename a torn `.jpg` into place. A unique suffix per write gives each
-/// writer its own temp sibling, so the final atomic rename always promotes a whole
-/// file. The thread id keeps it unique across processes too (Linux tids are
-/// system-wide). Worst case is a uniquely-named orphan tmp on a hard crash — best-
-/// effort cleanup already deletes it on every non-crash failure path.
+/// Per-write nonce for the disk-cache temp file (ROD-243). With concurrent cover workers,
+/// two threads (or a second app instance) can persist the SAME url at once; a fixed
+/// `<path>.tmp` would let them interleave into one temp file and then rename a torn `.jpg`
+/// into place. A unique suffix per write gives each writer its own temp sibling, so the
+/// atomic rename always promotes a whole file. The thread id keeps it unique across
+/// processes too (Linux tids are system-wide). Worst case is a uniquely-named orphan tmp on
+/// a hard crash; best-effort cleanup deletes it on every non-crash failure path.
 var disk_tmp_nonce: std.atomic.Value(u64) = .init(0);
 
 /// Persist raw cover `body` for `url` to disk, best-effort. A failure (read-only
@@ -1313,16 +1290,13 @@ fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: [
 /// ceiling — far above any healthy image fetch, only tripping on a stalled host.
 const cover_fetch_deadline_s = 20;
 
-/// The actual cover GET, run as a cancelable unit of concurrency by `withDeadline`
-/// (ROD-265). Takes a provider-resolved `CoverRequest` — an absolute URL plus any
-/// CDN headers (ROD-267): some cover CDNs (AllAnime's is Cloudflare-fronted) 403 a
-/// refererless GET, so Referer/UA ride along when the provider set them. Owns its
-/// `std.http.Client` so a deadline cancel unwinds this frame — freeing the
-/// connection — instead of leaving a socket blocked in `recv`. Returns the encoded
-/// body as an exact, gpa-owned slice (the caller frees it). Fetch and non-200
-/// failures return `error.CoverFetchFailed`; allocation failures propagate as
-/// `error.OutOfMemory`. `loadCoverPixels` collapses both — plus the deadline's
-/// `error.Timeout` — to a cover miss at the `withDeadline` call site.
+/// The actual cover GET, run as a cancelable unit by `withDeadline` (ROD-265). Takes a
+/// provider-resolved `CoverRequest` (absolute URL + any CDN headers, ROD-267): some cover
+/// CDNs 403 a refererless GET, so Referer/UA ride along when the provider set them. Owns
+/// its `std.http.Client` so a deadline cancel unwinds this frame and frees the connection
+/// instead of leaving a socket blocked in `recv`. Returns the encoded body as an exact
+/// gpa-owned slice (caller frees). Fetch and non-200 failures return `error.CoverFetchFailed`;
+/// `loadCoverPixels` collapses that, OOM, and the deadline's `error.Timeout` to a cover miss.
 fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u8 {
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
@@ -1360,20 +1334,16 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u
     return gpa.dupe(u8, resp_writer.buffered());
 }
 
-/// Shared cover load (ROD-243): resolve `url` to gpa-owned, INDEPENDENT decoded
-/// pixels via cache → disk → network, or return an error. The returned `rgba` is
-/// never a cache-owned pointer, so it stays valid past any concurrent eviction —
-/// the caller owns it. Safe for concurrent callers: the single-cover worker and the
-/// Discover grid worker share one `CoverCaches`.
+/// Shared cover load (ROD-243): resolve `url` to gpa-owned, INDEPENDENT decoded pixels via
+/// cache -> disk -> network, or an error. The returned `rgba` is never a cache-owned
+/// pointer, so it stays valid past any concurrent eviction (the caller owns it). Safe for
+/// concurrent callers: the single-cover worker and the Discover grid share one
+/// `CoverCaches`, under its lock discipline (see `CoverCaches`).
 ///
-/// Lock rule: every dupe of a slice that lives in (or was just inserted into) a
-/// cache happens while `caches.mu` is held; `decodeCoverBody` and `client.fetch`
-/// run *unlocked* so a slow decode/fetch never stalls another worker.
-///
-/// `url` is the raw stored cover ref and is the cache key at every layer (memory,
-/// disk). Only the network branch resolves it — via `provider.coverRequest` — into
-/// the absolute URL actually fetched, so a CDN-host rotation never invalidates the
-/// cache and the CDN host stays behind the provider seam (ROD-267).
+/// `url` is the raw stored cover ref and the cache key at every layer (memory, disk). Only
+/// the network branch resolves it (via `provider.coverRequest`) into the absolute URL
+/// actually fetched, so a CDN-host rotation never invalidates the cache and the host stays
+/// behind the provider seam (ROD-267).
 pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
     // 1) Decoded-cache hit: dupe the pixels out under the lock (get() promotes, so
     //    it mutates — even this read holds the lock).
@@ -1461,19 +1431,16 @@ pub fn coverTask(
     postCoverDoneOwned(loop, gpa, decoded, for_id);
 }
 
-/// Background task: load ONE Discover-grid cover and post it (ROD-240). `url` is a
-/// gpa-owned string owned by this task; it transfers to the result event (the UI
-/// thread frees it) on both the done and error paths, and is freed here only if the
-/// post itself fails. `drain` bounds the worker fan-out: the pump caps how many of
-/// these run at once (`config.discoverCoverConcurrency`) by gating spawns on
-/// `drain.inflight`, and `finish()` runs as the worker's LAST action (after the
-/// final `postEvent`) so the teardown `drain()` can never unblock while a worker
-/// might still touch `loop`/`gpa` (ROD-179). N of these plus the single-cover
-/// worker may touch `caches` concurrently — safe under its lock (see
-/// `loadCoverPixels`). The per-frame pump replaces the old batch worker: instead of
-/// one thread draining a snapshot, each frame tops the in-flight set back up to the
-/// cap against live slot state, so a fetch is never spent on a card already scrolled
-/// past.
+/// Background task: load ONE Discover-grid cover and post it (ROD-240). `url` is gpa-owned
+/// by this task; it transfers to the result event (UI thread frees it) on both done and
+/// error paths, and is freed here only if the post fails. `drain` bounds the fan-out: the
+/// pump caps how many run at once (`config.discoverCoverConcurrency`) by gating spawns on
+/// `drain.inflight`, and `finish()` runs as the worker's LAST action so teardown `drain()`
+/// can never unblock while a worker might still touch `loop`/`gpa` (ROD-179). N of these
+/// plus the single-cover worker may touch `caches` concurrently, safe under its lock. The
+/// per-frame pump replaces the old batch worker: each frame tops the in-flight set back to
+/// the cap against live slot state, so a fetch is never spent on an already-scrolled-past
+/// card.
 pub fn discoverCoverTask(
     loop: *Loop,
     gpa: Allocator,

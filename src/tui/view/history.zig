@@ -1,14 +1,12 @@
 //! Zigoku — History (Watchlist) view list render pass.
 //! Extracted from app.zig along the tick/draw seam (ROD-144). Driven by
-//! app.drawContent's `.history` arm; reads list state (the viewport is settled
-//! by app.layout() before the draw pass — ROD-155). Takes `*const App`; its
-//! only writes are to the passed-in RenderScratch.
+//! app.drawContent's `.history` arm; the viewport is settled by app.layout() before the
+//! draw pass (ROD-155). Takes `*const App`; its only writes are to the passed RenderScratch.
 //!
-//! ROD-139: entries render grouped by watch-state (§5.4) — a status header +
-//! `border.hair` rule per group, in `ListStatus.group_order`. `list_cursor` is
-//! an *entry* ordinal (nav skips headers for free); `list_top` is a *physical
-//! row* offset (chrome-aware scroll). A single `walk()` drives measure,
-//! selection and paint so the group/chrome layout has exactly one definition.
+//! ROD-139: entries render grouped by watch-state (§5.4), a status header + `border.hair`
+//! rule per group in `ListStatus.group_order`. `list_cursor` is an entry ordinal (nav skips
+//! headers); `list_top` is a physical row offset (chrome-aware scroll). One `walk()` drives
+//! measure, selection and paint, so the group/chrome layout has exactly one definition.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -37,22 +35,20 @@ const hairline = "─" ** hairline_cols;
 
 // ── Layout walk ──────────────────────────────────────────────────────────────
 //
-// The grouped layout is defined once, here. `walk` emits, in §5.4 order, every
-// physical element of the filtered list with its physical row, invoking `ctx`'s
-// callbacks. Measure (geometry/selection) and paint (draw) both drive it, so the
-// chrome budget — header + hairline + the blank row before each group but the
-// first — can never disagree between scroll math and what's painted.
+// The grouped layout is defined once, here. `walk` emits, in §5.4 order, every physical
+// element of the filtered list with its physical row, invoking `ctx`'s callbacks. Measure
+// (geometry/selection) and paint both drive it, so the chrome budget (header + hairline +
+// the blank row before each group but the first) can never disagree between scroll math and
+// paint.
 //
-// Per-group physical cost: [1 blank if not first] + 1 header + 1 hairline + 2·N.
-// `ctx` must expose: onBlank(phys), onHeader(phys, status, count),
-// onHairline(phys), onEntry(phys, rec, idx, ordinal, selected) — where `idx` is
-// the record's index into self.history (for callers that mutate it). Returns
-// total rows.
+// Per-group physical cost: [1 blank if not first] + 1 header + 1 hairline + 2·N. `ctx` must
+// expose onBlank(phys), onHeader(phys, status, count), onHairline(phys), and
+// onEntry(phys, rec, idx, ordinal, selected), where `idx` is the record's index into
+// self.history. Returns total rows.
 //
-// Cost: each walk is O(groups · N) — one `groupCount` scan per group plus the
-// entry scan. A wide History frame drives up to THREE walks (layout→geometry,
-// drawContent→recordAtCursor, draw), which is fine for real watchlist sizes.
-// Before adding a fourth caller, cache a single walk per frame instead.
+// Cost: each walk is O(groups · N). A wide History frame drives up to THREE walks (layout,
+// recordAtCursor, draw), fine for real watchlist sizes; before adding a fourth caller,
+// cache a single walk per frame instead.
 
 fn groupCount(self: *const App, status: ListStatus) usize {
     var n: usize = 0;
@@ -335,17 +331,15 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
         return;
     }
     if (self.history.len == 0) {
-        // First-run absent state (§9.5): an empty watchlist is, by definition, a
-        // user who doesn't yet know what to watch — so point them at Discover (the
-        // zero-input popular feed, ROD-247), not Browse's blank `/` prompt that
-        // demands a title up front (ROD-254 supersedes ROD-211's Browse pointer).
-        // Three-element block mirrors Browse's own absent state (browse.zig): the
-        // `B search` hint recedes to fg3 for the users who *do* know the title.
+        // First-run absent state (§9.5): an empty watchlist is a user who doesn't yet know
+        // what to watch, so point them at Discover (the zero-input popular feed, ROD-247),
+        // not Browse's blank `/` prompt that demands a title up front (ROD-254 supersedes
+        // ROD-211). The three-element block mirrors Browse's own absent state (browse.zig);
+        // the `B search` hint recedes to fg3 for users who DO know the title.
         //
-        // Draw into a content-height child window (like Browse's list pane) so the
-        // taller three-row block clips to the content area instead of overdrawing
-        // the top bar — History's list path uses absolute root coords, which let
-        // `mid -| 2` reach row 0 on a very short terminal (ROD-254 review).
+        // Draw into a content-height child window so the three-row block clips to the
+        // content area instead of overdrawing the top bar (History's list path uses absolute
+        // root coords, which let `mid -| 2` reach row 0 on a short terminal; ROD-254 review).
         const pane = win.child(.{ .y_off = top, .width = w, .height = visible });
         const mid = visible / 2;
         centerText(pane, mid -| 2, w, "nothing watched yet", self.s(self.palette.fg2, .{ .italic = true }));

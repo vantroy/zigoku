@@ -10,18 +10,16 @@ const AnimeRecord = store_mod.AnimeRecord;
 
 // ── tiny render helpers ─────────────────────────────────────────────────────
 
-/// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) means "the focused
-/// cursor row" everywhere (▸, title, bar), so it is granted ONLY to the selected
-/// row while the list pane holds keyboard focus — and there it OVERRIDES the
-/// status color (a selected completed/planning row's bar is cyan too, so the
-/// cursor always owns the single brightest bar; this is the §4.1 repro fix). Off
-/// that one row everything steps down:
-///   - selected but list unfocused (detail pane active) → fg2, all statuses (the
-///     row recedes but is still "where you are")
-///   - unselected watching/paused → fg2 (status, not selection — can't out-shout
-///     the cursor; the ▸/◐ glyph still carries the status identity)
-///   - unselected planning → chrome (empty-bar tint, §4.5)
-///   - unselected completed/dropped → fg3 (text.dim)
+/// §4.5 + ROD-194: the bar fill color. `state.focus` (cyan) means "the focused cursor
+/// row" everywhere (▸, title, bar), so it is granted ONLY to the selected row while the
+/// list pane holds keyboard focus, and there it OVERRIDES the status color (a selected
+/// completed/planning row's bar is cyan too, so the cursor always owns the single
+/// brightest bar; the §4.1 repro fix). Off that one row everything steps down:
+///   - selected but list unfocused (detail pane active): fg2, all statuses.
+///   - unselected watching/paused: fg2 (status can't out-shout the cursor; the ▸/◐ glyph
+///     still carries the status identity).
+///   - unselected planning: chrome (empty-bar tint, §4.5).
+///   - unselected completed/dropped: fg3 (text.dim).
 /// Pure so the rule can be unit-tested without a render pass.
 pub fn barFillColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *const colors.Palette) vaxis.Color {
     if (selected) return if (list_focused) pal.focus else pal.fg2;
@@ -47,52 +45,46 @@ pub fn barFracColor(rec: AnimeRecord, selected: bool, list_focused: bool, pal: *
 /// bar is already full. See drawProgressBar and ROD-285's MAX_SANE_PROGRESS.
 const PROGRESS_MULT_CEILING: i64 = 1_000_000_000;
 
-/// §4.5 progress bar for a history row. `row_bg` is the row's background color
-/// (bg.surface for the focused entry while the list pane has focus, bg.base
-/// otherwise). `frac_buf` must be App-owned — vaxis holds a reference until the
-/// next render call. `avail` is the total columns available for the whole
-/// "[bar]  N / M eps" element starting at `col` (caller-computed against the
-/// list's right edge, accounting for the left margin) — the frac is clipped to it
-/// so it can't bleed into a neighbour. `selected`/`list_focused` gate the §4.1
-/// selection affordance into the fill (ROD-194).
-/// How many of `bar_w` cells to fill for `progress` of `total_episodes` watched.
-/// Pure + overflow-proof so it's testable without a vaxis window and can't panic on a
-/// corrupt/hostile `progress` (see PROGRESS_MULT_CEILING). `total_episodes` null or
-/// ≤ 0 → the "unknown length" heuristic (a third-full stub when any progress exists).
+/// How many of `bar_w` cells to fill for `progress` of `total_episodes` watched. Pure and
+/// overflow-proof so it's testable without a vaxis window and can't panic on a
+/// corrupt/hostile `progress` (see PROGRESS_MULT_CEILING). `total_episodes` null or <= 0
+/// uses the "unknown length" heuristic (a third-full stub when any progress exists).
 fn progressFill(progress: i64, total_episodes: ?i64, bar_w: u16) u16 {
     const total = total_episodes orelse return if (progress > 0) bar_w / 3 else 0;
     if (total <= 0) return if (progress > 0) bar_w / 3 else 0;
     const p = @max(0, progress);
-    // Full bar once watched ≥ the episode count. Deciding this BEFORE the multiply
-    // below means `p * bw` only runs with p < total, and capping p at
-    // PROGRESS_MULT_CEILING keeps that product from overflowing i64 on a corrupt or
-    // hostile progress/total (belt to ROD-285's ingestion clamp — ReleaseSafe turns an
-    // overflow here into a render-loop panic, so guard it at the use site too, not only
-    // at the trust boundary).
+    // Full bar once watched >= the episode count. Deciding this BEFORE the multiply means
+    // `p * bw` only runs with p < total, and capping p at PROGRESS_MULT_CEILING keeps that
+    // product from overflowing i64 on a corrupt/hostile progress/total (a belt to ROD-285's
+    // ingestion clamp: ReleaseSafe turns an overflow here into a render-loop panic, so guard
+    // it at the use site too, not only at the trust boundary).
     if (p >= total) return bar_w;
     const bw: i64 = @intCast(bar_w);
     const f = @divTrunc(@min(p, PROGRESS_MULT_CEILING) * bw, total);
     return @intCast(@min(bw, f));
 }
 
-/// The numerator to render in the "N / M eps" fraction: the watch high-water,
-/// floored at 0 and clamped so it never exceeds a real (positive) total. A stale
-/// high-water above a shrunken total — AniList's planned count overwritten by a
-/// smaller aired count once a show is airing (ROD-297) — would otherwise render a
-/// nonsensical "14 / 2". `progressFill` already paints a full bar once
-/// progress ≥ total, so the clamped "2 / 2" matches the bar the user sees. This
-/// heals the display only; separating planned vs aired in the data model is the
-/// structural follow-up. The `@max(0, …)` floor mirrors `progressFill`'s use-site
-/// defense against a trust-boundary-crossed progress (see PROGRESS_MULT_CEILING),
-/// so a negative never renders "-5 / 12". A non-positive total (the AllAnime
-/// `total_episodes = 0` quirk) has no real denominator to clamp against, so the
-/// floored progress passes through — preserving the pre-existing "N / 0" display.
+/// The numerator for the "N / M eps" fraction: the watch high-water, floored at 0 and
+/// clamped so it never exceeds a real (positive) total. A stale high-water above a shrunken
+/// total (AniList's planned count overwritten by a smaller aired count once airing, ROD-297)
+/// would otherwise render a nonsensical "14 / 2"; since `progressFill` already paints a full
+/// bar once progress >= total, the clamped "2 / 2" matches what the user sees. Display heal
+/// only; separating planned vs aired in the data model is the structural follow-up. The
+/// `@max(0, …)` floor mirrors `progressFill`'s use-site defense (see PROGRESS_MULT_CEILING).
+/// A non-positive total (the AllAnime `total_episodes = 0` quirk) has no denominator to
+/// clamp against, so the floored progress passes through, preserving the "N / 0" display.
 fn clampFrac(progress: i64, total: i64) i64 {
     const p = @max(0, progress);
     if (total <= 0) return p;
     return @min(p, total);
 }
 
+/// §4.5 progress bar for a history row. `row_bg` is the row background (bg.surface for the
+/// focused entry while the list has focus, bg.base otherwise). `frac_buf` must be App-owned
+/// (vaxis holds a reference until the next render). `avail` is the total columns for the
+/// whole "[bar]  N / M eps" element from `col` (caller-computed against the list's right
+/// edge), and the frac is clipped to it so it can't bleed into a neighbour.
+/// `selected`/`list_focused` gate the §4.1 selection affordance into the fill (ROD-194).
 pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail: u16, rec: AnimeRecord, row_bg: vaxis.Color, frac_buf: []u8, pal: *const colors.Palette, selected: bool, list_focused: bool) void {
     const is_paused = rec.list_status == .paused;
 
@@ -124,17 +116,13 @@ pub fn drawProgressBar(win: vaxis.Window, row: u16, col: u16, bar_w: u16, avail:
     putClipped(win, row, frac_col, frac_max, frac, style(frac_color, .{ .bg = row_bg }));
 }
 
-/// Truncate `text` to at most `max_cols` display columns, copying the result
-/// into `buf` and appending a single-column "…" when (and only when) truncation
-/// actually happened (ROD-166, §4.7). Cuts on grapheme-cluster boundaries via
-/// vaxis's iterator, so a multibyte cluster is never split — and measures real
-/// display width (gwidth), so a wide CJK glyph counts as the 2 columns it paints.
-///
-/// Unlike `putClipped` (which clips silently at the cell grid), this leaves a "…"
-/// affordance so the user knows the copy was cut. Returns the slice of `buf`
-/// written. The copy stops early if the next cluster + "…" would overflow `buf`,
-/// so a [80]u8 caller can never overrun regardless of how byte-dense the input
-/// is (the toast budget is 36 cols / well within 80 bytes for any real copy).
+/// Truncate `text` to at most `max_cols` display columns, copying into `buf` and appending
+/// a single-column "…" only when truncation actually happened (ROD-166, §4.7). Cuts on
+/// grapheme-cluster boundaries (never splits a multibyte cluster) and measures real display
+/// width (gwidth), so a wide CJK glyph counts as its 2 columns. Unlike `putClipped` (which
+/// clips silently), this leaves a "…" affordance so the user knows the copy was cut. Returns
+/// the slice of `buf` written. The copy stops early if the next cluster + "…" would overflow
+/// `buf`, so a [80]u8 caller can never overrun regardless of input density.
 pub fn truncateToWidth(buf: []u8, text: []const u8, max_cols: u16) []const u8 {
     if (max_cols == 0) return buf[0..0];
     // Fast path only when the copy fits BOTH the column budget AND the byte

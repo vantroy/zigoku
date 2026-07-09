@@ -76,23 +76,20 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
         // ── Meta zone: AniList score (right) + episode count (left) ──────────
-        // §4.1/§4.3: the row is glyph + title + score, the score taking the
-        // rightmost `score_w` cols, right-anchored and §2.2 tier-coloured. All
-        // columns are PANE-RELATIVE: the dominant Browse layout is the split list
-        // pane (~38% of the terminal, `PaneSplit.list_w`), so a fixed meta column
-        // would fall outside it.
+        // §4.1/§4.3: the row is glyph + title + score, the score taking the rightmost
+        // `score_w` cols, right-anchored and §2.2 tier-coloured. All columns are
+        // PANE-RELATIVE: the Browse layout is the split list pane (~38%, `PaneSplit.list_w`),
+        // so a fixed meta column would fall outside it.
         //
         // Priority on a tight pane is title > score > eps. The title is the primary
-        // identifier, so it falls off last; the eps count is the first meta to drop
-        // (it gets two floors below). The score is a tiny, high-value badge worth
-        // clipping a long title slightly for, so it persists down to a small title
-        // floor (`min_title`). The eps count, by contrast, only appears once the
-        // title still clears a *comfortable* width (`comfort_title`) — so it drops
-        // before the title gets squeezed, never the other way round (ROD-226).
+        // identifier, so it falls off last; the eps count drops first (two floors below). The
+        // score is a tiny high-value badge worth clipping a long title slightly for, so it
+        // persists down to `min_title`. The eps count only appears once the title clears a
+        // COMFORTABLE width (`comfort_title`), so it drops before the title is squeezed, never
+        // the other way round (ROD-226).
         //
-        // Compact list form `[NN]` (no `/100`): the denominator is redundant in a
-        // tight row — the tier colour already reads it as a score. The detail pane
-        // keeps the full §4.3 `[NN/100]`, where the line has room.
+        // Compact list form `[NN]` (no `/100`): the denominator is redundant in a tight row
+        // (the tier colour already reads it as a score). The detail pane keeps `[NN/100]`.
         const score_w: u16 = 5; // "[100]" = 5 chars
         const eps_w: u16 = 9; // "1000 sub" worst case + slack
         const meta_gap: u16 = 2; // keeps the title/eps/score fields from touching
