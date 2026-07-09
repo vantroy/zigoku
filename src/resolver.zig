@@ -90,13 +90,13 @@ fn candidateScore(canonical: Anime, cand: Anime) i32 {
             score += 120;
         } else if (diff <= 3) {
             score += 60;
-        } else if (!domain.isStillAiring(canonical.status) and cand_eps + 2 < known_eps) {
-            // A SETTLED canonical (FINISHED/CANCELLED, so its total is authoritative) whose
-            // candidate lists far fewer episodes is a different, smaller work sharing the
-            // title: a movie, OVA, or recap, not the series. Hard-reject (the anilist matcher's
-            // veto, restored) so a lone exact-title hit cannot bind it. A still-airing canonical
-            // legitimately lists fewer (not all episodes exist yet), so the veto is gated on
-            // settled status.
+        } else if (totalIsAuthoritative(canonical.status)) {
+            // A canonical with an authoritative total whose candidate is off by more than 3 in
+            // EITHER direction is a different work sharing the title: a movie/OVA with far fewer
+            // episodes, or an unrelated long-runner with far more. Hard-reject so a lone
+            // exact-title hit cannot bind it. A still-releasing canonical is spared (its provider
+            // listing is legitimately partial). Compares via `diff`, never `cand_eps + 2`, so a
+            // garbage or hostile episode count near u32 max cannot overflow-panic.
             return -4000;
         } else {
             score -= 120;
@@ -124,6 +124,20 @@ fn candidateScore(canonical: Anime, cand: Anime) i32 {
 fn candidateEpisodes(cand: Anime) u32 {
     if (cand.total_episodes) |t| return t;
     return @max(cand.eps_sub, cand.eps_dub);
+}
+
+/// Whether the canonical's `total_episodes` can be trusted as a final count for the episode
+/// veto. True for a settled show (FINISHED/CANCELLED) AND for an unknown/null status: a
+/// doubtful count should reject a wild-episode-gap candidate rather than mint a wrong bind.
+/// False only while a show is actively RELEASING or on HIATUS, where the provider legitimately
+/// lists fewer episodes than the planned total. Deliberately NOT `domain.isStillAiring`: its
+/// completion-side default (null means still airing, so spare it) is the opposite bias from
+/// what a mis-bind guard wants (null means doubtful, so reject the wild gap).
+fn totalIsAuthoritative(status: ?[]const u8) bool {
+    const s = status orelse return true;
+    if (std.ascii.eqlIgnoreCase(s, "RELEASING")) return false;
+    if (std.ascii.eqlIgnoreCase(s, "HIATUS")) return false;
+    return true;
 }
 
 fn absDiff(a: u32, b: u32) u32 {
@@ -212,6 +226,37 @@ test "bestProviderMatch spares a still-airing canonical whose provider lists few
     };
     const idx = bestProviderMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
     try std.testing.expectEqualStrings("op", candidates[idx].id);
+}
+
+test "bestProviderMatch rejects a same-title long-runner with far more episodes (symmetric veto)" {
+    // The veto is symmetric: a settled 12-ep canonical must not bind a lone same-title 500-ep
+    // long-runner either. Before this it only rejected the far-FEWER (movie) direction.
+    const canonical: Anime = .{ .id = "1", .name = "X", .anilist_id = 1, .total_episodes = 12, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "long-runner", .name = "X", .total_episodes = 500 },
+    };
+    try std.testing.expect(bestProviderMatch(canonical, &candidates) == null);
+}
+
+test "bestProviderMatch applies the veto to an unclassified (null-status) canonical" {
+    // A null/unknown status must NOT spare the candidate (that reopened the exact movie
+    // mis-bind this ticket fixed): a doubtful total rejects a wild-episode-gap hit.
+    const canonical: Anime = .{ .id = "1", .name = "Given", .anilist_id = 1, .total_episodes = 25, .status = null };
+    const candidates = [_]Anime{
+        .{ .id = "movie", .name = "Given", .total_episodes = 1 },
+    };
+    try std.testing.expect(bestProviderMatch(canonical, &candidates) == null);
+}
+
+test "bestProviderMatch does not overflow on a garbage huge episode count" {
+    // A hostile or broken provider row with total_episodes near u32 max must not crash the
+    // scorer: a `cand_eps + 2` compare panicked in the shipped ReleaseSafe build. The settled
+    // veto rejects it cleanly via absDiff instead.
+    const canonical: Anime = .{ .id = "1", .name = "X", .anilist_id = 1, .total_episodes = 100, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "garbage", .name = "X", .total_episodes = std.math.maxInt(u32) },
+    };
+    try std.testing.expect(bestProviderMatch(canonical, &candidates) == null);
 }
 
 test "bestProviderMatch returns null on an empty catalog page" {
