@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const domain = @import("domain.zig");
+const source = @import("source.zig");
 const deadline = @import("util/deadline.zig");
 const log = @import("log.zig");
 
@@ -23,7 +24,8 @@ const ENDPOINT = "https://graphql.anilist.co";
 const ANILIST_DEADLINE_S = 10;
 // Shared selection set so the search and by-id queries can never drift apart.
 const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source countryOfOrigin genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} nextAiringEpisode{episode airingAt} description(asHtml:false) coverImage{large}";
-const GQL_SEARCH = "query($search:String!,$perPage:Int!){Page(perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
+// $page is required: every caller must bind it (enrichBySearch fixes page 1).
+const GQL_SEARCH = "query($search:String!,$perPage:Int!,$page:Int!){Page(page:$page,perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
@@ -229,16 +231,16 @@ fn classifyById(arena: Allocator, raw: []const u8) EnrichError!?Metadata {
 }
 
 fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Metadata {
-    const search = show.english_name orelse show.name;
+    const title = show.english_name orelse show.name;
     // Nothing to look up — a confirmed "no title, no possible match", not a fetch
     // failure. Return null so the refresh path stamps it (negative cache) rather
     // than re-attempting a doomed search on every view.
-    if (search.len == 0) return null;
+    if (title.len == 0) return null;
 
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":8}}}}",
-        .{ GQL_SEARCH, try jsonEscape(arena, search) },
+        "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":8,\"page\":1}}}}",
+        .{ GQL_SEARCH, try jsonEscape(arena, title) },
     );
     const raw = postGql(arena, io, body) orelse return error.NoAnswer;
     return classifyBySearch(arena, show, raw);
@@ -324,6 +326,77 @@ fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
     const out = try arena.alloc(Metadata, media.len);
     for (media, 0..) |m, i| out[i] = try mediaToMeta(arena, m);
     return out;
+}
+
+/// AniList discovery search (ROD-326): browse-facing, off the `SourceProvider` vtable
+/// (the discovery axis; catalog/binding search stays on the vtable, ROD-328). Rows are
+/// arena-borrowed like `enrichBatch`'s return. Same three-state contract as `enrichBatch`
+/// (ROD-278): `error.NoAnswer` is a transport miss, an empty slice a confirmed no-match.
+/// `page` is 1-based.
+pub fn search(arena: Allocator, io: Io, query: []const u8, page: u32) EnrichError![]domain.Anime {
+    if (query.len == 0) return &.{};
+    const raw = postGql(arena, io, try searchBody(arena, query, page)) orelse return error.NoAnswer;
+    return pageToAnime(arena, raw);
+}
+
+/// Split from `search` so the paging wiring is unit-testable without a POST. `query` is
+/// JSON-escaped: unlike the comptime-guarded selection set, it is untrusted input.
+fn searchBody(arena: Allocator, query: []const u8, page: u32) ![]const u8 {
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":{d},\"page\":{d}}}}}",
+        .{ GQL_SEARCH, try jsonEscape(arena, query), source.search_page_size, page },
+    );
+}
+
+/// JSON to rows, split from `search` so the mapping is unit-testable. Same three-state
+/// classification as `pageToMetas`: `{"data":null}` is no-answer, an empty page is empty.
+fn pageToAnime(arena: Allocator, raw: []const u8) EnrichError![]domain.Anime {
+    const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
+    const media = data.Page.media;
+    const out = try arena.alloc(domain.Anime, media.len);
+    for (media, 0..) |m, i| out[i] = try metaToAnime(arena, try mediaToMeta(arena, m));
+    return out;
+}
+
+/// Arena-borrowed from `meta` (the worker deep-copies to GPA, like `enrichBatch`). `id`
+/// is the stringified `anilist_id`: an opaque UI handle, never a provider show id, so it
+/// must never reach `provider.episodes()`/`resolve()` (the resolver binds those, ROD-328).
+fn metaToAnime(arena: Allocator, meta: Metadata) !domain.Anime {
+    // anilist_id is set from the non-optional Media.id, so a parsed hit always has one.
+    const id = try std.fmt.allocPrint(arena, "{d}", .{meta.anilist_id.?});
+    const name = meta.title_romaji orelse meta.title_english orelse meta.title_native orelse "";
+    return .{
+        .id = id,
+        .name = name,
+        .english_name = meta.title_english,
+        .title_romaji = meta.title_romaji,
+        .native_name = meta.title_native,
+        .mal_id = meta.mal_id,
+        .anilist_id = meta.anilist_id,
+        .thumb = meta.thumb,
+        .total_episodes = meta.total_episodes,
+        .duration = meta.duration,
+        .year = meta.year,
+        .season = meta.season,
+        .start_date = meta.start_date,
+        .status = meta.status,
+        .description = meta.description,
+        .genres = meta.genres,
+        .score = meta.score,
+        .studios = meta.studios,
+        .source_material = meta.source_material,
+        .rank = meta.rank,
+        .rank_type = meta.rank_type,
+        .rank_year = meta.rank_year,
+        .next_airing_at = meta.next_airing_at,
+        .next_airing_episode = meta.next_airing_episode,
+        .country = meta.country,
+        .kind = meta.kind,
+    };
 }
 
 /// The raw HTTP outcome of one GraphQL POST — the status code kept alongside the
@@ -1271,6 +1344,67 @@ test "pageToMetas: {\"data\":null} is no-answer, an empty page is a confirmed em
     // A parsed page with zero media IS a confirmed empty answer → empty slice, no error.
     const empty = try pageToMetas(a, "{\"data\":{\"Page\":{\"media\":[]}}}");
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "pageToAnime maps a search Page to browse rows; id is the stringified anilist_id (ROD-326)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two hits: one fully populated, one with romaji absent so `name` falls through to
+    // english (never blank). An unknown field (siteUrl) must be skipped.
+    const json =
+        \\{"data":{"Page":{"media":[
+        \\{"id":182255,"idMal":52991,"title":{"romaji":"Sousou no Frieren","english":"Frieren","native":"葬送のフリーレン"},"episodes":28,"averageScore":89,"season":"FALL","seasonYear":2023,"siteUrl":"x"},
+        \\{"id":1,"title":{"romaji":null,"english":"Only English","native":null}}
+        \\]}}}
+    ;
+    const rows = try pageToAnime(a, json);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("182255", rows[0].id);
+    try std.testing.expectEqual(@as(?u64, 182255), rows[0].anilist_id);
+    try std.testing.expectEqual(@as(?u64, 52991), rows[0].mal_id);
+    try std.testing.expectEqualStrings("Sousou no Frieren", rows[0].name);
+    try std.testing.expectEqualStrings("Sousou no Frieren", rows[0].title_romaji.?);
+    try std.testing.expectEqualStrings("Frieren", rows[0].english_name.?);
+    try std.testing.expectEqual(@as(?u32, 28), rows[0].total_episodes);
+    try std.testing.expectEqual(domain.Season.fall, rows[0].season.?);
+    // AniList carries no per-track count, so eps_sub/eps_dub stay 0.
+    try std.testing.expectEqual(@as(u32, 0), rows[0].eps_sub);
+    try std.testing.expectEqual(@as(u32, 0), rows[0].eps_dub);
+    try std.testing.expectEqualStrings("1", rows[1].id);
+    try std.testing.expectEqualStrings("Only English", rows[1].name);
+}
+
+test "pageToAnime: {\"data\":null} and malformed are no-answer, an empty page is a confirmed empty answer (ROD-326)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Same three-state contract as pageToMetas: a GraphQL-level error / unparseable
+    // bytes are no answer; a parsed-but-empty page is a confirmed no-match.
+    try std.testing.expectError(error.NoAnswer, pageToAnime(a, "{\"data\":null}"));
+    try std.testing.expectError(error.NoAnswer, pageToAnime(a, "}{"));
+    const empty = try pageToAnime(a, "{\"data\":{\"Page\":{\"media\":[]}}}");
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "searchBody carries search/perPage/page, JSON-escapes the query; GQL_SEARCH declares $page (ROD-326)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // The operation declares and uses $page, and every hit page fetches exactly the
+    // canonical stride the browse load-more footer keys off.
+    try std.testing.expect(std.mem.indexOf(u8, GQL_SEARCH, "$page:Int!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, GQL_SEARCH, "page:$page") != null);
+
+    // A quote in the query must survive as an escaped JSON string, round-tripping back
+    // to the original on parse (proves jsonEscape, not raw interpolation).
+    const body = try searchBody(a, "Cowboy \"Bebop\"", 3);
+    const parsed = try std.json.parseFromSlice(struct {
+        variables: struct { search: []const u8, perPage: u32, page: u32 },
+    }, a, body, .{ .ignore_unknown_fields = true });
+    try std.testing.expectEqualStrings("Cowboy \"Bebop\"", parsed.value.variables.search);
+    try std.testing.expectEqual(@as(u32, @intCast(source.search_page_size)), parsed.value.variables.perPage);
+    try std.testing.expectEqual(@as(u32, 3), parsed.value.variables.page);
 }
 
 test "classifyById: three-state map — match / confirmed no-match / no answer (ROD-278)" {
