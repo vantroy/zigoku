@@ -1,18 +1,17 @@
 //! Zigoku — AniList OAuth credentials (ROD-283).
 //!
-//! One ZON file at `{configDir}/auth.zon` (→ `~/.config/zigoku/auth.zon`) holds
-//! the OAuth Implicit Grant bearer token and the identity it was minted for. Kept
-//! separate from `config.zon` (ROD-85) on purpose: the secret gets its own file
-//! with `0600` perms and never rides along in the config the Settings tab
-//! round-trips on every edit.
+//! One ZON file at `{configDir}/auth.zon` (→ `~/.config/zigoku/auth.zon`) holds the OAuth
+//! Implicit Grant bearer token and the identity it was minted for. Kept separate from
+//! `config.zon` (ROD-85) on purpose: the secret gets its own `0600` file and never rides
+//! along in the config the Settings tab round-trips on every edit.
 //!
-//! Credentials nest per-provider (`.anilist = .{ … }`) so a future MAL/Kitsu block
-//! slots in beside AniList without reshaping the file.
+//! Credentials nest per-provider (`.anilist = .{ … }`) so a future MAL/Kitsu block slots in
+//! without reshaping the file.
 //!
-//! Loading is *total*, exactly like `config.zig`: a missing, unreadable, oversized,
-//! or malformed file is never an error — it yields `Auth{}` (signed out) — so a
-//! corrupt token file can never wedge startup. `save` surfaces errors and writes
-//! `0600`; the capture flow (ROD-283.2) decides how to report a failed write.
+//! Loading is TOTAL, like `config.zig`: a missing, unreadable, oversized, or malformed file
+//! is never an error (it yields `Auth{}`, signed out), so a corrupt token file can't wedge
+//! startup. `save` surfaces errors and writes `0600`; the capture flow decides how to report
+//! a failed write.
 
 const std = @import("std");
 const Io = std.Io;
