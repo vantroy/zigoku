@@ -405,8 +405,8 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []c
 /// the provider that produced it (a static vtable string).
 const SearchMatch = struct { id: []const u8, source: []const u8 };
 
-/// Walk the registry order through `resolveViaSearch`, first confident match wins
-/// (ROD-343): each provider gets its full two-pass search before the next is tried,
+/// Walk the effective provider order through `resolveViaSearch`, first confident match
+/// wins (ROD-343/344): each provider gets its full two-pass search before the next is tried,
 /// so a strong first-provider match is never preempted by a weaker later one, and
 /// requests stay sequential (one provider at a time, the ROD-309 discipline).
 fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) ?SearchMatch {

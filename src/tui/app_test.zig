@@ -5207,23 +5207,43 @@ test "settings: landing cycle steps through all three startup-view presets and w
     try testing.expect(app.settings.dirty);
 }
 
-test "settings: provider row cycles the injected registry names into preferred_provider (ROD-344)" {
+test "settings: provider row cycles unset -> each registry name -> unset (ROD-344)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
     app.settings.provider_names = &.{ "senshi", "anipub" };
     app.settings.cursor = 5; // the provider row (rendered under Catalog)
 
-    // Unset preference displays the effective leader, never a blank value.
+    // Unset displays the effective leader tagged (default): distinguishable
+    // from an explicit pin to the same provider, never blank.
     try testing.expectEqualStrings("", app.config.preferred_provider);
-    try testing.expectEqualStrings("senshi", app.settings.value(&app.config, .provider));
+    try testing.expectEqualStrings("senshi (default)", app.settings.value(&app.config, .provider));
 
-    try testTick(&app, keyEv('l', .{})); // unset (leader) -> anipub
-    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
-    try testing.expectEqualStrings("anipub", app.settings.value(&app.config, .provider));
+    try testTick(&app, keyEv('l', .{})); // unset -> explicit senshi pin
+    try testing.expectEqualStrings("senshi", app.config.preferred_provider);
+    try testing.expectEqualStrings("senshi", app.settings.value(&app.config, .provider));
     try testing.expect(app.settings.dirty);
 
-    try testTick(&app, keyEv('l', .{})); // forward wrap back to senshi
+    try testTick(&app, keyEv('l', .{})); // senshi -> anipub
+    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+
+    try testTick(&app, keyEv('l', .{})); // anipub -> unset again: the wheel has a way back
+    try testing.expectEqualStrings("", app.config.preferred_provider);
+    try testing.expectEqualStrings("senshi (default)", app.settings.value(&app.config, .provider));
+
+    try testTick(&app, keyEv('h', .{})); // reverse wrap: unset -> anipub
+    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+}
+
+test "settings: provider row re-enters the wheel at unset from an unrecognized value (ROD-344)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.cursor = 5;
+    app.config.preferred_provider = "garbage"; // hand-edited config
+
+    try testTick(&app, keyEv('l', .{})); // treated as unset -> senshi, not a wedge
     try testing.expectEqualStrings("senshi", app.config.preferred_provider);
 }
 

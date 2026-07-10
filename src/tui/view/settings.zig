@@ -45,16 +45,11 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     }
     y += 1;
 
-    // Catalog: the provider order preference (row 5, ROD-344) above the
-    // read-only system rows. The interactive row keeps its settings_rows index
+    // Catalog: two read-only status rows, then the provider order preference
+    // (settings_rows[5], ROD-344). Status above controls, matching the AniList
+    // Sync section's order; the interactive row keeps its settings_rows index
     // contiguous with Player's, so j/k walks the sections top-to-bottom.
     y = drawSettingsHeader(self, win, y, w, "Catalog");
-    {
-        const r = settings_rows[i];
-        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
-        i += 1;
-        y += 1;
-    }
     drawInertRow(self, win, y, w, "enrichment sync", "automatic");
     y += 1;
     // Real resolved cover-cache path (honours $XDG_CACHE_HOME), resolved once in
@@ -62,6 +57,12 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     // cache home could be located (ROD-225).
     drawInertRow(self, win, y, w, "cover art cache", self.cover_cache_display orelse "~/.cache/zigoku/covers");
     y += 1;
+    {
+        const r = settings_rows[i];
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
+        i += 1;
+        y += 1;
+    }
     y += 1;
 
     // Interface: the toggle/cycle rows 6..11 (cover art … title language).

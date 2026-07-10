@@ -160,10 +160,29 @@ fn cycle(config: *Config, id: SettingId, dir: i8, provider_names: []const []cons
         // config string field is as safe as the preset literals (ROD-344). An
         // un-injected list (unit tests) makes the row inert rather than a mod-0.
         .provider => if (provider_names.len > 0) {
-            config.preferred_provider = cyclePreset(provider_names, config.preferred_provider, dir);
+            config.preferred_provider = cycleProvider(provider_names, config.preferred_provider, dir);
         },
         else => {},
     }
+}
+
+/// Cycle the provider preference through unset ("") then each provider name,
+/// wrapping. Unset is a REAL stop, not a display quirk: "" means "follow the
+/// registry's construction leader", which an explicit pin to the same name
+/// does not (the leader can change under a pin; the review flagged the
+/// one-way door). An unrecognized current value re-enters the wheel at unset.
+fn cycleProvider(names: []const []const u8, current: []const u8, dir: i8) []const u8 {
+    // Positions: 0 = unset, 1..names.len = names[pos - 1].
+    const n = names.len + 1;
+    var idx: usize = 0;
+    for (names, 0..) |p, i| {
+        if (std.mem.eql(u8, p, current)) {
+            idx = i + 1;
+            break;
+        }
+    }
+    const next = if (dir > 0) (idx + 1) % n else (idx + n - 1) % n;
+    return if (next == 0) "" else names[next - 1];
 }
 
 fn toggle(config: *Config, id: SettingId) void {
@@ -196,6 +215,11 @@ pub const SettingsState = struct {
     /// draw-local stack buffer, because vaxis keeps the printed slice by
     /// reference until render — a stack buffer would dangle.
     value_buf: [16]u8 = undefined,
+    /// Scratch for the provider row's "name (default)" form (ROD-344). Its own
+    /// buffer, NOT value_buf: value() runs once per row within a single draw
+    /// pass, so two rows sharing one buffer would clobber each other's slice
+    /// before vx.render() reads them.
+    provider_value_buf: [48]u8 = undefined,
 
     /// The registry's provider names in construction order, injected once by
     /// `run()` (ROD-344). The preset list for the provider row: the settings
@@ -355,12 +379,14 @@ pub const SettingsState = struct {
             .translation => config.translation,
             .skip_mode => config.skip_mode,
             .resume_offset => std.fmt.bufPrint(&self.value_buf, "{d}s", .{config.resume_offset_sec}) catch "?",
-            // An unset preference displays the effective leader (construction
-            // order's index 0), so the row never reads as blank (ROD-344).
+            // An unset preference displays the effective leader tagged
+            // "(default)", so the row never reads blank AND unset stays
+            // distinguishable from an explicit pin to the same provider
+            // (ROD-344 review).
             .provider => if (config.preferred_provider.len > 0)
                 config.preferred_provider
             else if (self.provider_names.len > 0)
-                self.provider_names[0]
+                std.fmt.bufPrint(&self.provider_value_buf, "{s} (default)", .{self.provider_names[0]}) catch self.provider_names[0]
             else
                 "",
             .cover_art => if (config.cover_art) "on" else "off",
