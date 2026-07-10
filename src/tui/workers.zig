@@ -352,15 +352,20 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
     };
 }
 
-/// Background task: tier-C binding resolve (ROD-328). A Browse search hit whose play
-/// provider does NOT id-key on a canonical (`canonicalKey` returned null, e.g. a canonical
-/// with no MAL id) is resolved by searching the provider's OWN catalog by the canonical
-/// title and fuzzy-matching (`resolver.bestProviderMatch`, the STRONG canonical→provider
-/// direction). A confident match yields the provider's opaque id; no match or a failed
-/// search both collapse to `ok = false` (the add path then persists the unbound marker,
-/// ROD-329; Play just toasts). Add (`for_play` false) then probes `episodes` to confirm the
-/// match has playable episodes, the same bar tier-A Add holds; Play skips that probe
-/// because its own downstream episode fetch is the confirmation.
+/// Background task: search-then-match binding resolve (ROD-328/342). A Browse search hit
+/// whose play provider does NOT id-key on a canonical (`canonicalKey` returned null) is
+/// resolved by searching the provider's OWN catalog and matching: tier B first
+/// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
+/// in its results, e.g. anipub's MALID backfill), then tier C
+/// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
+/// query passes: the canonical (romaji) title, then the English title, since an
+/// English-titled catalog (anipub) misses a romaji query entirely, and a confident
+/// match on the first pass skips the second. A confident match yields the provider's
+/// opaque id; no match or a failed search both collapse to `ok = false` (the add path
+/// then persists the unbound marker, ROD-329; Play just toasts). Add (`for_play` false)
+/// then probes `episodes` to confirm the match has playable episodes, the same bar
+/// tier-A Add holds; Play skips that probe because its own downstream episode fetch is
+/// the confirmation.
 ///
 /// `canonical` is a gpa-owned deep copy (freed here) so it outlives the caller's return
 /// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into gpa
@@ -375,30 +380,39 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: Sour
     defer arena.deinit();
 
     const resolved: ?[]const u8 = blk: {
-        if (canonical.name.len == 0) break :blk null; // no title to search by
         const opts: source_mod.SearchOptions = .{
             .translation = translation,
             .limit = source_mod.search_page_size,
             .page = 1,
         };
-        const results = provider.search(arena.allocator(), io, canonical.name, opts) catch |e| {
-            log.debug("resolve-search failed: {s}", .{@errorName(e)});
-            break :blk null;
-        };
-        const idx = resolver.bestProviderMatch(canonical, results) orelse break :blk null;
-        const matched_id = results[idx].id;
-        // Add confirms the match actually has playable episodes (parity with tier-A's
-        // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
-        // its own downstream episode fetch is the confirmation. Sequential after the search, so
-        // still one provider request at a time (ROD-309).
-        if (!for_play) {
-            const eps = provider.episodes(arena.allocator(), io, matched_id, translation) catch |e| {
-                log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
-                break :blk null;
+        const passes = [_]?[]const u8{ canonical.name, canonical.english_name };
+        for (passes, 0..) |pass, pi| {
+            const query = pass orelse continue;
+            if (query.len == 0) continue;
+            // Skip a redundant second search when the English title IS the name.
+            if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
+            const results = provider.search(arena.allocator(), io, query, opts) catch |e| {
+                log.debug("resolve-search failed: {s}", .{@errorName(e)});
+                continue;
             };
-            if (eps.len == 0) break :blk null;
+            const idx = resolver.bestIdMatch(canonical, results) orelse
+                resolver.bestProviderMatch(canonical, results) orelse continue;
+            const matched_id = results[idx].id;
+            // Add confirms the match actually has playable episodes (parity with tier-A's
+            // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
+            // its own downstream episode fetch is the confirmation. Sequential after the search, so
+            // still one provider request at a time (ROD-309). A confident match that fails the
+            // probe ends the resolve; no second-opinion shopping on the other title.
+            if (!for_play) {
+                const eps = provider.episodes(arena.allocator(), io, matched_id, translation) catch |e| {
+                    log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
+                    break :blk null;
+                };
+                if (eps.len == 0) break :blk null;
+            }
+            break :blk gpa.dupe(u8, matched_id) catch null;
         }
-        break :blk gpa.dupe(u8, matched_id) catch null;
+        break :blk null;
     };
 
     const ok = resolved != null;

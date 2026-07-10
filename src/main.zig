@@ -21,6 +21,16 @@ pub const std_options: std.Options = .{
     .logFn = zigoku.log.logFn,
 };
 
+// TEMPORARY (ROD-342, dies with the ROD-343 registry): pick the sole play
+// provider by env (`ZIGOKU_PROVIDER=anipub`) so the new provider is provable
+// end-to-end before order/override/fallback exist. Unset or anything else =
+// senshi, so a normal launch is byte-identical to before.
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
+fn anipubSelected() bool {
+    const v = getenv("ZIGOKU_PROVIDER") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "anipub");
+}
+
 const Cli = struct {
     query: []const u8,
     translation: zigoku.Translation = .sub,
@@ -175,10 +185,12 @@ pub fn main(init: std.process.Init) !void {
     defer if (store_opt) |*st| st.close();
 
     // One provider for the whole CLI run, so both run() and the error reporter
-    // read the source name from the same vtable seam. `senshi` must outlive both
-    // calls — this frame does. (ROD-301: AllAnime is captcha-dead — see ROD-300.)
+    // read the source name from the same vtable seam. Both concrete providers
+    // must outlive both calls; this frame does. (ROD-301: AllAnime is
+    // captcha-dead, see ROD-300.)
     var senshi = zigoku.Senshi.init();
-    const provider = senshi.provider();
+    var anipub = zigoku.AniPub.init();
+    const provider = if (anipubSelected()) anipub.provider() else senshi.provider();
 
     run(arena, io, out, in, cli, cfg, provider, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err, provider.displayName());
@@ -407,7 +419,8 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
 
     // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.
     var senshi = zigoku.Senshi.init();
-    const provider = senshi.provider();
+    var anipub = zigoku.AniPub.init();
+    const provider = if (anipubSelected()) anipub.provider() else senshi.provider();
     try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg, cfg_path);
 }
 
