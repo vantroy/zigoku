@@ -2044,11 +2044,12 @@ pub const App = struct {
                 };
                 self.gpa.free(ev.results);
                 // Stamp freshness + exhaustion only on a successful append. Exhaustion
-                // is AniList's own has-more signal (pageInfo.hasNextPage, §9.6), not
-                // the retired "page came back short" heuristic.
+                // is AniList's own has-more signal (pageInfo.hasNextPage, §9.6) or the
+                // retention cap (max_feed_rows, ROD-339); never the retired "page came
+                // back short" heuristic.
                 slot.fetched_at = Store.nowSecs();
                 slot.page = ev.page;
-                slot.exhausted = !ev.has_next;
+                slot.exhausted = !ev.has_next or slot.results.items.len >= DiscoverState.max_feed_rows;
                 // Rows arrive fully enriched (full GQL_FIELDS); no enrich pass.
                 // Mirror them into the canonical spine so a later Browse hit or
                 // detail open hydrates rich (persist like search, ROD-336).
@@ -2428,8 +2429,11 @@ pub const App = struct {
     /// live threads to approach the OS thread/fd ceiling, where `std.Thread.spawn`
     /// starts failing, which is exactly what tips a fetch onto `withDeadline`'s
     /// unbounded inline fallback (ROD-264). Bounding our own fan-out keeps us clear.
-    /// In normal use the in-flight set sits far below this; the cap is a backstop,
-    /// not a tuning dial. (Covers ride their own drain + cap, ROD-240.)
+    /// Under the current call graph this is pure headroom, not a reachable limit:
+    /// every fireDiscoverFeed caller fires only the active axis behind its own
+    /// `loading` gate, so at most one fetch per axis (4 total) is ever in flight
+    /// (ROD-339); kept as the backstop for any future fan-out caller. (Covers ride
+    /// their own drain + cap, ROD-240.)
     const discover_feed_cap = 8;
 
     /// True when the Discover feed pool is at the soft cap (ROD-264 #3): the
