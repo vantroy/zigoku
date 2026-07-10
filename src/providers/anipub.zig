@@ -178,7 +178,13 @@ pub const AniPub = struct {
                 return parsed.value;
             },
             .object => |o| {
-                if (o.get("found") != null) return &.{}; // the no-hit sentinel
+                // The no-hit sentinel is {"found":false}. Check the VALUE, not key
+                // presence: a hypothetical found:true carrying hit fields must
+                // parse as a hit, not vanish as a false miss (chaos-pass find).
+                // A non-bool "found" is drift; treat it as no hits, not a crash.
+                if (o.get("found")) |f| {
+                    if (f != .bool or !f.bool) return &.{};
+                }
                 const parsed = try std.json.parseFromValue(Hit, arena, val.value, .{ .ignore_unknown_fields = true });
                 const one = try arena.alloc(Hit, 1);
                 one[0] = parsed.value;
@@ -524,6 +530,14 @@ test "parseSearchHits: a bare single-hit object and the found:false sentinel" {
         \\{"found":false}
     );
     try testing.expectEqual(@as(usize, 0), none.len);
+
+    // A found:true shape carrying hit fields is a HIT, not a miss (the sentinel
+    // keys on the value; key presence alone must not discard a real result).
+    const found_true = try AniPub.parseSearchHits(a,
+        \\{"found":true,"Name":"Attack on Titan","Id":16498}
+    );
+    try testing.expectEqual(@as(usize, 1), found_true.len);
+    try testing.expectEqual(@as(?u64, 16498), found_true[0].Id);
 
     // Anything else is drift, not a silent empty result.
     try testing.expectError(error.HttpNotOk, AniPub.parseSearchHits(a, "\"err\""));

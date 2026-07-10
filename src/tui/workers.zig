@@ -379,41 +379,10 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: Sour
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const resolved: ?[]const u8 = blk: {
-        const opts: source_mod.SearchOptions = .{
-            .translation = translation,
-            .limit = source_mod.search_page_size,
-            .page = 1,
-        };
-        const passes = [_]?[]const u8{ canonical.name, canonical.english_name };
-        for (passes, 0..) |pass, pi| {
-            const query = pass orelse continue;
-            if (query.len == 0) continue;
-            // Skip a redundant second search when the English title IS the name.
-            if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
-            const results = provider.search(arena.allocator(), io, query, opts) catch |e| {
-                log.debug("resolve-search failed: {s}", .{@errorName(e)});
-                continue;
-            };
-            const idx = resolver.bestIdMatch(canonical, results) orelse
-                resolver.bestProviderMatch(canonical, results) orelse continue;
-            const matched_id = results[idx].id;
-            // Add confirms the match actually has playable episodes (parity with tier-A's
-            // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
-            // its own downstream episode fetch is the confirmation. Sequential after the search, so
-            // still one provider request at a time (ROD-309). A confident match that fails the
-            // probe ends the resolve; no second-opinion shopping on the other title.
-            if (!for_play) {
-                const eps = provider.episodes(arena.allocator(), io, matched_id, translation) catch |e| {
-                    log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
-                    break :blk null;
-                };
-                if (eps.len == 0) break :blk null;
-            }
-            break :blk gpa.dupe(u8, matched_id) catch null;
-        }
-        break :blk null;
-    };
+    const resolved: ?[]const u8 = if (resolveViaSearch(arena.allocator(), io, provider, canonical, translation, for_play)) |m|
+        gpa.dupe(u8, m) catch null
+    else
+        null;
 
     const ok = resolved != null;
     const source_id: []const u8 = resolved orelse &.{};
@@ -425,6 +394,46 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: Sour
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         if (resolved) |r| gpa.free(r);
     };
+}
+
+/// The search→match→probe core of `resolveSearchTask`, split from the thread/event
+/// glue so the pass control flow is unit-testable with a stub provider. Returns the
+/// matched provider id (borrowing from `arena` via the provider's results) or null.
+fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) ?[]const u8 {
+    const opts: source_mod.SearchOptions = .{
+        .translation = translation,
+        .limit = source_mod.search_page_size,
+        .page = 1,
+    };
+    const passes = [_]?[]const u8{ canonical.name, canonical.english_name };
+    for (passes, 0..) |pass, pi| {
+        const query = pass orelse continue;
+        if (query.len == 0) continue;
+        // Skip a redundant second search when the English title IS the name.
+        if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
+        const results = provider.search(arena, io, query, opts) catch |e| {
+            log.debug("resolve-search failed: {s}", .{@errorName(e)});
+            continue;
+        };
+        const idx = resolver.bestIdMatch(canonical, results) orelse
+            resolver.bestProviderMatch(canonical, results) orelse continue;
+        const matched_id = results[idx].id;
+        // Add confirms the match actually has playable episodes (parity with tier-A's
+        // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
+        // its own downstream episode fetch is the confirmation. Sequential after the search, so
+        // still one provider request at a time (ROD-309). A failed or empty probe falls
+        // through to the next pass (bounded at 2): a dead listing on one title must not
+        // also deny the other title's legitimate match.
+        if (!for_play) {
+            const eps = provider.episodes(arena, io, matched_id, translation) catch |e| {
+                log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
+                continue;
+            };
+            if (eps.len == 0) continue;
+        }
+        return matched_id;
+    }
+    return null;
 }
 
 /// Background task: fetch one Discover feed page for `axis` from AniList (ROD-336).
@@ -1596,4 +1605,113 @@ test "playAttemptRetryable: only an unplayed open-failure with budget left retri
 
     // Guard the backoff table covers every retry the gate permits.
     try std.testing.expectEqual(MAX_PLAY_ATTEMPTS - 1, RETRY_BACKOFFS_MS.len);
+}
+
+// ── ROD-342: resolveViaSearch pass control flow, driven by a stub provider ──────
+
+/// In-process `SourceProvider` for exercising `resolveViaSearch` without network:
+/// two canned query→results rows and a single show id whose episode probe lists
+/// anything. Everything else errors or lists empty, mirroring a miss.
+const StubCatalog = struct {
+    romaji: []const Anime = &.{},
+    english: []const Anime = &.{},
+    /// The one show id whose episode probe succeeds; all others list empty.
+    alive_id: []const u8 = "",
+    /// Search-call count, for pinning the redundant-pass skip.
+    searches: u32 = 0,
+
+    fn provider(self: *StubCatalog) SourceProvider {
+        return .{ .ptr = self, .vtable = &stub_vtable };
+    }
+    const stub_vtable: source_mod.SourceProvider.VTable = .{
+        .name = stubName,
+        .displayName = stubName,
+        .search = stubSearch,
+        .canonicalKey = stubCanonicalKey,
+        .episodes = stubEpisodes,
+        .resolve = stubResolve,
+        .coverRequest = stubCover,
+    };
+    fn stubName(_: *anyopaque) []const u8 {
+        return "stub";
+    }
+    fn stubSearch(ptr: *anyopaque, arena: Allocator, _: std.Io, query: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+        const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        self.searches += 1;
+        const rows: []const Anime = if (std.mem.eql(u8, query, "Romaji Title"))
+            self.romaji
+        else if (std.mem.eql(u8, query, "English Title"))
+            self.english
+        else
+            &.{};
+        return arena.dupe(Anime, rows);
+    }
+    fn stubCanonicalKey(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
+        return null;
+    }
+    fn stubEpisodes(ptr: *anyopaque, arena: Allocator, _: std.Io, show_id: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+        const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, show_id, self.alive_id)) return arena.alloc(domain.EpisodeNumber, 0);
+        const eps = try arena.alloc(domain.EpisodeNumber, 1);
+        eps[0] = .{ .raw = "1" };
+        return eps;
+    }
+    fn stubResolve(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
+        return error.NotImplemented;
+    }
+    fn stubCover(_: *anyopaque, _: Allocator, _: []const u8) anyerror!source_mod.CoverRequest {
+        return error.NotImplemented;
+    }
+};
+
+test "resolveViaSearch: English retry pass binds when the romaji pass misses (ROD-342)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // The anipub shape: an English-only-searchable catalog embedding mal ids.
+    const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 154587, .mal_id = 52991 };
+    var stub = StubCatalog{
+        .english = &.{.{ .id = "2454", .name = "English Title", .mal_id = 52991 }},
+    };
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("2454", got);
+}
+
+test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add probe" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // Pass 1 id-matches a listing whose episode probe comes up empty; pass 2 must
+    // still get its shot instead of the whole resolve dying with it.
+    const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
+    var stub = StubCatalog{
+        .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
+        .english = &.{.{ .id = "alive", .name = "English Title", .mal_id = 52991 }},
+        .alive_id = "alive",
+    };
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("alive", got);
+
+    // Both passes dead → null, never a bind on an unplayable listing.
+    stub.alive_id = "";
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) == null);
+}
+
+test "resolveViaSearch: Play skips the probe; identical English title skips pass 2" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // for_play: the downstream episode fetch is the confirmation, so a probe-dead
+    // listing still resolves (and its failure surfaces on that fetch instead).
+    const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
+    var stub = StubCatalog{
+        .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
+    };
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("dead", got);
+    try std.testing.expectEqual(@as(u32, 1), stub.searches); // pass-1 hit → pass 2 never fired
+
+    // english_name == name: the second pass is a redundant query and must not fire
+    // even when pass 1 misses (one search total, resolve collapses to null).
+    const same_title: Anime = .{ .id = "2", .name = "No Such Show", .english_name = "No Such Show", .anilist_id = 2 };
+    var stub2 = StubCatalog{};
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true) == null);
+    try std.testing.expectEqual(@as(u32, 1), stub2.searches);
 }
