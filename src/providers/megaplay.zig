@@ -75,7 +75,9 @@ pub fn resolve(arena: Allocator, io: Io, realid: []const u8, tt: domain.Translat
     // is lang-agnostic at this layer: the {sub|dub} path segment is where the
     // track forks, yielding a distinct data-id per track (spike: Frieren ep1
     // sub=13458, dub=13452).
-    const embed_url = try std.fmt.allocPrint(arena, HOST ++ "/stream/s-2/{s}/{s}", .{ realid, langPath(tt) });
+    // {sub|dub} is exactly Translation's tagname, so `str()` (the cross-provider
+    // wire literal) is the segment; no provider-local lookup needed.
+    const embed_url = try std.fmt.allocPrint(arena, HOST ++ "/stream/s-2/{s}/{s}", .{ realid, tt.str() });
     const html = try request(arena, io, embed_url, .embed);
     const data_id = parseDataId(html) orelse {
         log.warn("megaplay embed {s}: no data-id in {d} byte(s) of HTML", .{ embed_url, html.len });
@@ -164,14 +166,6 @@ fn parseDataId(html: []const u8) ?[]const u8 {
         from = at + needle.len;
     }
     return null;
-}
-
-/// The {sub|dub} embed path segment for a track.
-fn langPath(tt: domain.Translation) []const u8 {
-    return switch (tt) {
-        .sub => "sub",
-        .dub => "dub",
-    };
 }
 
 /// An AniPub realid is a numeric id parsed out of the ep[] links. Enforce
@@ -296,11 +290,6 @@ test "guardRealId accepts a numeric realid, rejects traversal/injection" {
     try testing.expectError(error.InvalidRealId, guardRealId("../etc"));
     try testing.expectError(error.InvalidRealId, guardRealId("107259/x"));
     try testing.expectError(error.InvalidRealId, guardRealId("13458abc"));
-}
-
-test "langPath forks the embed path per track" {
-    try testing.expectEqualStrings("sub", langPath(.sub));
-    try testing.expectEqualStrings("dub", langPath(.dub));
 }
 
 test "mapSources maps a live-shaped getSources body (ROD-341)" {
