@@ -703,6 +703,15 @@ pub const App = struct {
     /// entry so a non-resolving open (History/Discover) can never inherit a stale bind.
     pending_bind: ?i64 = null,
 
+    /// ROD-346: the in-flight provider-fallback walk, or null. Built at the FIRST
+    /// failure of a canonical-capable episode fetch (never at fire time: the fetch
+    /// identity (for_source, for_id) is the H2-safe key, live nav state is not),
+    /// advanced by each subsequent failure, freed on grid success, exhaustion, or
+    /// any user-driven fire. Walk hops take it out of this field before re-entering
+    /// `fireEpisodesForId` (which clears it, same idiom as `pending_bind`) and put
+    /// it back once the hop is in flight.
+    fallback: ?Fallback = null,
+
     history_filter: [128]u8 = undefined,
     history_filter_len: usize = 0,
 
@@ -1136,6 +1145,7 @@ pub const App = struct {
     /// run() and must execute before this cleanup touches anything workers can
     /// still reference.
     pub fn deinitOwnedState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
+        self.clearFallback();
         self.search.deinit(self.gpa);
         self.discover.deinit(self.gpa);
         self.episodes.freeResults(self.gpa);
@@ -1953,6 +1963,11 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
+                    // ROD-346: a single-provider tier-A probe miss (ev.source names the
+                    // probed provider) widens to a search over the REMAINING providers
+                    // before persisting the no-source verdict. The search walk itself
+                    // posts an empty source, so this fires at most once per add.
+                    if (ev.source.len > 0 and self.fireResolveAddWiden(loop, io, registry, ev.anilist_id, ev.source)) return;
                     // Resolver miss (tier-A + tier-C both missed): persist the unbound
                     // terminal state (ROD-329) instead of a dead-end toast. A null store or
                     // a false return (no canonical row) falls back to the plain error, never
@@ -2007,6 +2022,12 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.play_resolving = false;
                 if (!ev.ok) {
+                    // ROD-346: a walk hop's search missed; advance to the next provider.
+                    // Guarded on the walk's anilist_id so a late miss for a superseded
+                    // search can never advance a newer show's walk.
+                    if (self.fallback != null and self.fallback.?.anilist_id == ev.anilist_id) {
+                        if (self.advanceFallback(loop, io, registry, null, null)) return;
+                    }
                     // No confident provider match (unmatched, ROD-329): same dead-end as a
                     // failed episode fetch.
                     self.pushToast(.@"error", "couldn't load episodes", false);
@@ -2015,7 +2036,17 @@ pub const App = struct {
                 // Confirmed match: fire the episode fetch on the provider that matched
                 // (ev.source, ROD-343), then arm pending_bind (order matters:
                 // fireEpisodesForId nulls it at entry, same trap as fireEpisodesResolved).
+                // The walk (if any) survives the fire the same way: its hop's probe
+                // failure must still be able to advance it.
+                const walk = self.fallback;
+                self.fallback = null;
                 self.fireEpisodesForId(loop, io, registry, ev.source_id, ev.source);
+                if (self.episodes.loading) {
+                    self.fallback = walk;
+                } else if (walk) |w| {
+                    var done = w; // fetch settled synchronously: the walk is finished
+                    done.deinit(self.gpa);
+                }
                 self.pending_bind = ev.anilist_id;
             },
 
@@ -2219,6 +2250,9 @@ pub const App = struct {
                     }
                 }
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
+                // ROD-346: the grid landed, so any fallback walk delivered (or was
+                // never needed). Frees it; a fresh failure builds a fresh walk.
+                self.clearFallback();
             },
             .episodes_error => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -2229,9 +2263,14 @@ pub const App = struct {
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // ROD-327: the tier-A existence probe failed → resolver miss, write no
-                // state (the unmatched terminal state is ROD-329). The toast below is the
-                // shared dead-end copy.
+                // state (the unmatched terminal state is ROD-329). Captured first: a
+                // virgin probe's aid is the walk's only handle on the canonical.
+                const failed_bind = self.pending_bind;
                 self.pending_bind = null;
+                // ROD-346: walk the remaining providers before declaring the dead end.
+                // A fired hop suppresses the demote + toast below; exhaustion (or a
+                // show that can't fall back) falls through to them.
+                if (self.advanceFallback(loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
                 // ROD-229: an auto-opened resume landing whose grid fetch failed
                 // must not strand the user on a blank detail pane — demote to the
                 // History view (cursor already parked on the target row). The toast
@@ -2840,6 +2879,9 @@ pub const App = struct {
         // open (History/Discover) never inherits a stale one. A resolving Browse fire
         // re-sets it immediately after this returns (fireEpisodesBrowse).
         self.pending_bind = null;
+        // ROD-346: same for the fallback walk. A user-driven fire kills a stale walk;
+        // walk hops hold theirs in a local across this call and re-install after.
+        self.clearFallback();
         // ROD-329: clears the sentinel flag; a populated grid must never render "no source
         // available" (the History gate re-sets it, this fetch never runs for a sentinel row).
         self.episodes.unbound = false;
@@ -2974,6 +3016,9 @@ pub const App = struct {
     /// first. Shared by Browse (two-pane focus + zoom) and the Discover zoom (ROD-336)
     /// so the routing lives once.
     fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, sel: Anime) void {
+        // ROD-346: a `.needs_search` verdict never reaches fireEpisodesForId, so a
+        // stale walk from a previous show must die here, not there.
+        self.clearFallback();
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         switch (browseResolveTarget(registry, self.effectivePreference(), sel, self.store, arena.allocator())) {
@@ -3050,6 +3095,166 @@ pub const App = struct {
         t.detach();
     }
 
+    /// ROD-346: one provider-fallback walk (see the `fallback` field doc for the
+    /// lifecycle). Provider-major, per the ticket: each remaining provider gets its
+    /// full tier-0 → tier-A → tier-C shot before the next is tried, in effective
+    /// order. The initial resolve stays tier-major (ROD-343, don't re-open); this
+    /// walk only runs once that resolve's provider has already failed.
+    pub const Fallback = struct {
+        /// gpa-owned deep copy of the canonical entity: the fuel for
+        /// `canonicalKey` and the tier-C title search.
+        canonical: Anime,
+        anilist_id: i64,
+        /// Effective-order snapshot at walk creation, gpa-owned (mirrors the
+        /// tier-C worker: a preference change mid-walk must not reshuffle it).
+        providers: []SourceProvider,
+        /// providers[0..next) are consumed; monotonic, so every provider is
+        /// attempted at most once per walk. That bound is the whole probe budget.
+        next: usize = 0,
+        /// Bitmask over providers[]: entries that already failed BEFORE the walk
+        /// reached them (the provider whose failure created the walk).
+        tried: u16 = 0,
+
+        fn deinit(self: *Fallback, gpa: Allocator) void {
+            workers.freeOwnedAnime(gpa, self.canonical);
+            gpa.free(self.providers);
+        }
+    };
+
+    /// pub for the app_test teardowns (a test that arms a walk must free it).
+    pub fn clearFallback(self: *App) void {
+        if (self.fallback) |*w| w.deinit(self.gpa);
+        self.fallback = null;
+    }
+
+    /// Build the walk from the failed fetch's identity (ROD-346). The canonical
+    /// entity is looked up by anilist_id: `pending_aid` (a virgin tier-A probe whose
+    /// binding was never minted) or the failed binding's own row. Returns false when
+    /// the show can't fall back (no store, no canonical identity): the caller's
+    /// dead-end handling stands.
+    fn beginFallback(self: *App, registry: Registry, pending_aid: ?i64) bool {
+        const st = self.store orelse return false;
+        const src = self.episodes.for_source orelse return false;
+        const fid = self.episodes.for_id orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const looked_up: ?i64 = pending_aid orelse blk: {
+            const rec = (st.getAnime(arena.allocator(), src, fid) catch null) orelse break :blk null;
+            break :blk rec.anilist_id;
+        };
+        const aid = looked_up orelse return false;
+        const canon_rec = (st.getCanonicalByAnilistId(arena.allocator(), aid) catch null) orelse return false;
+        const canonical = workers.dupeOwnedAnime(self.gpa, selection.animeFromHistoryRecord(canon_rec)) catch return false;
+        const providers = registry.orderedAlloc(self.gpa, self.effectivePreference()) catch {
+            workers.freeOwnedAnime(self.gpa, canonical);
+            return false;
+        };
+        std.debug.assert(providers.len <= 16); // `tried` bitmask capacity
+        var tried: u16 = 0;
+        for (providers, 0..) |p, i| {
+            if (std.mem.eql(u8, p.name(), src)) tried |= @as(u16, 1) << @intCast(i);
+        }
+        self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = tried };
+        return true;
+    }
+
+    /// Advance (or begin) the fallback walk after a failed episode fetch or a failed
+    /// tier-C hop (ROD-346). Returns true when a next-provider attempt is in flight
+    /// (the caller suppresses its dead-end handling); false when there is nothing to
+    /// walk or the order is exhausted (walk freed, the caller's dead-end copy stands).
+    /// Sequential single-flight by construction: one hop fires per failure event, and
+    /// each hop rides the existing episode-fetch / `play_resolving` guards.
+    fn advanceFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, pending_aid: ?i64, failed_name: ?[]const u8) bool {
+        if (self.fallback == null and !self.beginFallback(registry, pending_aid)) return false;
+        var walk = self.fallback.?;
+        self.fallback = null; // taken: hop fires re-enter fireEpisodesForId, which clears the field
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        while (walk.next < walk.providers.len) {
+            const idx = walk.next;
+            const p = walk.providers[idx];
+            walk.next += 1;
+            if ((walk.tried >> @intCast(idx)) & 1 != 0) continue;
+            // Tier 0: an existing binding on this provider.
+            const bound_id: ?[]const u8 = if (self.store) |st|
+                (st.bindingSourceId(scratch, p.name(), walk.anilist_id) catch null)
+            else
+                null;
+            if (bound_id) |sid| {
+                self.fireFallbackFetch(loop, io, registry, walk, p, sid, null, failed_name);
+                return true;
+            }
+            // Tier A: the provider derives its own catalog key from the canonical.
+            if (p.canonicalKey(scratch, walk.canonical) catch null) |key| {
+                self.fireFallbackFetch(loop, io, registry, walk, p, key, walk.anilist_id, failed_name);
+                return true;
+            }
+            // Tier C: single-provider title search; its miss advances the walk again
+            // via `.resolve_play_target`. A failed spawn counts as tried, keep walking.
+            if (self.spawnFallbackSearch(loop, io, p, walk.canonical, walk.anilist_id, failed_name)) {
+                self.fallback = walk;
+                return true;
+            }
+        }
+        walk.deinit(self.gpa);
+        return false;
+    }
+
+    /// A walk hop's episode fetch (tier 0 / tier A). The fetch doubles as the
+    /// existence probe exactly like the initial resolve; `bind` mints on
+    /// `.episodes_done`. `resume_landing_pending` survives the hop (the fire clears
+    /// it) so an auto-resume landing demotes only when the whole walk is exhausted.
+    fn fireFallbackFetch(self: *App, loop: *Loop, io: std.Io, registry: Registry, walk: Fallback, p: SourceProvider, id: []const u8, bind: ?i64, failed_name: ?[]const u8) void {
+        self.toastFallbackHop(p, failed_name);
+        const landing = self.resume_landing_pending;
+        self.fireEpisodesResolved(loop, io, registry, p.name(), id, bind);
+        self.resume_landing_pending = landing and self.episodes.loading;
+        if (self.episodes.loading) {
+            self.fallback = walk; // async fetch in flight: the walk waits for its verdict
+        } else {
+            var w = walk; // synchronous cache hit: the hop already landed the grid
+            w.deinit(self.gpa);
+        }
+    }
+
+    /// A walk hop's tier-C search: `resolveSearchTask` over ONE provider (mirrors
+    /// `fireResolvePlaySearch`, which walks the whole order for the initial resolve).
+    fn spawnFallbackSearch(self: *App, loop: *Loop, io: std.Io, p: SourceProvider, canonical: Anime, anilist_id: i64, failed_name: ?[]const u8) bool {
+        if (self.play_resolving) return false;
+        const gpa = self.gpa;
+        const snap = workers.dupeOwnedAnime(gpa, canonical) catch return false;
+        const one = gpa.alloc(SourceProvider, 1) catch {
+            workers.freeOwnedAnime(gpa, snap);
+            return false;
+        };
+        one[0] = p;
+        self.async_start_ms = self.now_ms;
+        self.play_resolving = true;
+        self.play_resolve_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
+            loop, gpa, io, one, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
+        }) catch {
+            self.play_resolve_drain.finish(); // no worker will run, rebalance the count
+            self.play_resolving = false;
+            gpa.free(one);
+            workers.freeOwnedAnime(gpa, snap);
+            return false;
+        };
+        t.detach();
+        self.toastFallbackHop(p, failed_name);
+        return true;
+    }
+
+    fn toastFallbackHop(self: *App, next_p: SourceProvider, failed_name: ?[]const u8) void {
+        var buf: [96]u8 = undefined;
+        const msg = if (failed_name) |f|
+            std.fmt.bufPrint(&buf, "{s} failed, trying {s}…", .{ f, next_p.displayName() }) catch "trying next provider…"
+        else
+            std.fmt.bufPrint(&buf, "trying {s}…", .{next_p.displayName()}) catch "trying next provider…";
+        self.pushToast(.warn, msg, false);
+    }
+
     /// ROD-229: index of the show to resume — the most-recently-watched row, i.e.
     /// the first with a non-null `last_watched_at`. `loadHistory` sorts those rows
     /// first (DESC NULLS LAST), so this is normally index 0; the scan keeps it
@@ -3117,6 +3322,7 @@ pub const App = struct {
             self.episodes.freeResults(self.gpa);
             self.episodes.cursor = 0;
             self.pending_bind = null;
+            self.clearFallback();
             self.resume_landing_pending = false;
             self.async_start_ms = 0; // no async op runs; retire any slow-path spinner
             self.episodes.loading = false;
@@ -3815,6 +4021,59 @@ pub const App = struct {
             return;
         };
         t.detach();
+    }
+
+    /// ROD-346: the Add twin of the fallback walk, collapsed to one shot: a tier-A
+    /// add probe missed on one provider, so search the rest of the effective order
+    /// (`resolveSearchTask` walks them first-confident-match). The probed provider is
+    /// dropped: its tier-C search would recover the same id that just failed the
+    /// probe, one more request against a catalog we just watched miss (ROD-309
+    /// discipline). Returns false when there is nothing to widen to (the caller's
+    /// unbound verdict stands).
+    fn fireResolveAddWiden(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64, failed_source: []const u8) bool {
+        if (self.add_resolving) return false;
+        const st = self.store orelse return false;
+        const gpa = self.gpa;
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const rec = (st.getCanonicalByAnilistId(arena.allocator(), anilist_id) catch null) orelse return false;
+        const all = registry.orderedAlloc(gpa, self.effectivePreference()) catch return false;
+        var n: usize = 0;
+        for (all) |p| {
+            if (std.mem.eql(u8, p.name(), failed_source)) continue;
+            all[n] = p;
+            n += 1;
+        }
+        if (n == 0) {
+            gpa.free(all);
+            return false;
+        }
+        // Exact-fit copy: the worker frees its slice with gpa.free, so it must own
+        // a whole allocation, never a shortened view of one.
+        const remaining = gpa.alloc(SourceProvider, n) catch {
+            gpa.free(all);
+            return false;
+        };
+        @memcpy(remaining, all[0..n]);
+        gpa.free(all);
+        const snap = workers.dupeOwnedAnime(gpa, selection.animeFromHistoryRecord(rec)) catch {
+            gpa.free(remaining);
+            return false;
+        };
+        self.async_start_ms = self.now_ms;
+        self.add_resolving = true;
+        self.add_resolve_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
+            loop, gpa, io, remaining, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
+        }) catch {
+            self.add_resolve_drain.finish(); // no worker will run, rebalance the count
+            self.add_resolving = false;
+            gpa.free(remaining);
+            workers.freeOwnedAnime(gpa, snap);
+            return false;
+        };
+        t.detach();
+        return true;
     }
 
     /// Spawn the detached tier-A add-resolve worker (ROD-327): probes `provider.episodes`
