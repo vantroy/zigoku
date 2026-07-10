@@ -1561,6 +1561,14 @@ test "discoverBody: axis sort + paging vars; season rides only on This Season (R
         try std.testing.expectEqualStrings("ID_DESC", parsed.value.variables.sort[1]);
     }
 
+    // Popular: same sort pair as This Season but with no season filter.
+    {
+        const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .popular, 1, 0), .{ .ignore_unknown_fields = true });
+        try std.testing.expectEqualStrings("POPULARITY_DESC", parsed.value.variables.sort[0]);
+        try std.testing.expectEqualStrings("ID_DESC", parsed.value.variables.sort[1]);
+        try std.testing.expect(parsed.value.variables.season == null);
+    }
+
     // This Season at 2026-07-10T00:00:00Z: the current cour rides as season/seasonYear.
     {
         const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .this_season, 1, 1_783_641_600 * 1000), .{ .ignore_unknown_fields = true });
