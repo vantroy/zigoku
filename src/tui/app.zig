@@ -2250,9 +2250,10 @@ pub const App = struct {
                     }
                 }
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
-                // ROD-346: the grid landed, so any fallback walk delivered (or was
-                // never needed). Frees it; a fresh failure builds a fresh walk.
-                self.clearFallback();
+                // ROD-346: the grid landed, so any fallback walk delivered: retire
+                // it, or run its play continuation (which keeps the walk armed
+                // across the relaunch, see completeFallback).
+                self.completeFallback(loop, io, registry);
             },
             .episodes_error => |ev| {
                 defer self.gpa.free(ev.for_id);
@@ -2352,9 +2353,25 @@ pub const App = struct {
                 // quit mpv at any second. Count it only if the final position
                 // cleared the completion bar.
                 self.finishPlayback(final_update, watchCompleted(final_update));
+                // ROD-346: playback worked, so any relaunch walk is finished.
+                self.clearFallback();
             },
             .play_error => |ev| {
                 const completed = watchCompleted(ev.final);
+                // ROD-346: only a stream that never meaningfully played hops the
+                // walk (the CF-penalty shape). A mid-episode death relaunching
+                // elsewhere would be a loop hazard, not a rescue. The continuation
+                // is captured BEFORE finishPlayback clears the session, and only
+                // when the detail grid still shows the played binding (nav state
+                // can have moved on; a mismatched relaunch would be chaos).
+                const never_played = if (ev.final) |f| !f.isMeaningful() else true;
+                const cont_ok = !completed and never_played and self.store != null and
+                    self.episodes.for_id != null and self.session.anime_id.len > 0 and
+                    std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?) and
+                    self.episodes.for_source != null and self.session.source.len > 0 and
+                    std.mem.eql(u8, self.session.source, self.episodes.for_source.?);
+                const ep_copy: ?[]const u8 = if (cont_ok) self.gpa.dupe(u8, self.session.episode_raw) catch null else null;
+                const ordinal = self.session.episode_index;
                 self.finishPlayback(ev.final, completed);
                 // §4.10: a play that errored without reaching the watched bar is a
                 // genuine failure (resolve failed, or mpv died mid-episode) —
@@ -2363,9 +2380,18 @@ pub const App = struct {
                 // resolve-side network/blocked/server class when we know it; the
                 // mpv-spawn classes fall back to the generic line (ROD-230 refines).
                 if (!completed) {
+                    if (ep_copy) |raw| {
+                        if (self.advancePlayFallback(loop, io, registry, raw, ordinal)) return;
+                    } else {
+                        // Not hopping (mid-episode death, or the pane moved on):
+                        // any armed relaunch walk is over.
+                        self.clearFallback();
+                    }
                     var buf: [128]u8 = undefined;
                     const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "playback failed";
                     self.pushToast(.@"error", copy, false);
+                } else {
+                    self.clearFallback();
                 }
             },
             .play_retry => |r| {
@@ -3114,12 +3140,31 @@ pub const App = struct {
         /// Bitmask over providers[]: entries that already failed BEFORE the walk
         /// reached them (the provider whose failure created the walk).
         tried: u16 = 0,
+        /// Play continuation (ROD-346): once a hop's grid lands, re-land this
+        /// episode and relaunch. Raw label is gpa-owned; `ordinal` (1-based) is
+        /// the positional fallback when the hop provider labels episodes
+        /// differently. Null for a plain episode-fetch walk.
+        play: ?PlayCont = null,
+
+        pub const PlayCont = struct { episode_raw: []const u8, ordinal: u32 };
 
         fn deinit(self: *Fallback, gpa: Allocator) void {
             workers.freeOwnedAnime(gpa, self.canonical);
             gpa.free(self.providers);
+            if (self.play) |cont| gpa.free(cont.episode_raw);
         }
     };
+
+    /// Map the failed episode onto a hop provider's grid (ROD-346): exact raw-label
+    /// match first, same 1-based ordinal as fallback (providers label positionally,
+    /// senshi and anipub both), null when the grid is too short for either.
+    pub fn mapEpisodeIndex(episodes: []const domain.EpisodeNumber, raw: []const u8, ordinal: u32) ?usize {
+        for (episodes, 0..) |ep, i| {
+            if (std.mem.eql(u8, ep.raw, raw)) return i;
+        }
+        if (ordinal >= 1 and @as(usize, ordinal) - 1 < episodes.len) return @as(usize, ordinal) - 1;
+        return null;
+    }
 
     /// pub for the app_test teardowns (a test that arms a walk must free it).
     pub fn clearFallback(self: *App) void {
@@ -3210,12 +3255,63 @@ pub const App = struct {
         const landing = self.resume_landing_pending;
         self.fireEpisodesResolved(loop, io, registry, p.name(), id, bind);
         self.resume_landing_pending = landing and self.episodes.loading;
-        if (self.episodes.loading) {
-            self.fallback = walk; // async fetch in flight: the walk waits for its verdict
-        } else {
-            var w = walk; // synchronous cache hit: the hop already landed the grid
-            w.deinit(self.gpa);
+        self.fallback = walk;
+        // A synchronous cache hit already landed the grid: no episodes_done will
+        // come, so the walk completes (or retires) here.
+        if (!self.episodes.loading) self.completeFallback(loop, io, registry);
+    }
+
+    /// The walk's grid landed (ROD-346). A plain episode walk just retires. A play
+    /// continuation re-lands the failed episode on the hop provider and relaunches;
+    /// the walk STAYS ARMED across that relaunch, so a stream that fails on this
+    /// provider too advances the SAME walk. That is the relaunch chain's bound:
+    /// each provider gets at most one shot per walk, never a ping-pong of fresh
+    /// walks between two broken providers.
+    fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
+        var walk = self.fallback orelse return;
+        const cont = walk.play orelse {
+            self.fallback = null;
+            walk.deinit(self.gpa);
+            return;
+        };
+        const eps = self.episodes.results orelse {
+            self.fallback = null;
+            walk.deinit(self.gpa);
+            return;
+        };
+        const idx = mapEpisodeIndex(eps, cont.episode_raw, cont.ordinal) orelse {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "episode {s} not found on {s}", .{ cont.episode_raw, self.owningProvider(registry).displayName() }) catch "episode not found on this provider";
+            self.pushToast(.warn, msg, false);
+            self.fallback = null;
+            walk.deinit(self.gpa);
+            return;
+        };
+        self.episodes.cursor = idx;
+        self.firePlay(loop, io, registry);
+    }
+
+    /// ROD-346 play surface: a stream that never opened (`isMeaningful` false on the
+    /// final position) hops the walk. A relaunch failure advances the walk the last
+    /// hop left armed; a first failure builds a fresh one from the played binding.
+    /// Takes ownership of `episode_raw` on every path. Returns true when a hop is in
+    /// flight (the caller suppresses the failure toast).
+    fn advancePlayFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, episode_raw: []const u8, ordinal: u32) bool {
+        if (self.fallback) |*w| {
+            if (w.play != null) {
+                // Same episode, standing walk: the fresh dupe is redundant.
+                self.gpa.free(episode_raw);
+                return self.advanceFallback(loop, io, registry, null, self.owningProvider(registry).displayName());
+            }
+            // An episode walk without a play continuation can't own a play failure.
+            self.clearFallback();
         }
+        if (!self.beginFallback(registry, null)) {
+            self.gpa.free(episode_raw);
+            return false;
+        }
+        self.fallback.?.play = .{ .episode_raw = episode_raw, .ordinal = ordinal };
+        return self.advanceFallback(loop, io, registry, null, self.owningProvider(registry).displayName());
     }
 
     /// A walk hop's tier-C search: `resolveSearchTask` over ONE provider (mirrors

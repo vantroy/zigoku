@@ -6373,3 +6373,104 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
+
+test "ROD-346: mapEpisodeIndex prefers the raw label, falls back to ordinal, else null" {
+    const eps = [_]domain.EpisodeNumber{ .{ .raw = "0" }, .{ .raw = "1" }, .{ .raw = "2" } };
+    // Label match wins even when it disagrees with the ordinal position.
+    try testing.expectEqual(@as(?usize, 1), App.mapEpisodeIndex(&eps, "1", 3));
+    // No label match: 1-based ordinal maps positionally.
+    try testing.expectEqual(@as(?usize, 2), App.mapEpisodeIndex(&eps, "SP3", 3));
+    // Neither fits: the hop provider's grid is too short.
+    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "SP9", 9));
+    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "9", 0));
+}
+
+test "ROD-346: a never-played stream failure relaunches on the hop provider, bounded by one shot each" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.skip_mode = "none"; // keep playTask off the network (no AniSkip/Jikan)
+    // The relaunch spawns a REAL playTask; `true` stands in for mpv (exits 0
+    // instantly, so no production error log trips the runner's guard).
+    app.config.mpv_path = "true";
+    defer app.clearFallback();
+    // The play that is about to fail: alpha's grid is loaded and the session
+    // carries the fire-time identity, episode "1" (ordinal 1).
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+    try testing.expect(app.session.begin(app.gpa, "alpha", "a1", "1", 1, .sub, 0));
+    app.playing = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    // Failure 1: the stream never opened (final null, the CF-penalty shape).
+    try app.tick(.{ .play_error = .{ .final = null, .cause = error.NoAnswer } }, &loop, io, registry);
+
+    // The walk armed a play continuation and fired beta's tier-A probe.
+    try testing.expect(!app.playing);
+    try testing.expect(app.fallback != null);
+    try testing.expect(app.fallback.?.play != null);
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+
+    // Land the hop grid: the continuation re-lands episode "1" and relaunches.
+    var done: ?Event = null;
+    while (loop.queue.tryPop() catch null) |ev| {
+        if (done == null and ev == .episodes_done) {
+            done = ev;
+        } else freeTestEvent(app.gpa, ev);
+    }
+    try app.tick(done.?, &loop, io, registry);
+
+    try testing.expectEqual(@as(usize, 0), app.episodes.cursor);
+    try testing.expect(app.playing); // the relaunch committed
+    try testing.expectEqualStrings("beta", app.session.source);
+    try testing.expectEqualStrings("52991", app.session.anime_id);
+    try testing.expect(app.fallback != null); // armed across the relaunch
+
+    // Let the relaunch's worker finish; DROP its play_done unhandled so the
+    // session stays armed, then inject failure 2 as another never-played error
+    // (the shape a second broken provider would post).
+    if (app.play_thread) |t| {
+        t.join();
+        app.play_thread = null;
+    }
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    try app.tick(.{ .play_error = .{ .final = null, .cause = error.NoAnswer } }, &loop, io, registry);
+
+    // Both providers consumed: the walk exhausts instead of ping-ponging back
+    // to alpha (whose fetch never fires), and the dead-end toast lands.
+    try testing.expect(app.fallback == null);
+    try testing.expect(!app.playing);
+    try testing.expect(!alpha.hit.load(.acquire));
+    var saw_error = false;
+    for (app.toast_queue) |slot| {
+        if (slot) |t| {
+            if (t.kind == .@"error") saw_error = true;
+        }
+    }
+    try testing.expect(saw_error);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
