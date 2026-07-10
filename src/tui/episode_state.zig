@@ -39,10 +39,10 @@ pub const EpisodeState = struct {
     for_source: ?[]const u8 = null,
     /// Whether an episode fetch is in flight.
     loading: bool = false,
-    /// The open show is the ROD-329 unbound sentinel: no play provider stocks it, so the
-    /// detail grid renders "no source available" and no fetch fires. Set only by the
-    /// History-record open gate (`fireEpisodesForHistoryRecord`); a real fetch clears it at
-    /// `fireEpisodesForId`'s entry, so `results != null` always implies this is false.
+    /// ROD-329: true when the open show is the unbound sentinel (no play provider stocks
+    /// it), so the grid renders "no source available" with no fetch. Set only by the
+    /// History-open gate and cleared at `fireEpisodesForId` entry, so `results != null`
+    /// always implies this is false.
     unbound: bool = false,
     /// Cursor position within the episode grid (0-based index into `results`).
     cursor: usize = 0,

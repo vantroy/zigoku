@@ -433,9 +433,9 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// title and fuzzy-matching (`resolver.bestProviderMatch`, the STRONG canonical→provider
 /// direction). A confident match yields the provider's opaque id; no match or a failed
 /// search both collapse to `ok = false` (the add path then persists the unbound marker,
-/// ROD-329; Play just toasts). The Add path (`for_play` false)
-/// then probes `episodes` to confirm the match has playable episodes, the same bar tier-A Add
-/// holds; Play skips that probe because its own downstream episode fetch is the confirmation.
+/// ROD-329; Play just toasts). Add (`for_play` false) then probes `episodes` to confirm the
+/// match has playable episodes, the same bar tier-A Add holds; Play skips that probe
+/// because its own downstream episode fetch is the confirmation.
 ///
 /// `canonical` is a gpa-owned deep copy (freed here) so it outlives the caller's return
 /// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into gpa

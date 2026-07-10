@@ -1952,11 +1952,10 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
-                    // Resolver miss: no play provider stocks this canonical (tier-A + tier-C
-                    // both missed). Persist the explicit unbound terminal state (ROD-329) so
-                    // the show enters History as a visible marker with Play disabled, rather
-                    // than a dead-end toast. A null store or a false return (no canonical row)
-                    // falls back to the plain error, never a false success.
+                    // Resolver miss (tier-A + tier-C both missed): persist the unbound
+                    // terminal state (ROD-329) instead of a dead-end toast. A null store or
+                    // a false return (no canonical row) falls back to the plain error, never
+                    // a false success.
                     const st = self.store orelse {
                         self.pushToast(.@"error", "couldn't add to watchlist", false);
                         return;
@@ -2972,9 +2971,8 @@ pub const App = struct {
         // open (History/Discover) never inherits a stale one. A resolving Browse fire
         // re-sets it immediately after this returns (fireEpisodesBrowse).
         self.pending_bind = null;
-        // ROD-329: any real fetch clears the unbound marker, so the invariant holds that a
-        // populated grid is never labelled "no source available" (the History gate re-sets
-        // it only for a sentinel row, which never reaches this fetch).
+        // ROD-329: clears the sentinel flag; a populated grid must never render "no source
+        // available" (the History gate re-sets it, this fetch never runs for a sentinel row).
         self.episodes.unbound = false;
 
         // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
@@ -3207,14 +3205,13 @@ pub const App = struct {
         self.resume_landing_pending = self.episodes.loading;
     }
 
-    /// Open a History/Detail record's episode grid, routing the ROD-329 unbound sentinel to
-    /// the explicit "no source available" terminal instead of a provider fetch. Every
-    /// History-origin open goes through here so the gate lives ONCE. It must key on
-    /// `rec.source` (the `AnimeRecord` carries it; `selection.animeFromHistoryRecord` drops
-    /// it), so it sits before `fireEpisodesForId`'s bare-`source_id` fetch. The unbound
-    /// branch clears the grid rather than merely skipping the fetch: a leftover `results` /
-    /// `for_id` from a previously-viewed show would otherwise let `firePlay` launch THAT
-    /// show while the pane displays this one.
+    /// Every History-origin episode-grid open routes through here (ONE gate) so the
+    /// ROD-329 unbound sentinel renders "no source available" instead of firing a provider
+    /// fetch. Must key on `rec.source`: `fireEpisodesForId` only gets a bare `source_id`,
+    /// and `selection.animeFromHistoryRecord` drops `source` before that point. The unbound
+    /// branch clears the grid rather than skipping the fetch: a leftover `results`/`for_id`
+    /// from a previously-viewed show would let `firePlay` launch THAT show while the pane
+    /// displays this one.
     fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, rec: AnimeRecord) void {
         if (std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)) {
             self.episodes.freeResults(self.gpa);
@@ -4019,13 +4016,12 @@ pub const App = struct {
     /// bare codepoint — Ctrl-C (quit) is matched earlier in onKey, so no clash.
     /// Extracted from onKey verbatim (ROD-218, no behavior change).
     fn onHistoryMutationKey(self: *App, key: vaxis.Key) bool {
-        // ROD-329: freeze only progress-recompute (r) on an unbound row. r rebuilds progress
-        // from the episode_progress rows a sentinel can never have, so it would only zero it.
-        // The status transitions (p/c/w/P) stay live: a user tracking a show they watch
-        // elsewhere can mark it watching/completed here and it syncs (loadDirtyForSync is
-        // source-agnostic). x (drop) and u (undo, keyed on the mutation's own row via
-        // applyUndo → indexById, not the cursor) were never gated. Consumed so r never falls
-        // through to nav.
+        // ROD-329: r (progress recompute) is frozen on an unbound row because it rebuilds
+        // progress from episode_progress rows a sentinel never has, so it would only zero
+        // it. p/c/w/P stay live: a user tracking a show watched elsewhere can still mark it
+        // watching/completed and have it sync (loadDirtyForSync is source-agnostic). u is
+        // NOT gated either: applyUndo keys off the mutation's own row (indexById), not the
+        // cursor, so gating it here would block undoing an unrelated row's edit.
         if (key.matches('r', .{})) {
             const on_unbound = if (self.selectedHistoryRecord()) |rec|
                 std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)

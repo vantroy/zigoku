@@ -63,13 +63,10 @@ const WAL_RETRY_BACKOFF_MS: c_int = 5;
 pub const WATCHED_RATIO = 0.95;
 pub const NATURAL_END_RATIO = 0.80;
 
-/// Reserved pseudo-`source` for a canonical entity that resolved to NO play provider
-/// (ROD-329): a real AniList id, but tier-A + tier-C found nothing stocked. The binding
-/// row keeps the entity visible in History as an explicit terminal marker with Play
-/// disabled, rather than a silent add-time toast. Distinct from the enrichment
-/// "confirmed-unmatched" three-state (canonical_id NULL, see MIGRATION_V14 comment): that
-/// is an id-miss (AniList found no record); this is a provider-miss (id known, nobody
-/// plays it). The gate keys on this exact string, so it is never a real provider name.
+/// Reserved pseudo-`source`: a canonical resolved (real AniList id) but no play provider
+/// stocks it (ROD-329). Distinct from the enrichment "confirmed-unmatched" state
+/// (canonical_id NULL, see MIGRATION_V14 comment), which is an id-miss; this is a
+/// provider-miss. Never a real provider name: the History gate keys on this exact string.
 pub const SOURCE_UNBOUND = "unbound";
 
 const SqliteDb = ?*c.sqlite3;
@@ -918,12 +915,11 @@ pub const Store = struct {
             std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
             return false;
         };
-        // ROD-329: a real provider bind supersedes any prior `unbound` sentinel for this
-        // canonical. The two share `canonical_id`, so a lingering sentinel (NULL
-        // last_watched, lower rowid) would win loadHistory's ROD-313 collapse and mask the
-        // now-playable row indefinitely. Delete it, and inherit its visibility: the sentinel
-        // is always minted visible, so a hidden Play-path bind must reveal here or the show
-        // drops out of History. Skipped when binding the sentinel itself (markUnbound).
+        // ROD-329: a real bind supersedes any prior `unbound` sentinel for this canonical
+        // (shared `canonical_id`). A lingering sentinel (NULL last_watched, lower rowid)
+        // wins loadHistory's ROD-313 collapse and would mask the now-playable row, so
+        // delete it. Inherit its visibility: the sentinel always mints visible, so a hidden
+        // Play-path bind must reveal here or the show drops out of History.
         var effective_visible = visible;
         if (!std.mem.eql(u8, source, SOURCE_UNBOUND) and try self.supersedeUnbound(anilist_id)) {
             effective_visible = true;
@@ -941,10 +937,9 @@ pub const Store = struct {
         return true;
     }
 
-    /// Delete the `unbound` sentinel for `anilist_id` if present, returning whether a row was
-    /// removed (ROD-329). The sentinel is keyed on the PK `(SOURCE_UNBOUND, stringify(id))`
-    /// exactly as `markUnbound` wrote it, so this is a single indexed delete. The sentinel
-    /// owns no episode rows (Play is gated off it), so nothing cascades.
+    /// Delete the `unbound` sentinel for `anilist_id`, if present (ROD-329). A plain row
+    /// delete is safe: the sentinel owns no episode_progress rows (Play is gated off it),
+    /// so nothing cascades.
     fn supersedeUnbound(self: *Store, anilist_id: i64) Error!bool {
         var buf: [24]u8 = undefined;
         const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
@@ -956,22 +951,19 @@ pub const Store = struct {
         return c.sqlite3_changes(self.db) > 0;
     }
 
-    /// Persist the explicit unbound terminal state for a canonical (ROD-329): the add-time
-    /// resolver found no play provider (tier-A + tier-C both missed), so mint a visible
-    /// `SOURCE_UNBOUND` binding keyed on the stringified `anilist_id`. Thin wrapper over
-    /// `bindCanonical` so the sentinel reuses its ON-CONFLICT / MAX-merge / canonical-check
-    /// semantics unchanged; a separate name keeps `bindCanonical`'s "provider stocks the
-    /// show" contract honest and centralizes the stringify convention. Returns false when
-    /// no canonical row exists (persist ran out of order): the caller must not toast success.
+    /// Persist the ROD-329 unbound terminal state: the add-time resolver found no play
+    /// provider, so mint a visible `SOURCE_UNBOUND` binding. A thin wrapper over
+    /// `bindCanonical` (reuses its conflict/merge semantics) rather than a bespoke insert,
+    /// to keep `bindCanonical`'s "provider stocks the show" contract honest. Returns false
+    /// when no canonical row exists yet: the caller must not toast success on that.
     pub fn markUnbound(self: *Store, anilist_id: i64, now: i64, scratch: Allocator) Error!bool {
         var buf: [24]u8 = undefined;
         const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
         return self.bindCanonical(SOURCE_UNBOUND, source_id, anilist_id, true, now, scratch);
     }
 
-    /// The sentinel's PK `source_id` for a canonical: the stringified `anilist_id`, written
-    /// into `buf` (ROD-329). The mint (`markUnbound`) and the delete (`supersedeUnbound`)
-    /// must key the row identically, so this format lives in one place.
+    /// The sentinel's `source_id`, in one place so `markUnbound` and `supersedeUnbound`
+    /// can't key the row differently (ROD-329).
     fn unboundSourceId(buf: []u8, anilist_id: i64) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{d}", .{anilist_id}) catch null;
     }
@@ -3550,9 +3542,8 @@ test "markUnbound persists a visible sentinel keyed on the anilist_id, idempoten
         .mal_id = 52991,
     }, true, 7000, arena);
 
-    // Now the sentinel mints: source=SOURCE_UNBOUND, source_id=stringified anilist_id,
-    // visible, linked to the canonical, and it surfaces as one History card (title
-    // resolved through the canonical join).
+    // Sentinel mints and surfaces as one History card (title resolved through the
+    // canonical join).
     try testing.expect(try s.markUnbound(182255, 1000, arena));
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE source='unbound';"));
     try testing.expectEqual(@as(?i64, 182255), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source='unbound' AND source_id='182255';"));
@@ -3601,12 +3592,10 @@ test "a real provider bind supersedes the unbound sentinel and inherits its visi
     // visibility is inherited; otherwise the show would vanish from History.
     try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 2000, arena));
 
-    // The sentinel is gone, the real binding took its place, and it is still visible.
     try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE source='unbound';"));
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
     try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='senshi';"));
 
-    // loadHistory shows exactly one card, now the real, playable binding.
     const hist = try s.loadHistory(arena);
     try testing.expectEqual(@as(usize, 1), hist.len);
     try testing.expectEqualStrings("senshi", hist[0].source);

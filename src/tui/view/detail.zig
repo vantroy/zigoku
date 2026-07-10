@@ -762,10 +762,9 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
     if (self.episodes.unbound) {
-        // ROD-329: the open show is the unbound sentinel, so no play provider stocks it.
-        // There is no grid to draw and Play is inert. Distinct copy from the zero-episode
-        // empty below (that is "the provider returned nothing"; this is "no provider at
-        // all"), styled the same as the other §4.6 empties so it reads as deliberate.
+        // ROD-329: no grid to draw and Play is inert. Distinct copy from the zero-episode
+        // empty below ("provider returned nothing" vs "no provider at all"), styled per
+        // §4.6 so it reads as deliberate, not a bug.
         if (h > 1) centerText(win, h / 2, w, "no source available", self.s(self.palette.fg3, .{ .italic = true }));
         return;
     }

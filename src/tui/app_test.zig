@@ -3456,9 +3456,8 @@ test "resolve_add_result binds revealed and toasts success on a hit; clears the 
 }
 
 test "resolve_add_result miss with no canonical row falls back to the error toast, writes nothing (ROD-329)" {
-    // The add-resolve miss now mints an unbound marker (markUnbound) ONLY when a canonical
-    // row exists. With none seeded, markUnbound returns false and the handler falls back to
-    // the plain "couldn't add" error: never a false success, never a phantom row.
+    // markUnbound only mints a marker when a canonical row exists; with none seeded it
+    // returns false, so the handler falls back to the plain error, never a phantom row.
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -3504,8 +3503,7 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     try testing.expect(!app.add_resolving);
     try testing.expect(app.history_dirty); // a new marker row → reload so it surfaces this session
     try testing.expectEqual(Toast.Kind.warn, app.toast_queue[0].?.kind);
-    // The sentinel persisted, visible, keyed on the stringified anilist_id and carrying the
-    // real anilist_id (the linchpin that keeps it in sync's push set).
+    // anilist_id is the linchpin that keeps this row in sync's push set.
     const rec = (try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")).?;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
     try testing.expect(rec.history_visible);
@@ -3538,8 +3536,6 @@ test "opening an unbound row clears a prior show's grid so firePlay can't launch
 
     try testTick(&app, keyEv('l', .{}));
 
-    // The gate cleared the stale grid (so firePlay's `results/for_id orelse return` trips)
-    // and flagged the explicit terminal state for the renderer.
     try testing.expect(app.episodes.results == null);
     try testing.expect(app.episodes.for_id == null);
     try testing.expect(app.episodes.unbound);
