@@ -1601,11 +1601,27 @@ pub const Store = struct {
     /// mixing sub and dub rows would give a meaningless combined count. Accepted
     /// limitation (ROD-193): if the session's translation has no rows but another does,
     /// this returns 0. Recompute-only: no `episode_progress` rows are deleted.
+    ///
+    /// ROD-346: rows are the UNION across sibling bindings through `canonical_id`
+    /// (per-episode watched = MAX across siblings), so a freshly-minted fallback
+    /// binding recomputes to the show's true high-water instead of 0, which would
+    /// otherwise push an AniList progress downgrade (the ROD-323 shape). The
+    /// UPDATE still targets only the queried binding. NULL `canonical_id` never
+    /// cross-joins (see getResume).
     pub fn recomputeProgress(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
-        // 1. Fetch all episode_progress rows for this (source, source_id, translation).
+        // 1. Fetch the union of episode_progress rows across sibling bindings.
         const sql_sel =
-            \\SELECT episode, fully_watched FROM episode_progress
-            \\WHERE source = ? AND source_id = ? AND translation = ?
+            \\SELECT ep.episode, MAX(ep.fully_watched)
+            \\FROM episode_progress ep
+            \\WHERE ep.translation = ?3
+            \\  AND ((ep.source = ?1 AND ep.source_id = ?2)
+            \\    OR EXISTS (
+            \\      SELECT 1 FROM anime self_row JOIN anime sib
+            \\        ON sib.canonical_id = self_row.canonical_id
+            \\      WHERE self_row.source = ?1 AND self_row.source_id = ?2
+            \\        AND self_row.canonical_id IS NOT NULL
+            \\        AND sib.source = ep.source AND sib.source_id = ep.source_id))
+            \\GROUP BY ep.episode
         ;
         const stmt = try self.prepare(sql_sel);
         defer _ = c.sqlite3_finalize(stmt);
@@ -1694,6 +1710,12 @@ pub const Store = struct {
     }
 
     /// The saved resume point, or null if this episode was never started.
+    ///
+    /// ROD-346: reads aggregate across sibling bindings through `canonical_id`
+    /// (writes stay per-binding) so watch state follows a show across a provider
+    /// fallback/flip. Freshest sibling row wins; the queried binding wins ties.
+    /// A NULL `canonical_id` must never cross-join (the ROD-313 lesson: SQLite
+    /// would fuse the whole unmatched tail), so the EXISTS arm requires it non-null.
     pub fn getResume(
         self: *Store,
         source: []const u8,
@@ -1702,8 +1724,19 @@ pub const Store = struct {
         episode: []const u8,
     ) Error!?Resume {
         const sql =
-            \\SELECT position_secs, duration_secs, fully_watched FROM episode_progress
-            \\WHERE source = ? AND source_id = ? AND translation = ? AND episode = ?
+            \\SELECT ep.position_secs, ep.duration_secs, ep.fully_watched
+            \\FROM episode_progress ep
+            \\WHERE ep.translation = ?3 AND ep.episode = ?4
+            \\  AND ((ep.source = ?1 AND ep.source_id = ?2)
+            \\    OR EXISTS (
+            \\      SELECT 1 FROM anime self_row JOIN anime sib
+            \\        ON sib.canonical_id = self_row.canonical_id
+            \\      WHERE self_row.source = ?1 AND self_row.source_id = ?2
+            \\        AND self_row.canonical_id IS NOT NULL
+            \\        AND sib.source = ep.source AND sib.source_id = ep.source_id))
+            \\ORDER BY ep.updated_at DESC,
+            \\         (ep.source = ?1 AND ep.source_id = ?2) DESC
+            \\LIMIT 1
         ;
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
@@ -4085,6 +4118,80 @@ test "recomputeProgress: gap-watch documents strategy-A under-count (ROD-193)" {
     const hw = try s.recomputeProgress(arena, T_SOURCE, "x", .sub);
     // Sorted rows: ["3", "5"]. Last fully-watched is index 1 (0-based) → 1-based = 2.
     try testing.expectEqual(@as(i64, 2), hw);
+}
+
+test "getResume reads through canonical_id: a sibling binding's resume follows the show (ROD-346)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // One show, bound on two providers. All watch state lives on the senshi
+    // binding; the anipub binding is a fresh fallback mint (ROD-346).
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (900, 'Frieren');");
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "52991", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 1000, arena);
+    try s.upsertAnime(.{ .source = "anipub", .source_id = "2454", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 1001, arena);
+    try s.saveProgress("senshi", "52991", .sub, "9", 300, 1400, 5000);
+
+    // The fresh binding resumes from the sibling's row.
+    const r = (try s.getResume("anipub", "2454", .sub, "9")).?;
+    try testing.expectEqual(@as(f64, 300), r.position_secs);
+
+    // Freshest sibling wins: a later anipub checkpoint supersedes the senshi row.
+    try s.saveProgress("anipub", "2454", .sub, "9", 700, 1400, 6000);
+    const r2 = (try s.getResume("senshi", "52991", .sub, "9")).?;
+    try testing.expectEqual(@as(f64, 700), r2.position_secs);
+
+    // Translation stays scoped across siblings: no dub row exists anywhere.
+    try testing.expect((try s.getResume("anipub", "2454", .dub, "9")) == null);
+}
+
+test "getResume: NULL canonical_id never cross-joins two unmatched rows (ROD-346)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Two unrelated unmatched-tail rows (canonical_id NULL on both).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A" }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001, arena);
+    try s.saveProgress(T_SOURCE, "a", .sub, "1", 300, 1400, 5000);
+
+    try testing.expect((try s.getResume(T_SOURCE, "b", .sub, "1")) == null);
+}
+
+test "recomputeProgress unions episode rows across sibling bindings (ROD-346)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (900, 'Frieren');");
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "52991", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 1000, arena);
+    try s.upsertAnime(.{ .source = "anipub", .source_id = "2454", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 1001, arena);
+
+    // Eps 1..3 fully watched on senshi; ep 3 also STARTED (not watched) on anipub:
+    // the per-episode MAX must keep it watched, not let the weaker row demote it.
+    try s.saveProgress("senshi", "52991", .sub, "1", 950, 1000, 5001);
+    try s.saveProgress("senshi", "52991", .sub, "2", 950, 1000, 5002);
+    try s.saveProgress("senshi", "52991", .sub, "3", 950, 1000, 5003);
+    try s.saveProgress("anipub", "2454", .sub, "3", 120, 1400, 6000);
+
+    // The fresh anipub binding recomputes to the show's true high-water, not 0
+    // (a 0 here is the ROD-323 AniList-downgrade shape).
+    const hw = try s.recomputeProgress(arena, "anipub", "2454", .sub);
+    try testing.expectEqual(@as(i64, 3), hw);
+    try testing.expectEqual(@as(i64, 3), (try s.getAnime(arena, "anipub", "2454")).?.progress);
+
+    // The UPDATE targets only the queried binding; the sibling row is untouched.
+    try testing.expectEqual(@as(i64, 0), (try s.getAnime(arena, "senshi", "52991")).?.progress);
+
+    // Dub rows on a sibling never leak into a sub recompute.
+    try s.saveProgress("anipub", "2454", .dub, "4", 950, 1000, 7000);
+    try testing.expectEqual(@as(i64, 3), try s.recomputeProgress(arena, "senshi", "52991", .sub));
 }
 
 test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor clobbers (ROD-267 review)" {
