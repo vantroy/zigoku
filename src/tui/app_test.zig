@@ -5852,6 +5852,118 @@ test "ROD-343: a history row fetches episodes on its owning provider, not the de
     app.episodes.freeResults(app.gpa);
 }
 
+test "ROD-343: browse open dispatches the fetch to the provider the verdict bound" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // Canonical stamped fresh so opening it can't fire a refresh-on-view enrich
+    // worker; the binding lives on the SECOND provider.
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 120; // two-pane: l drills into the detail pane and fires the fetch
+    try app.search.results.ensureTotalCapacity(app.gpa, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try app.gpa.dupe(u8, "154587"),
+        .name = try app.gpa.dupe(u8, "Frieren"),
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    });
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('l', .{}), &loop, io, registry);
+
+    // The wiring under test (review H1): the verdict resolved .bound on beta, so the
+    // spawned fetch must run on beta. A registry-primary regression would hit alpha.
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    for (app.search.results.items) |r| freeOwnedAnime(app.gpa, r);
+    app.search.results.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-343: browse P-add reveals the binding under the provider that owns it" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 120;
+    try app.search.results.ensureTotalCapacity(app.gpa, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try app.gpa.dupe(u8, "154587"),
+        .name = try app.gpa.dupe(u8, "Frieren"),
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    });
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('P', .{}), &loop, io, registry);
+
+    // The reveal must persist under the owning provider (beta), and the row must
+    // now surface in History. A registry-primary regression would re-key it alpha.
+    const recs = try st.loadHistory(arena);
+    var found = false;
+    for (recs) |rec| {
+        if (std.mem.eql(u8, rec.source_id, "99999")) {
+            try testing.expectEqualStrings("beta", rec.source);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+    try testing.expect(app.history_dirty);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    for (app.search.results.items) |r| freeOwnedAnime(app.gpa, r);
+    app.search.results.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+}
+
 test "ROD-343: a history row from an unregistered source falls back to the default provider" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta" };
