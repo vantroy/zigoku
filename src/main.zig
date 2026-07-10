@@ -430,11 +430,8 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
     }
 
     // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.
-    // Registry threading into tui.run itself is the next ROD-343 step; until
-    // then the TUI runs on the registry default, byte-identical to before.
     var live = LiveProviders.init();
-    const provider = live.registry().primary();
-    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg, cfg_path);
+    try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, live.registry(), cfg, cfg_path);
 }
 
 /// The whole vertical slice, top to bottom. `store` is optional — every

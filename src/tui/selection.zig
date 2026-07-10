@@ -23,7 +23,7 @@ const app_mod = @import("app.zig");
 const Allocator = std.mem.Allocator;
 const Anime = domain.Anime;
 const AnimeRecord = store_mod.AnimeRecord;
-const SourceProvider = source_mod.SourceProvider;
+const Registry = source_mod.Registry;
 const Loop = event_mod.Loop;
 const App = app_mod.App;
 
@@ -281,13 +281,13 @@ pub fn coverTracksCursor(self: *const App) bool {
 /// subsystem (CoverState never reaches into selection state itself — ROD-160).
 /// Called immediately for discrete nav (pane/view switch) and from the .tick
 /// settle for cursor-tracked scrolling (ROD-202).
-pub fn syncCover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+pub fn syncCover(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
     const anime = detailSyncTarget(self);
     const started = self.cover.sync(
         self.gpa,
         loop,
         io,
-        provider,
+        registry.primary(),
         &self.cover_caches,
         self.now_ms,
         if (anime) |a| a.id else null,
@@ -482,11 +482,11 @@ fn formatStudios(buf: []u8, studios: []const []const u8) []const u8 {
     };
 }
 
-pub fn currentDetailSourceName(self: *const App, provider: SourceProvider) []const u8 {
+pub fn currentDetailSourceName(self: *const App, registry: Registry) []const u8 {
     if (historyDetailActive(self)) {
         if (self.selectedHistoryRecord()) |rec| return rec.source;
     }
-    return provider.name();
+    return registry.primary().name();
 }
 
 /// Resolve the history record whose cursor should seed the episode grid, or

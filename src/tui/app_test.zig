@@ -89,6 +89,12 @@ fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
 }
 
+const dummy_slots = [_]SourceProvider{.{ .ptr = undefined, .vtable = &dummy_vtable }};
+
+fn dummyRegistry() source_mod.Registry {
+    return .{ .providers = &dummy_slots };
+}
+
 /// A provider whose `episodes` fetch parks until the test releases it — a
 /// deterministic stand-in for a slow in-flight network fetch (ROD-179). Per
 /// instance state rides on the vtable's `*anyopaque` self.
@@ -154,7 +160,7 @@ fn testTick(app: *App, event: Event) !void {
     // tty and vaxis are never accessed by postEvent, so undefined is safe there.
     const io = std.testing.io;
     var loop = initTestLoop();
-    try app.tick(event, &loop, io, dummyProvider());
+    try app.tick(event, &loop, io, dummyRegistry());
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
@@ -925,16 +931,16 @@ test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping alrea
     // already marked loading so a wave never re-selects one. This proves the
     // per-frame half of the bound; the cap-minus-in-flight half (`busy` > 0) is
     // proved separately below, since `busy` stays 0 here (no worker decrements it).
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 3), countLoadingCovers(&app)); // wave 1
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 6), countLoadingCovers(&app)); // wave 2
     // Only 2 cards remain — the cap is an upper bound, not a quota.
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
     // Everything is now in flight → a further pump marks nothing new (never exceeds
     // the visible set regardless of how many pumps fire — fast scroll can't pile up).
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
 }
 
@@ -968,12 +974,12 @@ test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
     // tally). With cap 3 the pump may start only ONE more — `budget = cap - busy` —
     // which is the actual guard behind "never more than N downloads at once".
     app.discover_cover_drain.inflight.store(2, .release);
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Already at the cap → the pump starts nothing new this frame.
     app.discover_cover_drain.inflight.store(3, .release);
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Required before any drain(): no real workers exist to decrement the simulated
@@ -3941,7 +3947,7 @@ test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-2
     }
 
     var loop = initTestLoop();
-    app.pumpDiscoverCovers(&loop, std.testing.io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, std.testing.io, dummyRegistry());
 
     // Every visible card's slot is now in-flight, marked from the borrowed thumb.
     for (thumbs) |t| {
@@ -5659,7 +5665,8 @@ test "ROD-238: drainTtyResponses sweeps buffered bytes and leaves the fd non-blo
 
 test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     var gate: GateProvider = .{};
-    const provider = gate.provider();
+    const gate_slots = [_]SourceProvider{gate.provider()};
+    const registry: source_mod.Registry = .{ .providers = &gate_slots };
 
     var app: App = .{};
     app.gpa = std.testing.allocator;
@@ -5675,7 +5682,7 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     app.active_view = .history;
     app.active_pane = .list;
     app.list_cursor = 0;
-    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
     try testing.expectEqual(@as(usize, 1), app.episode_drain.inflight.load(.acquire));
     try testing.expect(app.episodes.loading);
     try testing.expectEqualStrings("a", app.episodes.for_id.?);
@@ -5687,7 +5694,7 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     app.active_view = .history;
     app.active_pane = .list;
     app.list_cursor = 1;
-    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
     try testing.expectEqual(@as(usize, 2), app.episode_drain.inflight.load(.acquire));
     try testing.expectEqualStrings("b", app.episodes.for_id.?);
 
