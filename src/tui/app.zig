@@ -2997,7 +2997,7 @@ pub const App = struct {
         self.pending_bind = bind;
     }
 
-    /// Fire the tier-C Play resolve worker (ROD-328): title-search the play provider for a
+    /// Fire the tier-C Play resolve worker (ROD-328): title-search the registry (in order) for a
     /// Browse hit that could not tier-A (`canonicalKey` returned null). On a confident match
     /// `.resolve_play_target` arms `pending_bind` and fires the episode fetch; a miss toasts.
     /// gpa owns a deep copy of the canonical (the worker frees it). Bounded to one in-flight
@@ -3759,7 +3759,7 @@ pub const App = struct {
         self.pushToast(.success, "added to watchlist", false);
     }
 
-    /// Fire the tier-C Add resolve worker (ROD-328): title-search the play provider for a
+    /// Fire the tier-C Add resolve worker (ROD-328): title-search the registry (in order) for a
     /// Browse-P hit that could not tier-A. On a confident match `.resolve_add_result` mints
     /// the binding revealed; a miss toasts. Mirrors `fireResolvePlaySearch` but binds
     /// visible (Add) rather than firing an episode fetch, and shares the Add path's
