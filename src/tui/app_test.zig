@@ -6247,6 +6247,8 @@ test "ROD-346: a landed fallback grid mints under the hop provider and clears th
         .mal_id = 52991,
     }, true, 5000, arena);
     try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // Real watch state on the failing binding: the mint must inherit it.
+    try st.saveProgress("alpha", "a1", .sub, "1", 950, 1000, 5001);
 
     var app: App = .{};
     app.gpa = std.testing.allocator;
@@ -6274,6 +6276,10 @@ test "ROD-346: a landed fallback grid mints under the hop provider and clears th
     try testing.expect(app.pending_bind == null);
     const rec = (try st.getAnime(arena, "beta", "52991")).?;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
+    // Mint-time recompute through the canonical union: the fresh binding and the
+    // in-memory grid both carry alpha's high-water, not 0 (ROD-346 watch-state join).
+    try testing.expectEqual(@as(i64, 1), rec.progress);
+    try testing.expectEqual(@as(u32, 1), app.episodes.progress);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }

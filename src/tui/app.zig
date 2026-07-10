@@ -2246,6 +2246,18 @@ pub const App = struct {
                             // A false bind leaves this show unbindable: the grid still renders
                             // from the event payload, but a later recordPlay would FK-fail.
                             if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
+                            // ROD-346: a fresh mint starts at progress 0, but its siblings may
+                            // hold real watch state; recompute through the canonical union so
+                            // the grid dims (and the History/sync number reads) correctly
+                            // before the first play on this binding. The seed pass above ran
+                            // pre-mint and saw no row, so patch the in-memory grid too.
+                            if (bound) {
+                                const hw = st.recomputeProgress(arena.allocator(), source, ev.for_id, self.translation) catch |e| blk: {
+                                    log.debug("mint-time recompute failed: {s}", .{@errorName(e)});
+                                    break :blk 0;
+                                };
+                                if (hw > 0) self.syncEpisodeProgress(source, ev.for_id, hw);
+                            }
                         } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
                     }
                 }
