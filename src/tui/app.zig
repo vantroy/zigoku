@@ -714,10 +714,6 @@ pub const App = struct {
     active_view: enum { browse, history, detail, settings, discover } = .history,
     /// Which top-level view opened the standalone detail screen.
     detail_origin: enum { browse, history, discover } = .browse,
-    /// Inert since ROD-336: Discover is AniList-backed, so every provider has it and
-    /// nothing sets this false anymore (`run()` used to cache `supportsDiscover()`).
-    /// The field, its D/F3 gate, and the chrome dimming go with the vtable (ROD-337).
-    discover_supported: bool = true,
 
     /// Which pane has keyboard focus within the current view.
     /// Meaningful in both Browse and History (two-pane at `w >= pane_split_min`,
@@ -3251,14 +3247,6 @@ pub const App = struct {
         if (key.matches(vaxis.Key.f3, .{}) or
             (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
         {
-            // Unreachable since ROD-336 (see discover_supported's doc): Discover is
-            // AniList-backed, no provider gate. Removed with the vtable (ROD-337).
-            if (!self.discover_supported) {
-                var buf: [80]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "No Discover feed on {s} yet", .{provider.displayName()}) catch "No Discover feed yet";
-                self.pushToast(.info, msg, false);
-                return;
-            }
             if (self.active_view != .discover) {
                 if (self.active_view == .settings) self.leaveSettings(io);
                 self.active_view = .discover;

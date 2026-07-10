@@ -294,7 +294,7 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     try ids_buf.append(arena, ']');
 
     // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50: the
-    // caller feeds at most one feed page (popular_page_size = 30), so ids.len ≤ 50 holds. If
+    // caller (provider_migrate's v13 backfill) chunks ids at 50, so ids.len ≤ 50 holds. If
     // the page size is ever raised past 50, AniList 400s the query, postGql returns null,
     // error.NoAnswer, and the page degrades to `[--]` un-stamped. Chunk the ids first.
     //
