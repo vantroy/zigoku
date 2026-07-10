@@ -14,8 +14,6 @@
 //!   * cover art       → /posters/{mal_id}.webp
 //!
 //! Every site-specific fact is quarantined here behind the `source.SourceProvider` vtable.
-//! Discover is OFF: senshi has no time-windowed popularity feed (its /anime/trending is a
-//! ~7-item hot list), so `supportsDiscover()` is false and `popular()` is an inert stub.
 //! Lifting the m3u8/quality machinery out of allanime.zig into a shared module is ROD-302.
 
 const std = @import("std");
@@ -61,10 +59,8 @@ pub const Senshi = struct {
     const vtable: source.SourceProvider.VTable = .{
         .name = nameErased,
         .displayName = displayNameErased,
-        .supportsDiscover = supportsDiscoverErased,
         .search = searchErased,
         .canonicalKey = canonicalKeyErased,
-        .popular = popularErased,
         .episodes = episodesErased,
         .resolve = resolveErased,
         .coverRequest = coverRequestErased,
@@ -79,19 +75,9 @@ pub const Senshi = struct {
         _ = ptr;
         return display_name;
     }
-    fn supportsDiscoverErased(ptr: *anyopaque) bool {
-        _ = ptr;
-        // senshi has no time-windowed popularity feed — Discover stays hidden for it
-        // until a per-provider Discover is built (see the file header + popular()).
-        return false;
-    }
     fn searchErased(ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) anyerror![]domain.Anime {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
         return self.search(arena, io, query, opts);
-    }
-    fn popularErased(ptr: *anyopaque, arena: Allocator, io: Io, opts: source.PopularOptions) anyerror![]domain.Anime {
-        const self: *Senshi = @ptrCast(@alignCast(ptr));
-        return self.popular(arena, io, opts);
     }
     fn canonicalKeyErased(ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
         _ = ptr;
@@ -151,19 +137,12 @@ pub const Senshi = struct {
         ani_year: ?u32 = null,
         genres: ?[]const u8 = null, // "Action, Comedy"
         studios: ?[]const u8 = null, // "Lerche, …"
-        // Windowed view counts. Not consumed today — Discover is off for senshi —
-        // but retained (with mapAnime's `view_count` param) for the per-provider
-        // Discover feed that will surface them as the card's ranking metric (ROD-302).
-        views_day: ?u64 = null,
-        views_week: ?u64 = null,
-        views_month: ?u64 = null,
     };
     const FilterResp = struct { data: []SAnime = &.{} };
 
     /// Map one raw senshi anime object to a `domain.Anime`. String fields borrow
-    /// the parsed-JSON slices (caller owns the arena lifetime). `view_count` is the
-    /// windowed count the feed passes in (null for search, where rank isn't views).
-    fn mapAnime(arena: Allocator, s: SAnime, view_count: ?u64) !domain.Anime {
+    /// the parsed-JSON slices (caller owns the arena lifetime).
+    fn mapAnime(arena: Allocator, s: SAnime) !domain.Anime {
         // 0–10 → AniList's 0–100 axis, so a senshi score and an AniList-enriched
         // score read on the same scale. Guard finiteness (@intFromFloat is UB on
         // NaN/Inf) and clamp a corrupt over-range value.
@@ -202,7 +181,6 @@ pub const Senshi = struct {
             .description = s.ani_description,
             .genres = try splitCsv(arena, s.genres),
             .studios = try splitCsv(arena, s.studios),
-            .view_count = view_count,
         };
     }
 
@@ -224,25 +202,9 @@ pub const Senshi = struct {
         const parsed = try std.json.parseFromSlice(FilterResp, arena, raw, .{ .ignore_unknown_fields = true });
 
         var list: std.ArrayList(domain.Anime) = .empty;
-        for (parsed.value.data) |s| try list.append(arena, try mapAnime(arena, s, null));
+        for (parsed.value.data) |s| try list.append(arena, try mapAnime(arena, s));
         if (list.items.len > opts.limit) list.shrinkRetainingCapacity(opts.limit);
         return list.items;
-    }
-
-    // ── popular ──────────────────────────────────────────────────────────────────
-
-    /// Inert: senshi exposes no time-windowed popularity feed to back a Discover
-    /// grid. `supportsDiscover()` returns false, so the app never opens the Discover
-    /// view for senshi and this is never called — it returns empty rather than error
-    /// as a belt-and-suspenders no-op. (An earlier cut rode `/anime/filter` sorted by
-    /// score, but that made all four window tabs render the identical grid — flagged
-    /// in review, ROD-301; reverted pending a per-provider Discover.)
-    pub fn popular(self: *Senshi, arena: Allocator, io: Io, opts: source.PopularOptions) ![]domain.Anime {
-        _ = self;
-        _ = arena;
-        _ = io;
-        _ = opts;
-        return &.{};
     }
 
     // ── episodes ──────────────────────────────────────────────────────────────
@@ -583,9 +545,8 @@ test "mapAnime maps a filter row into a domain.Anime (ROD-301)" {
         .ani_year = 2026,
         .genres = "Drama, Suspense",
         .studios = "Lerche",
-        .views_week = 1496,
     };
-    const m = try Senshi.mapAnime(a, row, row.views_week);
+    const m = try Senshi.mapAnime(a, row);
 
     try testing.expectEqualStrings("59708", m.id); // MAL id, stringified → show handle
     try testing.expectEqual(@as(?u64, 59708), m.mal_id); // free AniSkip key
@@ -600,7 +561,6 @@ test "mapAnime maps a filter row into a domain.Anime (ROD-301)" {
     try testing.expectEqual(@as(usize, 2), m.genres.len);
     try testing.expectEqualStrings("Drama", m.genres[0]);
     try testing.expectEqualStrings("Suspense", m.genres[1]);
-    try testing.expectEqual(@as(?u64, 1496), m.view_count);
 }
 
 test "mapStatus folds senshi wording onto the canonical airing vocab (ROD-296)" {

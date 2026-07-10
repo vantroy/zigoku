@@ -204,7 +204,6 @@ pub fn dupeOwnedAnime(alloc: Allocator, a: Anime) !Anime {
         .rank_year = a.rank_year,
         .next_airing_at = a.next_airing_at,
         .next_airing_episode = a.next_airing_episode,
-        .view_count = a.view_count, // scalar, no heap — must survive the dupe (ROD-239)
     };
     errdefer freeOwnedAnime(alloc, out);
 

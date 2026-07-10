@@ -71,24 +71,15 @@ fn dummyDisplayNameFn(_: *anyopaque) []const u8 {
     return "TestSrc";
 }
 
-fn dummyPopularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
-    return &.{};
-}
-
 fn dummyCoverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
     return .{ .url = try gpa.dupe(u8, ref) };
-}
-fn dummySupportsDiscoverFn(_: *anyopaque) bool {
-    return true;
 }
 
 const dummy_vtable: SourceProvider.VTable = .{
     .name = dummyNameFn,
     .displayName = dummyDisplayNameFn,
-    .supportsDiscover = dummySupportsDiscoverFn,
     .search = dummySearchFn,
     .canonicalKey = dummyCanonicalKeyFn,
-    .popular = dummyPopularFn,
     .episodes = dummyEpisodesFn,
     .resolve = dummyResolveFn,
     .coverRequest = dummyCoverRequestFn,
@@ -118,18 +109,12 @@ const GateProvider = struct {
     fn displayNameFn(_: *anyopaque) []const u8 {
         return "TestSrc";
     }
-    fn supportsDiscoverFn(_: *anyopaque) bool {
-        return true;
-    }
     fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         return &.{};
     }
     fn canonicalKeyFn(_: *anyopaque, arena: Allocator, canonical: Anime) anyerror!?[]const u8 {
         const mal = canonical.mal_id orelse return null;
         return try std.fmt.allocPrint(arena, "{d}", .{mal});
-    }
-    fn popularFn(_: *anyopaque, _: Allocator, _: std.Io, _: source_mod.PopularOptions) anyerror![]Anime {
-        return &.{};
     }
     fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
         return .{ .url = "" };
@@ -141,10 +126,8 @@ const GateProvider = struct {
     const vtable: SourceProvider.VTable = .{
         .name = nameFn,
         .displayName = displayNameFn,
-        .supportsDiscover = supportsDiscoverFn,
         .search = searchFn,
         .canonicalKey = canonicalKeyFn,
-        .popular = popularFn,
         .episodes = episodesFn,
         .resolve = resolveFn,
         .coverRequest = coverRequestFn,
@@ -310,22 +293,6 @@ test "quit keys: q from browse and Ctrl-C" {
     try testing.expect(!app.should_quit);
     try testTick(&app, keyEv('c', .{ .ctrl = true }));
     try testing.expect(app.should_quit);
-}
-
-test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
-    // Manually simulates the pre-ROD-336 provider gate: nothing sets this field at
-    // runtime anymore (Discover is AniList-backed), but the guard path stays until
-    // ROD-337 deletes it with the vtable, so pin its behavior until then.
-    var app: App = .{};
-    app.input_mode = .normal;
-    app.discover_supported = false;
-    app.active_view = .history;
-    try testTick(&app, keyEv('D', .{}));
-    try testing.expect(app.active_view == .history);
-
-    app.active_view = .browse;
-    try testTick(&app, keyEv(vaxis.Key.f3, .{}));
-    try testing.expect(app.active_view == .browse);
 }
 
 test "scope-tagged count fits cnt_scratch (ROD-211)" {

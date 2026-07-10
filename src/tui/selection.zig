@@ -34,7 +34,7 @@ pub fn selectedAnime(self: *const App) ?Anime {
 
 /// The Discover card under the grid cursor (ROD-239) — the show a zoom opened
 /// from Discover (`detail_origin == .discover`) is committed to. Reads the
-/// active window's slot, so it carries that window's `view_count`.
+/// active axis's slot.
 pub fn selectedDiscoverAnime(self: *const App) ?Anime {
     const items = self.discover.activeSlot().results.items;
     if (self.discover.cursor >= items.len) return null;
@@ -62,11 +62,10 @@ pub fn cellPx(self: *const App) [2]u16 {
 pub fn topBarSeasonChip(self: *App) []const u8 {
     switch (self.active_view) {
         .settings => return "",
-        // The Discover GRID chip reads the selected card's season once it's
-        // batch-enriched (ROD-247): the popular feed nulls season/airedStart, so
-        // a freshly-loaded card shows no chip until the page batch lands, then
-        // the kanji+year appears. An unenriched / no-id card stays season-null →
-        // "" (never a misleading cour fallback here, matching the zoom arm).
+        // The Discover GRID chip reads the selected card's season: AniList feed
+        // rows arrive fully enriched (ROD-336), so it's present whenever AniList
+        // knows it. A season-null card shows no chip, "" (never a misleading
+        // cour fallback here, matching the zoom arm).
         .discover => {
             const a = selectedDiscoverAnime(self) orelse return "";
             if (a.season != null and a.year != null)

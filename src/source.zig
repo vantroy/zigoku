@@ -31,24 +31,6 @@ pub const SearchOptions = struct {
     page: u32 = 1,
 };
 
-/// How many entries one Popular-feed page fetches (and the Discover grid appends
-/// per load-more). The grid's load-more trigger keys off
-/// `results.len % popular_page_size == 0`, so this MUST equal the count a full
-/// page returns. Distinct from `search_page_size` (ROD-239): the feed paginates
-/// the site's ranked popular list, not a relevance search.
-pub const popular_page_size: usize = 30;
-
-/// Which popularity window the Popular feed ranks over. Provider-agnostic — a
-/// source maps each to whatever its own API speaks (AllAnime → a `dateRange` in
-/// days, all-time = 0); the encoding stays quarantined in the provider.
-pub const PopularWindow = enum { daily, weekly, monthly, all_time };
-
-pub const PopularOptions = struct {
-    window: PopularWindow = .daily,
-    /// Page number for pagination (1-indexed).
-    page: u32 = 1,
-};
-
 /// A resolved, fetchable cover request (ROD-267). A provider turns a stored cover ref (which
 /// may be a provider-relative `mcovers/…` path with no host) into an absolute URL plus
 /// whatever headers its cover CDN gates on. `url` is owned by the allocator passed to
@@ -74,12 +56,6 @@ pub const SourceProvider = struct {
         /// looks best to a user. THE seam for the site name above the vtable — no
         /// copy upstream of here hardcodes it, since the source is swappable.
         displayName: *const fn (ptr: *anyopaque) []const u8,
-        /// Whether this source offers a Discover feed — a windowed, paginated
-        /// popularity ranking via `popular()`. A source with no such feed (senshi:
-        /// its trending endpoint is a ~7-item hot list, not a windowed grid) returns
-        /// false, and the app hides the Discover view for it until a per-provider
-        /// Discover is built. AllAnime's `queryPopular` feed is the reference → true.
-        supportsDiscover: *const fn (ptr: *anyopaque) bool,
         /// Search this provider's OWN catalog; return shows ranked best-match-first.
         /// ROD-328: this is the resolver's per-provider CATALOG primitive: the tier-C
         /// binding path (fuzzy-match a known canonical title against the provider's own
@@ -96,10 +72,6 @@ pub const SourceProvider = struct {
         /// resolver falls to tier-C `search`), NOT "not stocked". The returned string is
         /// owned by `arena`.
         canonicalKey: *const fn (ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8,
-        /// Fetch one page of the source's popularity-ranked feed for `opts.window`,
-        /// in the server's rank order (NOT re-sorted — rank == array position).
-        /// A distinct persisted query from `search` (ROD-239).
-        popular: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, opts: PopularOptions) anyerror![]domain.Anime,
         /// List a show's episode numbers in the given track, numerically sorted.
         episodes: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber,
         /// Resolve a playable stream for one episode at the requested quality.
@@ -120,17 +92,11 @@ pub const SourceProvider = struct {
     pub fn displayName(self: SourceProvider) []const u8 {
         return self.vtable.displayName(self.ptr);
     }
-    pub fn supportsDiscover(self: SourceProvider) bool {
-        return self.vtable.supportsDiscover(self.ptr);
-    }
     pub fn search(self: SourceProvider, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime {
         return self.vtable.search(self.ptr, arena, io, query, opts);
     }
     pub fn canonicalKey(self: SourceProvider, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
         return self.vtable.canonicalKey(self.ptr, arena, canonical);
-    }
-    pub fn popular(self: SourceProvider, arena: Allocator, io: Io, opts: PopularOptions) anyerror![]domain.Anime {
-        return self.vtable.popular(self.ptr, arena, io, opts);
     }
     pub fn episodes(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
         return self.vtable.episodes(self.ptr, arena, io, show_id, tt);
