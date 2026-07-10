@@ -365,7 +365,7 @@ Single row. Full terminal width. Content:
 - App name: `text.primary` + bold. Always visible, never interactive.
 - `░` separator: `border.hair`.
 - View tab strip (ROD-250): a persistent four-tab strip naming every view, with the
-  active one highlighted — the same passive idiom as the §3.8 window bar. Each tab
+  active one highlighted — the same passive idiom as the §3.8 axis bar. Each tab
   brackets its view-switch key letter (`[B]rowse · [H]istory · [D]iscover ·
   [S]ettings`), so the strip both shows *where you are* and teaches the keys. It is
   **passive**: no tab focus model, no `j`/`k` into it — the bracketed letters fire
@@ -471,7 +471,7 @@ one scrollable card grid.
 ┌────────────────── TERMINAL WIDTH ──────────────────┐
 │  TOP BAR               (1 row, §3.4)               │
 │  spacer                (1 row)                      │
-│  WINDOW BAR            (1 row)                      │
+│  AXIS BAR              (1 row)                      │
 │  spacer                (1 row)                      │
 │  CARD GRID             (all remaining rows, scroll) │
 │  BOTTOM BAR            (1 row, §3.5)               │
@@ -491,8 +491,8 @@ breakpoints:
 
 `w − 2` removes the 2-cell left margin (§3.7). Each card occupies one slot
 (`slot_w × slot_h`). `slot_h = cover_h + 4`: three meta rows (rank+badge+score,
-title, view-count+genre-glyphs) plus one gap row. Rows visible per frame =
-`(content_h − 2) / slot_h`, where `content_h − 2` removes the window bar row and
+title, format+genre-glyphs) plus one gap row. Rows visible per frame =
+`(content_h − 2) / slot_h`, where `content_h − 2` removes the axis bar row and
 its spacer from the content height.
 
 **Adaptive cover height (ROD-247).** `cover_h` is derived from the terminal's
@@ -504,26 +504,39 @@ to the pre-fill fixed values — 7 for the large tier, 5 for the small — which
 always the minimum (the adaptive height never shrinks below them). The trade: taller
 covers mean fewer card-rows above the fold, offset by fuller poster art.
 
-**Window-toggle bar.** One row at y = 2 (after top bar + spacer), left margin 2 cells.
-Content: `[1] Daily · [2] Weekly · [3] Monthly · [4] All-Time`. Each window is
-prefixed with its `1`–`4` direct-select key (ROD-248) so the bar teaches its own
-bindings in place.
+**Axis bar.** One row at y = 2 (after top bar + spacer), left margin 2 cells.
+Content: `[1] Trending · [2] Popular · [3] Top Rated · [4] This Season`. Each axis
+is prefixed with its `1`–`4` direct-select key (ROD-248, carried forward unchanged)
+so the bar teaches its own bindings in place. Cut over from AllAnime's four
+time-windows of one metric (view count) to AniList's four independent ranking axes
+(ROD-325):
+
+| Axis | AniList sort | Notes |
+|---|---|---|
+| Trending | `TRENDING_DESC` | Default axis. AniList's own hot-right-now signal — the closest successor to the old `Daily` window. |
+| Popular | `POPULARITY_DESC` | All-time member-list count. Successor to `All-Time`. |
+| Top Rated | `SCORE_DESC` | New axis — AllAnime had no score field to sort by; AniList does. |
+| This Season | `POPULARITY_DESC` + `season`/`seasonYear` filter (current cour) | New axis — a season-scoped view the old feed couldn't offer (AllAnime's popularity feed was global-only). |
 
 | State | Token | Modifier |
 |---|---|---|
-| Active window label | `state.focus` | bold |
-| Inactive window labels | `text.muted` | — |
-| Active window `[N]` key | `state.focus` | — (lifts with the label so the entry reads as a unit) |
-| Inactive window `[N]` keys | `text.muted` | — (legible — it's the binding being taught; `text.dim` buries it) |
+| Active axis label | `state.focus` | bold |
+| Inactive axis labels | `text.muted` | — |
+| Active axis `[N]` key | `state.focus` | — (lifts with the label so the entry reads as a unit) |
+| Inactive axis `[N]` keys | `text.muted` | — (legible — it's the binding being taught; `text.dim` buries it) |
 | Separator `·` dots | `text.dim` | — |
 
-The bar is **passive** — there is no "window bar focus." The `[`/`]` cycle keys and
-`1`–`4` direct-select keys drive the active window regardless of the grid cursor
+The bar is **passive** — there is no "axis bar focus." The `[`/`]` cycle keys and
+`1`–`4` direct-select keys drive the active axis regardless of the grid cursor
 position; the inline `[N]` annotations make those direct-select keys discoverable
-without a focus model (ROD-248 — the j/k-into-the-bar idea was considered and
-dropped: it would collide with the card-grid `j`/`k`). A window change clears
-results, shows the loading state, refetches with the appropriate `dateRange` value
-(§9.6), and resets cursor and scroll.
+without a focus model (ROD-248 — unchanged rationale). An axis change clears
+results, shows the loading state, refetches per the axis→query mapping (§9.6), and
+resets cursor and scroll.
+
+`This Season` suppresses the card-level `NEW` badge (item 3 below): every card on
+that axis is already this-cour by construction, so the badge would fire on every
+card and stop meaning anything. `TOP` (rank #1) is unaffected — it tracks position,
+not recency, and stays meaningful on every axis.
 
 **Card anatomy.** Each card occupies one slot, rendered top-to-bottom:
 
@@ -548,20 +561,25 @@ results, shows the loading state, refetches with the appropriate `dateRange` val
    Tier colour per §2.2 with one exception: the 91+ tier is capped at `text.primary`
    on cards — `state.now` is reserved for the `TOP` rank pointer (§0
    one-magenta-at-a-time), so a top-scored #1 card does not double-paint both `TOP`
-   and the badge in hot+bold. `[--]` in `text.dim` for unenriched or null scores.
+   and the badge in hot+bold. `[--]` in `text.dim` for null scores.
 4. **Title row (row 1).** The resolved primary title (`title_language`, §9.1a) in
    `text.primary` (unselected) or `state.focus` + bold (selected). Clipped to
    `cover_w` columns with `…` (§2.1).
-5. **View count + genre row (row 2).** Windowed view count in `text.muted`,
-   left-anchored. Format: `1.4m` / `660.17k` / `892`. Absent/null: `—` in `text.dim`.
-   The count is the windowed metric (`rangeViews`); the All-Time window uses the
-   lifetime total. Up to two **genre glyphs** are right-anchored at the cover edge on
-   the same row, in `text.dim`, single-space separated — ambient glyph texture rather
-   than a label; the full genre list lives in the zoom detail pane. Monochrome BMP
-   symbols (not emoji) so they render deterministically over tmux/Kitty/SSH. The
-   single space is what keeps the pair legible; `text.dim` keeps them as texture (a
-   brighter tier made them compete with the view-count). Absent for unenriched or
-   genre-unmapped cards. Vocabulary: §3.8a.
+5. **Format + genre row (row 2, ROD-325).** `format` in `text.muted`, left-anchored:
+   `TV`, `Movie`, `OVA`, `ONA`, `Spec`, `Music` (abbreviated to fit the 14-col small
+   tier). Episode count follows as `· Nep` when `episodes` is non-null and the
+   format isn't `Movie` (a movie's episode count of 1 is redundant with the format
+   label): `TV · 24ep`. An airing show with an unannounced total renders `TV · ??ep`
+   rather than guessing. `format` itself null or unmapped: `—` in `text.dim` (whole
+   field absent, not a partial render). This replaces the old windowed view count
+   (§9.6) — AniList has no per-show view-count equivalent, and format/episode count
+   is genuinely new discovery information the card never carried before (format was
+   previously detail-pane-only). Up to two **genre glyphs** are right-anchored at
+   the cover edge on the same row, in `text.dim`, single-space separated — ambient
+   glyph texture rather than a label; the full genre list lives in the zoom detail
+   pane. Monochrome BMP symbols (not emoji) so they render deterministically over
+   tmux/Kitty/SSH. The single space is what keeps the pair legible; `text.dim` keeps
+   them as texture. Absent for genre-unmapped cards. Vocabulary: §3.8a.
 6. **Gap row (row 3).** Empty — gives the grid visual breathing room between card rows.
 7. **Peek row (when space allows).** After the last full card row, any leftover
    vertical band (≥ 3 rows tall) renders the tops of the **next card-row's covers**,
@@ -580,26 +598,26 @@ results, shows the loading state, refetches with the appropriate `dateRange` val
 | `TOP` badge | `state.now` | bold |
 | `NEW` badge | `state.focus` | bold |
 | Score badge `[NN]` | §2.2 tier colour; 91+ capped at `text.primary` on cards | right-anchored at cover edge, rank row |
-| Score badge `[--]` (unenriched / null) | `text.dim` | right-anchored at cover edge, rank row |
+| Score badge `[--]` (null) | `text.dim` | right-anchored at cover edge, rank row |
 | Title (unselected) | `text.primary` | clipped with `…` |
 | Title (selected) | `state.focus` | bold, clipped with `…` |
-| View count | `text.muted` | — |
-| View count absent | `text.dim` | `—` placeholder |
-| Genre glyphs (≤ 2) | `text.dim` | right-anchored at cover edge, view-count row; single-space separated |
+| Format + episode count | `text.muted` | `TV · 24ep` / `Movie` / `TV · ??ep` |
+| Format absent | `text.dim` | `—` placeholder |
+| Genre glyphs (≤ 2) | `text.dim` | right-anchored at cover edge, format row; single-space separated |
 
 **Grid states.** When the results array is empty, one of three states renders centered
 in the card-grid region:
 
 | State | Render | Token |
 |---|---|---|
-| Initial load / window refetch | `⠋ loading popular…` | `state.focus`; escalates to `state.now` + `taking a moment…` after >3 s (§4.8 slow rule) |
+| Initial load / axis refetch | `⠋ loading feed…` | `state.focus`; escalates to `state.now` + `taking a moment…` after >3 s (§4.8 slow rule) |
 | Empty (no entries returned) | `no entries` | `text.muted` + italic |
 | Error / offline | `[!] can't reach the feed` (heading) · `check your connection` (sub-line) | `state.now` + bold · `text.muted` + italic |
 
 The loading state uses the §4.8 braille spinner and `isSlowPath()` escalation. The
 error state is persistent — the feed is unreachable, not transiently failed. `[`/`]`/
-`1`–`4` retry by refetching the active window; the error clears on the first
-successful response. This follows the §9.3b pattern applied to the Popular feed.
+`1`–`4` retry by refetching the active axis; the error clears on the first
+successful response. This follows the §9.3b pattern applied to the Discover feed.
 
 When results are already on screen and a next page is in flight, a load-more footer
 renders below the last visible card row:
@@ -612,12 +630,15 @@ renders below the last visible card row:
 **Season chip and `·` dot.**
 
 The season chip (§3.4) tracks the **selected card** in the Discover grid (ROD-247):
-once the page batch enriches the card, the kanji+year chip appears in the top bar
-for the cursor position. When the selected card has no season data (unenriched, or
-the feed returned null) the chip is absent — there is no cour fallback (the grid has
-no ambient single-season context, and a misleading ambient chip would collide with the
-"selected show's season" meaning it carries in Browse/History). The detail zoom
-(`detail_origin = .discover`) follows the same rule.
+the kanji+year chip appears in the top bar for the cursor position as soon as the
+card is on screen — AniList's feed response arrives fully enriched (§9.6, ROD-325),
+so there is no longer a batch-enrich delay between a card rendering and its season
+data being available. When the selected card genuinely has no season data (AniList
+returned null — rare, mostly unannounced titles) the chip is absent — there is no
+cour fallback (the grid has no ambient single-season context, and a misleading
+ambient chip would collide with the "selected show's season" meaning it carries in
+Browse/History). The detail zoom (`detail_origin = .discover`) follows the same
+rule.
 
 The `·` pane-focus dot is always `state.focus` in Discover. The view is single-pane:
 there is no list/detail split and therefore no dim state.
@@ -1858,9 +1879,9 @@ pixels; fallback 7 when unreported). 5 columns. Card 3 selected.
 
 ```
                                                                                          [context: top bar, full width]
-  ZIGOKU  ░  Discover  冬 2026                                                   ·        [fg+bold name; chrome sep; f Discover tab (active); season chip m — selected card's season when enriched, absent otherwise; f · always lit — single pane]
+  ZIGOKU  ░  Discover  冬 2026                                                   ·        [fg+bold name; chrome sep; f Discover tab (active); season chip m — selected card's season, absent if AniList returned null; f · always lit — single pane]
                                                                                          [spacer row]
-  [1] Daily · [2] Weekly · [3] Monthly · [4] All-Time                                    [active=Daily f+bold; rest m; [N] keys m (active lifts to f); separator dots d]
+  [1] Trending · [2] Popular · [3] Top Rated · [4] This Season                           [active=Trending f+bold; rest m; [N] keys m (active lifts to f); separator dots d]
                                                                                          [spacer row]
   [  COVER  ][  COVER  ][  COVER  ][  COVER  ][  COVER  ]                               [5 cover blocks; cover_h rows each; bg.surface fill — height adaptive (fills card width)]
   [         ][         ][         ][         ][         ]
@@ -1869,38 +1890,42 @@ pixels; fallback 7 when unreported). 5 columns. Card 3 selected.
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
   [         ][         ][         ][         ][         ]
-  #1 TOP    [--]  #2     [72]  ▸#3 NEW  [85]  #4   [68]  #5   [--]                     [rank fg; score badge right-anchored at cover edge: [NN] tier-colour (91+ capped fg on cards); [--] d when unenriched; TOP h+bold; NEW f+bold; ▸ f gutter (x-1)]
+  #1 TOP    [--]  #2     [72]  ▸#3 NEW  [85]  #4   [68]  #5   [--]                     [rank fg; score badge right-anchored at cover edge: [NN] tier-colour (91+ capped fg on cards); [--] d when null; TOP h+bold; NEW f+bold (suppressed on This Season); ▸ f gutter (x-1)]
   Frieren: B… FMA: Brothe Vinland S  Mob Psycho  Steins;Ga…                            [title fg; selected (#3) f+bold; clipped to cover_w with …]
-  1.4m      ⚜♨  659.29k  ⚔   892.10k  ⚔   341.2k  ⚜    —                              [count m left-anchored; genre glyphs d right-anchored (§3.8a); absent if unenriched / unmapped]
+  TV · 28ep ⚜♨  TV · 64ep ⚔   TV · 24ep ⚔   TV · 12ep ⚜    —                          [format+eps m left-anchored, TV·Nep / Movie / TV·??ep; genre glyphs d right-anchored (§3.8a); — d when format null]
                                                                                          [gap row — slot_h = cover_h + 4]
   [PEEK CVR][PEEK CVR][PEEK CVR][PEEK CVR][PEEK CVR]                                    [peek row: tops of next card-row's covers clipped to leftover band (≥ 3 rows); no meta]
 
-  ▌  hjkl move · enter open · P save · [ ] window · / search · q quit
+  ▌  hjkl move · enter open · P save · [ ] axis · / search · q quit
 ```
 
 Notes:
 - Top-bar strip: the `[D]iscover` tab is active (`state.focus` + bold) per §3.4; the
   mockup above shows the shorthand label. Season chip tracks the selected card's
-  season+year once batch-enriched; absent (no cour fallback) when null — see §3.8.
+  season+year — present as soon as the card is on screen (AniList's feed response
+  arrives fully enriched, §9.6); absent (no cour fallback) only when AniList itself
+  returned null — see §3.8.
 - `·` dot: always `state.focus` — single pane, no dim state.
-- Window bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
-  own. Window change triggers a refetch.
+- Axis bar: the `[`/`]` and `1`–`4` keys drive it; the bar has no cursor of its
+  own. Axis change triggers a refetch.
 - The `▸` selection marker sits in the **left gutter at `x-1`** (one column left of
   the card's content origin) on the **rank row** (`y + cover_h`), `state.focus`,
   text-on-base. No box border, no background band around the card. The marker does
   not touch the cover cell, so cover art is never masked or composited.
 - `TOP` is always rank #1 (`state.now` + bold). `NEW` is a current-cour show not
-  ranked #1 (`state.focus` + bold). The two are mutually exclusive.
+  ranked #1 (`state.focus` + bold), suppressed entirely on the `This Season` axis
+  (every card there is already this-cour). The two are mutually exclusive.
 - Score badge `[NN]` / `[--]`: right-anchored at the cover edge on the rank row.
   Tier colour per §2.2; the 91+ tier is capped at `text.primary` on cards —
-  `state.now` is reserved for the `TOP` pointer. `[--]` in `text.dim` for unenriched
-  or null scores.
+  `state.now` is reserved for the `TOP` pointer. `[--]` in `text.dim` for null
+  scores.
 - Title clips to `cover_w` (20 cols at the large tier) with `…`. Selected title is
   `state.focus` + bold; unselected is `text.primary`.
-- View count absent renders `—` in `text.dim` (not italic — factual placeholder, §1.3).
+- Format + episode count absent renders `—` in `text.dim` (not italic — factual
+  placeholder, §1.3).
 - Genre glyphs (§3.8a): up to 2 monochrome BMP symbols right-anchored at the cover
-  edge on the view-count row, in `text.dim`. Absent for unenriched or genre-unmapped
-  cards. The full genre list is in the detail zoom pane.
+  edge on the format row, in `text.dim`. Absent for genre-unmapped cards. The full
+  genre list is in the detail zoom pane.
 - Gap row is part of `slot_h = cover_h + 4`.
 - Peek row: the leftover vertical band below the last full card row (when ≥ 3 rows
   remain) shows the tops of the next card-row's covers clipped to that band. The
@@ -2641,62 +2666,86 @@ post-search enrichment needs no flag); it is currently always `false`.
 
 ---
 
-### 9.6 Discover / Popular — Data Layer
+### 9.6 Discover — Data Layer
 
-The Popular feed uses a dedicated AllAnime persisted query, distinct from the
-universal search query used by Browse.
+Cut over from AllAnime's provider-specific popularity feed to AniList as the
+discovery brain (ROD-325). AniList sits off the provider vtable, same split as the
+ROD-324/326 search-brain cutover: discovery is a single global catalogue concern,
+not a provider-relative one, so Discover talks to AniList directly rather than
+through a swappable `SourceProvider`.
 
-**Query hash:** `60f50b84bb545fa25ee7f7c8c0adbf8f5cea40f7b1ef8501cbbff70e38589489`
+**Query.** `Page(page: N, perPage: 20) { pageInfo { hasNextPage } media(sort: [...], type: ANIME, season: ..., seasonYear: ...) { ...GQL_FIELDS } }`
+— the same full field set (`GQL_FIELDS` in `anilist.zig`) the search/by-id paths
+already use, not the narrower `GQL_BATCH_FIELDS`. One call returns a fully-enriched
+page: title, cover, score, genres, season, format, episodes all arrive together —
+no separate batch-enrich pass.
 
-**Variables:** `{ "type": "anime", "size": 20, "dateRange": N, "page": 1, "allowUnknown": false, "allowAdult": false }`
+**Axis → query mapping:**
 
-**Window → `dateRange` mapping:**
+| Axis | `sort` | Extra filter |
+|---|---|---|
+| Trending | `[TRENDING_DESC, POPULARITY_DESC]` | — |
+| Popular | `[POPULARITY_DESC, ID_DESC]` | — |
+| Top Rated | `[SCORE_DESC, ID_DESC]` | — |
+| This Season | `[POPULARITY_DESC, ID_DESC]` | `season`/`seasonYear` = current cour (same season-boundary logic as §2.3 kanji chips / the `NEW` badge) |
 
-| Window label | `dateRange` value |
-|---|---|
-| Daily | `1` |
-| Weekly | `7` |
-| Monthly | `30` |
-| All-Time | `0` |
+Every axis carries a secondary sort key (`POPULARITY_DESC` or `ID_DESC`) purely for
+pagination stability — AniList ties on the primary key at the tail of a large
+result set, and an unstable tiebreak would reshuffle already-loaded pages on the
+next fetch, desyncing the grid's rank numbers from what the user already scrolled
+past.
 
-**Per item:** rank position (derived from result index + 1 on the receiving side),
-cover URL, romaji + english + native title, view count (`rangeViews` for windowed windows;
-lifetime total for All-Time), `showId`. `TOP` and `NEW` badges are **derived
-render-side** — not payload fields. `TOP` is always rank #1; `NEW` is computed from
-the show's season/year against the current cour (the same season-boundary logic as
-§2.3 kanji chips).
+**Per item:** rank position (derived from result index + 1 on the receiving side,
+unchanged from the old feed), cover URL (`coverImage.large` — an absolute AniList
+URL; the existing cover pipeline already handles absolute URLs, no change needed),
+romaji + english + native title, `score`, `genres`, `season`/`seasonYear`,
+`format`, `episodes`, `id`/`idMal`. `TOP` and `NEW` badges stay **derived
+render-side** — not payload fields. `TOP` is always rank #1. `NEW` is computed from
+season/year against the current cour (§2.3 logic) and is suppressed outright on the
+`This Season` axis (§3.8 — every card there is already this-cour, so the badge
+would fire on every card and stop meaning anything).
 
-**Pagination:** `size: 20` entries per page; `page` increments on each next-page
-fetch. The feed has a practical ceiling of ~500 entries. The next page prefetches
-when the grid cursor comes within 2 card-rows of the last loaded entry. A window
-change resets `page` to 1, clears results, and refetches from the top.
+**Pagination:** `perPage: 20`, `page` increments on each next-page fetch, gated by
+AniList's own `pageInfo.hasNextPage` rather than the old "page came back short of
+`size`" heuristic — an explicit signal instead of an inferred one. The next page
+prefetches when the grid cursor comes within 2 card-rows of the last loaded entry,
+unchanged from the old feed. An axis change resets to page 1, clears results, and
+refetches from the top. AniList's ~90 req/min rate limit means only an axis-switch
+or page-advance cache miss spends budget — the per-axis slot cache (below) is what
+keeps casual axis-flipping from burning it.
 
-**Per-window slot.** Each window (`Daily` / `Weekly` / `Monthly` / `All-Time`)
+**Per-axis slot.** Each axis (`Trending` / `Popular` / `Top Rated` / `This Season`)
 holds its own result list, cursor, scroll position, loading flag, and exhaustion
-flag. Switching windows preserves each slot's state — `Daily` data is not flushed
-when the user briefly visits `Weekly`. A window whose slot is empty at activation
-triggers a fresh fetch.
+flag — the same per-slot architecture as the old per-window cache, carried forward
+unchanged. Switching axes preserves each slot's state. An axis whose slot is empty
+at activation triggers a fresh fetch. One relaxation from the old invariant: the
+old `view_count` was strictly per-window (the same show read `~12k` on Daily and
+`~660k` on All-Time, so it could never be cached across windows or persisted to a
+shared store column). AniList's `score`/`genres`/`format`/`episodes` are properties
+of the media object itself, not the axis — the same show carries the same score
+and format no matter which axis surfaced it, so they may be shared/persisted across
+slots. Only rank/position stays axis-relative.
 
-**Batched per-page AniList enrichment (ROD-247).** Each time a page of feed results
-lands, a single AniList call hydrates `score`, `genres`, and `season` for all cards
-on that page. This fires on a dedicated thread slot (`discover_batch_enrich_thread`)
-separate from the Browse enrichment path, so the two cannot block each other. Before
-the batch completes, cards degrade gracefully per the table below; fields fill in
-per-card once the batch lands. Detail zoom from Discover (`Enter`) additionally fires
-the lazy single-card enrich (`discover_enrich_thread`) for any remaining fields, and
-uses the existing `episodesTask` / `drawDetailPane` pipeline.
+**Enrichment passes — removed.** The old `discover_batch_enrich_thread` (per-page
+AniList batch-enrich, ROD-247) and the score/genre/season portion of
+`discover_enrich_thread` (per-card lazy enrich on zoom) are no longer needed — the
+feed query already returns `score`, `genres`, `season`, `format`, and `episodes` in
+the same response that supplies the title and cover. Detail zoom (`Enter`) still
+fires `episodesTask` for the episode grid; that data was never part of either
+enrichment pass and isn't part of the feed query either.
 
-**Null-degrade rules.** The Popular grid renders whatever fields are present and
-falls back where enrichment has not yet completed:
+**Null-degrade rules.** AniList's response is complete on arrival, so these are
+genuine per-field data gaps (unannounced titles, an obscure entry missing a field)
+rather than a transient pre-enrichment state:
 
 | Field | Present | Absent fallback |
 |---|---|---|
 | Cover URL | cover art — Kitty image, or half-block mosaic on non-Kitty terminals (§3.8) | `bg.surface` placeholder fill (§3.8) |
-| View count | formatted count in `text.muted` | `—` in `text.dim` |
+| Format + episodes | `TV · 24ep` / `Movie` / `TV · ??ep` in `text.muted` (§3.8) | `—` in `text.dim` |
 | Score | `[NN]` badge, tier-coloured per §2.2; 91+ capped at `text.primary` on cards | `[--]` in `text.dim` |
-| Genres | up to 2 genre glyphs in `text.dim`, right-anchored on the view-count row (§3.8a) | glyph pair absent |
-| Season/year | `NEW` badge derivation + top-bar season chip for the selected card | `NEW` badge suppressed; chip absent |
-| Primary title (`title_language`, §9.1a) | shown, clipped | never blank — the chain backstops to romaji, which AllAnime always supplies |
+| Genres | up to 2 genre glyphs in `text.dim`, right-anchored on the format row (§3.8a) | glyph pair absent |
+| Season/year | `NEW` badge derivation (suppressed on `This Season`) + top-bar season chip for the selected card | `NEW` badge suppressed; chip absent |
+| Primary title (`title_language`, §9.1a) | shown, clipped | never blank — the chain backstops to romaji, which AniList always supplies |
 
 ---
 
@@ -3073,7 +3122,7 @@ available. The `▌` reappears when the edit is committed or cancelled.
 #### Discover — normal
 
 ```
-  ▌  hjkl move · enter open · P save · [ ] window · / search · q quit
+  ▌  hjkl move · enter open · P save · [ ] axis · / search · q quit
 ```
 
 Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `q`.
@@ -3081,8 +3130,8 @@ Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `q`.
 `hjkl` navigate the card grid (left/right wrap within a row; up/down move card-rows).
 `enter` opens the detail zoom (`active_view = .detail`, `detail_origin = .discover`).
 `P` saves the selected card to the watchlist per the §4.10 path.
-`[`/`]` cycle the active window (`Daily` → `Weekly` → `Monthly` → `All-Time` and back);
-`1`–`4` select directly (ROD-248 annotates these in the window bar itself).
+`[`/`]` cycle the active axis (`Trending` → `Popular` → `Top Rated` → `This Season`
+and back); `1`–`4` select directly (ROD-248 annotates these in the axis bar itself).
 `/` jumps to Browse and opens its search prompt — there is no in-view filter in Discover.
 The view keys (`D` is a no-op here; `B`/`H`/`S` switch away) live in the top-bar
 tab strip (§3.4), not this line. `q` quits.

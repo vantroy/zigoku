@@ -198,7 +198,7 @@ pub const Season = enum {
     /// boundaries so the top-bar "current season" fallback (ROD-186) agrees with
     /// the show chips it sits beside: 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov.
     /// Note December belongs to the *next* year's Winter cour on AniList — that
-    /// year roll is the caller's concern (see selection.currentCour); this is month→season
+    /// year roll is the caller's concern (see currentCour); this is month→season
     /// only. Out-of-range months can't occur (std clock yields 1–12) but default to
     /// winter rather than trap.
     pub fn fromMonth(month: u4) Season {
@@ -210,6 +210,22 @@ pub const Season = enum {
         };
     }
 };
+
+/// A broadcast cour: a season anchored to its year.
+pub const Cour = struct { season: Season, year: u32 };
+
+/// The broadcast cour for an epoch-ms instant, with December rolled into next
+/// year's Winter cour per AniList's boundaries. The single cour computation: the
+/// top-bar chip, the Discover NEW badge, and the This Season feed axis (ROD-334)
+/// all read it, so they can never disagree on which cour "now" is. Total: a
+/// pre-epoch instant clamps to 1970 rather than trapping.
+pub fn currentCour(now_ms: i64) Cour {
+    const secs: u64 = @intCast(@max(0, @divFloor(now_ms, std.time.ms_per_s)));
+    const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
+    const month = yd.calculateMonthDay().month.numeric();
+    const year: u32 = if (month == 12) @as(u32, yd.year) + 1 else yd.year;
+    return .{ .season = Season.fromMonth(month), .year = year };
+}
 
 /// A calendar date at whatever precision the source offered. `year` is always
 /// present when the date exists; `month`/`day` fill in when known (AllAnime
@@ -592,6 +608,21 @@ test "Season.kanji returns correct glyphs" {
     try std.testing.expectEqualStrings("春", Season.spring.kanji());
     try std.testing.expectEqualStrings("夏", Season.summer.kanji());
     try std.testing.expectEqualStrings("秋", Season.fall.kanji());
+}
+
+test "currentCour: cour mapping, December year roll, pre-epoch clamp (ROD-334)" {
+    // 2026-07-10T00:00:00Z → Summer 2026.
+    const summer = currentCour(1_783_641_600 * 1000);
+    try std.testing.expectEqual(Season.summer, summer.season);
+    try std.testing.expectEqual(@as(u32, 2026), summer.year);
+    // 2025-12-15T00:00:00Z: December belongs to NEXT year's Winter cour on AniList.
+    const winter = currentCour(1_765_756_800 * 1000);
+    try std.testing.expectEqual(Season.winter, winter.season);
+    try std.testing.expectEqual(@as(u32, 2026), winter.year);
+    // A pre-epoch instant clamps to 1970 rather than trapping.
+    const clamped = currentCour(-42);
+    try std.testing.expectEqual(Season.winter, clamped.season);
+    try std.testing.expectEqual(@as(u32, 1970), clamped.year);
 }
 
 test "Season.fromMonth maps months to AniList cours (ROD-186)" {

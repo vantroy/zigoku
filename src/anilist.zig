@@ -36,13 +36,19 @@ const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "
 // dozens of synopses per page would be bytes for text nobody's reading yet. Keep
 // this set and GQL_FIELDS divergent on purpose.
 const GQL_BATCH_FIELDS = "id idMal averageScore genres season seasonYear startDate{year}";
+// ROD-334 Discover feed (§9.6): the full GQL_FIELDS set, so one call returns a
+// fully-enriched page, no batch-enrich pass. `sort`/`season`/`seasonYear` ride as
+// variables so all four axes share this one operation; `pageInfo.hasNextPage` is
+// the exhaustion signal (replaces the old "page came back short" heuristic).
+const GQL_DISCOVER = "query($page:Int!,$perPage:Int!,$sort:[MediaSort],$season:MediaSeason,$seasonYear:Int){Page(page:$page,perPage:$perPage){pageInfo{hasNextPage} media(type:ANIME,sort:$sort,season:$season,seasonYear:$seasonYear){" ++ GQL_FIELDS ++ "}}}";
 
 // Both queries are interpolated raw into a JSON body with `{s}`, so they must
 // contain nothing that needs JSON-string escaping. Enforce at comptime rather
 // than reaching for std.json.stringify on a constant — if someone adds a quote
 // or control char to the selection set, this fails the build, not a 400 at runtime.
 comptime {
-    for (GQL_SEARCH ++ GQL_BY_ID ++ GQL_BATCH_FIELDS) |c| {
+    @setEvalBranchQuota(4000);
+    for (GQL_SEARCH ++ GQL_BY_ID ++ GQL_BATCH_FIELDS ++ GQL_DISCOVER) |c| {
         if (c == '"' or c == '\\' or c < 0x20) {
             @compileError("GraphQL query contains a character that needs JSON escaping; build the request body with std.json instead of {s} interpolation");
         }
@@ -157,8 +163,14 @@ const Media = struct {
     coverImage: Cover = .{},
 };
 
+const PageInfo = struct {
+    hasNextPage: bool = false,
+};
+
 const Page = struct {
     media: []Media,
+    // Requested by GQL_DISCOVER only; null on the search/batch responses.
+    pageInfo: ?PageInfo = null,
 };
 
 const Data = struct {
@@ -356,10 +368,102 @@ fn pageToAnime(arena: Allocator, raw: []const u8) EnrichError![]domain.Anime {
         .ignore_unknown_fields = true,
     }) catch return error.NoAnswer;
     const data = parsed.value.data orelse return error.NoAnswer;
-    const media = data.Page.media;
+    return mediaToRows(arena, data.Page.media);
+}
+
+fn mediaToRows(arena: Allocator, media: []const Media) ![]domain.Anime {
     const out = try arena.alloc(domain.Anime, media.len);
     for (media, 0..) |m, i| out[i] = try metaToAnime(arena, try mediaToMeta(arena, m));
     return out;
+}
+
+/// The four Discover feed axes (ROD-334, §3.8/§9.6). Off the vtable like `search`:
+/// discovery is a global catalogue concern, not a provider-relative one.
+pub const DiscoverAxis = enum {
+    trending,
+    popular,
+    top_rated,
+    this_season,
+
+    /// This axis's `sort` variable value, as a ready JSON array. Every axis carries
+    /// a secondary tiebreak key: AniList ties on the primary at the tail of a large
+    /// result set, and an unstable order would reshuffle already-loaded pages on
+    /// the next fetch (§9.6).
+    fn sortJson(self: DiscoverAxis) []const u8 {
+        return switch (self) {
+            .trending => "[\"TRENDING_DESC\",\"POPULARITY_DESC\"]",
+            .popular, .this_season => "[\"POPULARITY_DESC\",\"ID_DESC\"]",
+            .top_rated => "[\"SCORE_DESC\",\"ID_DESC\"]",
+        };
+    }
+};
+
+/// Feed page stride (§9.6). AniList caps Page.perPage at 50; keep it under that.
+pub const discover_page_size = 20;
+
+/// One parsed feed page: rows plus AniList's own has-more signal, the pagination
+/// gate (§9.6). Rows are arena-borrowed like `search`'s.
+pub const DiscoverPage = struct {
+    rows: []domain.Anime,
+    has_next_page: bool,
+};
+
+/// Fetch one Discover feed page (ROD-334). `page` is 1-based; `now_ms` anchors the
+/// This Season cour (other axes ignore it). Same three-state contract as `search`
+/// (ROD-278): `error.NoAnswer` is a transport miss, an empty page a confirmed one.
+pub fn discover(arena: Allocator, io: Io, axis: DiscoverAxis, page: u32, now_ms: i64) EnrichError!DiscoverPage {
+    const raw = postGql(arena, io, try discoverBody(arena, axis, page, now_ms)) orelse return error.NoAnswer;
+    return pageToDiscover(arena, raw);
+}
+
+/// Split from `discover` so the axis→variables wiring is unit-testable without a
+/// POST. `season`/`seasonYear` are OMITTED (not null'd) off the This Season axis:
+/// a declared-but-unprovided nullable variable leaves the argument unset per the
+/// GraphQL spec, whereas an explicit null would filter on `season == null`.
+fn discoverBody(arena: Allocator, axis: DiscoverAxis, page: u32, now_ms: i64) ![]const u8 {
+    const season_vars: []const u8 = switch (axis) {
+        .this_season => blk: {
+            const c = domain.currentCour(now_ms);
+            break :blk try std.fmt.allocPrint(
+                arena,
+                ",\"season\":\"{s}\",\"seasonYear\":{d}",
+                .{ seasonEnum(c.season), c.year },
+            );
+        },
+        else => "",
+    };
+    // sortJson/seasonEnum are fixed enum-derived literals, JSON-safe interpolated on
+    // the same trust basis as saveMediaListEntry's status value.
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"query\":\"{s}\",\"variables\":{{\"page\":{d},\"perPage\":{d},\"sort\":{s}{s}}}}}",
+        .{ GQL_DISCOVER, page, discover_page_size, axis.sortJson(), season_vars },
+    );
+}
+
+/// `domain.Season` to AniList's `MediaSeason` enum spelling.
+fn seasonEnum(s: domain.Season) []const u8 {
+    return switch (s) {
+        .winter => "WINTER",
+        .spring => "SPRING",
+        .summer => "SUMMER",
+        .fall => "FALL",
+    };
+}
+
+/// JSON to a feed page, split from `discover` so the mapping is unit-testable. Same
+/// three-state classification as `pageToAnime`. A response missing `pageInfo` (API
+/// drift) reads as exhausted: pagination stops rather than spinning on a signal
+/// that never arrives.
+fn pageToDiscover(arena: Allocator, raw: []const u8) EnrichError!DiscoverPage {
+    const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.NoAnswer;
+    const data = parsed.value.data orelse return error.NoAnswer;
+    return .{
+        .rows = try mediaToRows(arena, data.Page.media),
+        .has_next_page = if (data.Page.pageInfo) |pi| pi.hasNextPage else false,
+    };
 }
 
 /// Arena-borrowed from `meta` (the worker deep-copies to GPA, like `enrichBatch`). `id`
@@ -1410,6 +1514,106 @@ test "searchBody carries search/perPage/page, JSON-escapes the query; GQL_SEARCH
     try std.testing.expectEqualStrings("Cowboy \"Bebop\"", parsed.value.variables.search);
     try std.testing.expectEqual(@as(u32, @intCast(source.search_page_size)), parsed.value.variables.perPage);
     try std.testing.expectEqual(@as(u32, 3), parsed.value.variables.page);
+}
+
+test "GQL_DISCOVER requests pageInfo and rides sort/season as variables (ROD-334)" {
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, "pageInfo{hasNextPage}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, "$page:Int!") != null);
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, "sort:$sort") != null);
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, "season:$season") != null);
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, "seasonYear:$seasonYear") != null);
+    // The feed reuses the FULL field set: a page arrives enriched, no batch pass (§9.6).
+    try std.testing.expect(std.mem.indexOf(u8, GQL_DISCOVER, GQL_FIELDS) != null);
+}
+
+test "discoverBody: axis sort + paging vars; season rides only on This Season (ROD-334)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Vars = struct {
+        variables: struct {
+            page: u32,
+            perPage: u32,
+            sort: []const []const u8,
+            season: ?[]const u8 = null,
+            seasonYear: ?u32 = null,
+        },
+    };
+
+    // Trending: its sort pair, the requested page, the canonical stride, and NO
+    // season/seasonYear keys (omitted, not null'd: an explicit null would filter).
+    {
+        const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .trending, 3, 0), .{ .ignore_unknown_fields = true });
+        const v = parsed.value.variables;
+        try std.testing.expectEqual(@as(u32, 3), v.page);
+        try std.testing.expectEqual(@as(u32, discover_page_size), v.perPage);
+        try std.testing.expectEqual(@as(usize, 2), v.sort.len);
+        try std.testing.expectEqualStrings("TRENDING_DESC", v.sort[0]);
+        try std.testing.expectEqualStrings("POPULARITY_DESC", v.sort[1]);
+        try std.testing.expect(v.season == null);
+        try std.testing.expect(v.seasonYear == null);
+    }
+
+    // Top Rated: SCORE_DESC with the ID_DESC tiebreak (§9.6 pagination stability).
+    {
+        const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .top_rated, 1, 0), .{ .ignore_unknown_fields = true });
+        try std.testing.expectEqualStrings("SCORE_DESC", parsed.value.variables.sort[0]);
+        try std.testing.expectEqualStrings("ID_DESC", parsed.value.variables.sort[1]);
+    }
+
+    // Popular: same sort pair as This Season but with no season filter.
+    {
+        const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .popular, 1, 0), .{ .ignore_unknown_fields = true });
+        try std.testing.expectEqualStrings("POPULARITY_DESC", parsed.value.variables.sort[0]);
+        try std.testing.expectEqualStrings("ID_DESC", parsed.value.variables.sort[1]);
+        try std.testing.expect(parsed.value.variables.season == null);
+    }
+
+    // This Season at 2026-07-10T00:00:00Z: the current cour rides as season/seasonYear.
+    {
+        const parsed = try std.json.parseFromSlice(Vars, a, try discoverBody(a, .this_season, 1, 1_783_641_600 * 1000), .{ .ignore_unknown_fields = true });
+        const v = parsed.value.variables;
+        try std.testing.expectEqualStrings("POPULARITY_DESC", v.sort[0]);
+        try std.testing.expectEqualStrings("SUMMER", v.season.?);
+        try std.testing.expectEqual(@as(?u32, 2026), v.seasonYear);
+    }
+}
+
+test "pageToDiscover: rows + hasNextPage; missing pageInfo reads exhausted (ROD-334)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A page with more behind it. The card fields the §3.8 row needs (format →
+    // kind, episodes) must survive the mapping.
+    const json =
+        \\{"data":{"Page":{"pageInfo":{"hasNextPage":true},"media":[
+        \\{"id":182255,"idMal":52991,"title":{"romaji":"Sousou no Frieren"},"episodes":28,"format":"TV","averageScore":89,"season":"FALL","seasonYear":2023},
+        \\{"id":1,"title":{"english":"Only English"},"format":"MOVIE"}
+        \\]}}}
+    ;
+    const page = try pageToDiscover(a, json);
+    try std.testing.expect(page.has_next_page);
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqualStrings("182255", page.rows[0].id);
+    try std.testing.expectEqual(@as(?u64, 182255), page.rows[0].anilist_id);
+    try std.testing.expectEqualStrings("TV", page.rows[0].kind.?);
+    try std.testing.expectEqual(@as(?u32, 28), page.rows[0].total_episodes);
+    try std.testing.expectEqualStrings("MOVIE", page.rows[1].kind.?);
+
+    // The last page: an explicit hasNextPage:false gates further fetches.
+    const last = try pageToDiscover(a, "{\"data\":{\"Page\":{\"pageInfo\":{\"hasNextPage\":false},\"media\":[]}}}");
+    try std.testing.expect(!last.has_next_page);
+    try std.testing.expectEqual(@as(usize, 0), last.rows.len);
+
+    // pageInfo absent (API drift) → exhausted, not an infinite next-page spin.
+    const drifted = try pageToDiscover(a, "{\"data\":{\"Page\":{\"media\":[]}}}");
+    try std.testing.expect(!drifted.has_next_page);
+
+    // Same three-state contract as pageToAnime: GraphQL-level error / unparseable
+    // bytes are no answer, never a confirmed-empty page.
+    try std.testing.expectError(error.NoAnswer, pageToDiscover(a, "{\"data\":null}"));
+    try std.testing.expectError(error.NoAnswer, pageToDiscover(a, "}{"));
 }
 
 test "classifyById: three-state map — match / confirmed no-match / no answer (ROD-278)" {
