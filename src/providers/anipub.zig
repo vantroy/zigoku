@@ -13,8 +13,10 @@
 //!                 NUMERIC-id form carries MALID (the slug form omits it); a missing id
 //!                 answers HTTP 200 with the bare JSON string "err"
 //!   * episodes  → GET /v1/api/details/{Id}   → local.ep[], index = episode number; each
-//!                 link is `src=https://anipub.xyz/video/{realid}/{lang}` (a literal
-//!                 `src=` attribute prefix, not a clean URL)
+//!                 link carries a literal `src=` attribute prefix (not a clean URL) in
+//!                 one of TWO live shapes, both megaplay-backed (ROD-350):
+//!                 `https://anipub.xyz/video/{realid}/{lang}` or
+//!                 `https://gogoanime.com.by/streaming.php?id={slug}&ep={realid}&…`
 //!
 //! Tier B: the canonical id (MALID) sits behind a per-show network call, so
 //! `canonicalKey` returns null and the resolver routes `.needs_search`. search()
@@ -308,12 +310,10 @@ pub const AniPub = struct {
         if (n > eps.len) return error.InvalidEpisode;
 
         const link = eps[n - 1].link orelse return error.BadEpisodeLink;
-        const realid = parseRealId(link) orelse {
-            // A well-formed link on a foreign host is a KNOWN catalog reality, not
-            // drift: a large share of anipub's entries embed gogoanime's
-            // streaming.php instead of the megaplay /video/ shape (ROD-350 is the
-            // extractor for those). Name it distinctly and log the link so the
-            // receipt says which host the show actually needs.
+        const realid = parseRealId(link) orelse parseGogoRealId(link) orelse {
+            // Neither live link shape: host drift, or a junk slot (a bare
+            // /anime/{slug} show page in an ep slot is live-observed). Log the
+            // link so the receipt says what the show actually embeds.
             log.warn("anipub resolve: unsupported ep link for show={s} ep={s}: {s}", .{ show_id, ep.raw, link });
             return error.UnsupportedStreamHost;
         };
@@ -326,10 +326,12 @@ pub const AniPub = struct {
         return stream.link;
     }
 
-    /// Extract the megaplay realid out of an ep link: the digit run after
-    /// `/video/` in `src=https://anipub.xyz/video/107259/sub`. The literal `src=`
-    /// attribute prefix needs no stripping (the marker search skips it). Null when
-    /// the link doesn't carry the shape (host drift or a dead slot).
+    /// Extract the megaplay realid out of a /video/-shaped ep link: the digit run
+    /// after `/video/` in `src=https://anipub.xyz/video/107259/sub`. The literal
+    /// `src=` attribute prefix needs no stripping (the marker search skips it),
+    /// and a `www.` host variant is live-observed and irrelevant to the marker.
+    /// Null when the link doesn't carry the shape (resolve then tries the
+    /// gogoanime shape, ROD-350).
     fn parseRealId(link: []const u8) ?[]const u8 {
         const marker = "/video/";
         const at = std.mem.indexOf(u8, link, marker) orelse return null;
@@ -338,6 +340,31 @@ pub const AniPub = struct {
         while (i < link.len and std.ascii.isDigit(link[i])) i += 1;
         if (i == start) return null;
         return link[start..i];
+    }
+
+    /// Extract the megaplay realid out of a gogoanime-shaped ep link: the digit
+    /// run in the `ep=` query param of `…gogoanime.com.by/streaming.php?id={slug}
+    /// &ep=10790&server=hd-1&type=dub`. streaming.php is a thin iframe wrapper
+    /// around megaplay s-2 and its `ep` value IS the megaplay realid, so no
+    /// gogoanime fetch ever happens (live-verified across server=hd-1/2/3, all
+    /// ignored by the wrapper; ROD-350). The stored `type=` is likewise ignored:
+    /// like the /video/ shape's lang segment, the sub/dub fork belongs to the
+    /// caller's requested track. Null when the link isn't streaming.php-shaped
+    /// or carries no numeric ep.
+    fn parseGogoRealId(link: []const u8) ?[]const u8 {
+        if (std.mem.indexOf(u8, link, "/streaming.php?") == null) return null;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, link, from, "ep=")) |at| {
+            from = at + "ep=".len;
+            // Anchor on a param boundary so "ep=" inside another name
+            // (e.g. "deep=") can't match.
+            if (at == 0 or (link[at - 1] != '?' and link[at - 1] != '&')) continue;
+            var i = from;
+            const start = i;
+            while (i < link.len and std.ascii.isDigit(link[i])) i += 1;
+            if (i > start) return link[start..i];
+        }
+        return null;
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
@@ -657,9 +684,41 @@ test "parseDetailsEps unwraps the local.ep envelope; missing local is drift" {
 test "parseRealId strips the src= attribute prefix and bounds on digits" {
     try testing.expectEqualStrings("107259", AniPub.parseRealId("src=https://anipub.xyz/video/107259/sub").?);
     try testing.expectEqualStrings("42", AniPub.parseRealId("https://anipub.xyz/video/42/dub").?);
+    // The www. host variant is live-observed (Solo Leveling's catalog entry).
+    try testing.expectEqualStrings("115276", AniPub.parseRealId("src=https://www.anipub.xyz/video/115276/dub").?);
     try testing.expect(AniPub.parseRealId("src=https://anipub.xyz/watch/107259/sub") == null);
     try testing.expect(AniPub.parseRealId("src=https://anipub.xyz/video//sub") == null);
     try testing.expect(AniPub.parseRealId("") == null);
+}
+
+test "parseGogoRealId: the streaming.php ep param is the megaplay realid (ROD-350)" {
+    // The live shape, verbatim from /v1/api/details (JJK ep1). server= and
+    // type= ride along and are ignored.
+    try testing.expectEqualStrings("10790", AniPub.parseGogoRealId(
+        "src=https://gogoanime.com.by/streaming.php?id=jujutsu-kaisen-tv-534&ep=10790&server=hd-1&type=dub",
+    ).?);
+    // server=hd-3 (Apothecary Diaries ep1, the ROD-350 repro) parses the same.
+    try testing.expectEqualStrings("108899", AniPub.parseGogoRealId(
+        "src=https://gogoanime.com.by/streaming.php?id=the-apothecary-diaries-18578&ep=108899&server=hd-3&type=dub",
+    ).?);
+    // ep as the first param.
+    try testing.expectEqualStrings("42", AniPub.parseGogoRealId("https://gogoanime.com.by/streaming.php?ep=42").?);
+}
+
+test "parseGogoRealId rejects junk slots and near-miss params" {
+    // A bare show page in an ep slot is live-observed (Spy x Family's movie
+    // tail); its slug digits must not read as a realid.
+    try testing.expect(AniPub.parseGogoRealId("src=https://gogoanime.com.by/anime/spy-x-family-code-white-19291") == null);
+    // "ep=" inside another param name is not the ep param.
+    try testing.expect(AniPub.parseGogoRealId("https://x/streaming.php?deep=123&type=dub") == null);
+    // A boundary-anchored ep with no digits is a dead slot, not a realid; a
+    // later real ep param still wins.
+    try testing.expect(AniPub.parseGogoRealId("https://x/streaming.php?ep=abc") == null);
+    try testing.expectEqualStrings("7", AniPub.parseGogoRealId("https://x/streaming.php?deep=1&ep=7").?);
+    // A hostile link STARTING with "ep=" puts the match at index 0; the
+    // boundary check must not underflow, and the anchored param still wins.
+    try testing.expectEqualStrings("1", AniPub.parseGogoRealId("ep=9/streaming.php?ep=1").?);
+    try testing.expect(AniPub.parseGogoRealId("") == null);
 }
 
 test "canonicalKey is always null: tier B routes via needs_search (ROD-342)" {
