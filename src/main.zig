@@ -199,10 +199,11 @@ pub fn main(init: std.process.Init) !void {
 
     // One provider for the whole CLI run, so both run() and the error reporter
     // read the source name from the same vtable seam. The one-shot CLI flow
-    // never iterates providers; it stays pinned to the registry default and
-    // `Registry` deliberately doesn't thread past this frame (ROD-343).
+    // never iterates providers; it plays on the user's preferred provider
+    // (ROD-344, registry default when unset) and `Registry` deliberately
+    // doesn't thread past this frame (ROD-343).
     var live = LiveProviders.init();
-    const provider = live.registry().primary();
+    const provider = live.registry().preferred(cfg.preferred_provider);
 
     run(arena, io, out, in, cli, cfg, provider, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err, provider.displayName());

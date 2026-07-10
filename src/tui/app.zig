@@ -191,6 +191,13 @@ pub fn run(
         .browse => .browse,
         .history, .last_watched => .history,
     };
+    // Preset list for the Settings provider row (ROD-344): the registry's names
+    // in construction order. The names are static vtable strings; only the
+    // slice needs an owner, and it must outlive the app loop.
+    const provider_names = try gpa.alloc([]const u8, registry.providers.len);
+    defer gpa.free(provider_names);
+    for (registry.providers, 0..) |p, pi| provider_names[pi] = p.name();
+    app.settings.provider_names = provider_names;
     defer app.deinitOwnedState(&vx, writer);
 
     // ── AniList connection (ROD-291) ──────────────────────────────────────────
@@ -2806,6 +2813,17 @@ pub const App = struct {
         return registry.byName(src) orelse registry.primary();
     }
 
+    /// The provider preference in force for NEW canonical resolution (ROD-344):
+    /// tier walk order and the tier-C worker's snapshot. Today the global
+    /// setting alone; the per-show override (ROD-345) layers in HERE (show
+    /// orelse global), never at the walk sites. Deliberately NOT consulted by
+    /// the unknown-owner fallbacks (`owningProvider`, the play spawn, `.direct`
+    /// adds): those ids historically belong to `primary()`, and re-routing them
+    /// by preference would persist them under the wrong provider.
+    fn effectivePreference(self: *const App) []const u8 {
+        return self.config.preferred_provider;
+    }
+
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8) void {
         // ROD-179: do NOT join a prior in-flight episode fetch here — that would
         // block the main loop on a slow network when a settled-then-resumed scroll
@@ -2920,29 +2938,33 @@ pub const App = struct {
     /// deriving a fresh key on an earlier one, because it respects where the user's
     /// history for the show already lives (provider-major would shadow a later
     /// provider's bindings forever, since the first provider's canonicalKey hits
-    /// whenever a mal_id exists). Within a tier, registry order breaks ties.
+    /// whenever a mal_id exists). Within a tier, the EFFECTIVE order breaks ties
+    /// (ROD-344): `preferred` leads, construction order for the rest.
     /// `scratch` owns any store-read or `canonicalKey` id string; the caller uses it before
     /// `scratch` dies (the fetch spawn dupes it).
-    pub fn browseResolveTarget(registry: Registry, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
+    pub fn browseResolveTarget(registry: Registry, preferred: []const u8, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
         const aid = sel.anilist_id orelse return .{ .direct = sel.id };
         const aid_i64 = std.math.cast(i64, aid) orelse return .{ .direct = sel.id };
         var idbuf: [24]u8 = undefined;
         const aid_str = std.fmt.bufPrint(&idbuf, "{d}", .{aid}) catch return .{ .direct = sel.id };
         // A provider-keyed row (id != stringified anilist_id) fetches as-is.
         if (!std.mem.eql(u8, sel.id, aid_str)) return .{ .direct = sel.id };
-        // Tier 0: an existing binding on any provider wins, registry order on ties.
+        // Tier 0: an existing binding on any provider wins, effective order on ties.
         if (store) |st| {
-            for (registry.providers) |p| {
+            var it = registry.ordered(preferred);
+            while (it.next()) |p| {
                 if (st.bindingSourceId(scratch, p.name(), aid_i64) catch null) |sid|
                     return .{ .bound = .{ .provider = p, .id = sid, .anilist_id = aid_i64 } };
             }
         }
-        // Tier A: the first provider that keys its own catalog by canonical id.
-        for (registry.providers) |p| {
+        // Tier A: the first provider (effective order) that keys its own catalog
+        // by canonical id.
+        var it = registry.ordered(preferred);
+        while (it.next()) |p| {
             if (p.canonicalKey(scratch, sel) catch null) |key|
                 return .{ .tier_a = .{ .provider = p, .id = key, .anilist_id = aid_i64 } };
         }
-        // Tier C: a title search (the worker walks the registry).
+        // Tier C: a title search (the worker walks an effective-order snapshot).
         return .{ .needs_search = aid_i64 };
     }
 
@@ -2954,7 +2976,7 @@ pub const App = struct {
     fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, sel: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(registry, sel, self.store, arena.allocator())) {
+        switch (browseResolveTarget(registry, self.effectivePreference(), sel, self.store, arena.allocator())) {
             .direct => |id| self.fireEpisodesResolved(loop, io, registry, null, id, null),
             // Tier 0: the binding already exists, so fetch by the stored id with no re-bind.
             .bound => |b| self.fireEpisodesResolved(loop, io, registry, b.provider.name(), b.id, null),
@@ -2997,7 +3019,7 @@ pub const App = struct {
         self.pending_bind = bind;
     }
 
-    /// Fire the tier-C Play resolve worker (ROD-328): title-search the registry (in order) for a
+    /// Fire the tier-C Play resolve worker (ROD-328): title-search the providers (effective order, ROD-344) for a
     /// Browse hit that could not tier-A (`canonicalKey` returned null). On a confident match
     /// `.resolve_play_target` arms `pending_bind` and fires the episode fetch; a miss toasts.
     /// gpa owns a deep copy of the canonical (the worker frees it). Bounded to one in-flight
@@ -3007,14 +3029,21 @@ pub const App = struct {
         if (self.play_resolving) return;
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
+        // Effective-order snapshot for the walk (ROD-344), owned by the worker:
+        // the preference can change mid-flight, the snapshot can't.
+        const providers = registry.orderedAlloc(gpa, self.effectivePreference()) catch {
+            workers.freeOwnedAnime(gpa, snap);
+            return;
+        };
         self.async_start_ms = self.now_ms; // slow-path spinner while the search runs
         self.play_resolving = true;
         self.play_resolve_drain.begin();
         const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-            loop, gpa, io, registry.providers, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
+            loop, gpa, io, providers, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
         }) catch {
             self.play_resolve_drain.finish(); // no worker will run, rebalance the count
             self.play_resolving = false;
+            gpa.free(providers);
             workers.freeOwnedAnime(gpa, snap);
             return;
         };
@@ -3729,7 +3758,7 @@ pub const App = struct {
     fn addSelectedCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, anime: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(registry, anime, self.store, arena.allocator())) {
+        switch (browseResolveTarget(registry, self.effectivePreference(), anime, self.store, arena.allocator())) {
             // No resolve happened (already provider-keyed): the default provider owns it.
             .direct => self.addToWatchlist(registry.primary(), anime),
             // Tier 0: the binding already exists, so reveal it in place (no probe/search).
@@ -3759,7 +3788,7 @@ pub const App = struct {
         self.pushToast(.success, "added to watchlist", false);
     }
 
-    /// Fire the tier-C Add resolve worker (ROD-328): title-search the registry (in order) for a
+    /// Fire the tier-C Add resolve worker (ROD-328): title-search the providers (effective order, ROD-344) for a
     /// Browse-P hit that could not tier-A. On a confident match `.resolve_add_result` mints
     /// the binding revealed; a miss toasts. Mirrors `fireResolvePlaySearch` but binds
     /// visible (Add) rather than firing an episode fetch, and shares the Add path's
@@ -3768,14 +3797,20 @@ pub const App = struct {
         if (self.add_resolving) return;
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
+        // Effective-order snapshot, worker-owned; mirrors fireResolvePlaySearch.
+        const providers = registry.orderedAlloc(gpa, self.effectivePreference()) catch {
+            workers.freeOwnedAnime(gpa, snap);
+            return;
+        };
         self.async_start_ms = self.now_ms; // slow-path spinner while the search runs
         self.add_resolving = true;
         self.add_resolve_drain.begin();
         const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-            loop, gpa, io, registry.providers, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
+            loop, gpa, io, providers, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
         }) catch {
             self.add_resolve_drain.finish(); // no worker will run, rebalance the count
             self.add_resolving = false;
+            gpa.free(providers);
             workers.freeOwnedAnime(gpa, snap);
             return;
         };

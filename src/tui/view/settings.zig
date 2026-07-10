@@ -45,8 +45,16 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     }
     y += 1;
 
-    // Catalog — read-only system state, never focusable (skipped by nav).
+    // Catalog: the provider order preference (row 5, ROD-344) above the
+    // read-only system rows. The interactive row keeps its settings_rows index
+    // contiguous with Player's, so j/k walks the sections top-to-bottom.
     y = drawSettingsHeader(self, win, y, w, "Catalog");
+    {
+        const r = settings_rows[i];
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
+        i += 1;
+        y += 1;
+    }
     drawInertRow(self, win, y, w, "enrichment sync", "automatic");
     y += 1;
     // Real resolved cover-cache path (honours $XDG_CACHE_HOME), resolved once in
@@ -56,9 +64,9 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
     y += 1;
 
-    // Interface — the toggle/cycle rows 5..10 (cover art … title language).
+    // Interface: the toggle/cycle rows 6..11 (cover art … title language).
     y = drawSettingsHeader(self, win, y, w, "Interface");
-    while (i < 10) : (i += 1) {
+    while (i < 11) : (i += 1) {
         const r = settings_rows[i];
         drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
         y += 1;
@@ -66,7 +74,7 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
 
     // AniList Sync (ROD-286) — a read-only account status (like Catalog), then the
-    // interactive connect action + sync master-switch toggle (rows 10..end).
+    // interactive connect action + sync master-switch toggle (rows 11..end).
     y = drawSettingsHeader(self, win, y, w, "AniList Sync");
     drawInertRow(self, win, y, w, "account", accountStatus(self));
     y += 1;

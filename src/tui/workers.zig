@@ -354,8 +354,11 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 }
 
 /// Background task: search-then-match binding resolve (ROD-328/342). A Browse search hit
-/// that could not tier-A anywhere is resolved by walking `providers` in registry order
-/// (ROD-343, first confident match wins; the posted event carries the winner's name).
+/// that could not tier-A anywhere is resolved by walking `providers` in effective order
+/// (ROD-343/344: the caller's `Registry.orderedAlloc` snapshot, preference first; first
+/// confident match wins and the posted event carries the winner's name). `providers` is
+/// gpa-owned by this task and freed here, so a preference change mid-flight can't touch
+/// a walk already underway.
 /// Per provider: search its OWN catalog and match: tier B first
 /// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
 /// in its results, e.g. anipub's MALID backfill), then tier C
@@ -377,6 +380,7 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// worker can no longer touch loop/gpa.
 pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
     defer drain.finish();
+    defer gpa.free(providers);
     defer freeOwnedAnime(gpa, canonical);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
