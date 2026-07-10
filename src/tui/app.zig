@@ -2244,7 +2244,7 @@ pub const App = struct {
                 // the network/blocked/server class when we know it; data-shape
                 // failures fall back to the generic line.
                 var buf: [128]u8 = undefined;
-                const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "couldn't load episodes";
+                const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "couldn't load episodes";
                 self.pushToast(.@"error", copy, false);
             },
             .cover_done => |ev| {
@@ -2321,7 +2321,7 @@ pub const App = struct {
                 // mpv-spawn classes fall back to the generic line (ROD-230 refines).
                 if (!completed) {
                     var buf: [128]u8 = undefined;
-                    const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "playback failed";
+                    const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "playback failed";
                     self.pushToast(.@"error", copy, false);
                 }
             },
@@ -2799,6 +2799,16 @@ pub const App = struct {
         t.detach();
     }
 
+    /// The provider that owns the episode pane's show (ROD-343). `for_source` is
+    /// captured at fire time, so a late async failure names the right source even
+    /// after nav moved on. Default provider before any fetch exists, or when the
+    /// row's source is no longer registered (a retired provider's rows fetch on
+    /// the default rather than dead-ending).
+    fn owningProvider(self: *const App, registry: Registry) SourceProvider {
+        const src = self.episodes.for_source orelse return registry.primary();
+        return registry.byName(src) orelse registry.primary();
+    }
+
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8) void {
         // ROD-179: do NOT join a prior in-flight episode fetch here — that would
         // block the main loop on a slow network when a settled-then-resumed scroll
@@ -2872,7 +2882,7 @@ pub const App = struct {
         // detach so a later supersede never has to join this one (ROD-179).
         self.episode_drain.begin();
         const t = std.Thread.spawn(.{}, episodesTask, .{
-            loop, self.gpa, io, registry.primary(), id_for_task, self.translation, &self.episode_drain,
+            loop, self.gpa, io, registry.byName(source) orelse registry.primary(), id_for_task, self.translation, &self.episode_drain,
         }) catch {
             self.episode_drain.finish(); // no worker will run — rebalance the count
             self.gpa.free(id_for_task);
@@ -3158,7 +3168,7 @@ pub const App = struct {
             loop,
             self.gpa,
             io,
-            registry.primary(),
+            registry.byName(source_name) orelse registry.primary(),
             id_copy,
             ep_copy,
             self.translation,

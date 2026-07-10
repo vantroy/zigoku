@@ -5712,3 +5712,113 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     app.cover.joinThread();
     app.episodes.freeResults(app.gpa);
 }
+
+/// A provider that records whether its `episodes` fetch ran; per-instance
+/// state rides on the vtable's `*anyopaque` self (ROD-343 routing tests).
+const RecordingProvider = struct {
+    id: []const u8,
+    hit: std.atomic.Value(bool) = .init(false),
+
+    fn nameFn(ptr: *anyopaque) []const u8 {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        return self.id;
+    }
+    fn displayNameFn(_: *anyopaque) []const u8 {
+        return "Rec";
+    }
+    fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+        return &.{};
+    }
+    fn canonicalKeyFn(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
+        return null;
+    }
+    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        self.hit.store(true, .release);
+        const eps = try arena.alloc(domain.EpisodeNumber, 1);
+        eps[0] = .{ .raw = "1" };
+        return eps;
+    }
+    fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
+        return .{ .url = "" };
+    }
+    fn coverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
+        return .{ .url = try gpa.dupe(u8, ref) };
+    }
+
+    const vtable: SourceProvider.VTable = .{
+        .name = nameFn,
+        .displayName = displayNameFn,
+        .search = searchFn,
+        .canonicalKey = canonicalKeyFn,
+        .episodes = episodesFn,
+        .resolve = resolveFn,
+        .coverRequest = coverRequestFn,
+    };
+
+    fn provider(self: *RecordingProvider) SourceProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "ROD-343: a history row fetches episodes on its owning provider, not the default" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "x", .title = "Shibuya", .total_episodes = 12, .progress = 0 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120; // zoom tier: Enter on a history row fires the async fetch
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-343: a history row from an unregistered source falls back to the default provider" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = [_]AnimeRecord{
+        .{ .source = "retired", .source_id = "y", .title = "Lain", .total_episodes = 13, .progress = 0 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(alpha.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
