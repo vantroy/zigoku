@@ -256,6 +256,23 @@ pub fn build(b: *std.Build) void {
     const spike_megaplay_step = b.step("spike-megaplay", "ROD-341: live megaplay extractor check");
     spike_megaplay_step.dependOn(&run_spike_megaplay.step);
 
+    // spike-anipub: drive the real AniPub provider vtable against the live host
+    // (ROD-342): search + MALID backfill → episodes → resolve, minus mpv.
+    const spike_anipub = b.addExecutable(.{
+        .name = "spike-anipub",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/anipub_provider.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zigoku", .module = mod }},
+        }),
+    });
+    const run_spike_anipub = b.addRunArtifact(spike_anipub);
+    if (b.args) |args| run_spike_anipub.addArgs(args);
+    const spike_anipub_step = b.step("spike-anipub", "ROD-342: live anipub provider check");
+    spike_anipub_step.dependOn(&run_spike_anipub.step);
+
     // spike-tui: prove libvaxis boots under Zig 0.16 (ROD-71). Renders a
     // Terminal Ghost frame + event loop in a real terminal.
     const spike_tui = b.addExecutable(.{
