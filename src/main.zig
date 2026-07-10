@@ -21,15 +21,28 @@ pub const std_options: std.Options = .{
     .logFn = zigoku.log.logFn,
 };
 
-// TEMPORARY (ROD-342, dies with the ROD-343 registry): pick the sole play
-// provider by env (`ZIGOKU_PROVIDER=anipub`) so the new provider is provable
-// end-to-end before order/override/fallback exist. Unset or anything else =
-// senshi, so a normal launch is byte-identical to before.
-extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
-fn anipubSelected() bool {
-    const v = getenv("ZIGOKU_PROVIDER") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "anipub");
-}
+/// The one place the live provider set and its order are defined (ROD-343):
+/// senshi first, anipub second. The registry's fat pointers alias `self`, so
+/// call `registry()` on a variable that outlives every use of the result and
+/// don't move it afterwards.
+const LiveProviders = struct {
+    senshi: zigoku.Senshi,
+    anipub: zigoku.AniPub,
+    slots: [2]zigoku.SourceProvider,
+
+    fn init() LiveProviders {
+        return .{
+            .senshi = zigoku.Senshi.init(),
+            .anipub = zigoku.AniPub.init(),
+            .slots = undefined,
+        };
+    }
+
+    fn registry(self: *LiveProviders) zigoku.Registry {
+        self.slots = .{ self.senshi.provider(), self.anipub.provider() };
+        return .{ .providers = &self.slots };
+    }
+};
 
 const Cli = struct {
     query: []const u8,
@@ -185,12 +198,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (store_opt) |*st| st.close();
 
     // One provider for the whole CLI run, so both run() and the error reporter
-    // read the source name from the same vtable seam. Both concrete providers
-    // must outlive both calls; this frame does. (ROD-301: AllAnime is
-    // captcha-dead, see ROD-300.)
-    var senshi = zigoku.Senshi.init();
-    var anipub = zigoku.AniPub.init();
-    const provider = if (anipubSelected()) anipub.provider() else senshi.provider();
+    // read the source name from the same vtable seam. The one-shot CLI flow
+    // never iterates providers; it stays pinned to the registry default and
+    // `Registry` deliberately doesn't thread past this frame (ROD-343).
+    var live = LiveProviders.init();
+    const provider = live.registry().primary();
 
     run(arena, io, out, in, cli, cfg, provider, if (store_opt) |*st| st else null) catch |err| {
         try reportError(out, err, provider.displayName());
@@ -418,9 +430,10 @@ fn runTui(init: std.process.Init, arena: std.mem.Allocator, cfg: zigoku.Config, 
     }
 
     // ROD-301: senshi replaces the captcha-walled AllAnime as the live source.
-    var senshi = zigoku.Senshi.init();
-    var anipub = zigoku.AniPub.init();
-    const provider = if (anipubSelected()) anipub.provider() else senshi.provider();
+    // Registry threading into tui.run itself is the next ROD-343 step; until
+    // then the TUI runs on the registry default, byte-identical to before.
+    var live = LiveProviders.init();
+    const provider = live.registry().primary();
     try zigoku.tui.run(init.gpa, init.io, init.environ_map, if (store_opt) |*st| st else null, provider, cfg, cfg_path);
 }
 
