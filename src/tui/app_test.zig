@@ -3351,7 +3351,7 @@ test "resolve_add_result binds revealed and toasts success on a hit; clears the 
     app.add_resolving = true; // fireResolveAdd set it; the handler must clear it
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(app.history_dirty);
@@ -3376,7 +3376,7 @@ test "resolve_add_result miss with no canonical row falls back to the error toas
     app.add_resolving = true;
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = &.{} } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(!app.history_dirty);
@@ -3404,7 +3404,7 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     app.add_resolving = true;
 
     // A real miss carries an empty source_id (the worker posts &.{} on no match).
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{} } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{} } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(app.history_dirty); // a new marker row → reload so it surfaces this session
@@ -3460,7 +3460,7 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
     // the binding here; pending_bind stays armed, which is the handoff under test.
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
     try testing.expect(!app.play_resolving);
     try testing.expectEqual(@as(?i64, 154587), app.pending_bind); // armed for the episode fetch
@@ -3473,7 +3473,7 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     app.gpa = std.testing.allocator;
     app.play_resolving = true;
 
-    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "" } });
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = &.{} } });
 
     try testing.expect(!app.play_resolving);
     try testing.expect(app.pending_bind == null);
@@ -3489,7 +3489,7 @@ test "browseResolveTarget: a provider-keyed row is .direct (ROD-328)" {
     defer arena_inst.deinit();
     // id != stringified anilist_id → not an unresolved AniList hit, fetch as-is.
     const sel: Anime = .{ .id = "52991", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, null, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, null, arena_inst.allocator())) {
         .direct => |id| try testing.expectEqualStrings("52991", id),
         else => return error.TestExpectationFailed,
     }
@@ -3503,7 +3503,7 @@ test "browseResolveTarget: an AniList hit with a mal_id is .tier_a (ROD-328)" {
     // id == stringified anilist_id (an unresolved hit), mal_id present, no binding yet →
     // the provider's canonicalKey derives its id.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
         .tier_a => |t| {
             try testing.expectEqualStrings("52991", t.id);
             try testing.expectEqual(@as(i64, 154587), t.anilist_id);
@@ -3519,7 +3519,7 @@ test "browseResolveTarget: an AniList hit with no mal_id is .needs_search (ROD-3
     defer st.close();
     // No mal_id → canonicalKey returns null → tier-C title search.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
         .needs_search => |aid| try testing.expectEqual(@as(i64, 154587), aid),
         else => return error.TestExpectationFailed,
     }
@@ -3544,10 +3544,70 @@ test "browseResolveTarget: an existing binding is tier 0 and wins over tier A (R
 
     // An AniList hit that is ALSO tier-A eligible (carries a mal_id): tier 0 must still win.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena)) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("99999", b.id); // the stored binding, not tier-A's 52991
             try testing.expectEqual(@as(i64, 154587), b.anilist_id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: tier 0 on a later provider beats tier A on the first (ROD-343)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // The binding lives on the SECOND provider; the first is tier-A capable (the
+    // dummy canonicalKey derives the mal_id). Provider-major would verdict .tier_a
+    // on the first and shadow the second's binding forever.
+    var beta = RecordingProvider{ .id = "beta" };
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, 1000, arena));
+
+    const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("beta", b.provider.name());
+            try testing.expectEqualStrings("99999", b.id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: bindings on both providers tie to registry order (ROD-343)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("allanime", "11111", 154587, false, 1000, arena));
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, 1000, arena));
+
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("allanime", b.provider.name());
+            try testing.expectEqualStrings("11111", b.id);
         },
         else => return error.TestExpectationFailed,
     }
