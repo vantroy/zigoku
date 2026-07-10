@@ -1607,8 +1607,52 @@ pub const Store = struct {
     /// binding recomputes to the show's true high-water instead of 0, which would
     /// otherwise push an AniList progress downgrade (the ROD-323 shape). The
     /// UPDATE still targets only the queried binding. NULL `canonical_id` never
-    /// cross-joins (see getResume).
+    /// cross-joins (see getResume). Siblings correlate per episode by RAW LABEL:
+    /// providers that label the same episode differently ("9" vs "09") count it
+    /// twice; the codebase-wide raw-label identity scheme, not a new assumption.
     pub fn recomputeProgress(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
+        const high_water = try self.unionHighWater(scratch, source, source_id, tt);
+        const sql_upd = "UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?";
+        const upd = try self.prepare(sql_upd);
+        defer _ = c.sqlite3_finalize(upd);
+        try checkBind(upd, c.sqlite3_bind_int64(upd, 1, high_water));
+        try bindText(upd, 2, source);
+        try bindText(upd, 3, source_id);
+        try self.stepDone(upd);
+        return high_water;
+    }
+
+    /// Raise-only twin of `recomputeProgress` for a fallback-walk landing (ROD-346):
+    /// never LOWERS the binding's progress, so landing on a force-completed sibling
+    /// (the ROD-131 c-key snap, which has no episode_progress rows behind it) can't
+    /// silently un-complete it. The exact recompute stays the afterPlay/r-key
+    /// contract; this one only closes the "fresh or stale binding under-reads the
+    /// union" gap. Returns the binding's resulting progress.
+    pub fn raiseProgressToUnion(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
+        const high_water = try self.unionHighWater(scratch, source, source_id, tt);
+        const sql_upd = "UPDATE anime SET progress = MAX(progress, ?) WHERE source = ? AND source_id = ?";
+        const upd = try self.prepare(sql_upd);
+        defer _ = c.sqlite3_finalize(upd);
+        try checkBind(upd, c.sqlite3_bind_int64(upd, 1, high_water));
+        try bindText(upd, 2, source);
+        try bindText(upd, 3, source_id);
+        try self.stepDone(upd);
+
+        const sql_sel = "SELECT progress FROM anime WHERE source = ? AND source_id = ?";
+        const sel = try self.prepare(sql_sel);
+        defer _ = c.sqlite3_finalize(sel);
+        try bindText(sel, 1, source);
+        try bindText(sel, 2, source_id);
+        return switch (c.sqlite3_step(sel)) {
+            c.SQLITE_ROW => c.sqlite3_column_int64(sel, 0),
+            c.SQLITE_DONE => high_water, // no binding row: nothing raised, report the union
+            else => error.Step,
+        };
+    }
+
+    /// The cross-sibling watched high-water (see recomputeProgress for the contract);
+    /// pure read, shared by the exact and raise-only writers.
+    fn unionHighWater(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
         // 1. Fetch the union of episode_progress rows across sibling bindings.
         const sql_sel =
             \\SELECT ep.episode, MAX(ep.fully_watched)
@@ -1658,16 +1702,6 @@ pub const Store = struct {
         for (rows.items, 0..) |row, i| {
             if (row.watched) high_water = @intCast(i + 1);
         }
-
-        // 5. UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?
-        const sql_upd = "UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?";
-        const upd = try self.prepare(sql_upd);
-        defer _ = c.sqlite3_finalize(upd);
-        try checkBind(upd, c.sqlite3_bind_int64(upd, 1, high_water));
-        try bindText(upd, 2, source);
-        try bindText(upd, 3, source_id);
-        try self.stepDone(upd);
-
         return high_water;
     }
 
@@ -4192,6 +4226,32 @@ test "recomputeProgress unions episode rows across sibling bindings (ROD-346)" {
     // Dub rows on a sibling never leak into a sub recompute.
     try s.saveProgress("anipub", "2454", .dub, "4", 950, 1000, 7000);
     try testing.expectEqual(@as(i64, 3), try s.recomputeProgress(arena, "senshi", "52991", .sub));
+}
+
+test "raiseProgressToUnion raises a lagging binding but never lowers a force-completed one (ROD-346 review)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (900, 'Frieren');");
+    // The union's real high-water lives on the first binding: eps 1..3 watched.
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "a", .title = "F", .anilist_id = 900, .canonical_id = 900 }, 1000, arena);
+    try s.saveProgress("senshi", "a", .sub, "1", 950, 1000, 5001);
+    try s.saveProgress("senshi", "a", .sub, "2", 950, 1000, 5002);
+    try s.saveProgress("senshi", "a", .sub, "3", 950, 1000, 5003);
+
+    // A lagging sibling (progress 1) raises to the union.
+    try s.upsertAnime(.{ .source = "anipub", .source_id = "b", .title = "F", .anilist_id = 900, .canonical_id = 900, .progress = 1 }, 1001, arena);
+    try testing.expectEqual(@as(i64, 3), try s.raiseProgressToUnion(arena, "anipub", "b", .sub));
+    try testing.expectEqual(@as(i64, 3), (try s.getAnime(arena, "anipub", "b")).?.progress);
+
+    // A force-completed sibling (c-key snap: progress 12, no rows behind it) is
+    // NEVER lowered; the exact recompute stays the afterPlay/r-key contract.
+    try s.upsertAnime(.{ .source = "other", .source_id = "c", .title = "F", .anilist_id = 900, .canonical_id = 900, .progress = 12 }, 1002, arena);
+    try testing.expectEqual(@as(i64, 12), try s.raiseProgressToUnion(arena, "other", "c", .sub));
+    try testing.expectEqual(@as(i64, 12), (try s.getAnime(arena, "other", "c")).?.progress);
 }
 
 test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor clobbers (ROD-267 review)" {

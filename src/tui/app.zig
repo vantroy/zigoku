@@ -818,6 +818,12 @@ pub const App = struct {
     /// fallback to ONE search at a time (same ROD-309 discipline as `add_resolving`). Set in
     /// `fireResolvePlaySearch`, cleared in `.resolve_play_target`.
     play_resolving: bool = false,
+    /// ROD-346: the anilist_id the in-flight Play search was fired FOR. The
+    /// `.resolve_play_target` handler drops a result that no longer matches, so a
+    /// late search can't hijack the grid of a show the user has since opened
+    /// (`fireEpisodesForId` has no keep-check of its own). Set beside
+    /// `play_resolving`; cleared by the handler and by any user-driven fire.
+    play_resolve_aid: ?i64 = null,
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
     /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
@@ -2021,6 +2027,13 @@ pub const App = struct {
                 defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
                 self.async_start_ms = 0;
                 self.play_resolving = false;
+                // ROD-346: drop a result the user has superseded (they fired another
+                // show's fetch, which cleared play_resolve_aid). Installing it would
+                // hijack the currently-displayed grid; its dead-end toast would name a
+                // show they already left.
+                const wanted = self.play_resolve_aid != null and self.play_resolve_aid.? == ev.anilist_id;
+                self.play_resolve_aid = null;
+                if (!wanted) return;
                 if (!ev.ok) {
                     // ROD-346: a walk hop's search missed; advance to the next provider.
                     // Guarded on the walk's anilist_id so a late miss for a superseded
@@ -2028,11 +2041,18 @@ pub const App = struct {
                     if (self.fallback != null and self.fallback.?.anilist_id == ev.anilist_id) {
                         if (self.advanceFallback(loop, io, registry, null, null)) return;
                     }
+                    // ROD-346/ROD-229: a walk that started from the auto-resume landing
+                    // and exhausted HERE (tier-C was the last hop) must demote just like
+                    // the episodes_error dead end, or the user strands on a blank pane.
+                    self.demoteResumeLanding();
                     // No confident provider match (unmatched, ROD-329): same dead-end as a
                     // failed episode fetch.
                     self.pushToast(.@"error", "couldn't load episodes", false);
                     return;
                 }
+                // The staleness gate above makes this walk (if any) this result's own:
+                // both were keyed by the same fire (play_resolve_aid == ev.anilist_id).
+                std.debug.assert(self.fallback == null or self.fallback.?.anilist_id == ev.anilist_id);
                 // Confirmed match: fire the episode fetch on the provider that matched
                 // (ev.source, ROD-343), then arm pending_bind (order matters:
                 // fireEpisodesForId nulls it at entry, same trap as fireEpisodesResolved).
@@ -2252,7 +2272,7 @@ pub const App = struct {
                             // before the first play on this binding. The seed pass above ran
                             // pre-mint and saw no row, so patch the in-memory grid too.
                             if (bound) {
-                                const hw = st.recomputeProgress(arena.allocator(), source, ev.for_id, self.translation) catch |e| blk: {
+                                const hw = st.raiseProgressToUnion(arena.allocator(), source, ev.for_id, self.translation) catch |e| blk: {
                                     log.debug("mint-time recompute failed: {s}", .{@errorName(e)});
                                     break :blk 0;
                                 };
@@ -2289,11 +2309,7 @@ pub const App = struct {
                 // History view (cursor already parked on the target row). The toast
                 // below still explains the failure. A user-driven open is never
                 // pending here (cleared at fire time), so it stays put.
-                if (self.resume_landing_pending) {
-                    self.active_view = .history;
-                    self.active_pane = .list;
-                    self.resume_landing_pending = false;
-                }
+                self.demoteResumeLanding();
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
                 // failure so the blank pane isn't a silent dead end. ROD-173 names
@@ -2919,7 +2935,10 @@ pub const App = struct {
         self.pending_bind = null;
         // ROD-346: same for the fallback walk. A user-driven fire kills a stale walk;
         // walk hops hold theirs in a local across this call and re-install after.
+        // A late Play-search result is likewise no longer wanted once the user
+        // fired something else (the resolve_play_target staleness gate).
         self.clearFallback();
+        self.play_resolve_aid = null;
         // ROD-329: clears the sentinel flag; a populated grid must never render "no source
         // available" (the History gate re-sets it, this fetch never runs for a sentinel row).
         self.episodes.unbound = false;
@@ -3055,8 +3074,10 @@ pub const App = struct {
     /// so the routing lives once.
     fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, sel: Anime) void {
         // ROD-346: a `.needs_search` verdict never reaches fireEpisodesForId, so a
-        // stale walk from a previous show must die here, not there.
+        // stale walk (and a stale Play-search want) from a previous show must die
+        // here, not there.
         self.clearFallback();
+        self.play_resolve_aid = null;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         switch (browseResolveTarget(registry, self.effectivePreference(), sel, self.store, arena.allocator())) {
@@ -3131,6 +3152,7 @@ pub const App = struct {
             return;
         };
         t.detach();
+        self.play_resolve_aid = anilist_id; // the show this search is FOR (staleness gate)
     }
 
     /// ROD-346: one provider-fallback walk (see the `fallback` field doc for the
@@ -3178,6 +3200,16 @@ pub const App = struct {
         return null;
     }
 
+    /// ROD-229's demote, shared by every "the auto-resume landing dead-ended" site
+    /// (episodes_error, and the walk's tier-C exhaustion in resolve_play_target):
+    /// back to History rather than a stranded blank pane. No-op unless pending.
+    fn demoteResumeLanding(self: *App) void {
+        if (!self.resume_landing_pending) return;
+        self.active_view = .history;
+        self.active_pane = .list;
+        self.resume_landing_pending = false;
+    }
+
     /// pub for the app_test teardowns (a test that arms a walk must free it).
     pub fn clearFallback(self: *App) void {
         if (self.fallback) |*w| w.deinit(self.gpa);
@@ -3206,7 +3238,13 @@ pub const App = struct {
             workers.freeOwnedAnime(self.gpa, canonical);
             return false;
         };
-        std.debug.assert(providers.len <= 16); // `tried` bitmask capacity
+        // `tried` bitmask capacity; degrade to no-walk rather than overflow if the
+        // registry ever outgrows it (asserts compile out of release builds).
+        if (providers.len > 16) {
+            workers.freeOwnedAnime(self.gpa, canonical);
+            self.gpa.free(providers);
+            return false;
+        }
         var tried: u16 = 0;
         for (providers, 0..) |p, i| {
             if (std.mem.eql(u8, p.name(), src)) tried |= @as(u16, 1) << @intCast(i);
@@ -3281,6 +3319,26 @@ pub const App = struct {
     /// walks between two broken providers.
     fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         var walk = self.fallback orelse return;
+        // EVERY walk landing raises the landed binding's progress through the
+        // canonical union, not just a fresh mint: a tier-0 hop reuses an existing
+        // sibling row whose own progress can lag the union, which would under-dim
+        // the grid AND hand sync a stale (lower) number to push (the ROD-323
+        // shape). Raise-only, so landing on a force-completed sibling can't
+        // un-complete it. The mint path's raise in episodes_done ran pre-seed;
+        // this one patches the in-memory grid for the tier-0 shape.
+        if (self.store) |st| {
+            if (self.episodes.for_id) |fid| {
+                if (self.episodes.for_source) |fsrc| {
+                    var arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer arena.deinit();
+                    const hw = st.raiseProgressToUnion(arena.allocator(), fsrc, fid, self.translation) catch |e| blk: {
+                        log.debug("walk-landing raise failed: {s}", .{@errorName(e)});
+                        break :blk 0;
+                    };
+                    if (hw > 0) self.syncEpisodeProgress(fsrc, fid, hw);
+                }
+            }
+        }
         const cont = walk.play orelse {
             self.fallback = null;
             walk.deinit(self.gpa);
@@ -3311,7 +3369,10 @@ pub const App = struct {
     fn advancePlayFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, episode_raw: []const u8, ordinal: u32) bool {
         if (self.fallback) |*w| {
             if (w.play != null) {
-                // Same episode, standing walk: the fresh dupe is redundant.
+                // Same episode, standing walk: the fresh dupe is redundant. firePlay's
+                // `playing` guard structurally prevents a different episode starting
+                // while the relaunch is in flight; assert that non-local proof here.
+                std.debug.assert(std.mem.eql(u8, w.play.?.episode_raw, episode_raw));
                 self.gpa.free(episode_raw);
                 return self.advanceFallback(loop, io, registry, null, self.owningProvider(registry).displayName());
             }
@@ -3350,6 +3411,7 @@ pub const App = struct {
             return false;
         };
         t.detach();
+        self.play_resolve_aid = anilist_id; // the show this search is FOR (staleness gate)
         self.toastFallbackHop(p, failed_name);
         return true;
     }

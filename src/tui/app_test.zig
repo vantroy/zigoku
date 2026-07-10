@@ -3455,6 +3455,7 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
+    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
     defer app.episodes.freeResults(std.testing.allocator); // fireEpisodesForId dupes for_id/source
 
     // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
@@ -3472,6 +3473,7 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.play_resolving = true;
+    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
 
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = &.{} } });
 
@@ -6479,4 +6481,161 @@ test "ROD-346: a never-played stream failure relaunches on the hop provider, bou
     try testing.expect(saw_error);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stale progress" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "900",
+        .name = "Frieren",
+        .anilist_id = 900,
+    }, true, 5000, arena);
+    // Origin binding holds the real state: eps 1..8 fully watched.
+    try st.upsertAnime(.{ .source = "alpha", .source_id = "a1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 5000, arena);
+    var ep_buf: [2]u8 = undefined;
+    for (1..9) |n| {
+        const label = try std.fmt.bufPrint(&ep_buf, "{d}", .{n});
+        try st.saveProgress("alpha", "a1", .sub, label, 950, 1000, 5000 + @as(i64, @intCast(n)));
+    }
+    // The sibling binding the tier-0 hop will reuse: its OWN progress column is
+    // stale (2), and its episode cache is primed so the hop lands synchronously
+    // (tryCacheHit posts no episodes_done; completeFallback is the only recompute
+    // chance, the gap the review's Critical named).
+    try st.upsertAnime(.{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 }, 5001, arena);
+    const cached = [_]domain.EpisodeNumber{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" },
+        .{ .raw = "5" }, .{ .raw = "6" }, .{ .raw = "7" }, .{ .raw = "8" },
+    };
+    try st.putCachedEpisodes("beta", "b7", .sub, &cached, "FINISHED", store_mod.Store.nowSecs(), arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The hop reused beta's binding from cache (no probe thread, no mint) and the
+    // landing raised its progress through the canonical union: grid and store both
+    // read 8, not the stale 2 sync would otherwise push (the ROD-323 shape).
+    try testing.expect(!beta.hit.load(.acquire)); // cache hit: no network probe
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    try testing.expect(app.fallback == null); // synchronous landing completed the walk
+    try testing.expectEqual(@as(u32, 8), app.episodes.progress);
+    try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
+    // Writes stay per-binding: the origin row's own progress column is untouched.
+    try testing.expectEqual(@as(i64, 0), (try st.getAnime(arena, "alpha", "a1")).?.progress);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demotes to History" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" }; // tier-C only: no canonicalKey, search misses
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "900",
+        .name = "Frieren",
+        .anilist_id = 900,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+    // The auto-resume landing armed the demote contract before its fetch failed.
+    app.active_view = .detail;
+    app.active_pane = .detail;
+    app.resume_landing_pending = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The walk hopped to beta's tier-C search; the landing flag must survive the hop.
+    try testing.expect(app.play_resolving);
+    try testing.expect(app.resume_landing_pending);
+    app.play_resolve_drain.drain();
+    try testing.expect(beta.search_hit.load(.acquire));
+
+    // The search misses (empty stub catalog) and the walk exhausts: this dead end
+    // must demote exactly like episodes_error's (the ROD-229 contract).
+    var miss: ?Event = null;
+    while (loop.queue.tryPop() catch null) |ev| {
+        if (miss == null and ev == .resolve_play_target) {
+            miss = ev;
+        } else freeTestEvent(app.gpa, ev);
+    }
+    try app.tick(miss.?, &loop, io, registry);
+
+    try testing.expect(app.fallback == null);
+    try testing.expect(!app.resume_landing_pending);
+    try testing.expect(app.active_view == .history);
+    try testing.expect(app.active_pane == .list);
+    // Slot 0 holds the hop's warn toast; the dead-end error lands after it.
+    var saw_error = false;
+    for (app.toast_queue) |slot| {
+        if (slot) |t| {
+            if (t.kind == .@"error") saw_error = true;
+        }
+    }
+    try testing.expect(saw_error);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a superseded resolve_play_target success is dropped, never hijacks the grid" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.play_resolving = true;
+    // play_resolve_aid stays null: the user fired another show's fetch after this
+    // search spawned, which cleared the fire-time intent. The landed grid below is
+    // that other show's.
+    app.episodes.for_id = try app.gpa.dupe(u8, "current-show");
+    app.episodes.for_source = try app.gpa.dupe(u8, "senshi");
+    defer app.episodes.freeResults(app.gpa);
+
+    const sid = try std.testing.allocator.dupe(u8, "52991");
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
+
+    // Dropped: the guard cleared, but no fetch fired and no bind was armed; the
+    // user's current grid identity is untouched.
+    try testing.expect(!app.play_resolving);
+    try testing.expect(app.pending_bind == null);
+    try testing.expectEqualStrings("current-show", app.episodes.for_id.?);
+    try testing.expectEqualStrings("senshi", app.episodes.for_source.?);
 }
