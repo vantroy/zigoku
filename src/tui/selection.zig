@@ -121,7 +121,7 @@ fn seasonChipText(self: *App, season: ?domain.Season, year: ?u32) []const u8 {
 /// rather than flash 冬 1970 for one frame.
 fn courChip(self: *App) []const u8 {
     if (self.now_ms <= 0) return "";
-    const c = currentCour(self.now_ms);
+    const c = domain.currentCour(self.now_ms);
     return seasonChipText(self, c.season, c.year);
 }
 
@@ -133,19 +133,8 @@ pub fn isNewRelease(self: *const App, a: Anime) bool {
     if (self.now_ms <= 0) return false;
     const year = a.year orelse return false;
     const season = a.season orelse return false;
-    const c = currentCour(self.now_ms);
+    const c = domain.currentCour(self.now_ms);
     return year == c.year and season == c.season;
-}
-
-/// The broadcast cour for an epoch-ms instant, using AniList's season
-/// boundaries (domain.Season.fromMonth) with December rolled into next year's
-/// Winter cour — so the ambient chip names the same cour AniList would.
-fn currentCour(now_ms: i64) struct { season: domain.Season, year: u32 } {
-    const secs: u64 = @intCast(@divFloor(now_ms, std.time.ms_per_s));
-    const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
-    const month = yd.calculateMonthDay().month.numeric();
-    const year: u32 = if (month == 12) @as(u32, yd.year) + 1 else yd.year;
-    return .{ .season = domain.Season.fromMonth(month), .year = year };
 }
 
 fn historySeason(r: AnimeRecord) ?domain.Season {
