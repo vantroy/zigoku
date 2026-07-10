@@ -2463,7 +2463,7 @@ pub const App = struct {
         // ROD-264 #3: drop past the soft cap. Left un-set, the slot stays !loading,
         // so refreshDiscover / the prefetch trigger re-fire once the pool drains.
         if (self.discoverPoolSaturated()) {
-            log.debug("discover pool at cap ({d}) — dropping feed fetch, will re-fire", .{discover_feed_cap});
+            log.debug("discover pool at cap ({d}): dropping feed fetch, will re-fire", .{discover_feed_cap});
             return;
         }
         // ROD-251: detach, don't join a prior in-flight feed fetch: cycling axes

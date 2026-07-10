@@ -313,9 +313,9 @@ test "quit keys: q from browse and Ctrl-C" {
 }
 
 test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
-    // A source with no feed sets discover_supported=false at startup, so D (and its
-    // F3 alias) must not open Discover — the view stays put (the user gets a toast,
-    // not an empty grid; the [D] top-bar tab is dimmed to match).
+    // Manually simulates the pre-ROD-336 provider gate: nothing sets this field at
+    // runtime anymore (Discover is AniList-backed), but the guard path stays until
+    // ROD-337 deletes it with the vtable, so pin its behavior until then.
     var app: App = .{};
     app.input_mode = .normal;
     app.discover_supported = false;
