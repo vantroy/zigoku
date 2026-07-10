@@ -79,10 +79,11 @@ pub const Event = union(enum) {
     /// A tier-A add-to-watchlist resolve settled (ROD-327): the worker probed the play
     /// provider by the stringified mal_id (`source_id`) for an anilist_id-keyed Browse
     /// hit. `ok` true: the provider stocks the show, so the UI thread mints the binding
-    /// (`bindCanonical`) revealed and reloads History. `ok` false: resolver miss, no state
-    /// written (ROD-329 owns the unmatched state), plus a "couldn't add" toast. `source_id`
-    /// is gpa-owned; the UI thread frees it on either arm. `anilist_id` links the binding
-    /// to its canonical row.
+    /// (`bindCanonical`) revealed and reloads History. `ok` false: no provider stocks it, so
+    /// the UI thread persists the explicit unbound marker (ROD-329, `markUnbound`) and the
+    /// show enters History with Play disabled, or falls back to a "couldn't add" toast when
+    /// no canonical row exists. `source_id` is gpa-owned; the UI thread frees it on either
+    /// arm. `anilist_id` links the binding to its canonical row.
     resolve_add_result: struct {
         ok: bool,
         anilist_id: i64,
@@ -94,8 +95,9 @@ pub const Event = union(enum) {
     /// opaque id for the best catalog match (gpa-owned): the UI thread arms the bind
     /// (`pending_bind` = `anilist_id`) and fires the episode fetch, which confirms, caches,
     /// and mints the binding through the shared `.episodes_done` path. `ok` false: no
-    /// confident match (the unmatched state is ROD-329) plus a "couldn't load episodes"
-    /// toast. `source_id` is gpa-owned and freed by the UI thread when non-empty.
+    /// confident match, so a "couldn't load episodes" toast and nothing persisted (the Play
+    /// path mints no unbound marker; that is the add path only, ROD-329). `source_id` is
+    /// gpa-owned and freed by the UI thread when non-empty.
     resolve_play_target: struct {
         ok: bool,
         anilist_id: i64,

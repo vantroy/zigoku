@@ -4019,21 +4019,22 @@ pub const App = struct {
     /// bare codepoint — Ctrl-C (quit) is matched earlier in onKey, so no clash.
     /// Extracted from onKey verbatim (ROD-218, no behavior change).
     fn onHistoryMutationKey(self: *App, key: vaxis.Key) bool {
-        // ROD-329: an unbound row is a terminal marker with no in-app playback, so freeze the
-        // current-row watch-state transitions (p/c/w/P) and the progress recompute (r) on it.
-        // x (dropped) stays live so the user can still drop a show no provider carries. u is
-        // global undo, keyed on the mutation's OWN row not the cursor (applyUndo → indexById),
-        // so it must NOT be gated on the cursor sitting unbound. Frozen keys are still consumed
-        // so they never fall through to list-nav.
-        const on_unbound = if (self.selectedHistoryRecord()) |rec|
-            std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)
-        else
-            false;
-        if (on_unbound and (key.matches('p', .{}) or key.matches('c', .{}) or key.matches('w', .{}) or
-            key.matches('P', .{ .shift = true }) or key.matches('P', .{}) or key.matches('r', .{})))
-        {
-            self.pushToast(.info, "no source: can't update", false);
-            return true;
+        // ROD-329: freeze only progress-recompute (r) on an unbound row. r rebuilds progress
+        // from the episode_progress rows a sentinel can never have, so it would only zero it.
+        // The status transitions (p/c/w/P) stay live: a user tracking a show they watch
+        // elsewhere can mark it watching/completed here and it syncs (loadDirtyForSync is
+        // source-agnostic). x (drop) and u (undo, keyed on the mutation's own row via
+        // applyUndo → indexById, not the cursor) were never gated. Consumed so r never falls
+        // through to nav.
+        if (key.matches('r', .{})) {
+            const on_unbound = if (self.selectedHistoryRecord()) |rec|
+                std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)
+            else
+                false;
+            if (on_unbound) {
+                self.pushToast(.info, "no source: nothing to recompute", false);
+                return true;
+            }
         }
         if (key.matches('p', .{})) {
             self.setSelectedHistoryStatus(.paused);

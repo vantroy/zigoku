@@ -947,7 +947,7 @@ pub const Store = struct {
     /// owns no episode rows (Play is gated off it), so nothing cascades.
     fn supersedeUnbound(self: *Store, anilist_id: i64) Error!bool {
         var buf: [24]u8 = undefined;
-        const source_id = std.fmt.bufPrint(&buf, "{d}", .{anilist_id}) catch return false;
+        const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
         const stmt = try self.prepare("DELETE FROM anime WHERE source = ? AND source_id = ?");
         defer _ = c.sqlite3_finalize(stmt);
         try bindText(stmt, 1, SOURCE_UNBOUND);
@@ -965,8 +965,15 @@ pub const Store = struct {
     /// no canonical row exists (persist ran out of order): the caller must not toast success.
     pub fn markUnbound(self: *Store, anilist_id: i64, now: i64, scratch: Allocator) Error!bool {
         var buf: [24]u8 = undefined;
-        const source_id = std.fmt.bufPrint(&buf, "{d}", .{anilist_id}) catch return false;
+        const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
         return self.bindCanonical(SOURCE_UNBOUND, source_id, anilist_id, true, now, scratch);
+    }
+
+    /// The sentinel's PK `source_id` for a canonical: the stringified `anilist_id`, written
+    /// into `buf` (ROD-329). The mint (`markUnbound`) and the delete (`supersedeUnbound`)
+    /// must key the row identically, so this format lives in one place.
+    fn unboundSourceId(buf: []u8, anilist_id: i64) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{d}", .{anilist_id}) catch null;
     }
 
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and

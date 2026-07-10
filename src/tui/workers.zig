@@ -398,8 +398,8 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, pa
 /// is anilist_id-keyed; the play provider keys by the stringified mal_id (`candidate_id`).
 /// Probes `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
 /// the show, so the UI thread can mint the binding. A transport failure and an empty list
-/// both collapse to `ok = false` (no state written on a miss; ROD-329 owns the unmatched
-/// state), so both read as the same "couldn't add" outcome.
+/// both collapse to `ok = false`; the UI thread turns that miss into the explicit unbound
+/// marker (ROD-329, add path), so this worker writes no state itself.
 ///
 /// `candidate_id` ownership transfers to the `resolve_add_result` event on a successful
 /// post (the UI thread frees it on either arm); freed here only if the post fails.
@@ -432,7 +432,8 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// with no MAL id) is resolved by searching the provider's OWN catalog by the canonical
 /// title and fuzzy-matching (`resolver.bestProviderMatch`, the STRONG canonical→provider
 /// direction). A confident match yields the provider's opaque id; no match or a failed
-/// search both collapse to `ok = false` (unmatched, ROD-329). The Add path (`for_play` false)
+/// search both collapse to `ok = false` (the add path then persists the unbound marker,
+/// ROD-329; Play just toasts). The Add path (`for_play` false)
 /// then probes `episodes` to confirm the match has playable episodes, the same bar tier-A Add
 /// holds; Play skips that probe because its own downstream episode fetch is the confirmation.
 ///

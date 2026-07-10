@@ -11,7 +11,7 @@
 //! the two matchers share ONE title-normalization rule. Same thresholds (best >= 1200,
 //! margin >= 250): a lone title agreement clears the floor; episode-count and year are
 //! tie-breakers that earn the margin. Below either guard the resolver reports no match
-//! (the explicit unmatched state is ROD-329) rather than binding a guess.
+//! rather than binding a guess (the add-path miss becomes the explicit unbound state, ROD-329).
 //!
 //! Pure and provider-agnostic: no network, no threads, no `SourceProvider`. The worker
 //! (`workers.resolveSearchTask`) runs `provider.search` and feeds the results here.

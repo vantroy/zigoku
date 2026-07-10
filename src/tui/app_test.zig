@@ -3455,7 +3455,10 @@ test "resolve_add_result binds revealed and toasts success on a hit; clears the 
     try testing.expect(rec.history_visible); // revealed
 }
 
-test "resolve_add_result on a miss toasts the failure and writes no state (ROD-327)" {
+test "resolve_add_result miss with no canonical row falls back to the error toast, writes nothing (ROD-329)" {
+    // The add-resolve miss now mints an unbound marker (markUnbound) ONLY when a canonical
+    // row exists. With none seeded, markUnbound returns false and the handler falls back to
+    // the plain "couldn't add" error: never a false success, never a phantom row.
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -3473,7 +3476,73 @@ test "resolve_add_result on a miss toasts the failure and writes no state (ROD-3
     try testing.expect(!app.add_resolving);
     try testing.expect(!app.history_dirty);
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
-    try testing.expect((try st.getAnime(arena, "allanime", "52991")) == null); // no state
+    try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) == null); // no marker
+}
+
+test "resolve_add_result miss with a canonical row persists the unbound marker and warns (ROD-329)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    // A real miss carries an empty source_id (the worker posts &.{} on no match).
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{} } });
+
+    try testing.expect(!app.add_resolving);
+    try testing.expect(app.history_dirty); // a new marker row → reload so it surfaces this session
+    try testing.expectEqual(Toast.Kind.warn, app.toast_queue[0].?.kind);
+    // The sentinel persisted, visible, keyed on the stringified anilist_id and carrying the
+    // real anilist_id (the linchpin that keeps it in sync's push set).
+    const rec = (try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")).?;
+    try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
+    try testing.expect(rec.history_visible);
+}
+
+test "opening an unbound row clears a prior show's grid so firePlay can't launch it (ROD-329)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var recs = [_]store_mod.AnimeRecord{
+        .{ .source = store_mod.SOURCE_UNBOUND, .source_id = "999", .title = "Frieren" },
+    };
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.term_cols = 120; // two-pane: l drills straight through fireEpisodesForHistoryRecord
+    app.history = &recs;
+    app.list_cursor = 0;
+
+    // Simulate a previously-viewed show still resident in the grid. If the open gate merely
+    // skipped the fetch instead of clearing, these would survive and firePlay (which only
+    // checks results/for_id are non-null) would launch THIS show under the unbound pane.
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 1);
+    eps[0] = .{ .raw = try std.testing.allocator.dupe(u8, "1") };
+    app.episodes.results = eps;
+    app.episodes.for_id = try std.testing.allocator.dupe(u8, "prevshow");
+    app.episodes.for_source = try std.testing.allocator.dupe(u8, "senshi");
+
+    try testTick(&app, keyEv('l', .{}));
+
+    // The gate cleared the stale grid (so firePlay's `results/for_id orelse return` trips)
+    // and flagged the explicit terminal state for the renderer.
+    try testing.expect(app.episodes.results == null);
+    try testing.expect(app.episodes.for_id == null);
+    try testing.expect(app.episodes.unbound);
 }
 
 test "resolve_play_target on a hit arms the bind + fires the episode fetch; clears the guard (ROD-328)" {
