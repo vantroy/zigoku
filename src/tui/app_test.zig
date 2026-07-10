@@ -7,6 +7,7 @@ const event_mod = @import("event.zig");
 const workers = @import("workers.zig");
 const store_mod = @import("../store.zig");
 const source_mod = @import("../source.zig");
+const anilist = @import("../anilist.zig");
 const domain = @import("../domain.zig");
 const cover_mod = @import("../cover.zig");
 const colors = @import("colors.zig");
@@ -179,7 +180,7 @@ fn testTick(app: *App, event: Event) !void {
         t.join();
         app.search_thread = null;
     }
-    app.discover_drain.drain(); // Discover feed/enrich workers detach now (ROD-251); wait them out
+    app.discover_drain.drain(); // Discover feed workers detach now (ROD-251); wait them out
     // No-op today (the is_test gate in pumpDiscoverCovers prevents the grid-cover
     // workers from ever spawning in tests), but drained defensively so a future test
     // that drives the spawn path can't strand a worker on a torn-down loop. Bounded
@@ -224,12 +225,7 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             alloc.free(d.results);
             alloc.free(d.for_query);
         },
-        .popular_done => |d| {
-            for (d.results) |r| freeOwnedAnime(alloc, r);
-            alloc.free(d.results);
-        },
-        .discover_enriched => |d| freeOwnedAnime(alloc, d.result),
-        .discover_batch_enriched => |d| {
+        .discover_feed => |d| {
             for (d.results) |r| freeOwnedAnime(alloc, r);
             alloc.free(d.results);
         },
@@ -317,9 +313,9 @@ test "quit keys: q from browse and Ctrl-C" {
 }
 
 test "Discover key is gated off for a source with no windowed feed (ROD-301)" {
-    // A source with no feed sets discover_supported=false at startup, so D (and its
-    // F3 alias) must not open Discover — the view stays put (the user gets a toast,
-    // not an empty grid; the [D] top-bar tab is dimmed to match).
+    // Manually simulates the pre-ROD-336 provider gate: nothing sets this field at
+    // runtime anymore (Discover is AniList-backed), but the guard path stays until
+    // ROD-337 deletes it with the vtable, so pin its behavior until then.
     var app: App = .{};
     app.input_mode = .normal;
     app.discover_supported = false;
@@ -748,46 +744,55 @@ test "S in search mode does not switch to Settings (normal-mode guard, ROD-249)"
     try testing.expectEqual(@as(@TypeOf(app.active_view), .browse), app.active_view);
 }
 
-test "popular_done lands in its own window slot, not the active one (ROD-239)" {
+test "discover_feed lands in its own axis slot; hasNextPage drives exhaustion (ROD-336)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
-    app.discover.window = .daily;
+    app.discover.axis = .trending;
 
-    // A one-result WEEKLY page arrives while DAILY is the active window.
+    // A one-result POPULAR page arrives while TRENDING is the active axis.
     const results = try testing.allocator.alloc(Anime, 1);
-    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "w1", .name = "Weekly Show", .view_count = 39653 });
-    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .weekly, .page = 1 } });
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "1535", .name = "Death Note", .anilist_id = 1535, .score = 84 });
+    try testTick(&app, .{ .discover_feed = .{ .results = results, .axis = .popular, .page = 1, .has_next = true } });
 
-    // Landed in the weekly slot, stamped fresh…
-    const weekly = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.weekly)];
-    try testing.expectEqual(@as(usize, 1), weekly.results.items.len);
-    try testing.expectEqual(@as(u32, 1), weekly.page);
-    try testing.expect(weekly.fetched_at > 0);
-    try testing.expectEqual(@as(?u64, 39653), weekly.results.items[0].view_count);
-    // …and the active daily slot is untouched — no cross-window contamination.
+    // Landed in the popular slot, stamped fresh, not exhausted (AniList has more)…
+    const popular = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.popular)];
+    try testing.expectEqual(@as(usize, 1), popular.results.items.len);
+    try testing.expectEqual(@as(u32, 1), popular.page);
+    try testing.expect(popular.fetched_at > 0);
+    try testing.expect(!popular.exhausted);
+    try testing.expectEqual(@as(?u32, 84), popular.results.items[0].score);
+    // …and the active trending slot is untouched: no cross-axis contamination.
     try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+
+    // hasNextPage false flips the slot exhausted; the retired "short page"
+    // heuristic must play no part (this page is far under discover_page_size).
+    const tail = try testing.allocator.alloc(Anime, 1);
+    tail[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "5114", .name = "FMA:B", .anilist_id = 5114 });
+    try testTick(&app, .{ .discover_feed = .{ .results = tail, .axis = .popular, .page = 2, .has_next = false } });
+    try testing.expectEqual(@as(usize, 2), popular.results.items.len);
+    try testing.expect(popular.exhausted);
 }
 
 test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (ROD-239)" {
     // Cache HIT: a slot fetched within the TTL must NOT fire a fetch. Observable:
-    // firePopular sets the slot's loading flag before spawning; testTick drains the
-    // worker's .popular_done without processing it, so a fired fetch leaves loading
-    // set. A hit never calls firePopular, so loading stays false.
+    // fireDiscoverFeed sets the slot's loading flag before its is_test gate, so a
+    // fired fetch leaves loading set. A hit never calls fireDiscoverFeed, so
+    // loading stays false.
     {
         var app: App = .{};
         app.gpa = testing.allocator;
         defer app.discover.deinit(testing.allocator);
         app.active_view = .browse;
-        const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "d1", .name = "Daily Show" }));
-        daily.page = 1;
-        daily.fetched_at = store_mod.Store.nowSecs(); // fresh
+        const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "d1", .name = "Daily Show" }));
+        slot.page = 1;
+        slot.fetched_at = store_mod.Store.nowSecs(); // fresh
         try testTick(&app, keyEv('D', .{}));
         try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
-        try testing.expect(!daily.loading); // cache hit — no fetch fired
-        try testing.expectEqual(@as(usize, 1), daily.results.items.len); // preserved
+        try testing.expect(!slot.loading); // cache hit, no fetch fired
+        try testing.expectEqual(@as(usize, 1), slot.results.items.len); // preserved
     }
     // Cache MISS: an unfetched slot (page 0) fires a page-1 fetch on entry.
     {
@@ -797,8 +802,8 @@ test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (
         app.active_view = .browse;
         try testTick(&app, keyEv(vaxis.Key.f3, .{}));
         try testing.expectEqual(@as(@TypeOf(app.active_view), .discover), app.active_view);
-        // Stale/empty → firePopular ran (loading set; the drained .popular_done that
-        // would clear it is freed unprocessed by the test harness).
+        // Stale/empty → fireDiscoverFeed ran (loading set; the is_test gate skips
+        // the network worker, so nothing ever clears it here).
         try testing.expect(app.discover.activeSlot().loading);
     }
 }
@@ -809,10 +814,10 @@ test "Discover grid cursor: l advances, g/G jump to ends (ROD-239)" {
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
     app.term_cols = 120;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "Show" }));
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "Show" }));
     }
     try testTick(&app, keyEv('l', .{}));
     try testing.expectEqual(@as(usize, 1), app.discover.cursor);
@@ -822,47 +827,47 @@ test "Discover grid cursor: l advances, g/G jump to ends (ROD-239)" {
     try testing.expectEqual(@as(usize, 0), app.discover.cursor); // first
 }
 
-test "Discover window keys switch the active window and reset the cursor (ROD-239)" {
+test "Discover axis keys switch the active axis and reset the cursor (ROD-239)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
-    app.discover.window = .daily;
+    app.discover.axis = .trending;
     app.discover.cursor = 3;
-    // '2' selects Weekly directly; the cursor resets and the slot (stale) fetches.
+    // '2' selects Popular directly; the cursor resets and the slot (stale) fetches.
     try testTick(&app, keyEv('2', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .popular), app.discover.axis);
     try testing.expectEqual(@as(usize, 0), app.discover.cursor);
-    // ']' cycles forward Weekly → Monthly.
+    // ']' cycles forward Popular → Top Rated.
     try testTick(&app, keyEv(']', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .monthly), app.discover.window);
-    // '[' cycles back Monthly → Weekly.
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .top_rated), app.discover.axis);
+    // '[' cycles back Top Rated → Popular.
     try testTick(&app, keyEv('[', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .weekly), app.discover.window);
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .popular), app.discover.axis);
 }
 
-test "Discover window cycle wraps at both boundaries without overflow (ROD-246)" {
+test "Discover axis cycle wraps at both boundaries without overflow (ROD-246)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
 
-    // ']' from all_time must wrap forward to daily. Pre-ROD-246 this PANICKED:
+    // ']' from this_season must wrap forward to trending. Pre-ROD-246 this PANICKED:
     // @intFromEnum yields the enum's min tag type (u2 for 4 members), so `cur + 1`
-    // at cur == 3 (all_time) overflowed u2. A Debug test build would abort here.
-    app.discover.window = .all_time;
+    // at cur == 3 (this_season) overflowed u2. A Debug test build would abort here.
+    app.discover.axis = .this_season;
     try testTick(&app, keyEv(']', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .daily), app.discover.window);
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .trending), app.discover.axis);
 
-    // '[' from daily wraps the other way to all_time.
+    // '[' from trending wraps the other way to this_season.
     try testTick(&app, keyEv('[', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .all_time), app.discover.window);
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .this_season), app.discover.axis);
 
-    // A full forward sweep of all four windows returns to the start — every step,
-    // including the all_time→daily wrap, holds.
-    app.discover.window = .daily;
+    // A full forward sweep of all four axes returns to the start; every step,
+    // including the this_season→trending wrap, holds.
+    app.discover.axis = .trending;
     for (0..4) |_| try testTick(&app, keyEv(']', .{}));
-    try testing.expectEqual(@as(@TypeOf(app.discover.window), .daily), app.discover.window);
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .trending), app.discover.axis);
 }
 
 test "Discover Enter opens the detail zoom for the selected card; Esc returns (ROD-239)" {
@@ -871,8 +876,8 @@ test "Discover Enter opens the detail zoom for the selected card; Esc returns (R
     defer app.discover.deinit(testing.allocator);
     defer app.episodes.freeResults(testing.allocator); // Enter fires an episode fetch
     app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "z1", .name = "Zoom Me" }));
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "z1", .name = "Zoom Me" }));
     app.discover.cursor = 0;
 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
@@ -897,7 +902,7 @@ test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping alrea
     defer app.discover.deinit(testing.allocator);
     defer app.discover_covers.deinit(testing.allocator);
     app.active_view = .discover;
-    app.discover.window = .daily;
+    app.discover.axis = .trending;
     // Roomy 120x40 terminal → large tier (5 cols), 3 visible rows + 1 prefetch =
     // a 20-card window, so all 8 cards below are in range to fetch.
     app.term_cols = 120;
@@ -905,12 +910,12 @@ test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping alrea
     // Cap concurrency at 3 so the per-pump wave size is observable.
     app.config.discover_cover_concurrency = 3;
 
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         var buf: [32]u8 = undefined;
         const thumb = try std.fmt.bufPrint(&buf, "https://img/{d}.jpg", .{i});
-        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
             .id = "x",
             .name = "Show",
             .thumb = thumb, // dupeOwnedAnime copies it, so the stack buffer is safe
@@ -945,17 +950,17 @@ test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
     defer app.discover.deinit(testing.allocator);
     defer app.discover_covers.deinit(testing.allocator);
     app.active_view = .discover;
-    app.discover.window = .daily;
+    app.discover.axis = .trending;
     app.term_cols = 120;
     app.term_rows = 40;
     app.config.discover_cover_concurrency = 3;
 
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         var buf: [32]u8 = undefined;
         const thumb = try std.fmt.bufPrint(&buf, "https://img/{d}.jpg", .{i});
-        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{
             .id = "x",
             .name = "Show",
             .thumb = thumb,
@@ -988,30 +993,30 @@ test "Discover prefetches the next page near the end; exhausted/loading block it
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
     app.term_cols = 120; // → 5 columns
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
     var i: usize = 0;
     while (i < 30) : (i += 1) {
-        try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "S" }));
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "S" }));
     }
-    daily.page = 1;
+    slot.page = 1;
 
-    // Cursor at the top is not near the end → no prefetch. (firePopular sets
-    // loading before spawning; the harness drains the dummy page-2 reply without
-    // processing it, so a fired prefetch leaves loading set as the signal.)
+    // Cursor at the top is not near the end → no prefetch. (fireDiscoverFeed sets
+    // loading before its is_test gate skips the worker, so a fired prefetch leaves
+    // loading set as the signal.)
     app.discover.cursor = 0;
     try testTick(&app, keyEv('k', .{}));
-    try testing.expect(!daily.loading);
+    try testing.expect(!slot.loading);
 
     // Cursor near the end → the next page is prefetched.
     app.discover.cursor = 28;
     try testTick(&app, keyEv('l', .{}));
-    try testing.expect(daily.loading);
+    try testing.expect(slot.loading);
 
     // Exhausted blocks the prefetch even at the very end.
-    daily.loading = false;
-    daily.exhausted = true;
+    slot.loading = false;
+    slot.exhausted = true;
     try testTick(&app, keyEv('l', .{}));
-    try testing.expect(!daily.loading);
+    try testing.expect(!slot.loading);
 }
 
 test "Discover / jumps to Browse search (ROD-239)" {
@@ -1022,17 +1027,17 @@ test "Discover / jumps to Browse search (ROD-239)" {
     try testing.expectEqual(@as(@TypeOf(app.input_mode), .search), app.input_mode);
 }
 
-test "popular_error marks the window failed and clears its spinner (ROD-239)" {
+test "discover_feed_error marks the axis failed and clears its spinner (ROD-239)" {
     var app: App = .{};
     app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    daily.loading = true;
-    try testTick(&app, .{ .popular_error = .{ .window = .daily, .cause = error.NetworkDown } });
-    try testing.expect(!daily.loading);
-    try testing.expect(daily.failed); // drives the in-view "can't reach the feed"
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    slot.loading = true;
+    try testTick(&app, .{ .discover_feed_error = .{ .axis = .trending, .cause = error.NetworkDown } });
+    try testing.expect(!slot.loading);
+    try testing.expect(slot.failed); // drives the in-view "can't reach the feed"
 }
 
-test "popular_done persists feed rows to the store (persist like search, ROD-239)" {
+test "discover_feed persists rows canonically, never as provider bindings (ROD-336)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     var st = try store_mod.Store.openMemory();
@@ -1044,16 +1049,17 @@ test "popular_done persists feed rows to the store (persist like search, ROD-239
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
 
+    // An AniList feed row: id IS the stringified anilist_id (metaToAnime's
+    // convention). Persisting it keyed on (provider, "170577") was the landmine.
     const results = try testing.allocator.alloc(Anime, 1);
-    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "f1", .name = "Feed Show", .view_count = 12345 });
-    try testTick(&app, .{ .popular_done = .{ .results = results, .window = .daily, .page = 1 } });
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "170577", .name = "Feed Show", .anilist_id = 170577 });
+    try testTick(&app, .{ .discover_feed = .{ .results = results, .axis = .trending, .page = 1, .has_next = true } });
 
-    // The window-agnostic facts landed in the store, shareable with Browse. (The
-    // hidden-cache flag is a History-query filter column; getAnime doesn't surface
-    // it, so the row's presence + correct facts is the persist proof here.)
-    const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "f1")).?;
+    // The row landed in the canonical spine, shareable with Browse…
+    const rec = (try st.getCanonicalByAnilistId(arena_inst.allocator(), 170577)).?;
     try testing.expectEqualStrings("Feed Show", rec.title);
-    try testing.expectEqual(@as(?i64, null), rec.year); // no year in the feed payload row
+    // …and NO provider binding was minted (that's the resolver's job, ROD-328).
+    try testing.expect((try st.getAnime(arena_inst.allocator(), "allanime", "170577")) == null);
 }
 
 test "enrichment_refreshed overwrites drift fields, stamps freshness, preserves user state (ROD-182)" {
@@ -1154,199 +1160,23 @@ test "enrichment_refreshed with answered=false skips the stamp and the persist (
     try testing.expect(!app.history_dirty);
 }
 
-test "discover_batch_enriched with answered=false caches the slot but skips the freshness stamp (ROD-278)" {
-    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_inst.deinit();
-    const arena = arena_inst.allocator();
-    var st = try store_mod.Store.openMemory();
-    defer st.close();
-
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    app.store = &st;
-    defer app.discover.deinit(testing.allocator);
-    app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 }));
-
-    // The batch fetch hit a transport failure: enrichBatch errored, so the worker
-    // posts the stubs unchanged with answered=false (one card matching the slot).
-    const results = try testing.allocator.alloc(Anime, 1);
-    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 });
-    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = false } });
-
-    // The slot card is cached (persistSlot ran) but NOT stamped fresh — a failed page
-    // fetch must not burn the freshness clock on an un-enriched card.
-    const rec = (try st.getAnime(arena, "allanime", "a")).?;
-    try testing.expect(rec.enrichment_fetched_at == null);
-    try testing.expect(rec.enrichment_fieldset_version == null);
-}
-
-test "discover_enriched merges the synopsis into the slot card by id (ROD-239)" {
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    defer app.discover.deinit(testing.allocator);
-    app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    // A feed card as delivered: no synopsis (anyCard has no description).
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me" }));
-    try testing.expectEqual(@as(?[]const u8, null), daily.results.items[0].description);
-
-    // The lazily-enriched copy arrives (same id, now with a synopsis).
-    const enriched = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "e1", .name = "Enrich Me", .description = "A grand tale." });
-    try testTick(&app, .{ .discover_enriched = .{ .result = enriched, .window = .daily, .answered = true } });
-
-    // Merged in place — the zoom now has its synopsis.
-    try testing.expectEqualStrings("A grand tale.", daily.results.items[0].description.?);
-}
-
-test "discover_enriched drops the result when the show is gone from the slot (ROD-239)" {
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    defer app.discover.deinit(testing.allocator);
-    app.active_view = .discover;
-    // The slot was cleared/refetched between firing the enrich and its landing, so
-    // the show id no longer matches. The enriched result must be FREED, not leaked
-    // — the test allocator fails the test if the else-branch drops the free.
-    const orphan = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "gone", .name = "Gone", .description = "x" });
-    try testTick(&app, .{ .discover_enriched = .{ .result = orphan, .window = .daily, .answered = true } });
-    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
-}
-
-test "discover_batch_enriched merges N cards into the slot by id, drops stale (ROD-247)" {
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    defer app.discover.deinit(testing.allocator);
-    app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    // Three feed cards as delivered: score null, genres empty (the popular shape).
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1 }));
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "b", .name = "B", .anilist_id = 2 }));
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "c", .name = "C", .anilist_id = 3 }));
-
-    // The page batch lands: two cards now carry score/genres/season; the third
-    // result is a stale id no longer in the slot (must be FREED, not leaked — the
-    // test allocator fails the test otherwise).
-    const results = try testing.allocator.alloc(Anime, 3);
-    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .anilist_id = 1, .score = 88, .genres = &.{ "Action", "Comedy" }, .season = .fall, .year = 2023 });
-    results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "b", .name = "B", .anilist_id = 2, .score = 75 });
-    results[2] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "stale", .name = "Stale", .anilist_id = 9, .score = 50 });
-    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = true } });
-
-    // Cards a + b enriched in place; card c untouched; the stale result dropped.
-    try testing.expectEqual(@as(?u32, 88), daily.results.items[0].score);
-    try testing.expect(daily.results.items[0].season.? == .fall);
-    try testing.expectEqual(@as(usize, 2), daily.results.items[0].genres.len);
-    try testing.expectEqual(@as(?u32, 75), daily.results.items[1].score);
-    try testing.expectEqual(@as(?u32, null), daily.results.items[2].score);
-}
-
-test "discover_batch_enriched drops every result when the slot is cleared (ROD-247)" {
-    var app: App = .{};
-    app.gpa = testing.allocator;
-    defer app.discover.deinit(testing.allocator);
-    app.active_view = .discover;
-    // Slot cleared/refetched between firing the batch and its landing — no id
-    // matches, so all results must be freed (test allocator catches a leak).
-    const results = try testing.allocator.alloc(Anime, 2);
-    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "x", .name = "X", .anilist_id = 1, .score = 60 });
-    results[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "y", .name = "Y", .anilist_id = 2, .score = 70 });
-    try testTick(&app, .{ .discover_batch_enriched = .{ .results = results, .window = .daily, .answered = true } });
-    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
-}
-
-test "mergeEnrichedFillNull fills gaps without clobbering either side (ROD-247)" {
-    const gpa = testing.allocator;
-    // Live card already batch-enriched (score + genres); the incoming zoom result has
-    // the synopsis but a null score. The merge keeps the score AND gains the synopsis —
-    // neither concurrent enricher clobbers the other.
-    var live = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .score = 88, .genres = &.{"Action"} });
-    defer workers.freeOwnedAnime(gpa, live);
-    var incoming = try workers.dupeOwnedAnime(gpa, .{ .id = "a", .name = "A", .description = "A tale." });
-    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
-    try testing.expectEqual(@as(?u32, 88), live.score); // kept
-    try testing.expectEqual(@as(usize, 1), live.genres.len); // kept
-    try testing.expectEqualStrings("A tale.", live.description.?); // gained
-    // `incoming` is fully consumed (transferred fields nulled, the rest freed in the
-    // helper) — the test allocator fails on any leak or double-free.
-
-    // Reverse arrival order: live has the synopsis, incoming carries score + genres.
-    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .description = "Tale two." });
-    defer workers.freeOwnedAnime(gpa, live2);
-    var incoming2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .score = 73, .genres = &.{"Drama"} });
-    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
-    try testing.expectEqualStrings("Tale two.", live2.description.?); // kept
-    try testing.expectEqual(@as(?u32, 73), live2.score); // gained
-    try testing.expectEqual(@as(usize, 1), live2.genres.len); // gained
-}
-
-test "mergeEnrichedFillNull carries the ROD-261 enrichment fields, fill-if-null (ROD-261)" {
-    const gpa = testing.allocator;
-    // A Discover-origin merge must fold the enrichment-expansion fields too, or they
-    // silently vanish while the row is stamped fresh (the convergence gap review caught).
-    var live = try workers.dupeOwnedAnime(gpa, .{
-        .id = "a",
-        .name = "A",
-        .duration = 24,
-        .source_material = "MANGA",
-        .rank = 3,
-    });
-    defer workers.freeOwnedAnime(gpa, live);
-    var incoming = try workers.dupeOwnedAnime(gpa, .{
-        .id = "a",
-        .name = "A",
-        .duration = 99, // must NOT clobber live's 24
-        .rank_type = "RATED",
-        .rank_year = 2016,
-        .country = "CN",
-        .next_airing_at = 1_700_000_000,
-        .next_airing_episode = 14,
-    });
-    workers.mergeEnrichedFillNull(gpa, &live, &incoming);
-    // Live wins where it already had a value.
-    try testing.expectEqual(@as(?u32, 24), live.duration);
-    try testing.expectEqualStrings("MANGA", live.source_material.?);
-    try testing.expectEqual(@as(?u32, 3), live.rank);
-    // Gaps gained from incoming — heap strings transferred, scalars copied.
-    try testing.expectEqualStrings("RATED", live.rank_type.?);
-    try testing.expectEqual(@as(?u32, 2016), live.rank_year);
-    try testing.expectEqualStrings("CN", live.country.?);
-    try testing.expectEqual(@as(?i64, 1_700_000_000), live.next_airing_at);
-    try testing.expectEqual(@as(?u32, 14), live.next_airing_episode);
-
-    // Reverse arrival order: incoming carries what live lacks; live's country wins.
-    var live2 = try workers.dupeOwnedAnime(gpa, .{ .id = "b", .name = "B", .country = "KR" });
-    defer workers.freeOwnedAnime(gpa, live2);
-    var incoming2 = try workers.dupeOwnedAnime(gpa, .{
-        .id = "b",
-        .name = "B",
-        .duration = 22,
-        .source_material = "LIGHT_NOVEL",
-        .country = "JP", // must NOT clobber live2's KR
-    });
-    workers.mergeEnrichedFillNull(gpa, &live2, &incoming2);
-    try testing.expectEqualStrings("KR", live2.country.?); // kept
-    try testing.expectEqual(@as(?u32, 22), live2.duration); // gained
-    try testing.expectEqualStrings("LIGHT_NOVEL", live2.source_material.?); // gained
-}
-
 test "topBarSeasonChip shows the enriched Discover card's season, else nothing (ROD-247)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
-    app.discover.window = .daily;
+    app.discover.axis = .trending;
     app.discover.cursor = 0;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
 
     // Enriched card: season + year present → "<kanji> <year>".
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .season = .fall, .year = 2023 }));
+    try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "a", .name = "A", .season = .fall, .year = 2023 }));
     const chip = app.topBarSeasonChip();
     try testing.expect(std.mem.indexOf(u8, chip, "2023") != null);
     try testing.expect(std.mem.indexOf(u8, chip, domain.Season.fall.kanji()) != null);
 
     // Unenriched card (season still null from the feed) → no chip, no cour fallback.
-    daily.results.items[0].season = null;
+    slot.results.items[0].season = null;
     try testing.expectEqualStrings("", app.topBarSeasonChip());
 }
 
@@ -1362,7 +1192,7 @@ test "isNewRelease: current-cour match drives NEW; guards return false (ROD-239)
     try testing.expect(!app.isNewRelease(.{ .id = "a", .name = "n", .season = .spring, .year = 2026 }));
 }
 
-test "Discover P adds the selected card to the watchlist (ROD-239)" {
+test "Discover P on a provider-keyed card adds directly (.direct fallthrough, ROD-239)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     var st = try store_mod.Store.openMemory();
@@ -1373,15 +1203,91 @@ test "Discover P adds the selected card to the watchlist (ROD-239)" {
     app.store = &st;
     defer app.discover.deinit(testing.allocator);
     app.active_view = .discover;
-    const daily = &app.discover.slots[@intFromEnum(source_mod.PopularWindow.daily)];
-    try daily.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "p1", .name = "Plan Me" }));
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "p1", .name = "Plan Me" }));
     app.discover.cursor = 0;
 
     try testTick(&app, keyEv('P', .{ .shift = true }));
-    // The add flags a background history reload and lands a row in the store.
+    // No anilist_id → the resolver classifies .direct → the plain add. The add
+    // flags a background history reload and lands a row in the store.
     try testing.expect(app.history_dirty);
     const rec = (try st.getAnime(arena_inst.allocator(), "allanime", "p1")).?;
     try testing.expectEqualStrings("Plan Me", rec.title);
+}
+
+test "Discover Enter resolves an AniList-keyed card via the binding, never a.id (ROD-336)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // A prior resolve persisted this canonical and bound it under the provider's own id.
+    try st.upsertCanonicalOnly(.{ .id = "154587", .name = "Frieren S2", .anilist_id = 154587 }, false, 0, arena);
+    try testing.expect(try st.bindCanonical("allanime", "prov-99", 154587, false, 1000, arena));
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    defer app.episodes.freeResults(testing.allocator);
+    app.active_view = .discover;
+    // The feed card: id IS the stringified anilist_id (metaToAnime's convention);
+    // handing it to provider.episodes() raw was the ROD-336 misroute.
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "154587", .name = "Frieren S2", .anilist_id = 154587 }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+    try testing.expectEqual(@as(@TypeOf(app.active_view), .detail), app.active_view);
+    // The episode fetch fired for the BOUND provider id (tier 0), not the AniList id.
+    try testing.expectEqualStrings("prov-99", app.episodes.for_id.?);
+}
+
+test "Discover P on an AniList-keyed card reveals the binding, no bogus row (ROD-336)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // Same seeding as the Enter test: canonical + a hidden binding from a prior resolve.
+    try st.upsertCanonicalOnly(.{ .id = "154587", .name = "Frieren S2", .anilist_id = 154587 }, false, 0, arena);
+    try testing.expect(try st.bindCanonical("allanime", "prov-99", 154587, false, 1000, arena));
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "154587", .name = "Frieren S2", .anilist_id = 154587 }));
+    app.discover.cursor = 0;
+
+    try testTick(&app, keyEv('P', .{ .shift = true }));
+    // Tier 0 revealed the EXISTING binding in place…
+    try testing.expect(app.history_dirty);
+    const rec = (try st.getAnime(arena, "allanime", "prov-99")).?;
+    try testing.expect(rec.history_visible);
+    // …and never minted the landmine row keyed on the AniList id.
+    try testing.expect((try st.getAnime(arena, "allanime", "154587")) == null);
+}
+
+test "This Season fetch is gated on a live clock (ROD-336)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+
+    // Pre-tick (now_ms 0): selecting the axis must NOT fire; the cour clamp would
+    // send a wrong-but-plausible WINTER-1970 query. The slot stays !loading.
+    try testTick(&app, keyEv('4', .{}));
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.this_season)];
+    try testing.expectEqual(@as(@TypeOf(app.discover.axis), .this_season), app.discover.axis);
+    try testing.expect(!slot.loading);
+
+    // Clock ticked: re-selecting the axis fires (refreshDiscover's retry path).
+    app.now_ms = 1_783_641_600_000; // 2026-07-10 → Summer 2026
+    try testTick(&app, keyEv('4', .{}));
+    try testing.expect(slot.loading);
 }
 
 test "History p/x/c/w keybinds transition the focused entry, store + memory (ROD-139 C)" {
@@ -4031,9 +3937,9 @@ test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-2
     defer app.discover_covers.deinit(app.gpa);
 
     const thumbs = [_][]const u8{ "https://img/g1.png", "https://img/g2.png", "https://img/g3.png" };
-    const daily = &app.discover.slots[0];
+    const feed_slot = &app.discover.slots[0];
     for (thumbs) |t| {
-        try daily.results.append(app.gpa, .{
+        try feed_slot.results.append(app.gpa, .{
             .id = try app.gpa.dupe(u8, t),
             .name = try app.gpa.dupe(u8, "Show"),
             .thumb = try app.gpa.dupe(u8, t),

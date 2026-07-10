@@ -885,9 +885,9 @@ pub const Store = struct {
     ///
     /// `stamp_fresh` gates the freshness stamp (same contract as `upsertEnriched`, ROD-182):
     /// pass true only when `anime` carries the full enrichment field set from a confirmed
-    /// answer. AniList discovery search returns the full `GQL_FIELDS`, so search hits stamp
-    /// fresh; the ROD-325 Discover feed nulls score/season and MUST pass false, or those
-    /// gaps never draw a refresh.
+    /// answer. Both current callers qualify: AniList discovery search (ROD-326) and the
+    /// AniList Discover feed (ROD-336) return the full `GQL_FIELDS`. A caller with a
+    /// partial row MUST pass false, or its gaps never draw a refresh.
     pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, stamp_fresh: bool, now: i64, scratch: Allocator) Error!void {
         var rec = AnimeRecord.fromDomain("", anime, .sub);
         if (stamp_fresh) {

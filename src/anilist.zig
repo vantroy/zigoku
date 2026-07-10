@@ -29,12 +29,11 @@ const GQL_SEARCH = "query($search:String!,$perPage:Int!,$page:Int!){Page(page:$p
 // Deterministic join: when AllAnime handed us an AniList id (mined from the
 // cover url, ROD-181) we look the media up directly — no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
-// ROD-247 batched Discover enrichment: the card-signal subset only. Deliberately
-// NARROWER than GQL_FIELDS — no `description`, title, or studios — so one fetch
-// hydrating a whole page (~30-50 cards) stays light. The synopsis stays lazy-on-
-// zoom (workers.discoverEnrichTask, keyed on `description == null`); fetching
-// dozens of synopses per page would be bytes for text nobody's reading yet. Keep
-// this set and GQL_FIELDS divergent on purpose.
+// ROD-247 batched enrichment: the card-signal subset only. Deliberately NARROWER
+// than GQL_FIELDS (no `description`, title, or studios) so one fetch hydrating a
+// whole page (~30-50 ids) stays light. Its Discover callers died with the AniList
+// cutover (ROD-336); the v13 idMal backfill migration (provider_migrate.zig) still
+// batches through this. Keep this set and GQL_FIELDS divergent on purpose.
 const GQL_BATCH_FIELDS = "id idMal averageScore genres season seasonYear startDate{year}";
 // ROD-334 Discover feed (§9.6): the full GQL_FIELDS set, so one call returns a
 // fully-enriched page, no batch-enrich pass. `sort`/`season`/`seasonYear` ride as

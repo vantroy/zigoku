@@ -23,7 +23,7 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
 
     // View tab strip after the separator (§3.4/§10.3b, ROD-250): all four views,
     // the active one highlighted, each bracketing its view-switch key — the same
-    // passive idiom as the §3.8 window bar (no tab focus model; the bracketed
+    // passive idiom as the §3.8 axis bar (no tab focus model; the bracketed
     // letters just fire the existing normal-mode binds). In the zoom the active tab
     // follows detail_origin, so it still reads "where you came from". Every segment
     // is a static literal — no scratch lifetime concern.
@@ -200,7 +200,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
         .detail => "hjkl scroll · enter play · space/esc back · q quit",
-        .discover => "hjkl move · enter open · P save · [ ] window · / search · q quit",
+        .discover => "hjkl move · enter open · P save · [ ] axis · / search · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
         else

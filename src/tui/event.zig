@@ -5,7 +5,7 @@ const vaxis = @import("vaxis");
 const store_mod = @import("../store.zig");
 const domain = @import("../domain.zig");
 const player_mod = @import("../player.zig");
-const source_mod = @import("../source.zig");
+const anilist = @import("../anilist.zig");
 const login_loopback = @import("../login_loopback.zig");
 
 const AnimeRecord = store_mod.AnimeRecord;
@@ -102,45 +102,25 @@ pub const Event = union(enum) {
         anilist_id: i64,
         source_id: []const u8,
     },
-    /// Popular-feed results from a background thread (ROD-239). `results` is
-    /// gpa-allocated (each Anime's strings owned); App takes ownership into the
-    /// feed slot for `window`. `window` is carried so a result lands in its own
-    /// per-window cache slot even if the active window changed mid-flight; `page`
-    /// is the page this set belongs to.
-    popular_done: struct {
+    /// One Discover feed page from a background thread (ROD-336): AniList rows for
+    /// `axis`, fully enriched (full GQL_FIELDS; no follow-up enrich pass exists).
+    /// `results` is gpa-allocated (each Anime's strings owned); App takes ownership
+    /// into the slot for `axis`, carried so a page lands in its own per-axis cache
+    /// slot even if the active axis changed mid-flight. `has_next` is AniList's
+    /// `pageInfo.hasNextPage`, the pagination/exhaustion signal (§9.6).
+    discover_feed: struct {
         results: []Anime,
-        window: source_mod.PopularWindow,
+        axis: anilist.DiscoverAxis,
         page: u32,
+        has_next: bool,
     },
-    /// A Popular-feed fetch failed (ROD-239). `window` is the slot it was for (so
+    /// A Discover feed fetch failed (ROD-336). `axis` is the slot it was for (so
     /// the handler clears that slot's loading + marks it failed); `cause` names the
     /// failure class. Distinct from task_error so the feed owns its own error UX
     /// (in-view "can't reach the feed" + a feed toast) without touching Browse.
-    popular_error: struct {
-        window: source_mod.PopularWindow,
+    discover_feed_error: struct {
+        axis: anilist.DiscoverAxis,
         cause: anyerror,
-    },
-    /// One Discover card lazily enriched from AniList for its zoom (ROD-239). The
-    /// feed has no synopsis, so opening a card fetches it. `result` is gpa-owned;
-    /// App merges it into `window`'s slot (matched by id) and takes ownership.
-    /// `answered` (ROD-278): true if AniList returned a confirmed answer; false on a
-    /// transport failure — the handler stamps the persisted card's freshness clock
-    /// only when `answered`, so a failed fetch doesn't advance it.
-    discover_enriched: struct {
-        result: Anime,
-        window: source_mod.PopularWindow,
-        answered: bool,
-    },
-    /// A whole Discover feed page batch-enriched from AniList in one fetch (ROD-247): score
-    /// + genres + season, the fields the popular feed nulls. `results` is gpa-allocated; App
-    /// merges each into `window`'s slot by id and takes ownership (orphans freed). Distinct
-    /// from `discover_enriched` (the per-card zoom) so batch and zoom never share a thread
-    /// handle. `answered` (ROD-278): false on a transport failure, so the handler persists
-    /// the slot WITHOUT stamping freshness; a reached-but-empty page is true.
-    discover_batch_enriched: struct {
-        results: []Anime,
-        window: source_mod.PopularWindow,
-        answered: bool,
     },
     /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
     /// app takes ownership and merges fields into the live search results.

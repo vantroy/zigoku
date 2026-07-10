@@ -1,10 +1,10 @@
-//! Zigoku — Discover/Popular view render pass (ROD-239).
-//! The v0.2 headline feature: a popularity-ranked, window-toggled cover grid.
-//! Built in chunks — this one renders the window bar, the loading/empty states,
-//! and the navigable grid with GRACEFUL placeholder cells (rank `#N`, no art —
-//! covers are ROD-243). Reads DiscoverState through `self.discover.*` and writes
-//! only the window + scratch it's handed (the `*const App` + `*RenderScratch`
-//! split — ROD-144/155: the pass proves it mutates no app state).
+//! Zigoku: Discover view render pass (ROD-239, AniList-backed since ROD-336).
+//! An axis-toggled cover grid over AniList's four ranking axes (§3.8/§9.6):
+//! the axis bar, the loading/empty states, and the navigable grid with GRACEFUL
+//! placeholder cells (rank `#N`, no art; covers are ROD-243). Reads DiscoverState
+//! through `self.discover.*` and writes only the window + scratch it's handed (the
+//! `*const App` + `*RenderScratch` split, ROD-144/155: the pass proves it mutates
+//! no app state).
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -51,7 +51,7 @@ fn coverHeight(cover_w: u16, fallback: u16, cell_w_px: u16, cell_h_px: u16) u16 
 }
 
 /// Resolve the grid geometry for a content area `w` wide by `content_h` tall.
-/// `cols = max(1, (w-2)/slot_w)`; the grid sits below the window bar (1 row) and a
+/// `cols = max(1, (w-2)/slot_w)`; the grid sits below the axis bar (1 row) and a
 /// spacer (1 row), so its height is `content_h - 2`. `cell_w_px`/`cell_h_px` are the
 /// terminal's per-cell pixel size (0 when unreported) — they size the cover so it
 /// fills its width (ROD-247); pass 0 where only `cols` is needed.
@@ -80,19 +80,43 @@ pub fn gridCols(w: u16) u16 {
     return geometry(w, 0, 0, 0).cols;
 }
 
-/// Format a raw view count the way the site reads it: `1.4m`, `660.17k`, `892`.
-/// Lifetime-safe only while `buf` outlives vx.render() — callers pass scratch.
-fn formatViews(buf: []u8, n: u64) []const u8 {
-    if (n >= 1_000_000) {
-        return std.fmt.bufPrint(buf, "{d}.{d}m", .{ n / 1_000_000, (n % 1_000_000) / 100_000 }) catch "";
-    } else if (n >= 1_000) {
-        return std.fmt.bufPrint(buf, "{d}.{d:0>2}k", .{ n / 1_000, (n % 1_000) / 10 }) catch "";
+/// AniList `format` enum → the card label (§3.8), abbreviated to fit the small
+/// tier's 14-col card (SPECIAL → "Spec"; TV_SHORT reads as plain "TV"). Unmapped →
+/// null, and the card renders the dim placeholder dash (whole field absent, never a
+/// partial render).
+fn formatLabel(kind: []const u8) ?[]const u8 {
+    const map = [_][2][]const u8{
+        .{ "TV", "TV" },
+        .{ "TV_SHORT", "TV" },
+        .{ "MOVIE", "Movie" },
+        .{ "SPECIAL", "Spec" },
+        .{ "OVA", "OVA" },
+        .{ "ONA", "ONA" },
+        .{ "MUSIC", "Music" },
+    };
+    for (map) |m| {
+        if (std.mem.eql(u8, m[0], kind)) return m[1];
     }
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch "";
+    return null;
+}
+
+/// The card's format+episodes cell (§3.8, ROD-336): `TV · 24ep`, bare `Movie` (a
+/// movie's episode count is redundant with the label), `TV · ??ep` for an airing
+/// show with no announced total. Null/unmapped format → null (the caller renders
+/// the dim placeholder dash). Lifetime-safe only while `buf` outlives vx.render();
+/// callers pass scratch.
+fn formatKindEps(buf: []u8, a: Anime) ?[]const u8 {
+    const kind = a.kind orelse return null;
+    const label = formatLabel(kind) orelse return null;
+    if (std.mem.eql(u8, kind, "MOVIE")) return label;
+    if (a.total_episodes) |n| {
+        return std.fmt.bufPrint(buf, "{s} \u{00B7} {d}ep", .{ label, n }) catch label;
+    }
+    return std.fmt.bufPrint(buf, "{s} \u{00B7} ??ep", .{label}) catch label;
 }
 
 /// AniList's fixed genre vocabulary mapped to monochrome BMP symbols (ROD-247).
-/// On a popularity grid the genre text is repetitive mush, so the card shows it as
+/// On a discovery grid the genre text is repetitive mush, so the card shows it as
 /// ambient glyph texture rather than a precise label — the full list lives in the
 /// zoom detail pane. Monochrome (not emoji) so it renders deterministically over
 /// tmux/Kitty/SSH; width is measured via gwidth at the call site. Unmapped → "".
@@ -132,21 +156,21 @@ fn fillRect(win: vaxis.Window, x: u16, y: u16, w: u16, h: u16, bg: vaxis.Color) 
     child.fill(.{ .style = .{ .bg = bg } });
 }
 
-/// The window-toggle segmented bar: each window prefixed with its `1`-`4`
-/// direct-select key (ROD-248) — `[1] Daily · [2] Weekly · …` — so the bar teaches
-/// its own bindings. Active window in state.focus+bold, the rest in text.muted,
-/// separator dots in text.dim. Passive — the keys driving it live in app.zig's
-/// onDiscoverKey.
-fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
-    const labels = [_][]const u8{ "Daily", "Weekly", "Monthly", "All-Time" };
+/// The axis-toggle segmented bar (§3.8): each axis prefixed with its `1`-`4`
+/// direct-select key (ROD-248), as in `[1] Trending · [2] Popular · …`, so the bar
+/// teaches its own bindings. Active axis in state.focus+bold, the rest in
+/// text.muted, separator dots in text.dim. Passive; the keys driving it live in
+/// app.zig's onDiscoverKey.
+fn drawAxisBar(self: *const App, win: vaxis.Window, row: u16) void {
+    const labels = [_][]const u8{ "Trending", "Popular", "Top Rated", "This Season" };
     // Static `[N]` literals — vaxis holds the printed slice by reference, so a
     // bufPrint'd scratch would dangle; the keys are fixed (1-4), so literals fit.
     const keys = [_][]const u8{ "[1]", "[2]", "[3]", "[4]" };
-    const active = @intFromEnum(self.discover.window);
+    const active = @intFromEnum(self.discover.axis);
     var col: u16 = 2;
     for (labels, keys, 0..) |label, keyhint, i| {
         const on = i == active;
-        // The `[N]` hint reads at text.muted (fg2) off the active window — legible,
+        // The `[N]` hint reads at text.muted (fg2) off the active axis: legible,
         // since it's the binding we're teaching (text.dim buries it against bg_base);
         // it lifts to the focus tone on the active one so that entry reads as a unit.
         const key_sty = if (on) self.s(self.palette.focus, .{}) else self.s(self.palette.fg2, .{});
@@ -163,8 +187,8 @@ fn drawWindowBar(self: *const App, win: vaxis.Window, row: u16) void {
 }
 
 /// One feed card: a placeholder cover cell with the rank centered, then the rank,
-/// title, and view-count metadata rows. `vis` indexes the per-frame scratch slots
-/// (the formatted rank/title/views must outlive vx.render — RenderScratch contract).
+/// title, and format+episodes metadata rows. `vis` indexes the per-frame scratch slots
+/// (the formatted rank/title/format must outlive vx.render, the RenderScratch contract).
 fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16, y: u16, geo: Geometry, vis: usize, idx: usize, a: Anime, selected: bool) void {
     // Rank string — reused for the in-cell placeholder and the metadata row.
     const rank: []const u8 = if (vis < scratch.score.len)
@@ -190,7 +214,9 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
     const badge_x = x + rank_w + 1;
     if (idx == 0) {
         put(win, rank_y, badge_x, "TOP", self.s(self.palette.hot, .{ .bold = true }));
-    } else if (self.isNewRelease(a)) {
+    } else if (self.discover.axis != .this_season and self.isNewRelease(a)) {
+        // NEW is suppressed on This Season (§3.8): every card there is this-cour by
+        // construction, so the badge would fire on all of them and mean nothing.
         put(win, rank_y, badge_x, "NEW", self.s(self.palette.focus, .{ .bold = true }));
     }
 
@@ -233,14 +259,20 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
         putClipped(win, rank_y + 1, x, geo.cover_w, card_title, title_sty);
     }
 
-    if (a.view_count) |vc| {
-        const vs: []const u8 = if (vis < scratch.meta.len) formatViews(&scratch.meta[vis], vc) else "";
-        put(win, rank_y + 2, x, vs, self.s(self.palette.fg2, .{}));
+    // Format + episodes (§3.8, ROD-336): `TV · 24ep` / `Movie` / `TV · ??ep`. A
+    // null/unmapped format renders the whole field as the dim placeholder dash (so does
+    // scratch-cap overflow: no slot to hold a bufPrint'd cell past 256 cards).
+    const fmt_cell: ?[]const u8 = if (vis < scratch.meta.len)
+        formatKindEps(&scratch.meta[vis], a)
+    else
+        null;
+    if (fmt_cell) |fc| {
+        put(win, rank_y + 2, x, fc, self.s(self.palette.fg2, .{}));
     } else {
         put(win, rank_y + 2, x, "—", self.s(self.palette.fg3, .{}));
     }
 
-    // Genre glyphs (ROD-247) ride the view-count row, right-anchored at the cover
+    // Genre glyphs (ROD-247) ride the format row, right-anchored at the cover
     // edge — mirrors the score badge column above, and frees the 4th meta row back
     // to a gap so the grid breathes. Up to two genres as monochrome symbols (ambient
     // texture, not a label — the full list is in the zoom). Built straight into
@@ -264,8 +296,8 @@ fn drawCard(self: *const App, scratch: *RenderScratch, win: vaxis.Window, x: u16
             const glyphs = scratch.disc_genre[vis][0..glen];
             const gw: u16 = @intCast(vaxis.gwidth.gwidth(glyphs, .unicode));
             // text.dim: ambient texture, not a label. fg2 was tried and reverted — it
-            // made the glyphs compete with the view-count; the space (above) is what
-            // fixed legibility, not brightness.
+            // made the glyphs compete with the left-anchored meta cell; the space
+            // (above) is what fixed legibility, not brightness.
             put(win, rank_y + 2, x + geo.cover_w -| gw, glyphs, self.s(self.palette.fg3, .{}));
         }
     }
@@ -301,7 +333,7 @@ fn drawCoverCell(self: *const App, win: vaxis.Window, x: u16, y: u16, geo: Geome
 /// Full-canvas Discover pass. `top` is the first content row; `visible` the
 /// content height; `w` the full width.
 pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u16, visible: u16, w: u16) void {
-    drawWindowBar(self, win, top);
+    drawAxisBar(self, win, top);
 
     const grid_top: u16 = top + 2;
     const cp = self.cellPx();
@@ -316,7 +348,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
             // error. After ~3s the slow path escalates focus→hot + "taking a
             // moment…", matching the bottom-bar spinner (§4.8/§5.6).
             const slow = self.isSlowPath();
-            const label: []const u8 = if (slow) "taking a moment\u{2026}" else "loading popular\u{2026}";
+            const label: []const u8 = if (slow) "taking a moment\u{2026}" else "loading feed\u{2026}";
             const color = if (slow) self.palette.hot else self.palette.focus;
             const msg = std.fmt.bufPrint(&scratch.msg, "{s} {s}", .{ self.spinnerChar(), label }) catch label;
             centerText(win, mid, w, msg, self.s(color, .{}));
@@ -435,6 +467,52 @@ test "geometry: covers grow to fill width from cell pixels, fall back when unkno
     try testing.expectEqual(fb.cols, a.cols); // cover height never moves the column count
     // Fewer card rows survive the taller slot — the accepted trade for filled covers.
     try testing.expect(a.rows_visible <= fb.rows_visible);
+}
+
+test "formatKindEps: TV·Nep, bare Movie, ??ep for unannounced, null for unmapped (ROD-336)" {
+    var buf: [48]u8 = undefined;
+    // The three §3.8 shapes.
+    try testing.expectEqualStrings("TV \u{00B7} 24ep", formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "TV", .total_episodes = 24 }).?);
+    try testing.expectEqualStrings("TV \u{00B7} ??ep", formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "TV", .total_episodes = null }).?);
+    // A movie's episode count (1) is redundant with the label; never rendered.
+    try testing.expectEqualStrings("Movie", formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "MOVIE", .total_episodes = 1 }).?);
+    // Abbreviations: SPECIAL fits the 14-col small tier; TV_SHORT reads as TV.
+    try testing.expectEqualStrings("Spec \u{00B7} 2ep", formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "SPECIAL", .total_episodes = 2 }).?);
+    try testing.expectEqualStrings("TV \u{00B7} 6ep", formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "TV_SHORT", .total_episodes = 6 }).?);
+    // Null / unmapped format → null (the card renders the dim dash instead).
+    try testing.expect(formatKindEps(&buf, .{ .id = "a", .name = "n" }) == null);
+    try testing.expect(formatKindEps(&buf, .{ .id = "a", .name = "n", .kind = "MIXTAPE" }) == null);
+}
+
+test "drawCard suppresses NEW on the This Season axis (ROD-336)" {
+    const t = std.testing;
+    var app: App = .{};
+    app.gpa = t.allocator;
+    app.now_ms = 1_783_641_600_000; // 2026-07-10 → Summer 2026 cour
+    const scratch = try t.allocator.create(app_mod.RenderScratch);
+    defer t.allocator.destroy(scratch);
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 24, .cols = 40, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 40, .height = 24, .screen = &screen };
+
+    const geo = geometry(40, 22, 0, 0);
+    // A current-cour show, idx=1 so the TOP badge can't shadow the NEW slot.
+    const a: Anime = .{ .id = "1", .name = "New Show", .season = .summer, .year = 2026 };
+    const x: u16 = 2;
+    const badge_x: u16 = x + 3; // rank "#2" (2 cols) + 1 gap
+    const rank_row: u16 = geo.cover_h;
+
+    // Off This Season the badge renders…
+    app.discover.axis = .trending;
+    drawCard(&app, scratch, win, x, 0, geo, 0, 1, a, false);
+    try t.expectEqualStrings("N", win.readCell(badge_x, rank_row).?.char.grapheme);
+
+    // …on This Season it is suppressed: every card there is this-cour (§3.8).
+    win.clear();
+    app.discover.axis = .this_season;
+    drawCard(&app, scratch, win, x, 0, geo, 0, 1, a, false);
+    try t.expect(!std.mem.eql(u8, "N", win.readCell(badge_x, rank_row).?.char.grapheme));
 }
 
 test "drawCard renders the primary title under title_language (ROD-205)" {
