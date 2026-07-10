@@ -47,6 +47,7 @@ pub const SourceProvider = source.SourceProvider;
 pub const SearchOptions = source.SearchOptions;
 pub const AllAnime = @import("providers/allanime.zig").AllAnime;
 pub const Senshi = @import("providers/senshi.zig").Senshi;
+pub const AniPub = @import("providers/anipub.zig").AniPub;
 
 // Re-export the domain vocabulary at the top level for ergonomic call sites.
 pub const Anime = domain.Anime;
@@ -124,5 +125,6 @@ test {
 
     _ = @import("providers/allanime.zig");
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests
+    _ = @import("providers/anipub.zig"); // ROD-342: run the anipub provider tests
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
 }

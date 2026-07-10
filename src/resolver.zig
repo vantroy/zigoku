@@ -30,6 +30,68 @@ const best_floor: i32 = 1200;
 /// win is no win.
 const match_margin: i32 = 250;
 
+/// Tier-B exact-id match (ROD-342): the first candidate whose embedded canonical id
+/// (anilist_id or mal_id, backfilled by a tier-B provider's catalog search, e.g. anipub's
+/// /api/info MALID) agrees with the canonical's, and whose other metadata does not
+/// contradict it. It is tried BEFORE `bestProviderMatch` and needs no title
+/// floor/margin (the whole point: a romaji canonical vs an English catalog title
+/// fails every fuzzy floor while the id still binds). But the id rides
+/// provider-entered metadata, so a candidate whose episode count or year screams
+/// "different work" is treated as a mis-stamped id and skipped, never bound: a
+/// wrong bind is a silently persisted watchlist row, the one outcome this whole
+/// resolver is designed to refuse. Among survivors, a CORROBORATED candidate
+/// (episode count or year positively agrees) beats a bare one regardless of list
+/// order, so a metadata-sparse decoy stamped with the target's id cannot outrank
+/// the corroborated real entry behind it; a bare survivor still binds when no
+/// corroborated one exists (a failed info backfill must not strand a legitimate
+/// bind). Ties within a class break first-hit: same canonical id = same work
+/// (the multi-binding case ROD-313 already collapses). No-op for a provider
+/// whose search results carry no ids (senshi); falls through to fuzzy.
+pub fn bestIdMatch(canonical: Anime, candidates: []const Anime) ?usize {
+    var bare: ?usize = null;
+    for (candidates, 0..) |cand, i| {
+        const id_agrees =
+            (canonical.anilist_id != null and cand.anilist_id != null and
+                canonical.anilist_id.? == cand.anilist_id.?) or
+            (canonical.mal_id != null and cand.mal_id != null and
+                canonical.mal_id.? == cand.mal_id.?);
+        if (!id_agrees) continue;
+        if (idMatchContradicted(canonical, cand)) continue;
+        if (idMatchCorroborated(canonical, cand)) return i;
+        if (bare == null) bare = i;
+    }
+    return bare;
+}
+
+/// Strong-evidence veto on an id agreement. Mirrors the fuzzy path's episode veto
+/// (authoritative canonical total vs a wild gap, either direction) and adds a year
+/// check (same work premieres in the same year; tolerance 1 absorbs cour-boundary
+/// drift). Absence of metadata never contradicts: a bare candidate with just an id
+/// still binds. Overflow-safe via `absDiff`, same lesson as ROD-328.
+fn idMatchContradicted(canonical: Anime, cand: Anime) bool {
+    const known_eps = canonical.total_episodes orelse 0;
+    const cand_eps = candidateEpisodes(cand);
+    if (known_eps > 0 and cand_eps > 0 and
+        totalIsAuthoritative(canonical.status) and absDiff(known_eps, cand_eps) > 3)
+        return true;
+    if (canonical.year != null and cand.year != null and
+        absDiff(canonical.year.?, cand.year.?) > 1)
+        return true;
+    return false;
+}
+
+/// Positive metadata agreement beyond the id itself: episode count inside the
+/// veto tolerance, or the year inside its. The uncontradicted-but-unproven
+/// middle (fields absent on either side) is neither corroborated nor vetoed.
+fn idMatchCorroborated(canonical: Anime, cand: Anime) bool {
+    const known_eps = canonical.total_episodes orelse 0;
+    const cand_eps = candidateEpisodes(cand);
+    if (known_eps > 0 and cand_eps > 0 and absDiff(known_eps, cand_eps) <= 3) return true;
+    if (canonical.year != null and cand.year != null and
+        absDiff(canonical.year.?, cand.year.?) <= 1) return true;
+    return false;
+}
+
 /// Pick the provider search result that best matches `canonical`, or null when nothing
 /// clears the confidence floor or the win is too narrow to trust. `candidates` are one
 /// provider's own catalog-search results (`domain.Anime` keyed by its opaque id); the
@@ -145,6 +207,98 @@ fn absDiff(a: u32, b: u32) u32 {
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
+
+test "bestIdMatch binds on mal_id agreement regardless of title (ROD-342)" {
+    // The tier-B point: an id match needs no title agreement at all; anipub's
+    // English Name vs the canonical romaji would fail every fuzzy floor.
+    const canonical: Anime = .{ .id = "154587", .name = "Sousou no Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    const candidates = [_]Anime{
+        .{ .id = "1443", .name = "Frieren: Beyond Journey's End Season 2", .mal_id = 58305 },
+        .{ .id = "2454", .name = "Frieren: Beyond Journey's End", .mal_id = 52991 },
+    };
+    const idx = bestIdMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("2454", candidates[idx].id);
+}
+
+test "bestIdMatch binds on anilist_id when the provider embeds one" {
+    const canonical: Anime = .{ .id = "1", .name = "X", .anilist_id = 999 };
+    const candidates = [_]Anime{
+        .{ .id = "a", .name = "Y", .anilist_id = 998 },
+        .{ .id = "b", .name = "Z", .anilist_id = 999 },
+    };
+    const idx = bestIdMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("b", candidates[idx].id);
+}
+
+test "bestIdMatch skips a candidate whose metadata contradicts the id (mis-stamped MALID)" {
+    // Chaos-pass repro (ROD-342): a decoy row carrying the canonical's mal_id but
+    // metadata screaming "different work" (1-ep 1998 OVA vs a settled 25-ep 2013
+    // series) must NOT bind on the bare id. Without the veto this returned index 0.
+    const canonical: Anime = .{ .id = "1", .name = "Attack on Titan", .anilist_id = 16498, .mal_id = 16498, .total_episodes = 25, .year = 2013, .status = "FINISHED" };
+    const decoy_only = [_]Anime{
+        .{ .id = "666", .name = "Some Random 1998 Cooking OVA", .mal_id = 16498, .total_episodes = 1, .year = 1998 },
+    };
+    try std.testing.expect(bestIdMatch(canonical, &decoy_only) == null);
+
+    // With a clean same-id row later in the list, the scan skips the decoy and
+    // binds the survivor instead of giving up.
+    const with_real = [_]Anime{
+        .{ .id = "666", .name = "Some Random 1998 Cooking OVA", .mal_id = 16498, .total_episodes = 1, .year = 1998 },
+        .{ .id = "42", .name = "Shingeki no Kyojin", .mal_id = 16498, .total_episodes = 25, .year = 2013 },
+    };
+    const idx = bestIdMatch(canonical, &with_real) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("42", with_real[idx].id);
+}
+
+test "bestIdMatch prefers a corroborated survivor over an earlier bare one (sparse decoy)" {
+    // Chaos re-verify find (ROD-342): a minimal hostile stamp ({"MALID":target},
+    // nothing else) is uncontradictable, so first-hit-wins let a sparse decoy
+    // ahead in the list beat the corroborated real entry behind it. Corroboration
+    // now outranks list order.
+    const canonical: Anime = .{ .id = "1", .name = "Fullmetal Alchemist: Brotherhood", .anilist_id = 5114, .mal_id = 5114, .total_episodes = 64, .year = 2009, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "sparse-decoy", .name = "Totally Different Show", .mal_id = 5114 },
+        .{ .id = "real", .name = "Fullmetal Alchemist: Brotherhood", .mal_id = 5114, .total_episodes = 64, .year = 2009 },
+    };
+    const idx = bestIdMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("real", candidates[idx].id);
+
+    // A sparse survivor alone still binds: absence of corroboration is not a veto
+    // (anipub's info backfill legitimately fails per candidate).
+    const sparse_only = [_]Anime{.{ .id = "sparse-decoy", .name = "Totally Different Show", .mal_id = 5114 }};
+    try std.testing.expect(bestIdMatch(canonical, &sparse_only) != null);
+}
+
+test "bestIdMatch veto: bare metadata never contradicts; releasing spares the eps gap" {
+    // A candidate with ONLY the id (anipub info fetch failed for eps/year) still binds.
+    const canonical: Anime = .{ .id = "1", .name = "X", .mal_id = 52991, .total_episodes = 28, .year = 2023, .status = "FINISHED" };
+    const bare = [_]Anime{.{ .id = "2454", .name = "Y", .mal_id = 52991 }};
+    try std.testing.expect(bestIdMatch(canonical, &bare) != null);
+
+    // A RELEASING canonical legitimately sees a partial provider count (ongoing
+    // show): the eps veto must not fire. Same sparing rule as the fuzzy veto.
+    const airing: Anime = .{ .id = "1", .name = "X", .mal_id = 59978, .total_episodes = 28, .year = 2026, .status = "RELEASING" };
+    const partial = [_]Anime{.{ .id = "1443", .name = "Y", .mal_id = 59978, .total_episodes = 4, .year = 2026 }};
+    try std.testing.expect(bestIdMatch(airing, &partial) != null);
+
+    // But a wild year gap contradicts even for a releasing show.
+    const wrong_year = [_]Anime{.{ .id = "9", .name = "Y", .mal_id = 59978, .year = 1998 }};
+    try std.testing.expect(bestIdMatch(airing, &wrong_year) == null);
+}
+
+test "bestIdMatch is a no-op when either side carries no ids (senshi shape)" {
+    // senshi tier-C: candidates are mal-keyed but the canonical reaching the search
+    // path has no mal_id (that's WHY it's tier-C), and senshi embeds no anilist_id.
+    const no_mal_canonical: Anime = .{ .id = "1", .name = "X", .anilist_id = 999 };
+    const mal_only = [_]Anime{.{ .id = "52991", .name = "X", .mal_id = 52991 }};
+    try std.testing.expect(bestIdMatch(no_mal_canonical, &mal_only) == null);
+
+    // Bare tier-C candidates (no ids at all) never id-match.
+    const bare = [_]Anime{.{ .id = "a", .name = "X" }};
+    const full: Anime = .{ .id = "1", .name = "X", .anilist_id = 999, .mal_id = 52991 };
+    try std.testing.expect(bestIdMatch(full, &bare) == null);
+    try std.testing.expect(bestIdMatch(full, &.{}) == null);
+}
 
 test "bestProviderMatch binds an exact title with episode + year agreement" {
     const canonical: Anime = .{
