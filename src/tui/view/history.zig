@@ -332,7 +332,7 @@ pub fn draw(self: *const App, scratch: *RenderScratch, win: vaxis.Window, top: u
     }
     if (self.history.len == 0) {
         // First-run absent state (§9.5): an empty watchlist is a user who doesn't yet know
-        // what to watch, so point them at Discover (the zero-input popular feed, ROD-247),
+        // what to watch, so point them at Discover (the zero-input feed, ROD-247),
         // not Browse's blank `/` prompt that demands a title up front (ROD-254 supersedes
         // ROD-211). The three-element block mirrors Browse's own absent state (browse.zig);
         // the `B search` hint recedes to fg3 for users who DO know the title.

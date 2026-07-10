@@ -249,60 +249,6 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     }
 }
 
-/// Merge an enriched copy into the live card, filling ONLY the fields the live card still
-/// lacks (live wins): the concurrency-safe replacement for `live.* = incoming` (ROD-247).
-/// The Discover slot has two concurrent enrichers (page batch + per-card zoom); a full
-/// overwrite from either's fire-time snapshot would clobber fields the other already
-/// filled (zoom lands, batch's score reverts to `[--]`; or batch lands, zoom's synopsis
-/// blanks). Fill-if-null mirrors `applyMetadata`'s "existing wins", so arrival order is
-/// irrelevant and no enrichment is lost. Ownership: adopted fields transfer out of
-/// `incoming` (nulled so they aren't freed); everything else it holds (including its
-/// id/name, live keeps its own) is freed here. `live`'s id/name/view_count/eps win.
-pub fn mergeEnrichedFillNull(gpa: Allocator, live: *Anime, incoming: *Anime) void {
-    mergeOptText(&live.english_name, &incoming.english_name);
-    mergeOptText(&live.title_romaji, &incoming.title_romaji);
-    mergeOptText(&live.native_name, &incoming.native_name);
-    mergeCoverPreferAbsolute(gpa, &live.thumb, &incoming.thumb);
-    mergeOptText(&live.banner, &incoming.banner);
-    mergeOptText(&live.status, &incoming.status);
-    mergeOptText(&live.description, &incoming.description);
-    mergeOptText(&live.kind, &incoming.kind);
-    mergeStrList(&live.genres, &incoming.genres);
-    mergeStrList(&live.studios, &incoming.studios);
-    // ROD-261: the enrichment-expansion fields ride this merge too, or a
-    // Discover-origin enrich (zoom/batch) silently drops them while persistSlot
-    // still stamps the row fresh at ENRICHMENT_FIELDSET_VERSION — a false "healed"
-    // that enrichmentStale then trusts until the TTL lapses (the convergence gap
-    // review caught). Same fill-if-null rule: heap strings transfer via
-    // mergeOptText (nulled so they aren't freed below), scalars copy when the
-    // live card lacks them.
-    mergeOptText(&live.source_material, &incoming.source_material);
-    mergeOptText(&live.rank_type, &incoming.rank_type);
-    mergeOptText(&live.country, &incoming.country);
-    if (live.mal_id == null) live.mal_id = incoming.mal_id;
-    if (live.anilist_id == null) live.anilist_id = incoming.anilist_id;
-    if (live.total_episodes == null) live.total_episodes = incoming.total_episodes;
-    if (live.duration == null) live.duration = incoming.duration;
-    if (live.year == null) live.year = incoming.year;
-    if (live.season == null) live.season = incoming.season;
-    if (live.start_date == null) live.start_date = incoming.start_date;
-    if (live.score == null) live.score = incoming.score;
-    if (live.rank == null) live.rank = incoming.rank;
-    if (live.rank_year == null) live.rank_year = incoming.rank_year;
-    if (live.next_airing_at == null) live.next_airing_at = incoming.next_airing_at;
-    if (live.next_airing_episode == null) live.next_airing_episode = incoming.next_airing_episode;
-    freeOwnedAnime(gpa, incoming.*); // frees id/name + every field not transferred above
-}
-
-/// Adopt `incoming`'s string only if `live` lacks one, transferring ownership (the
-/// source is nulled so the subsequent freeOwnedAnime won't double-free it).
-fn mergeOptText(live: *?[]const u8, incoming: *?[]const u8) void {
-    if (live.* == null) {
-        live.* = incoming.*;
-        incoming.* = null;
-    }
-}
-
 /// Whether to replace a card's current cover `cur` with an enriched `inc`: adopt
 /// when there's no cover yet, or when `cur` is only a relative ref and `inc` is a
 /// fetchable absolute url (ROD-267). Never downgrades an absolute url to a relative
@@ -311,26 +257,6 @@ fn preferCover(cur: ?[]const u8, inc: ?[]const u8) bool {
     const incoming = inc orelse return false;
     const current = cur orelse return true;
     return !domain.isAbsoluteUrl(current) and domain.isAbsoluteUrl(incoming);
-}
-
-/// Cover-thumb variant of `mergeOptText` that prefers an absolute url over a
-/// relative ref (ROD-267): when `preferCover` says so, adopt `incoming` (transfer
-/// ownership, null the source) and free `live`'s old relative thumb. Otherwise
-/// `live` keeps its thumb and the caller's `freeOwnedAnime` reclaims `incoming`'s.
-fn mergeCoverPreferAbsolute(gpa: Allocator, live: *?[]const u8, incoming: *?[]const u8) void {
-    if (!preferCover(live.*, incoming.*)) return;
-    if (live.*) |old| gpa.free(old);
-    live.* = incoming.*;
-    incoming.* = null;
-}
-
-/// List variant of mergeOptText: adopt only when live's list is empty; `&.{}` (len 0)
-/// is skipped by freeOwnedAnime, so the transferred slice isn't freed twice.
-fn mergeStrList(live: *[]const []const u8, incoming: *[]const []const u8) void {
-    if (live.*.len == 0) {
-        live.* = incoming.*;
-        incoming.* = &.{};
-    }
 }
 
 /// Background task: run a discovery search on AniList (ROD-327) and post the results to
@@ -488,35 +414,34 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: Sour
     };
 }
 
-/// Background task: fetch one page of the Popular feed for `window` (ROD-239).
+/// Background task: fetch one Discover feed page for `axis` from AniList (ROD-336).
+/// Off the vtable like `searchTask` (ROD-324): rows are anilist_id-keyed canonical
+/// entities, fully enriched (full GQL_FIELDS), so no follow-up enrich pass exists.
 /// Mirrors searchTask's ownership shape — dupes every owned string into gpa so the
-/// event payload outlives the worker's arena, and the UI thread frees `results`
-/// via the `.popular_done` arm. No query string to thread (the feed has none); a
-/// failure posts `.popular_error` (whose handler clears the slot's loading flag
-/// and marks it failed).
-pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32, drain: *ThreadDrain) void {
+/// event payload outlives the worker's arena; the UI thread frees `results` via the
+/// `.discover_feed` arm. `now_ms` anchors the This Season cour. Three-state (ROD-278):
+/// a transport miss (error.NoAnswer) posts `.discover_feed_error`; an empty page is a
+/// confirmed answer and posts normally.
+pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.DiscoverAxis, page: u32, now_ms: i64, drain: *ThreadDrain) void {
     defer drain.finish(); // ROD-251: detached; account so teardown can drain us
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const raw = provider.popular(arena.allocator(), io, .{
-        .window = window,
-        .page = page,
-    }) catch |e| {
-        log.debug("popular failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+    const feed = anilist.discover(arena.allocator(), io, axis, page, now_ms) catch |e| {
+        log.debug("discover feed failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .discover_feed_error = .{ .axis = axis, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
     // Dupe every owned string we thread into the UI so arena teardown cannot leave
     // dangling references in the event payload (mirrors searchTask).
     var owned = std.ArrayListUnmanaged(Anime).empty;
-    owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
-        log.debug("popular result alloc failed: {s}", .{@errorName(e)});
-        loop.postEvent(.{ .popular_error = .{ .window = window, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+    owned.ensureTotalCapacity(gpa, feed.rows.len) catch |e| {
+        log.debug("discover feed alloc failed: {s}", .{@errorName(e)});
+        loop.postEvent(.{ .discover_feed_error = .{ .axis = axis, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
-    for (raw) |a| {
+    for (feed.rows) |a| {
         const duped = dupeOwnedAnime(gpa, a) catch continue;
         owned.appendAssumeCapacity(duped);
     }
@@ -529,10 +454,11 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
         return;
     };
 
-    loop.postEvent(.{ .popular_done = .{
+    loop.postEvent(.{ .discover_feed = .{
         .results = exact,
-        .window = window,
+        .axis = axis,
         .page = page,
+        .has_next = feed.has_next_page,
     } }) catch {
         for (exact) |r| freeOwnedAnime(gpa, r);
         gpa.free(exact); // exact-fit: len == capacity, free is valid
@@ -543,7 +469,7 @@ pub fn popularTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProv
 /// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
 /// before the arena `meta` came from is torn down; a failed copy keeps the prior
 /// (blank) value rather than aliasing the soon-dead arena. Shared by the
-/// search-page enrich and the Discover lazy zoom enrich (ROD-239).
+/// search-page enrich and the ROD-182 refresh-on-view.
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
     // ROD-312: stash true romaji alongside the provider `name` (never overwritten
@@ -703,96 +629,6 @@ pub fn refreshEnrichTask(
         freeOwnedAnime(gpa, a);
         gpa.free(source);
     };
-}
-
-/// Lazy single-show enrich for the Discover zoom (ROD-239): the feed payload has
-/// no synopsis (anyCard has no description), so opening a card enriches just that
-/// show from AniList — far cheaper than enriching all ~30 grid cards proactively.
-/// `anime` is gpa-owned (the caller duped it); ownership transfers to the
-/// discover_enriched event on success, or is freed here on a post failure.
-/// `window` routes the merge to the right per-window slot.
-pub fn discoverEnrichTask(loop: *Loop, gpa: Allocator, io: std.Io, anime: Anime, window: source_mod.PopularWindow, drain: *ThreadDrain) void {
-    defer drain.finish(); // ROD-251: detached; account so teardown can drain us
-    var a = anime;
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    // A confirmed no-match still posts `a` unchanged — the merge is then a harmless
-    // self-replace and the zoom shows no synopsis (none exists). ROD-278: stamp
-    // freshness only when AniList answered; a transport failure leaves this card
-    // un-stamped so it retries on next view.
-    var answered = true;
-    if (anilist.enrich(arena.allocator(), io, a)) |maybe_meta| {
-        if (maybe_meta) |meta| applyMetadata(gpa, &a, meta);
-    } else |err| {
-        answered = false;
-        log.debug("discover enrich got no answer: {s}", .{@errorName(err)});
-    }
-    loop.postEvent(.{ .discover_enriched = .{ .result = a, .window = window, .answered = answered } }) catch {
-        freeOwnedAnime(gpa, a);
-    };
-}
-
-/// Batch-enrich a whole Discover feed page from AniList in ONE fetch (ROD-247): score +
-/// genres + season, the fields the popular feed nulls. `stubs` are gpa-owned copies of
-/// the page's cards (caller filtered to those with a mineable anilist_id); ownership
-/// transfers to the discover_batch_enriched event on success, or is freed here on a post
-/// failure (same contract as `enrichTask`). `window` routes the merge to the right slot.
-///
-/// One arena feeds N shows: every enriched field is deep-copied into GPA by
-/// `applyMetadata` while the arena is still live, so nothing aliases the parse arena after
-/// teardown. The genres/description slices are arena-borrowed: this is the UAF trap, and
-/// the ordering (copy in the loop, `defer arena.deinit()`) is what defuses it.
-pub fn discoverBatchEnrichTask(
-    loop: *Loop,
-    gpa: Allocator,
-    io: std.Io,
-    stubs: []Anime,
-    window: source_mod.PopularWindow,
-    drain: *ThreadDrain,
-) void {
-    defer drain.finish(); // ROD-251: detached; account so teardown can drain us
-    var posted = false;
-    defer if (!posted) {
-        for (stubs) |a| freeOwnedAnime(gpa, a);
-        gpa.free(stubs);
-    };
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-
-    // The caller already filtered to cards with an anilist_id; collect them for the
-    // batch query, guarding a stray null so it can't poison the join.
-    var ids: std.ArrayList(u64) = .empty;
-    for (stubs) |a| {
-        if (a.anilist_id) |id| ids.append(arena.allocator(), id) catch {};
-    }
-
-    // One round trip for the whole page. ROD-278: enrichBatch errors on a transport
-    // miss (vs an empty slice for a reached-but-no-matches page), so a failed page
-    // fetch sets answered=false and the handler leaves the slot un-stamped instead of
-    // burning the freshness clock on ~30 un-enriched cards. A reached-but-empty page
-    // still stamps (answered stays true) — the stubs stay at [--], the same as before.
-    var answered = true;
-    const metas = anilist.enrichBatch(arena.allocator(), io, ids.items) catch |err| blk: {
-        answered = false;
-        log.debug("discover batch enrich got no answer: {s}", .{@errorName(err)});
-        break :blk &.{};
-    };
-    for (stubs) |*a| {
-        const id = a.anilist_id orelse continue;
-        for (metas) |meta| {
-            if (meta.anilist_id == id) {
-                applyMetadata(gpa, a, meta); // deep-copies out of the arena
-                break;
-            }
-        }
-    }
-
-    loop.postEvent(.{ .discover_batch_enriched = .{ .results = stubs, .window = window, .answered = answered } }) catch |pe| {
-        log.debug("postEvent failed: {s}", .{@errorName(pe)});
-        return; // `posted` stays false → the defer frees stubs
-    };
-    posted = true;
 }
 
 /// Background task: pull history and post it back to the UI thread. Errors are
@@ -1728,32 +1564,6 @@ test "preferCover: absolute beats relative, never downgrades or churns (ROD-267)
     // Nothing incoming → nothing to adopt.
     try std.testing.expect(!preferCover("mcovers/x.webp", null));
     try std.testing.expect(!preferCover(null, null));
-}
-
-test "mergeCoverPreferAbsolute: upgrade frees the old relative thumb, keeps absolute otherwise (ROD-267)" {
-    const gpa = std.testing.allocator; // flags a leak or double-free
-
-    // Upgrade: relative → absolute. The old relative thumb must be freed (else the
-    // testing allocator reports a leak); the absolute's ownership transfers to live.
-    {
-        var live: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
-        var incoming: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
-        mergeCoverPreferAbsolute(gpa, &live, &incoming);
-        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
-        try std.testing.expect(incoming == null); // transferred out
-        gpa.free(live.?);
-    }
-    // No swap: absolute held, relative incoming. live is untouched; incoming stays
-    // owned by us (the real caller's freeOwnedAnime would reclaim it).
-    {
-        var live: ?[]const u8 = try gpa.dupe(u8, "https://s4.anilist.co/x.jpg");
-        var incoming: ?[]const u8 = try gpa.dupe(u8, "mcovers/x.webp");
-        mergeCoverPreferAbsolute(gpa, &live, &incoming);
-        try std.testing.expectEqualStrings("https://s4.anilist.co/x.jpg", live.?);
-        try std.testing.expect(incoming != null); // not transferred
-        gpa.free(live.?);
-        gpa.free(incoming.?);
-    }
 }
 
 test "playAttemptRetryable: only an unplayed open-failure with budget left retries (ROD-309)" {

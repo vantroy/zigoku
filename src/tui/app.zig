@@ -22,6 +22,7 @@ const event_mod = @import("event.zig");
 const render = @import("render.zig");
 const workers = @import("workers.zig");
 const config_mod = @import("../config.zig");
+const anilist = @import("../anilist.zig");
 const paths = @import("../paths.zig");
 const log = @import("../log.zig");
 const auth_mod = @import("../auth.zig");
@@ -165,7 +166,6 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
-    app.discover_supported = provider.supportsDiscover();
     // Seed the cell-pixel cache from the initial resize (the .winsize event was
     // drained above, so read vaxis's settled screen) — Discover's cover-fill height
     // needs it on the first frame (ROD-247).
@@ -398,7 +398,7 @@ pub fn run(
         app.pumpDiscoverCovers(&loop, io, provider);
         // ROD-272: top the feed up to the visible grid on a large monitor / after a
         // resize — same settled geometry, debounced by the slot's in-flight flag.
-        app.maybeFillDiscover(&loop, io, provider);
+        app.maybeFillDiscover(&loop, io);
         try app.draw(&vx, writer);
     }
 
@@ -714,11 +714,9 @@ pub const App = struct {
     active_view: enum { browse, history, detail, settings, discover } = .history,
     /// Which top-level view opened the standalone detail screen.
     detail_origin: enum { browse, history, discover } = .browse,
-    /// Whether the active source offers a Discover feed (`provider.supportsDiscover()`,
-    /// ROD-301). Cached once at startup — the provider is fixed for a run — so the
-    /// top-bar can dim the `[D]` tab and the D/F3 handler can gate entry without a
-    /// vtable call on every keypress/frame. Defaults true so a bare `App{}` (tests)
-    /// keeps Discover; `run()` sets the real value.
+    /// Inert since ROD-336: Discover is AniList-backed, so every provider has it and
+    /// nothing sets this false anymore (`run()` used to cache `supportsDiscover()`).
+    /// The field, its D/F3 gate, and the chrome dimming go with the vtable (ROD-337).
     discover_supported: bool = true,
 
     /// Which pane has keyboard focus within the current view.
@@ -740,8 +738,8 @@ pub const App = struct {
     /// constructible. See `SearchController`.
     search: SearchController = .{},
 
-    /// Discover/Popular feed controller (ROD-239): the active window, the grid
-    /// cursor/scroll, and the per-window result cache. Transport (the feed worker
+    /// Discover feed controller (ROD-239): the active ranking axis, the grid
+    /// cursor/scroll, and the per-axis result cache. Transport (the feed worker
     /// thread, the slow-path timer) stays on App, like SearchController. Embedded
     /// by value so `App{}` stays trivially constructible. See `DiscoverState`.
     discover: DiscoverState = .{},
@@ -760,14 +758,13 @@ pub const App = struct {
     /// the UI.
     enrich_thread: ?std.Thread = null,
 
-    /// Drain barrier for the three Discover async workers: the Popular feed fetch, the
-    /// lazy zoom-enrich, and the page batch-enrich. Before ROD-251 each had its own
-    /// thread handle joined ON the event thread before spawning its replacement, so
-    /// cycling windows (1→2→3→4) on a slow link froze the UI on the prior join. Now every
-    /// worker is detached and accounted here like `episode_drain`: a superseded fetch is
-    /// never joined, its stale result is keep-checked away on arrival, and teardown waits
-    /// the in-flight set out. Concurrency is free (these workers own their input copies
-    /// and only `postEvent`, touching no shared App state), so one counter suffices.
+    /// Drain barrier for the Discover feed fetches (down from three worker kinds:
+    /// the enrich passes died with the AniList cutover, ROD-336). Before ROD-251 the
+    /// fetch's thread handle was joined ON the event thread before spawning its
+    /// replacement, so cycling axes (1→2→3→4) on a slow link froze the UI on the prior
+    /// join. Now every worker is detached and accounted here like `episode_drain`: a
+    /// superseded fetch is never joined, its stale result lands in its own axis slot,
+    /// and teardown waits the in-flight set out.
     discover_drain: workers.ThreadDrain = .{},
 
     /// Bounded Discover-grid cover worker fan-out (ROD-240). Each visible cover is
@@ -2017,17 +2014,16 @@ pub const App = struct {
                 self.pending_bind = ev.anilist_id;
             },
 
-            .popular_done => |ev| {
-                // Land the page into ITS OWN window slot (by ev.window), never the
-                // active one — a window switch mid-flight must not misfile the
-                // result, and the windowed view_counts differ per slot (the
-                // DiscoverState invariant). No "stale drop": every page is valid
-                // cached data for the window it was fetched for.
-                const idx = @intFromEnum(ev.window);
+            .discover_feed => |ev| {
+                // Land the page into ITS OWN axis slot (by ev.axis), never the
+                // active one: an axis switch mid-flight must not misfile the
+                // result (the DiscoverState invariant). No "stale drop": every
+                // page is valid cached data for the axis it was fetched for.
+                const idx = @intFromEnum(ev.axis);
                 const slot = &self.discover.slots[idx];
                 slot.loading = false;
                 slot.failed = false; // a good page clears the feed's error state
-                const is_active = idx == @intFromEnum(self.discover.window);
+                const is_active = idx == @intFromEnum(self.discover.axis);
                 if (is_active) self.async_start_ms = 0;
                 // Clear the persistent feed-error toast on first success — only the
                 // feed-topic one, so a Browse search error survives (§9.3b, ROD-239).
@@ -2036,7 +2032,7 @@ pub const App = struct {
                         if (t.persistent and t.kind == .@"error" and t.topic == .feed) ts.* = null;
                     }
                 }
-                // Page 1 is a fresh window load — free the old slot contents first.
+                // Page 1 is a fresh axis load, so free the old slot contents first.
                 if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
                 const offset = slot.results.items.len;
                 // Take ownership: the duped Anime (strings already gpa-owned) move
@@ -2045,117 +2041,41 @@ pub const App = struct {
                     // OOM: free the page and bail WITHOUT stamping fetched_at/page —
                     // leaving the slot page-0 so refreshDiscover refetches it, rather
                     // than a fresh+exhausted+empty TTL-locked dead end (ROD-239 review).
-                    log.debug("appending popular results failed: {s}", .{@errorName(e)});
+                    log.debug("appending feed results failed: {s}", .{@errorName(e)});
                     for (ev.results) |r| freeOwnedAnime(self.gpa, r);
                     self.gpa.free(ev.results);
                     return;
                 };
                 self.gpa.free(ev.results);
-                // Stamp freshness + exhausted only on a successful append.
+                // Stamp freshness + exhaustion only on a successful append. Exhaustion
+                // is AniList's own has-more signal (pageInfo.hasNextPage, §9.6), not
+                // the retired "page came back short" heuristic.
                 slot.fetched_at = Store.nowSecs();
                 slot.page = ev.page;
-                // Cache the new rows as hidden store records — "persist like search"
-                // (window-agnostic facts only; the per-window view_count never
-                // persists — there is no such store column).
+                slot.exhausted = !ev.has_next;
+                // Rows arrive fully enriched (full GQL_FIELDS); no enrich pass.
+                // Mirror them into the canonical spine so a later Browse hit or
+                // detail open hydrates rich (persist like search, ROD-336).
                 const added = slot.results.items.len - offset;
-                // ROD-268: back-fill each card's stored anilist_id BEFORE persist +
-                // batch enrich (mirrors search's hydrate→persist→enrich order). A
-                // popular card's thumb is a provider-relative mcovers path with no
-                // mineable id, so without this an already-mapped show would be
-                // dropped from the batch (id-less) or fall to flaky title-match.
-                self.discover.hydrateSlotFromStore(self.gpa, self.store, provider.name(), idx, offset, added);
-                self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, offset, added, false);
-                // A short page (incl. the server's ~500 ceiling) means no more —
-                // stops the load-more prefetch and flips the footer to "all loaded".
-                slot.exhausted = added < source_mod.popular_page_size;
-                // Reset the grid cursor on a fresh load of the visible window.
+                self.discover.persistSlot(self.gpa, self.store, idx, offset, added);
+                // Reset the grid cursor on a fresh load of the visible axis.
                 if (is_active and ev.page == 1) {
                     self.discover.cursor = 0;
                     self.discover.scroll = 0;
                 }
-                // ROD-247: batch-enrich the cards just appended — one AniList fetch
-                // hydrates score + genres + season for the [offset, offset+added)
-                // slice. Only the new page is sent (earlier pages are already
-                // enriched), so the cost is one round trip per "load more".
-                self.fireDiscoverBatchEnrich(loop, io, ev.window, offset, added);
             },
 
-            .popular_error => |ev| {
+            .discover_feed_error => |ev| {
                 // Feed fetch failed (ROD-239, §9.3b). Mark the slot failed + clear
                 // its spinner; the view shows "can't reach the feed" while the slot
                 // is empty, and [ ] / 1-4 / re-entry retry (refreshDiscover re-fires
                 // a page-0 slot). Persistent toast, cleared on the next good page.
-                const slot = &self.discover.slots[@intFromEnum(ev.window)];
+                const slot = &self.discover.slots[@intFromEnum(ev.axis)];
                 slot.loading = false;
                 slot.failed = true;
-                if (@intFromEnum(ev.window) == @intFromEnum(self.discover.window)) self.async_start_ms = 0;
-                log.debug("popular fetch failed: {s}", .{@errorName(ev.cause)});
+                if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
+                log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
                 self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
-            },
-
-            .discover_enriched => |ev| {
-                // Merge the enriched show back into its window slot by id (the
-                // cursor may have moved). Free the stale row, take ownership of the
-                // enriched one; persist it so a later hit hydrates rich.
-                const idx = @intFromEnum(ev.window);
-                const items = self.discover.slots[idx].results.items;
-                var merged_at: ?usize = null;
-                for (items, 0..) |*live, i| {
-                    if (std.mem.eql(u8, live.id, ev.result.id)) {
-                        // Fill-if-null merge, not a full overwrite: the page batch may
-                        // have enriched this same card concurrently — keep both sides'
-                        // fields (ROD-247 race fix).
-                        var inc = ev.result;
-                        workers.mergeEnrichedFillNull(self.gpa, live, &inc);
-                        merged_at = i;
-                        break;
-                    }
-                }
-                if (merged_at) |i| {
-                    // ROD-278: stamp freshness only if AniList answered — a transport
-                    // failure persists the merged card without advancing its clock.
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, i, 1, ev.answered);
-                } else {
-                    freeOwnedAnime(self.gpa, ev.result); // slot cleared/refetched — drop it
-                }
-                // ROD-251: no join here — the worker is detached and self-accounts in
-                // discover_drain; it has already exited by the time this event lands.
-            },
-
-            .discover_batch_enriched => |ev| {
-                // Merge each batch-enriched card back into its window slot by id —
-                // same merge-by-id + free-orphan contract as discover_enriched,
-                // fanned over the whole page. The cursor/page may have moved or the
-                // slot been refetched, so an unmatched result is a stale drop.
-                const idx = @intFromEnum(ev.window);
-                const items = self.discover.slots[idx].results.items;
-                var merged_any = false;
-                for (ev.results) |enriched| {
-                    var merged = false;
-                    for (items) |*live| {
-                        if (std.mem.eql(u8, live.id, enriched.id)) {
-                            // Fill-if-null merge, not a full overwrite: a concurrent
-                            // zoom enrich may hold this card too — keep both sides'
-                            // fields (ROD-247 race fix).
-                            var inc = enriched;
-                            workers.mergeEnrichedFillNull(self.gpa, live, &inc);
-                            merged = true;
-                            merged_any = true;
-                            break;
-                        }
-                    }
-                    if (!merged) freeOwnedAnime(self.gpa, enriched); // slot moved on — drop
-                }
-                self.gpa.free(ev.results);
-                // Persist the whole slot once (idempotent upserts) rather than
-                // tracking each scattered merge position — N ≤ ~50 local rows.
-                // ROD-278: a transport-failed batch persists the slot without stamping
-                // freshness, so a failed page fetch doesn't burn the clock on [--] cards.
-                if (merged_any) {
-                    self.discover.persistSlot(self.gpa, self.store, provider.name(), self.translation, idx, 0, items.len, ev.answered);
-                }
-                // ROD-251: no join here — the worker is detached and self-accounts in
-                // discover_drain; it has already exited by the time this event lands.
             },
             .search_enriched => |ev| {
                 if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
@@ -2505,54 +2425,67 @@ pub const App = struct {
         };
     }
 
-    /// Soft cap on concurrently-spawned Discover background workers (ROD-264). The feed
-    /// fetch, zoom enrich, and batch enrich each spawn an uncapped `std.Thread` on the
-    /// shared `Io.Threaded` pool, whose own `concurrent_limit` is unbounded, so an
-    /// app-level cap is the only backstop. A saturation storm (rapid paging + zoom +
-    /// prefetch on a slow link) could pile enough live threads to approach the OS
-    /// thread/fd ceiling, where `std.Thread.spawn` starts failing, which is exactly what
-    /// tips a fetch onto `withDeadline`'s unbounded inline fallback (ROD-264). Bounding
-    /// our own fan-out keeps us clear. In normal use the in-flight set sits far below
-    /// this; the cap is a backstop, not a tuning dial.
-    const discover_enrich_cap = 8;
+    /// Soft cap on concurrently-spawned Discover feed fetches (ROD-264). Each fetch
+    /// spawns an uncapped `std.Thread` on the shared `Io.Threaded` pool, whose own
+    /// `concurrent_limit` is unbounded, so an app-level cap is the only backstop. A
+    /// saturation storm (rapid paging + axis cycling on a slow link) could pile enough
+    /// live threads to approach the OS thread/fd ceiling, where `std.Thread.spawn`
+    /// starts failing, which is exactly what tips a fetch onto `withDeadline`'s
+    /// unbounded inline fallback (ROD-264). Bounding our own fan-out keeps us clear.
+    /// In normal use the in-flight set sits far below this; the cap is a backstop,
+    /// not a tuning dial. (Covers ride their own drain + cap, ROD-240.)
+    const discover_feed_cap = 8;
 
-    /// True when the Discover worker pool is at the soft cap (ROD-264 #3): the
-    /// caller should DROP its spawn rather than queue it. Every Discover worker is
+    /// True when the Discover feed pool is at the soft cap (ROD-264 #3): the
+    /// caller should DROP its spawn rather than queue it. Every feed fetch is
     /// idempotent and recovered by a later trigger — `refreshDiscover`'s !loading
-    /// recheck (feed), the `description == null` recheck (zoom), or a window
-    /// re-fetch that re-appends + re-fires (page batch) — so a dropped spawn is
+    /// recheck, or the prefetch/fill passes re-firing, so a dropped spawn is
     /// deferred, not lost, the same drop-and-re-plan the cover pump uses (ROD-240).
     /// `.acquire` pairs with `finish()`'s release so a just-freed slot is observed
     /// promptly.
     fn discoverPoolSaturated(self: *App) bool {
-        return self.discover_drain.inflight.load(.acquire) >= discover_enrich_cap;
+        return self.discover_drain.inflight.load(.acquire) >= discover_feed_cap;
     }
 
-    /// Spawn the Popular-feed fetch for `window`/`page` (ROD-239). Detached and
-    /// accounted via `discover_drain` (ROD-251) — never joins a prior in-flight
-    /// fetch (that join on the event thread was the UI-freeze this ticket fixed).
-    /// Sets the target slot's loading flag; the `.popular_done` arm clears it and
-    /// lands the results in that slot (by window — not necessarily the active one).
-    fn firePopular(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, window: source_mod.PopularWindow, page: u32) void {
+    /// Spawn the Discover feed fetch for `axis`/`page` (ROD-336): AniList, off the
+    /// vtable, rows arrive fully enriched. Detached and accounted via `discover_drain`
+    /// (ROD-251); never joins a prior in-flight fetch (that join on the event thread
+    /// was the UI-freeze that ticket fixed). Sets the target slot's loading flag; the
+    /// `.discover_feed` arm clears it and lands the results in that slot (by axis,
+    /// not necessarily the active one).
+    fn fireDiscoverFeed(self: *App, loop: *Loop, io: std.Io, axis: anilist.DiscoverAxis, page: u32) void {
+        // This Season derives its cour from now_ms, whose pre-epoch clamp would turn a
+        // pre-tick call (now_ms == 0) into a wrong-but-plausible WINTER-1970 query;
+        // skip instead, like courChip/isNewRelease. run() stamps now_ms before the
+        // loop starts, so this never bites in practice; the slot stays !loading, so
+        // the next trigger re-fires.
+        if (axis == .this_season and self.now_ms <= 0) return;
         // ROD-264 #3: drop past the soft cap. Left un-set, the slot stays !loading,
         // so refreshDiscover / the prefetch trigger re-fire once the pool drains.
         if (self.discoverPoolSaturated()) {
-            log.debug("discover pool at cap ({d}) — dropping feed fetch, will re-fire", .{discover_enrich_cap});
+            log.debug("discover pool at cap ({d}) — dropping feed fetch, will re-fire", .{discover_feed_cap});
             return;
         }
-        // ROD-251: detach, don't join a prior in-flight feed fetch — cycling windows
+        // ROD-251: detach, don't join a prior in-flight feed fetch: cycling axes
         // (1→2→3→4) on a slow link would otherwise block the event thread on the old
-        // fetch's join. Each window writes its own slot (popular_done), so a superseded
+        // fetch's join. Each axis writes its own slot (.discover_feed), so a superseded
         // fetch is harmless; refreshDiscover's `slot.loading` guard already blocks a
-        // same-window double page-1 fire, and teardown waits the set out via
+        // same-axis double page-1 fire, and teardown waits the set out via
         // discover_drain.
-        const slot = &self.discover.slots[@intFromEnum(window)];
+        const slot = &self.discover.slots[@intFromEnum(axis)];
         slot.loading = true;
         self.async_start_ms = self.now_ms;
         // Account before the spawn so teardown's drain can never observe a gap.
         self.discover_drain.begin();
-        const t = std.Thread.spawn(.{}, workers.popularTask, .{
-            loop, self.gpa, io, provider, window, page, &self.discover_drain,
+        // No real worker under test (the fetch would hit the live AniList API). The
+        // loading mark above is what tests exercise; rebalance the drain since no
+        // worker will finish it.
+        if (builtin.is_test) {
+            self.discover_drain.finish();
+            return;
+        }
+        const t = std.Thread.spawn(.{}, workers.discoverFeedTask, .{
+            loop, self.gpa, io, axis, page, self.now_ms, &self.discover_drain,
         }) catch {
             self.discover_drain.finish(); // no worker will run — rebalance the count
             slot.loading = false;
@@ -2562,108 +2495,16 @@ pub const App = struct {
         t.detach();
     }
 
-    /// Cache-or-fetch the active Discover window (ROD-239). Renders the cached slot
+    /// Cache-or-fetch the active Discover axis (ROD-239). Renders the cached slot
     /// untouched when it's fresh (fetched within `feed_ttl_secs`); otherwise fires
-    /// a page-1 fetch. Called on entering Discover and on every window switch. The
-    /// per-window slot is the whole point — see the DiscoverState invariant.
-    fn refreshDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    /// a page-1 fetch. Called on entering Discover and on every axis switch. The
+    /// per-axis slot is the whole point; see the DiscoverState invariant.
+    fn refreshDiscover(self: *App, loop: *Loop, io: std.Io) void {
         const slot = self.discover.activeSlot();
-        if (slot.loading) return; // a fetch for this window is already in flight
+        if (slot.loading) return; // a fetch for this axis is already in flight
         const fresh = slot.page > 0 and (Store.nowSecs() - slot.fetched_at) < feed_ttl_secs;
         if (fresh) return; // cache hit — render the slot as-is, no network
-        self.firePopular(loop, io, provider, self.discover.window, 1);
-    }
-
-    /// Lazily enrich one Discover show for its zoom (ROD-239): the feed has no
-    /// synopsis, so opening a card fetches its AniList metadata off-thread and
-    /// merges it back into the slot (.discover_enriched). Detached + accounted via
-    /// `discover_drain` (ROD-251), like the feed fetch — no join on the event thread.
-    /// No-op in tests (network) and when nothing's missing.
-    fn fireDiscoverEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, anime: Anime) void {
-        if (builtin.is_test) return;
-        // ROD-264 #3: drop past the soft cap (before allocating the copy). The zoom's
-        // `description == null` recheck re-fires this when the pool drains.
-        if (self.discoverPoolSaturated()) {
-            log.debug("discover pool at cap ({d}) — dropping zoom enrich, will re-fire", .{discover_enrich_cap});
-            return;
-        }
-        const copy = dupeOwnedAnime(self.gpa, anime) catch return;
-        // ROD-251: detach + account, don't join. The discover_enriched handler merges
-        // this back by id and frees an orphan whose card the slot no longer holds, so
-        // a superseded zoom-enrich is keep-checked away without blocking the event
-        // thread.
-        self.discover_drain.begin();
-        const t = std.Thread.spawn(.{}, workers.discoverEnrichTask, .{
-            loop, self.gpa, io, copy, window, &self.discover_drain,
-        }) catch {
-            self.discover_drain.finish(); // no worker will run — rebalance the count
-            freeOwnedAnime(self.gpa, copy);
-            return;
-        };
-        t.detach();
-    }
-
-    /// Batch-enrich the Discover page just appended (ROD-247): one AniList fetch
-    /// hydrates score + genres + season for the [offset, offset+count) slice of
-    /// `window`'s slot (.discover_batch_enriched). Only cards with a mineable
-    /// anilist_id are sent — the worker joins AniList results by that id, and an
-    /// id-less card can't be enriched anyway (it stays [--]). Detached + accounted
-    /// via `discover_drain` (ROD-251), separate worker from the zoom enrich so Enter
-    /// never blocks on it and neither joins the other. No-op in tests.
-    fn fireDiscoverBatchEnrich(self: *App, loop: *Loop, io: std.Io, window: source_mod.PopularWindow, offset: usize, count: usize) void {
-        if (builtin.is_test) return;
-        if (count == 0) return;
-        // ROD-264 #3: drop past the soft cap (before building the stub slice).
-        // Unlike the feed fetch / zoom enrich, a page-batch has no recheck: the slot
-        // was already stamped fresh (`.popular_done`, above), so `refreshDiscover`
-        // won't re-fetch until the feed TTL (`feed_ttl_secs`) lapses and the window
-        // is next entered — the page's cards sit at [--] score/genre/season until
-        // then. Per-card zoom enrich still fills a card's metadata on open. Acceptable
-        // degradation, only under real saturation; making a dropped batch re-fire
-        // promptly is a tracked follow-up.
-        if (self.discoverPoolSaturated()) {
-            log.debug("discover pool at cap ({d}) — dropping batch enrich (page keeps [--] until re-fetch)", .{discover_enrich_cap});
-            return;
-        }
-        const idx = @intFromEnum(window);
-        const items = self.discover.slots[idx].results.items;
-        const hi = @min(offset + count, items.len);
-        if (offset >= hi) return;
-
-        var stubs: std.ArrayList(Anime) = .empty;
-        defer stubs.deinit(self.gpa); // no-op after a successful toOwnedSlice
-        for (items[offset..hi]) |a| {
-            if (a.anilist_id == null) continue; // can't join an id-less card
-            const copy = dupeOwnedAnime(self.gpa, a) catch {
-                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
-                return;
-            };
-            stubs.append(self.gpa, copy) catch {
-                freeOwnedAnime(self.gpa, copy);
-                for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
-                return;
-            };
-        }
-        if (stubs.items.len == 0) return; // no enrichable cards on this page
-
-        const owned = stubs.toOwnedSlice(self.gpa) catch {
-            for (stubs.items) |stub| freeOwnedAnime(self.gpa, stub);
-            return;
-        };
-
-        // ROD-251: detach + account, don't join. The discover_batch_enriched handler
-        // merges each card back by id and frees orphans whose slot moved on, so a
-        // superseded page batch is keep-checked away without blocking the event thread.
-        self.discover_drain.begin();
-        const t = std.Thread.spawn(.{}, workers.discoverBatchEnrichTask, .{
-            loop, self.gpa, io, owned, window, &self.discover_drain,
-        }) catch {
-            self.discover_drain.finish(); // no worker will run — rebalance the count
-            for (owned) |stub| freeOwnedAnime(self.gpa, stub);
-            self.gpa.free(owned);
-            return;
-        };
-        t.detach();
+        self.fireDiscoverFeed(loop, io, self.discover.axis, 1);
     }
 
     /// Pool cap for Discover-grid covers (ROD-243): retain roughly two large-tier
@@ -2858,7 +2699,8 @@ pub const App = struct {
     /// The pure refresh-on-view decision, split from `maybeRefreshEnrichment` so it's
     /// unit-testable without that function's `is_test` network guard. Refresh a TRACKED,
     /// STALE show UNLESS a competing enrich path already covers it:
-    ///   * `discover_inflight`:    a Discover feed/zoom enrich is running,
+    ///   * `discover_inflight`:    a Discover feed fetch is running (its rows arrive
+    ///                             fully enriched and persist fresh, ROD-336),
     ///   * `search_enrich_active`: a live Browse search-page enrich is running,
     ///   * `refresh_inflight`:     another refresh-on-view is already in flight.
     ///
@@ -2893,7 +2735,7 @@ pub const App = struct {
         // the episode cache-hit early-return in fireEpisodesForId, so without the
         // guard even a synchronous cache-hit test spawns a detached network thread
         // (leak + dangling thread). Same guard every sibling here carries (fireEnrich,
-        // fireDiscoverEnrich); tests exercise `shouldRefreshOnView` directly.
+        // fireDiscoverFeed); tests exercise `shouldRefreshOnView` directly.
         if (builtin.is_test) return;
         if (self.store == null) return;
         const r = rec orelse return;
@@ -3042,7 +2884,7 @@ pub const App = struct {
     /// ROD-327's inline tier-A into the provider-agnostic resolver). An unresolved AniList
     /// hit is marked by `id == stringified anilist_id` (`metaToAnime`'s convention).
     pub const ResolveVerdict = union(enum) {
-        /// Already provider-keyed (History/Discover origin, or not an AniList hit): fetch
+        /// Already provider-keyed (History origin, or not an AniList hit): fetch
         /// `id` as-is, no binding.
         direct: []const u8,
         /// Tier 0: this canonical is already bound on this provider (a prior resolve
@@ -3059,9 +2901,10 @@ pub const App = struct {
         needs_search: i64,
     };
 
-    /// Classify a Browse selection into how it resolves to a play provider (ROD-328).
-    /// Anything already provider-keyed (History/Discover, or an anilist_id-less row) is
-    /// `.direct`. For an unresolved AniList hit: tier 0 reuses an existing persisted binding
+    /// Classify a canonical-capable selection into how it resolves to a play provider
+    /// (ROD-328; Browse search and the Discover feed both key rows this way). Anything
+    /// already provider-keyed (History rows, or an anilist_id-less row) is `.direct`.
+    /// For an unresolved AniList hit: tier 0 reuses an existing persisted binding
     /// (the store short-circuit that keeps a re-searched tier-C show cheap on replay); else
     /// tier A asks the provider for its own key; else tier C falls to a title search.
     /// `scratch` owns any store-read or `canonicalKey` id string; the caller uses it before
@@ -3084,12 +2927,12 @@ pub const App = struct {
         return .{ .needs_search = aid_i64 };
     }
 
-    /// Fire a Browse episode fetch for the selected show, routing through the resolver
-    /// (ROD-328). `.direct`/`.tier_a` fetch immediately (the fetch doubles as the tier-A
-    /// existence probe); `.needs_search` fires the tier-C search worker first. Shared by
-    /// the two-pane focus path and the single-column zoom path so the routing lives once.
-    fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        const sel = selection.selectedAnime(self) orelse return;
+    /// Fire an episode fetch for a canonical-capable selection, routing through the
+    /// resolver (ROD-328). `.direct`/`.tier_a` fetch immediately (the fetch doubles as
+    /// the tier-A existence probe); `.needs_search` fires the tier-C search worker
+    /// first. Shared by Browse (two-pane focus + zoom) and the Discover zoom (ROD-336)
+    /// so the routing lives once.
+    fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, sel: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         switch (browseResolveTarget(provider, sel, self.store, arena.allocator())) {
@@ -3099,6 +2942,12 @@ pub const App = struct {
             .tier_a => |t| self.fireEpisodesResolved(loop, io, provider, t.id, t.anilist_id),
             .needs_search => |aid| self.fireResolvePlaySearch(loop, io, provider, sel, aid),
         }
+    }
+
+    /// Browse's Enter/l entry into `fireEpisodesCanonical`: resolve the list selection.
+    fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+        const sel = selection.selectedAnime(self) orelse return;
+        self.fireEpisodesCanonical(loop, io, provider, sel);
     }
 
     /// Shared tail of a resolved Browse fire (ROD-328): the in-flight guard, the episode
@@ -3402,10 +3251,8 @@ pub const App = struct {
         if (key.matches(vaxis.Key.f3, .{}) or
             (self.input_mode == .normal and (key.matches('D', .{ .shift = true }) or key.matches('D', .{}))))
         {
-            // Discover is hidden for a source with no windowed popularity feed
-            // (senshi) until a per-provider Discover is built (ROD-301). Swallow the
-            // key with a one-line toast instead of opening an empty, inert grid; the
-            // top-bar [D] tab is dimmed to match (chrome.drawTopBar).
+            // Unreachable since ROD-336 (see discover_supported's doc): Discover is
+            // AniList-backed, no provider gate. Removed with the vtable (ROD-337).
             if (!self.discover_supported) {
                 var buf: [80]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "No Discover feed on {s} yet", .{provider.displayName()}) catch "No Discover feed yet";
@@ -3418,9 +3265,9 @@ pub const App = struct {
                 self.active_pane = .list;
                 self.list_cursor = 0;
                 self.list_top = 0;
-                // Cache-or-fetch the active window on entry: a fresh slot renders
+                // Cache-or-fetch the active axis on entry: a fresh slot renders
                 // instantly, a stale/empty one fires a page-1 fetch (ROD-239).
-                self.refreshDiscover(loop, io, provider);
+                self.refreshDiscover(loop, io);
             }
             return;
         }
@@ -3489,35 +3336,31 @@ pub const App = struct {
         self.onListCursorKey(key, loop, io); // j/k/g/G: list cursor + load-more
     }
 
-    /// Normal-mode keys while Discover is active (ROD-239): window toggle ([ ] /
+    /// Normal-mode keys while Discover is active (ROD-239): axis toggle ([ ] /
     /// 1-4) and the 2D grid cursor (hjkl + g/G). Entry/exit ride the global F-key
     /// chain in onKey; this intercept owns everything else so a keypress can't leak
-    /// into the Browse/History handlers. (Enter→zoom, P→save, /→Browse land next.)
+    /// into the Browse/History handlers.
     fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
         // Enter → open the full-screen detail zoom for the selected card, exactly
         // like Browse/History (origin=.discover, so the back-nav returns here).
-        // fireEpisodesForId resolves status/source/seed from currentDetailAnime,
-        // which now reads selectedDiscoverAnime under this origin.
+        // Feed rows are anilist_id-keyed canonical rows (`a.id` is the stringified
+        // anilist_id, never a provider id, ROD-336), so the episode fetch routes
+        // through the resolver like Browse; a raw fireEpisodesForId(a.id) would hand
+        // the play provider an AniList id.
         if (key.matches(vaxis.Key.enter, .{})) {
             if (selection.selectedDiscoverAnime(self)) |a| {
                 self.detail_origin = .discover;
                 self.active_view = .detail;
                 self.active_pane = .detail;
-                // The feed payload has no synopsis — lazily enrich this one show so
-                // the zoom fills in (only when it's actually missing, ROD-239).
-                // ROD-279: fire this BEFORE fireEpisodesForId so its discover_drain.begin()
-                // is visible to the refresh-on-view dedup inside fireEpisodesForId — a
-                // tracked-and-in-feed show would otherwise double-fetch (refresh-on-view +
-                // this zoom enrich). This enrich already persists + freshness-stamps the
-                // row (ROD-280), so refresh-on-view is redundant for this open.
-                if (a.description == null) self.fireDiscoverEnrich(loop, io, self.discover.window, a);
-                self.fireEpisodesForId(loop, io, provider, a.id);
+                self.fireEpisodesCanonical(loop, io, provider, a);
             }
             return;
         }
-        // P → add the selected card to the watchlist (the Browse-add path).
+        // P → add the selected card to the watchlist, through the same resolver
+        // routing as Browse-P (ROD-336): a direct addToWatchlist would persist a
+        // bogus (provider, anilist_id) row.
         if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
-            if (selection.selectedDiscoverAnime(self)) |a| self.addToWatchlist(provider, a);
+            if (selection.selectedDiscoverAnime(self)) |a| self.addSelectedCanonical(loop, io, provider, a);
             return;
         }
         // / → jump to Browse and open its search prompt (the discovery→search seam).
@@ -3530,27 +3373,27 @@ pub const App = struct {
             return;
         }
 
-        // Window toggle — [ ] cycle, 1-4 direct select. Drives the feed regardless
-        // of the grid cursor (the segmented bar is passive).
+        // Axis toggle: [ ] cycle, 1-4 direct select (§3.8). Drives the feed
+        // regardless of the grid cursor (the segmented bar is passive).
         if (key.matches(']', .{}) or key.matches('[', .{})) {
-            const n = std.meta.fields(source_mod.PopularWindow).len;
+            const n = std.meta.fields(anilist.DiscoverAxis).len;
             // Widen to usize BEFORE the arithmetic (ROD-246): `@intFromEnum` infers
             // the enum's minimum tag type — u2 for a 4-member enum. The forward
             // `cur + 1` peer-resolves to u2 (the `comptime_int` 1 carries no width of
-            // its own), so it overflows when cur == 3 (all_time) and panics. The
+            // its own), so it overflows when cur == 3 (this_season) and panics. The
             // backward `cur + n - 1` escaped only because `n` is usize, peer-resolving
             // cur upward; the explicit cast makes both branches do the math in usize.
-            const cur: usize = @intFromEnum(self.discover.window);
+            const cur: usize = @intFromEnum(self.discover.axis);
             const next = if (key.matches(']', .{})) (cur + 1) % n else (cur + n - 1) % n;
-            self.setDiscoverWindow(@enumFromInt(next), loop, io, provider);
+            self.setDiscoverAxis(@enumFromInt(next), loop, io);
             return;
         }
-        if (key.matches('1', .{})) return self.setDiscoverWindow(.daily, loop, io, provider);
-        if (key.matches('2', .{})) return self.setDiscoverWindow(.weekly, loop, io, provider);
-        if (key.matches('3', .{})) return self.setDiscoverWindow(.monthly, loop, io, provider);
-        if (key.matches('4', .{})) return self.setDiscoverWindow(.all_time, loop, io, provider);
+        if (key.matches('1', .{})) return self.setDiscoverAxis(.trending, loop, io);
+        if (key.matches('2', .{})) return self.setDiscoverAxis(.popular, loop, io);
+        if (key.matches('3', .{})) return self.setDiscoverAxis(.top_rated, loop, io);
+        if (key.matches('4', .{})) return self.setDiscoverAxis(.this_season, loop, io);
 
-        // Grid cursor over the active window's results (flat index; the column
+        // Grid cursor over the active axis's results (flat index; the column
         // count resolves the 2D step). Inert while the slot is empty.
         const len = self.discover.activeSlot().results.items.len;
         if (len == 0) return;
@@ -3569,21 +3412,21 @@ pub const App = struct {
             self.discover.cursor = len - 1;
         }
         // Prefetch the next page once the cursor nears the grid's end (ROD-239).
-        self.maybePrefetchDiscover(loop, io, provider);
+        self.maybePrefetchDiscover(loop, io);
     }
 
-    /// Fire the next Popular page when the grid cursor comes within ~2 card-rows of
-    /// the end, unless the window is exhausted, already loading, or unfetched. The
-    /// page-> 1 tick arm appends (not clears) for page > 1, so the grid grows
-    /// in place; a short page sets `exhausted` and stops this (ROD-239 load-more).
-    fn maybePrefetchDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    /// Fire the next feed page when the grid cursor comes within ~2 card-rows of
+    /// the end, unless the axis is exhausted, already loading, or unfetched. The
+    /// page-> 1 tick arm appends (not clears) for page > 1, so the grid grows in
+    /// place; `hasNextPage` false sets `exhausted` and stops this (ROD-239 load-more).
+    fn maybePrefetchDiscover(self: *App, loop: *Loop, io: std.Io) void {
         const slot = self.discover.activeSlot();
         if (slot.loading or slot.exhausted or slot.page == 0) return;
         const len = slot.results.items.len;
         if (len == 0) return;
         const cols: usize = discover_view.gridCols(self.term_cols);
         if (self.discover.cursor + cols * 2 >= len) {
-            self.firePopular(loop, io, provider, self.discover.window, slot.page + 1);
+            self.fireDiscoverFeed(loop, io, self.discover.axis, slot.page + 1);
         }
     }
 
@@ -3603,7 +3446,7 @@ pub const App = struct {
     /// Whether the fill pass may fire for a slot in this state (ROD-272): an established
     /// feed (page > 0; page 1 is refreshDiscover's to own), idle (not loading), not
     /// exhausted, and not failed. The `failed` gate is what prevents a retry storm: a
-    /// fill-fired page that errors sets `slot.failed` and wakes the loop (.popular_error),
+    /// fill-fired page that errors sets `slot.failed` and wakes the loop (.discover_feed_error),
     /// so without it this every-frame pass would re-fire as fast as the fetch can fail. A
     /// later successful page (a user scroll re-fires the prefetch, clearing `failed`)
     /// resumes the fill; until then the grid degrades to under-filled, the pre-ROD-272
@@ -3612,16 +3455,16 @@ pub const App = struct {
         return page > 0 and !loading and !exhausted and !failed;
     }
 
-    /// Top the active Discover window up to the visible grid (ROD-272). The feed
-    /// paginates in fixed `popular_page_size` chunks, so on a large monitor the first page
-    /// leaves empty rows below the last card, and the cursor-proximity prefetch only fires
-    /// once the cursor nears the end (on load it sits at 0). This fires the next page
-    /// whenever the loaded set doesn't cover the visible rows (+ peek row), cascading
+    /// Top the active Discover axis up to the visible grid (ROD-272). The feed
+    /// paginates in fixed `discover_page_size` chunks, so on a large monitor the first
+    /// page leaves empty rows below the last card, and the cursor-proximity prefetch only
+    /// fires once the cursor nears the end (on load it sits at 0). This fires the next
+    /// page whenever the loaded set doesn't cover the visible rows (+ peek row), cascading
     /// page-by-page until the grid is full or the feed is exhausted. Called every frame
     /// with settled geometry, so it also refills after a resize. The state guard
     /// (discoverFillEligible) keeps one page in flight and backs off on a failed page, so
     /// a flaky feed can't turn this every-frame pass into a retry storm.
-    fn maybeFillDiscover(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn maybeFillDiscover(self: *App, loop: *Loop, io: std.Io) void {
         if (self.active_view != .discover) return;
         const slot = self.discover.activeSlot();
         if (!discoverFillEligible(slot.loading, slot.exhausted, slot.failed, slot.page)) return;
@@ -3631,21 +3474,21 @@ pub const App = struct {
         const cp = self.cellPx();
         const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
         if (discoverNeedsFill(slot.results.items.len, geo)) {
-            self.firePopular(loop, io, provider, self.discover.window, slot.page + 1);
+            self.fireDiscoverFeed(loop, io, self.discover.axis, slot.page + 1);
         }
     }
 
-    /// Switch the active Popular window and cache-or-fetch it (ROD-239). Resets the
-    /// grid cursor/scroll; a no-op if already on `window`.
-    fn setDiscoverWindow(self: *App, window: source_mod.PopularWindow, loop: *Loop, io: std.Io, provider: SourceProvider) void {
-        if (self.discover.window != window) {
-            self.discover.window = window;
+    /// Switch the active feed axis and cache-or-fetch it (ROD-239). Resets the
+    /// grid cursor/scroll; a no-op if already on `axis`.
+    fn setDiscoverAxis(self: *App, axis: anilist.DiscoverAxis, loop: *Loop, io: std.Io) void {
+        if (self.discover.axis != axis) {
+            self.discover.axis = axis;
             self.discover.cursor = 0;
             self.discover.scroll = 0;
         }
         // Cache-or-fetch — also the retry path: a failed/stale slot refetches, a
-        // fresh one is a no-op, so re-selecting the current window retries it (§9.3b).
-        self.refreshDiscover(loop, io, provider);
+        // fresh one is a no-op, so re-selecting the current axis retries it (§9.3b).
+        self.refreshDiscover(loop, io);
     }
 
     /// Drill forward (ROD-170 focus model): l/→/Enter reveal+focus the detail pane
@@ -3848,15 +3691,16 @@ pub const App = struct {
     fn onBrowseAddKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
         if (!(self.active_view == .browse and self.active_pane == .list and
             (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))) return false;
-        if (selection.selectedAnime(self)) |anime| self.addSelectedFromBrowse(loop, io, provider, anime);
+        if (selection.selectedAnime(self)) |anime| self.addSelectedCanonical(loop, io, provider, anime);
         return true; // P is consumed in Browse-list focus whether or not a row is selected
     }
 
-    /// Browse P (ROD-327/328): dispatches Add through the same resolver as the episode
-    /// fetch (`browseResolveTarget`). `.tier_a` fires the async probe; `.needs_search` fires
-    /// the tier-C title search; both mint the binding on success. `.direct` (an already
-    /// provider-keyed row, e.g. a future Discover cutover, ROD-325) adds synchronously.
-    fn addSelectedFromBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, anime: Anime) void {
+    /// P-add for a canonical-capable selection (ROD-327/328), shared by Browse and
+    /// Discover (ROD-336): dispatches Add through the same resolver as the episode
+    /// fetch (`browseResolveTarget`). `.tier_a` fires the async probe; `.needs_search`
+    /// fires the tier-C title search; both mint the binding on success. `.direct` (an
+    /// already provider-keyed row) adds synchronously.
+    fn addSelectedCanonical(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, anime: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         switch (browseResolveTarget(provider, anime, self.store, arena.allocator())) {
@@ -4259,11 +4103,11 @@ pub const App = struct {
     /// which withheld it from History at 60-99, is retired).
     pub const pane_split_min: u16 = 60;
 
-    /// How long a fetched Popular-feed window stays fresh in the in-memory cache
-    /// (ROD-239). Re-opening Discover or flipping back to a window within this
-    /// window renders the cached slot with no network; past it, the slot refetches.
-    /// "hour'ish" per the design steer — a feed isn't real-time, and the windowed
-    /// counts move slowly enough that an hour is invisible to the user.
+    /// How long a fetched feed axis stays fresh in the in-memory cache (ROD-239).
+    /// Re-opening Discover or flipping back to an axis within this window renders
+    /// the cached slot with no network; past it, the slot refetches. "hour'ish" per
+    /// the design steer: a feed isn't real-time, and the rankings move slowly
+    /// enough that an hour is invisible to the user.
     pub const feed_ttl_secs: i64 = 3600;
 
     /// Cursor-settle window (ms) before a cursor-tracked cover preview actually
@@ -4488,13 +4332,13 @@ test "discoverPoolSaturated trips at (not before) the soft cap (ROD-264)" {
     // Empty pool — always room to spawn.
     try testing.expect(!app.discoverPoolSaturated());
     // One below the cap — still room.
-    app.discover_drain.inflight.store(App.discover_enrich_cap - 1, .release);
+    app.discover_drain.inflight.store(App.discover_feed_cap - 1, .release);
     try testing.expect(!app.discoverPoolSaturated());
     // At the cap — drop. `>=`, not `==`, so a live cap decrease that strands
     // inflight above the new cap also reads saturated (same guard as the cover pump).
-    app.discover_drain.inflight.store(App.discover_enrich_cap, .release);
+    app.discover_drain.inflight.store(App.discover_feed_cap, .release);
     try testing.expect(app.discoverPoolSaturated());
-    app.discover_drain.inflight.store(App.discover_enrich_cap + 5, .release);
+    app.discover_drain.inflight.store(App.discover_feed_cap + 5, .release);
     try testing.expect(app.discoverPoolSaturated());
     // Leave the counter balanced — hygiene; this bare App is never torn down.
     app.discover_drain.inflight.store(0, .release);
@@ -4502,8 +4346,8 @@ test "discoverPoolSaturated trips at (not before) the soft cap (ROD-264)" {
 
 test "discoverNeedsFill: a short first page under-fills a wide grid, a full one doesn't (ROD-272)" {
     // A wide monitor (270 cols → 12 cards/row, ~5 visible rows on the fallback box)
-    // wants (5+1)*12 = 72 cards to cover the grid + peek row. One popular_page_size
-    // page (30) leaves the bottom rows empty — the bug this tops up.
+    // wants (5+1)*12 = 72 cards to cover the grid + peek row. A couple of
+    // discover_page_size pages still leave the bottom rows empty, the bug this tops up.
     const wide = discover_view.geometry(270, 57, 0, 0);
     try testing.expectEqual(@as(u16, 12), wide.cols);
     try testing.expectEqual(@as(u16, 5), wide.rows_visible);
@@ -4557,7 +4401,7 @@ test "discoverFillEligible gates the fill on an established, idle, live feed (RO
     try testing.expect(!App.discoverFillEligible(false, false, false, 0)); // page 0 is refreshDiscover's
     try testing.expect(!App.discoverFillEligible(true, false, false, 1)); // in flight → debounce
     try testing.expect(!App.discoverFillEligible(false, true, false, 1)); // feed exhausted
-    // The review blocker: a failed page must veto, else .popular_error wakes the loop
+    // The review blocker: a failed page must veto, else .discover_feed_error wakes the loop
     // and the fill re-fires as fast as the fetch can fail — an unbounded retry storm.
     try testing.expect(!App.discoverFillEligible(false, false, true, 1));
 }
