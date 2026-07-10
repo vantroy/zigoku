@@ -3455,6 +3455,7 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
+    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
     defer app.episodes.freeResults(std.testing.allocator); // fireEpisodesForId dupes for_id/source
 
     // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
@@ -3472,6 +3473,7 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.play_resolving = true;
+    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
 
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = &.{} } });
 
@@ -5865,6 +5867,11 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
 const RecordingProvider = struct {
     id: []const u8,
     hit: std.atomic.Value(bool) = .init(false),
+    /// Set by searchFn: pins that a tier-C walk actually searched THIS provider.
+    search_hit: std.atomic.Value(bool) = .init(false),
+    /// When true, canonicalKey derives stringify(mal_id) like a mal-keyed catalog;
+    /// when false the provider can only be reached by tier-C search.
+    tier_a: bool = false,
 
     fn nameFn(ptr: *anyopaque) []const u8 {
         const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
@@ -5873,11 +5880,16 @@ const RecordingProvider = struct {
     fn displayNameFn(_: *anyopaque) []const u8 {
         return "Rec";
     }
-    fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+    fn searchFn(ptr: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        self.search_hit.store(true, .release);
         return &.{};
     }
-    fn canonicalKeyFn(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
-        return null;
+    fn canonicalKeyFn(ptr: *anyopaque, arena: Allocator, canonical: Anime) anyerror!?[]const u8 {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        if (!self.tier_a) return null;
+        const mal = canonical.mal_id orelse return null;
+        return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
     fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
         const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
@@ -6080,4 +6092,550 @@ test "ROD-343: a history row from an unregistered source falls back to the defau
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
     app.cover.joinThread();
     app.episodes.freeResults(app.gpa);
+}
+
+// ── ROD-346: provider-fallback walk ─────────────────────────────────────────
+
+test "ROD-346: a failed episode fetch hops to the next provider's tier-A probe" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    // The failed fetch's identity: alpha's binding, as fireEpisodesForId set it.
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The walk skipped alpha (it just failed) and fired beta's tier-A probe:
+    // the fetch keys on stringify(mal_id) and pending_bind carries the mint.
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("52991", app.episodes.for_id.?);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+    try testing.expect(app.fallback != null);
+    try testing.expectEqual(Toast.Kind.warn, app.toast_queue[0].?.kind);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: a fallback hop reuses an existing sibling binding (tier 0) before probing" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // beta already carries its own binding under a DIFFERENT opaque id than
+    // tier-A would derive; the hop must fetch the stored id, not re-derive.
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    // Tier 0 re-binds nothing: the row already exists.
+    try testing.expect(app.pending_bind == null);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    const slots = [_]SourceProvider{alpha.provider()};
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The only provider is the one that failed: no hop fires, the existing
+    // dead-end copy stands, and no walk is left behind.
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expect(app.fallback == null);
+    try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: a landed fallback grid mints under the hop provider and clears the walk" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // Real watch state on the failing binding: the mint must inherit it.
+    try st.saveProgress("alpha", "a1", .sub, "1", 950, 1000, 5001);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+    app.episode_drain.drain();
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    try testing.expect(app.fallback != null);
+
+    // The hop's probe lands: episodes_done must mint (beta, 52991) and retire the walk.
+    const eps = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "1" }});
+    const done_id = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .episodes_done = .{ .episodes = eps, .for_id = done_id } }, &loop, io, registry);
+
+    try testing.expect(app.fallback == null);
+    try testing.expect(app.pending_bind == null);
+    const rec = (try st.getAnime(arena, "beta", "52991")).?;
+    try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
+    // Mint-time recompute through the canonical union: the fresh binding and the
+    // in-memory grid both carry alpha's high-water, not 0 (ROD-346 watch-state join).
+    try testing.expectEqual(@as(i64, 1), rec.progress);
+    try testing.expectEqual(@as(u32, 1), app.episodes.progress);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: a virgin tier-A probe failure walks on via pending_bind (no binding row yet)" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // Canonical only: the probe that failed never minted a binding.
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "52991");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    app.pending_bind = 154587; // the resolving Browse fire armed it
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // No binding row exists, so the walk's canonical handle came from the
+    // captured pending_bind; beta's probe fires with the re-armed mint.
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+    try testing.expect(app.fallback != null);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: a tier-A add-probe miss widens the search to the remaining providers before unbound" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true; // the probe that is about to report its miss
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const sid = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = "alpha" } }, &loop, io, registry);
+
+    // The probe miss (source names the probed provider) widened instead of
+    // persisting unbound: the search worker is in flight over beta only.
+    try testing.expect(app.add_resolving);
+    try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) == null);
+    app.add_resolve_drain.drain();
+    try testing.expect(beta.search_hit.load(.acquire));
+    try testing.expect(!alpha.search_hit.load(.acquire));
+
+    // The widened search misses too (both stubs return empty catalogs): its
+    // result posts with an empty source, which must now persist the marker.
+    var widened: ?Event = null;
+    while (loop.queue.tryPop() catch null) |ev| {
+        if (widened == null and ev == .resolve_add_result) {
+            widened = ev;
+        } else freeTestEvent(app.gpa, ev);
+    }
+    try app.tick(widened.?, &loop, io, registry);
+    try testing.expect(!app.add_resolving);
+    try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346: mapEpisodeIndex prefers the raw label, falls back to ordinal, else null" {
+    const eps = [_]domain.EpisodeNumber{ .{ .raw = "0" }, .{ .raw = "1" }, .{ .raw = "2" } };
+    // Label match wins even when it disagrees with the ordinal position.
+    try testing.expectEqual(@as(?usize, 1), App.mapEpisodeIndex(&eps, "1", 3));
+    // No label match: 1-based ordinal maps positionally.
+    try testing.expectEqual(@as(?usize, 2), App.mapEpisodeIndex(&eps, "SP3", 3));
+    // Neither fits: the hop provider's grid is too short.
+    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "SP9", 9));
+    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "9", 0));
+}
+
+test "ROD-346: a never-played stream failure relaunches on the hop provider, bounded by one shot each" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.skip_mode = "none"; // keep playTask off the network (no AniSkip/Jikan)
+    // The relaunch spawns a REAL playTask; `true` stands in for mpv (exits 0
+    // instantly, so no production error log trips the runner's guard).
+    app.config.mpv_path = "true";
+    defer app.clearFallback();
+    // The play that is about to fail: alpha's grid is loaded and the session
+    // carries the fire-time identity, episode "1" (ordinal 1).
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+    try testing.expect(app.session.begin(app.gpa, "alpha", "a1", "1", 1, .sub, 0));
+    app.playing = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    // Failure 1: the stream never opened (final null, the CF-penalty shape).
+    try app.tick(.{ .play_error = .{ .final = null, .cause = error.NoAnswer } }, &loop, io, registry);
+
+    // The walk armed a play continuation and fired beta's tier-A probe.
+    try testing.expect(!app.playing);
+    try testing.expect(app.fallback != null);
+    try testing.expect(app.fallback.?.play != null);
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+
+    // Land the hop grid: the continuation re-lands episode "1" and relaunches.
+    var done: ?Event = null;
+    while (loop.queue.tryPop() catch null) |ev| {
+        if (done == null and ev == .episodes_done) {
+            done = ev;
+        } else freeTestEvent(app.gpa, ev);
+    }
+    try app.tick(done.?, &loop, io, registry);
+
+    try testing.expectEqual(@as(usize, 0), app.episodes.cursor);
+    try testing.expect(app.playing); // the relaunch committed
+    try testing.expectEqualStrings("beta", app.session.source);
+    try testing.expectEqualStrings("52991", app.session.anime_id);
+    try testing.expect(app.fallback != null); // armed across the relaunch
+
+    // Let the relaunch's worker finish; DROP its play_done unhandled so the
+    // session stays armed, then inject failure 2 as another never-played error
+    // (the shape a second broken provider would post).
+    if (app.play_thread) |t| {
+        t.join();
+        app.play_thread = null;
+    }
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    try app.tick(.{ .play_error = .{ .final = null, .cause = error.NoAnswer } }, &loop, io, registry);
+
+    // Both providers consumed: the walk exhausts instead of ping-ponging back
+    // to alpha (whose fetch never fires), and the dead-end toast lands.
+    try testing.expect(app.fallback == null);
+    try testing.expect(!app.playing);
+    try testing.expect(!alpha.hit.load(.acquire));
+    var saw_error = false;
+    for (app.toast_queue) |slot| {
+        if (slot) |t| {
+            if (t.kind == .@"error") saw_error = true;
+        }
+    }
+    try testing.expect(saw_error);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stale progress" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "900",
+        .name = "Frieren",
+        .anilist_id = 900,
+    }, true, 5000, arena);
+    // Origin binding holds the real state: eps 1..8 fully watched.
+    try st.upsertAnime(.{ .source = "alpha", .source_id = "a1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 5000, arena);
+    var ep_buf: [2]u8 = undefined;
+    for (1..9) |n| {
+        const label = try std.fmt.bufPrint(&ep_buf, "{d}", .{n});
+        try st.saveProgress("alpha", "a1", .sub, label, 950, 1000, 5000 + @as(i64, @intCast(n)));
+    }
+    // The sibling binding the tier-0 hop will reuse: its OWN progress column is
+    // stale (2), and its episode cache is primed so the hop lands synchronously
+    // (tryCacheHit posts no episodes_done; completeFallback is the only recompute
+    // chance, the gap the review's Critical named).
+    try st.upsertAnime(.{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 }, 5001, arena);
+    const cached = [_]domain.EpisodeNumber{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" },
+        .{ .raw = "5" }, .{ .raw = "6" }, .{ .raw = "7" }, .{ .raw = "8" },
+    };
+    try st.putCachedEpisodes("beta", "b7", .sub, &cached, "FINISHED", store_mod.Store.nowSecs(), arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The hop reused beta's binding from cache (no probe thread, no mint) and the
+    // landing raised its progress through the canonical union: grid and store both
+    // read 8, not the stale 2 sync would otherwise push (the ROD-323 shape).
+    try testing.expect(!beta.hit.load(.acquire)); // cache hit: no network probe
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    try testing.expect(app.fallback == null); // synchronous landing completed the walk
+    try testing.expectEqual(@as(u32, 8), app.episodes.progress);
+    try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
+    // Writes stay per-binding: the origin row's own progress column is untouched.
+    try testing.expectEqual(@as(i64, 0), (try st.getAnime(arena, "alpha", "a1")).?.progress);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demotes to History" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" }; // tier-C only: no canonicalKey, search misses
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "900",
+        .name = "Frieren",
+        .anilist_id = 900,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, 5000, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+    // The auto-resume landing armed the demote contract before its fetch failed.
+    app.active_view = .detail;
+    app.active_pane = .detail;
+    app.resume_landing_pending = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    // The walk hopped to beta's tier-C search; the landing flag must survive the hop.
+    try testing.expect(app.play_resolving);
+    try testing.expect(app.resume_landing_pending);
+    app.play_resolve_drain.drain();
+    try testing.expect(beta.search_hit.load(.acquire));
+
+    // The search misses (empty stub catalog) and the walk exhausts: this dead end
+    // must demote exactly like episodes_error's (the ROD-229 contract).
+    var miss: ?Event = null;
+    while (loop.queue.tryPop() catch null) |ev| {
+        if (miss == null and ev == .resolve_play_target) {
+            miss = ev;
+        } else freeTestEvent(app.gpa, ev);
+    }
+    try app.tick(miss.?, &loop, io, registry);
+
+    try testing.expect(app.fallback == null);
+    try testing.expect(!app.resume_landing_pending);
+    try testing.expect(app.active_view == .history);
+    try testing.expect(app.active_pane == .list);
+    // Slot 0 holds the hop's warn toast; the dead-end error lands after it.
+    var saw_error = false;
+    for (app.toast_queue) |slot| {
+        if (slot) |t| {
+            if (t.kind == .@"error") saw_error = true;
+        }
+    }
+    try testing.expect(saw_error);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-346 review: a superseded resolve_play_target success is dropped, never hijacks the grid" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.play_resolving = true;
+    // play_resolve_aid stays null: the user fired another show's fetch after this
+    // search spawned, which cleared the fire-time intent. The landed grid below is
+    // that other show's.
+    app.episodes.for_id = try app.gpa.dupe(u8, "current-show");
+    app.episodes.for_source = try app.gpa.dupe(u8, "senshi");
+    defer app.episodes.freeResults(app.gpa);
+
+    const sid = try std.testing.allocator.dupe(u8, "52991");
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
+
+    // Dropped: the guard cleared, but no fetch fired and no bind was armed; the
+    // user's current grid identity is untouched.
+    try testing.expect(!app.play_resolving);
+    try testing.expect(app.pending_bind == null);
+    try testing.expectEqualStrings("current-show", app.episodes.for_id.?);
+    try testing.expectEqualStrings("senshi", app.episodes.for_source.?);
 }
