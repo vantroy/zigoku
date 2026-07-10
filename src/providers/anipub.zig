@@ -715,6 +715,9 @@ test "parseGogoRealId rejects junk slots and near-miss params" {
     // later real ep param still wins.
     try testing.expect(AniPub.parseGogoRealId("https://x/streaming.php?ep=abc") == null);
     try testing.expectEqualStrings("7", AniPub.parseGogoRealId("https://x/streaming.php?deep=1&ep=7").?);
+    // A hostile link STARTING with "ep=" puts the match at index 0; the
+    // boundary check must not underflow, and the anchored param still wins.
+    try testing.expectEqualStrings("1", AniPub.parseGogoRealId("ep=9/streaming.php?ep=1").?);
     try testing.expect(AniPub.parseGogoRealId("") == null);
 }
 
