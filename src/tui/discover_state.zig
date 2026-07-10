@@ -53,6 +53,14 @@ pub const Slot = struct {
 /// changes. Never intern or share an `Anime` across slots: a show on all four axes is
 /// four independent owned copies (ownership is per-slot; `clearSlot` frees per-slot).
 pub const DiscoverState = struct {
+    /// Hard ceiling on rows retained per axis slot (ROD-339). The load-more chain
+    /// has no natural bound: prefetch keeps paging while `hasNextPage` holds, so a
+    /// long scroll on a large axis (or a feed lying `has_next` forever) accumulates
+    /// without limit. Crossing this flips `exhausted`, the same downstream shape as
+    /// a real end-of-feed (footer copy, prefetch stop); a fresh page-1 load clears
+    /// the slot and re-arms the cap.
+    pub const max_feed_rows: usize = 300;
+
     /// The active ranking axis; drives both the axis bar and the fetch (§3.8/§9.6).
     axis: anilist.DiscoverAxis = .trending,
 

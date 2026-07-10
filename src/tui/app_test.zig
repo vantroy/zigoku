@@ -742,6 +742,33 @@ test "discover_feed lands in its own axis slot; hasNextPage drives exhaustion (R
     try testing.expect(popular.exhausted);
 }
 
+test "feed retention cap flips exhausted even while AniList reports more (ROD-339)" {
+    // The load-more chain has no natural bound (prefetch pages while hasNextPage
+    // holds), so max_feed_rows is the ceiling: crossing it must exhaust the slot
+    // exactly like a real end-of-feed, or a long scroll / a has_next-forever feed
+    // grows the slot without limit.
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.discover.axis = .trending;
+
+    // Seed the slot one row shy of the cap (owned rows, as landed pages are).
+    const slot = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+    var i: usize = 0;
+    while (i < app_mod.DiscoverState.max_feed_rows - 1) : (i += 1) {
+        try slot.results.append(testing.allocator, try workers.dupeOwnedAnime(testing.allocator, .{ .id = "1", .name = "filler" }));
+    }
+    slot.page = 15;
+
+    // The page that crosses the cap still reports has_next=true; the cap wins.
+    const results = try testing.allocator.alloc(Anime, 1);
+    results[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "2", .name = "last straw", .anilist_id = 2 });
+    try testTick(&app, .{ .discover_feed = .{ .results = results, .axis = .trending, .page = 16, .has_next = true } });
+
+    try testing.expectEqual(app_mod.DiscoverState.max_feed_rows, slot.results.items.len);
+    try testing.expect(slot.exhausted);
+}
+
 test "entering Discover with a fresh slot is a cache hit; a stale slot fetches (ROD-239)" {
     // Cache HIT: a slot fetched within the TTL must NOT fire a fetch. Observable:
     // fireDiscoverFeed sets the slot's loading flag before its is_test gate, so a
