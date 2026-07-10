@@ -77,12 +77,12 @@ pub const Event = union(enum) {
         page: u32,
     },
     /// A tier-A add-to-watchlist resolve settled (ROD-327): the worker probed the play
-    /// provider by the stringified mal_id (`source_id`) for an anilist_id-keyed Browse
-    /// hit. `ok` true: the provider stocks the show, so the UI thread mints the binding
-    /// (`bindCanonical`) revealed and reloads History. `ok` false: resolver miss, no state
-    /// written (ROD-329 owns the unmatched state), plus a "couldn't add" toast. `source_id`
-    /// is gpa-owned; the UI thread frees it on either arm. `anilist_id` links the binding
-    /// to its canonical row.
+    /// provider by the stringified mal_id (`source_id`) for an anilist_id-keyed Browse hit.
+    /// `ok` true: the UI thread mints the binding (`bindCanonical`) revealed and reloads
+    /// History. `ok` false: no provider stocks it, so the UI thread persists the unbound
+    /// marker (`markUnbound`, ROD-329), or falls back to a "couldn't add" toast when no
+    /// canonical row exists. `source_id` is gpa-owned, freed by the UI thread on either arm;
+    /// `anilist_id` links the binding to its canonical row.
     resolve_add_result: struct {
         ok: bool,
         anilist_id: i64,
@@ -93,9 +93,10 @@ pub const Event = union(enum) {
     /// null, e.g. a canonical with no MAL id). `ok` true: `source_id` is the provider's
     /// opaque id for the best catalog match (gpa-owned): the UI thread arms the bind
     /// (`pending_bind` = `anilist_id`) and fires the episode fetch, which confirms, caches,
-    /// and mints the binding through the shared `.episodes_done` path. `ok` false: no
-    /// confident match (the unmatched state is ROD-329) plus a "couldn't load episodes"
-    /// toast. `source_id` is gpa-owned and freed by the UI thread when non-empty.
+    /// and mints the binding through the shared `.episodes_done` path. `ok` false: just a
+    /// "couldn't load episodes" toast (the Play path never mints an unbound marker; that's
+    /// the add path only, ROD-329). `source_id` is gpa-owned and freed by the UI thread when
+    /// non-empty.
     resolve_play_target: struct {
         ok: bool,
         anilist_id: i64,

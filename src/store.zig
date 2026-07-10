@@ -63,6 +63,12 @@ const WAL_RETRY_BACKOFF_MS: c_int = 5;
 pub const WATCHED_RATIO = 0.95;
 pub const NATURAL_END_RATIO = 0.80;
 
+/// Reserved pseudo-`source`: a canonical resolved (real AniList id) but no play provider
+/// stocks it (ROD-329). Distinct from the enrichment "confirmed-unmatched" state
+/// (canonical_id NULL, see MIGRATION_V14 comment), which is an id-miss; this is a
+/// provider-miss. Never a real provider name: the History gate keys on this exact string.
+pub const SOURCE_UNBOUND = "unbound";
+
 const SqliteDb = ?*c.sqlite3;
 const Stmt = ?*c.sqlite3_stmt;
 
@@ -909,6 +915,15 @@ pub const Store = struct {
             std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
             return false;
         };
+        // ROD-329: a real bind supersedes any prior `unbound` sentinel for this canonical
+        // (shared `canonical_id`). A lingering sentinel (NULL last_watched, lower rowid)
+        // wins loadHistory's ROD-313 collapse and would mask the now-playable row, so
+        // delete it. Inherit its visibility: the sentinel always mints visible, so a hidden
+        // Play-path bind must reveal here or the show drops out of History.
+        var effective_visible = visible;
+        if (!std.mem.eql(u8, source, SOURCE_UNBOUND) and try self.supersedeUnbound(anilist_id)) {
+            effective_visible = true;
+        }
         const rec: AnimeRecord = .{
             .source = source,
             .source_id = source_id,
@@ -916,10 +931,41 @@ pub const Store = struct {
             .mal_id = canon.mal_id,
             .anilist_id = anilist_id,
             .canonical_id = anilist_id,
-            .history_visible = visible,
+            .history_visible = effective_visible,
         };
         try self.upsertAnime(rec, now, scratch);
         return true;
+    }
+
+    /// Delete the `unbound` sentinel for `anilist_id`, if present (ROD-329). A plain row
+    /// delete is safe: the sentinel owns no episode_progress rows (Play is gated off it),
+    /// so nothing cascades.
+    fn supersedeUnbound(self: *Store, anilist_id: i64) Error!bool {
+        var buf: [24]u8 = undefined;
+        const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
+        const stmt = try self.prepare("DELETE FROM anime WHERE source = ? AND source_id = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, SOURCE_UNBOUND);
+        try bindText(stmt, 2, source_id);
+        try self.stepDone(stmt);
+        return c.sqlite3_changes(self.db) > 0;
+    }
+
+    /// Persist the ROD-329 unbound terminal state: the add-time resolver found no play
+    /// provider, so mint a visible `SOURCE_UNBOUND` binding. A thin wrapper over
+    /// `bindCanonical` (reuses its conflict/merge semantics) rather than a bespoke insert,
+    /// to keep `bindCanonical`'s "provider stocks the show" contract honest. Returns false
+    /// when no canonical row exists yet: the caller must not toast success on that.
+    pub fn markUnbound(self: *Store, anilist_id: i64, now: i64, scratch: Allocator) Error!bool {
+        var buf: [24]u8 = undefined;
+        const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
+        return self.bindCanonical(SOURCE_UNBOUND, source_id, anilist_id, true, now, scratch);
+    }
+
+    /// The sentinel's `source_id`, in one place so `markUnbound` and `supersedeUnbound`
+    /// can't key the row differently (ROD-329).
+    fn unboundSourceId(buf: []u8, anilist_id: i64) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{d}", .{anilist_id}) catch null;
     }
 
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and
@@ -3464,6 +3510,129 @@ test "getCanonicalByAnilistId reads a hit back; bindCanonical mints a linked bin
     try testing.expectEqualStrings("Sousou no Frieren", hist[0].title);
     try testing.expectEqual(@as(?i64, 52991), hist[0].mal_id);
     try testing.expectEqual(@as(?i64, 89), hist[0].score);
+}
+
+test "markUnbound persists a visible sentinel keyed on the anilist_id, idempotent (ROD-329)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+
+    // No canonical row yet: markUnbound is an honest no-op (false) that writes nothing
+    // (the same guard as bindCanonical, since it routes through it).
+    try testing.expect(!(try s.markUnbound(182255, 500, arena)));
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+
+    try s.upsertCanonicalOnly(.{
+        .id = "182255",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+    }, true, 7000, arena);
+
+    // Sentinel mints and surfaces as one History card (title resolved through the
+    // canonical join).
+    try testing.expect(try s.markUnbound(182255, 1000, arena));
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE source='unbound';"));
+    try testing.expectEqual(@as(?i64, 182255), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source='unbound' AND source_id='182255';"));
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='unbound' AND source_id='182255';"));
+    const hist = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), hist.len);
+    try testing.expectEqualStrings("Sousou no Frieren", hist[0].title);
+    try testing.expectEqualStrings("unbound", hist[0].source);
+
+    // Re-run is idempotent (ON CONFLICT preserves the row): still exactly one binding.
+    try testing.expect(try s.markUnbound(182255, 2000, arena));
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+}
+
+test "a real provider bind supersedes the unbound sentinel and inherits its visibility (ROD-329)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+
+    try s.upsertCanonicalOnly(.{
+        .id = "182255",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+    }, true, 7000, arena);
+
+    // Add-time miss: the show enters History as an unbound sentinel.
+    try testing.expect(try s.markUnbound(182255, 1000, arena));
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+
+    // The provider later stocks it; a re-resolve mints the real binding. Bind HIDDEN
+    // (the Play path mints hidden, revealed by recordPlay) to prove the sentinel's
+    // visibility is inherited; otherwise the show would vanish from History.
+    try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 2000, arena));
+
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT COUNT(*) FROM anime WHERE source='unbound';"));
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT COUNT(*) FROM anime;"));
+    try testing.expectEqual(@as(?i64, 1), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='senshi';"));
+
+    const hist = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), hist.len);
+    try testing.expectEqualStrings("senshi", hist[0].source);
+    try testing.expectEqualStrings("52991", hist[0].source_id);
+    try testing.expectEqualStrings("Sousou no Frieren", hist[0].title);
+}
+
+test "bindCanonical does not force-reveal a hidden bind when no sentinel was superseded (ROD-329)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    const Q = struct {
+        fn int(st: *Store, sql: [*c]const u8) !?i64 {
+            const stmt = try st.prepare(sql);
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+            if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+            return c.sqlite3_column_int64(stmt, 0);
+        }
+    };
+
+    try s.upsertCanonicalOnly(.{
+        .id = "182255",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 182255,
+        .mal_id = 52991,
+    }, true, 7000, arena);
+
+    // No sentinel exists, so a hidden Play-path bind must stay hidden; the supersede
+    // path must not become a blanket "always reveal".
+    try testing.expect(try s.bindCanonical("senshi", "52991", 182255, false, 1000, arena));
+    try testing.expectEqual(@as(?i64, 0), try Q.int(&s, "SELECT history_visible FROM anime WHERE source='senshi';"));
+    try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len);
 }
 
 test "bindingSourceId returns an existing provider binding by canonical id, null otherwise (ROD-328 tier 0)" {

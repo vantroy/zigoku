@@ -761,6 +761,13 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
 }
 
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
+    if (self.episodes.unbound) {
+        // ROD-329: no grid to draw and Play is inert. Distinct copy from the zero-episode
+        // empty below ("provider returned nothing" vs "no provider at all"), styled per
+        // §4.6 so it reads as deliberate, not a bug.
+        if (h > 1) centerText(win, h / 2, w, "no source available", self.s(self.palette.fg3, .{ .italic = true }));
+        return;
+    }
     if (self.episodes.loading) {
         if (h > 0) centerText(win, 0, w, "⠋ loading episodes…", self.s(self.palette.focus, .{}));
         return;
