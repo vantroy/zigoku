@@ -108,3 +108,96 @@ pub const SourceProvider = struct {
         return self.vtable.coverRequest(self.ptr, gpa, ref);
     }
 };
+
+/// The ordered set of live providers (ROD-343). Order IS resolve precedence:
+/// index 0 is the default, and binding walks the slice first-hit-wins.
+/// Construction keeps senshi at index 0: that ordering is the guarantee that
+/// single-provider behavior stays byte-identical; don't reorder it outside the
+/// (future, ROD-340 slice D/F) user-facing override path.
+///
+/// This registry covers the catalog-binding + play axis ONLY. User-facing
+/// discovery/search lives on AniList, off the vtable (see `VTable.search`);
+/// never add a "search all providers" convenience here.
+pub const Registry = struct {
+    /// Non-empty, fixed at construction.
+    providers: []const SourceProvider,
+
+    /// The default provider for flows with no persisted binding to honor.
+    pub fn primary(self: Registry) SourceProvider {
+        return self.providers[0];
+    }
+
+    /// The provider owning a persisted `source` key (`name()` output). Rows
+    /// keyed `(source, source_id)` MUST route through this, never `primary()`:
+    /// playing/persisting a row on the wrong provider silently corrupts the
+    /// binding. Null = the row's provider isn't registered (retired source).
+    pub fn byName(self: Registry, source_name: []const u8) ?SourceProvider {
+        for (self.providers) |p| {
+            if (std.mem.eql(u8, p.name(), source_name)) return p;
+        }
+        return null;
+    }
+};
+
+/// Minimal vtable satisfier for registry tests: only `name` is live.
+const TestProvider = struct {
+    id: []const u8,
+
+    const vtable: SourceProvider.VTable = .{
+        .name = nameFn,
+        .displayName = displayNameFn,
+        .search = searchFn,
+        .canonicalKey = canonicalKeyFn,
+        .episodes = episodesFn,
+        .resolve = resolveFn,
+        .coverRequest = coverRequestFn,
+    };
+
+    fn provider(self: *TestProvider) SourceProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn nameFn(ptr: *anyopaque) []const u8 {
+        const self: *TestProvider = @ptrCast(@alignCast(ptr));
+        return self.id;
+    }
+    fn displayNameFn(_: *anyopaque) []const u8 {
+        return "Test";
+    }
+    fn searchFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: SearchOptions) anyerror![]domain.Anime {
+        return error.Unsupported;
+    }
+    fn canonicalKeyFn(_: *anyopaque, _: Allocator, _: domain.Anime) anyerror!?[]const u8 {
+        return null;
+    }
+    fn episodesFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+        return error.Unsupported;
+    }
+    fn resolveFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
+        return error.Unsupported;
+    }
+    fn coverRequestFn(_: *anyopaque, _: Allocator, _: []const u8) anyerror!CoverRequest {
+        return error.Unsupported;
+    }
+};
+
+test "Registry.primary returns the first provider" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider() } };
+    try std.testing.expectEqualStrings("senshi", reg.primary().name());
+}
+
+test "Registry.byName finds each registered provider" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider() } };
+    try std.testing.expectEqualStrings("senshi", reg.byName("senshi").?.name());
+    try std.testing.expectEqualStrings("anipub", reg.byName("anipub").?.name());
+}
+
+test "Registry.byName returns null for an unregistered source" {
+    var a = TestProvider{ .id = "senshi" };
+    const reg = Registry{ .providers = &.{a.provider()} };
+    try std.testing.expect(reg.byName("allanime") == null);
+}

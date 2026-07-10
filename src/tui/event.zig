@@ -87,6 +87,10 @@ pub const Event = union(enum) {
         ok: bool,
         anilist_id: i64,
         source_id: []const u8,
+        /// The provider that resolved the candidate (ROD-343): the binding is minted
+        /// under THIS name, never the registry default. A static vtable `name()`
+        /// string, never freed. Meaningful only when `ok`.
+        source: []const u8,
     },
     /// A tier-C Play resolve settled (ROD-328): the worker title-searched the play provider
     /// for an anilist_id-keyed Browse hit that could not tier-A (`canonicalKey` returned
@@ -101,6 +105,10 @@ pub const Event = union(enum) {
         ok: bool,
         anilist_id: i64,
         source_id: []const u8,
+        /// The provider whose catalog matched (ROD-343): the episode fetch fires on
+        /// it and the eventual bind is keyed under it. Static vtable `name()`
+        /// string, never freed. Meaningful only when `ok`.
+        source: []const u8,
     },
     /// One Discover feed page from a background thread (ROD-336): AniList rows for
     /// `axis`, fully enriched (full GQL_FIELDS; no follow-up enrich pass exists).

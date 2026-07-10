@@ -49,6 +49,7 @@ const AnimeRecord = store_mod.AnimeRecord;
 const Store = store_mod.Store;
 const Config = config_mod.Config;
 const SourceProvider = source_mod.SourceProvider;
+const Registry = source_mod.Registry;
 const Anime = domain.Anime;
 const Event = event_mod.Event;
 const Loop = event_mod.Loop;
@@ -117,7 +118,7 @@ pub fn run(
     io: std.Io,
     environ_map: *std.process.Environ.Map,
     store: ?*Store,
-    provider: SourceProvider,
+    registry: Registry,
     config: Config,
     config_path: ?[]const u8,
 ) !void {
@@ -252,7 +253,7 @@ pub fn run(
             app.setHistory(st.loadHistory(hist_arenas[0].allocator()) catch &.{});
             // ROD-229: same resume-landing resolution as the async .history_loaded
             // path, so a spawn-failure boot still honors landing == last_watched.
-            app.maybeResumeLanding(&loop, io, provider);
+            app.maybeResumeLanding(&loop, io, registry);
             break :blk null;
         };
     } else {
@@ -340,7 +341,7 @@ pub fn run(
             app.term_x_pixel = @intCast(vx.screen.width_pix);
             app.term_y_pixel = @intCast(vx.screen.height_pix);
         }
-        try app.tick(event, &loop, io, provider);
+        try app.tick(event, &loop, io, registry);
 
         // ROD-191: reap a finished reload. Its terminal event (success OR failure)
         // bumped history_reload_settled, so the latch always clears — even when
@@ -395,7 +396,7 @@ pub fn run(
         app.layout(win.height, win.width);
         // ROD-243: fetch the visible grid's covers off-thread once scroll is settled
         // (geometry known). No-op outside Discover / when nothing's missing.
-        app.pumpDiscoverCovers(&loop, io, provider);
+        app.pumpDiscoverCovers(&loop, io, registry);
         // ROD-272: top the feed up to the visible grid on a large monitor / after a
         // resize — same settled geometry, debounced by the slot's in-flight flag.
         app.maybeFillDiscover(&loop, io);
@@ -1805,12 +1806,12 @@ pub const App = struct {
     }
 
     // ── tick: fold one event into state ──────────────────────────────────────
-    pub fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, provider: SourceProvider) !void {
+    pub fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, registry: Registry) !void {
         // Snapshot the cursor so the post-dispatch cover sync can tell a cursor
         // move (debounce) from discrete nav (sync now) — ROD-202.
         const cursor_before = self.list_cursor;
         switch (event) {
-            .key_press => |key| self.onKey(key, loop, io, provider),
+            .key_press => |key| self.onKey(key, loop, io, registry),
             .winsize => |ws| {
                 // Screen resize is handled in run()'s loop (it owns vx), but the
                 // app still normalizes browse layout state here so draw remains pure.
@@ -1828,7 +1829,7 @@ pub const App = struct {
                 self.setHistory(recs);
                 // ROD-229: the initial load just landed — resolve the resume
                 // landing (no-op unless landing == last_watched). One-shot.
-                self.maybeResumeLanding(loop, io, provider);
+                self.maybeResumeLanding(loop, io, registry);
             },
             .history_reloaded => |recs| {
                 // ROD-191: a reload landed. setHistory swaps the slice; run() flips
@@ -1977,7 +1978,7 @@ pub const App = struct {
                 };
                 var arena = std.heap.ArenaAllocator.init(self.gpa);
                 defer arena.deinit();
-                const bound = st.bindCanonical(provider.name(), ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
+                const bound = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
                     log.debug("bindCanonical (add) failed: {s}", .{@errorName(e)});
                     self.pushToast(.@"error", "couldn't add to watchlist", false);
                     return;
@@ -2004,9 +2005,10 @@ pub const App = struct {
                     self.pushToast(.@"error", "couldn't load episodes", false);
                     return;
                 }
-                // Confirmed match: fire the episode fetch, then arm pending_bind (order
-                // matters: fireEpisodesForId nulls it at entry, same trap as fireEpisodesResolved).
-                self.fireEpisodesForId(loop, io, provider, ev.source_id);
+                // Confirmed match: fire the episode fetch on the provider that matched
+                // (ev.source, ROD-343), then arm pending_bind (order matters:
+                // fireEpisodesForId nulls it at entry, same trap as fireEpisodesResolved).
+                self.fireEpisodesForId(loop, io, registry, ev.source_id, ev.source);
                 self.pending_bind = ev.anilist_id;
             },
 
@@ -2187,15 +2189,12 @@ pub const App = struct {
                     // seed_arena (and rec's browse-origin slices) freed here.
                 }
                 // ROD-130: mirror the fresh fetch into the DB + hot LRU so the next visit
-                // to this show is a synchronous cache hit. Source/status are resolved from
-                // nav state here (ROD-180).
-                //
-                // NOTE: currentDetailSourceName reads live UI state; if the user returned
-                // to the History list before this async result arrived, it falls back to
-                // provider.name() and can mis-key a non-default-source show. Harmless today
-                // (a mis-keyed entry is never served and ages out); ROD-170 will capture
-                // the fetch's source at fire time.
-                const source = selection.currentDetailSourceName(self, provider);
+                // to this show is a synchronous cache hit. `for_source` is the fetch's
+                // source captured at fire time (ROD-343), so a late result binds and
+                // caches under the provider that actually served it even if nav moved
+                // on; the nav-state fallback only covers a for_source-less edge that
+                // the async path can't actually produce.
+                const source = self.episodes.for_source orelse selection.currentDetailSourceName(self, registry);
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
                 // ROD-327: tier-A resolve write. Bind BEFORE caching: episode_cache has an FK
                 // to anime(source, source_id), so the parent binding row must exist first, or
@@ -2242,7 +2241,7 @@ pub const App = struct {
                 // the network/blocked/server class when we know it; data-shape
                 // failures fall back to the generic line.
                 var buf: [128]u8 = undefined;
-                const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "couldn't load episodes";
+                const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "couldn't load episodes";
                 self.pushToast(.@"error", copy, false);
             },
             .cover_done => |ev| {
@@ -2319,7 +2318,7 @@ pub const App = struct {
                 // mpv-spawn classes fall back to the generic line (ROD-230 refines).
                 if (!completed) {
                     var buf: [128]u8 = undefined;
-                    const copy = failureClassCopy(ev.cause, provider.displayName(), &buf) orelse "playback failed";
+                    const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "playback failed";
                     self.pushToast(.@"error", copy, false);
                 }
             },
@@ -2346,7 +2345,7 @@ pub const App = struct {
                 // target costs nothing.
                 if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
                     self.cover_sync_deadline_ms = 0;
-                    selection.syncCover(self, loop, io, provider);
+                    selection.syncCover(self, loop, io, registry);
                 }
                 // The action-sync debounce settled (ROD-291): flush dirty local rows up
                 // to AniList off-thread. fireSyncFlush no-ops when unconnected or already
@@ -2387,12 +2386,12 @@ pub const App = struct {
                 //    now and cancel any pending settle — the cover must never lag a
                 //    deliberate keystroke.
                 self.cover_sync_deadline_ms = 0;
-                selection.syncCover(self, loop, io, provider);
+                selection.syncCover(self, loop, io, registry);
             } else {
                 // 3. Async completion / resize: refresh the cover, but don't stomp a
                 //    pending scroll settle — let the cursor settle drive it instead of
                 //    fetching the row we happen to be mid-scroll over.
-                if (self.cover_sync_deadline_ms == 0) selection.syncCover(self, loop, io, provider);
+                if (self.cover_sync_deadline_ms == 0) selection.syncCover(self, loop, io, registry);
             }
         }
     }
@@ -2529,7 +2528,7 @@ pub const App = struct {
     /// workers finish, so covers beyond the cap wait and fast scrolling can't spawn
     /// unbounded requests. No-op outside Discover; the spawn is gated under test (the plan
     /// + in-flight mark still run).
-    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         if (self.active_view != .discover) return;
 
         const w = self.term_cols;
@@ -2635,7 +2634,7 @@ pub const App = struct {
             // (nothing else would resolve this url, leaving it stranded `.loading`).
             self.discover_cover_drain.begin();
             const t = std.Thread.spawn(.{}, workers.discoverCoverTask, .{
-                loop, self.gpa, io, provider, owned_url, &self.cover_caches, &self.discover_cover_drain,
+                loop, self.gpa, io, registry.primary(), owned_url, &self.cover_caches, &self.discover_cover_drain,
             }) catch {
                 self.discover_cover_drain.finish();
                 self.resetLoadingSlot(url);
@@ -2797,7 +2796,17 @@ pub const App = struct {
         t.detach();
     }
 
-    fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, source_id: []const u8) void {
+    /// The provider that owns the episode pane's show (ROD-343). `for_source` is
+    /// captured at fire time, so a late async failure names the right source even
+    /// after nav moved on. Default provider before any fetch exists, or when the
+    /// row's source is no longer registered (a retired provider's rows fetch on
+    /// the default rather than dead-ending).
+    fn owningProvider(self: *const App, registry: Registry) SourceProvider {
+        const src = self.episodes.for_source orelse return registry.primary();
+        return registry.byName(src) orelse registry.primary();
+    }
+
+    fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8) void {
         // ROD-179: do NOT join a prior in-flight episode fetch here — that would
         // block the main loop on a slow network when a settled-then-resumed scroll
         // supersedes it (ROD-156). The old worker is already detached + accounted
@@ -2818,11 +2827,13 @@ pub const App = struct {
         self.episodes.unbound = false;
 
         // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
-        // Resolve the source/status/history-record from nav state here and hand
-        // them to the subsystem, which never reads App (ROD-180). On a hit the
+        // Resolve the source/status/history-record and hand them to the subsystem,
+        // which never reads App (ROD-180). A resolved Browse fire passes the
+        // provider it actually resolved on as `origin` (ROD-343); only an
+        // unresolved open derives the source from nav state. On a hit the
         // subsystem installs the results; clear the shared slow-path timer since
         // no async op is now running.
-        const source = selection.currentDetailSourceName(self, provider);
+        const source = origin orelse selection.currentDetailSourceName(self, registry);
         const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
         // ROD-163: resolve the seed record for either origin (history in-memory /
         // browse from the store). The arena backs a browse-origin store read and
@@ -2870,7 +2881,7 @@ pub const App = struct {
         // detach so a later supersede never has to join this one (ROD-179).
         self.episode_drain.begin();
         const t = std.Thread.spawn(.{}, episodesTask, .{
-            loop, self.gpa, io, provider, id_for_task, self.translation, &self.episode_drain,
+            loop, self.gpa, io, registry.byName(source) orelse registry.primary(), id_for_task, self.translation, &self.episode_drain,
         }) catch {
             self.episode_drain.finish(); // no worker will run — rebalance the count
             self.gpa.free(id_for_task);
@@ -2887,43 +2898,51 @@ pub const App = struct {
         /// Already provider-keyed (History origin, or not an AniList hit): fetch
         /// `id` as-is, no binding.
         direct: []const u8,
-        /// Tier 0: this canonical is already bound on this provider (a prior resolve
+        /// Tier 0: this canonical is already bound on `provider` (a prior resolve
         /// persisted the row), so reuse the stored provider id. No probe, no search, no
         /// re-bind. `anilist_id` is carried only for symmetry; the binding already exists.
-        bound: struct { id: []const u8, anilist_id: i64 },
-        /// Tier A: the play provider keys its own catalog by a canonical id, so it handed
+        bound: struct { provider: SourceProvider, id: []const u8, anilist_id: i64 },
+        /// Tier A: `provider` keys its own catalog by a canonical id, so it handed
         /// back its opaque id (`canonicalKey`). The episode fetch confirms it stocks the
         /// show, then the binding is minted to `anilist_id`.
-        tier_a: struct { id: []const u8, anilist_id: i64 },
-        /// Tier C: the provider does NOT id-key on a canonical, so a title search must
-        /// recover its id. Carries the `anilist_id` to bind once the search + episode fetch
-        /// land (ROD-328's tier-C fallback).
+        tier_a: struct { provider: SourceProvider, id: []const u8, anilist_id: i64 },
+        /// Tier C: no provider id-keys on this canonical, so a title search must
+        /// recover an id (the search worker walks the registry itself). Carries the
+        /// `anilist_id` to bind once the search + episode fetch land (ROD-328).
         needs_search: i64,
     };
 
     /// Classify a canonical-capable selection into how it resolves to a play provider
     /// (ROD-328; Browse search and the Discover feed both key rows this way). Anything
     /// already provider-keyed (History rows, or an anilist_id-less row) is `.direct`.
-    /// For an unresolved AniList hit: tier 0 reuses an existing persisted binding
-    /// (the store short-circuit that keeps a re-searched tier-C show cheap on replay); else
-    /// tier A asks the provider for its own key; else tier C falls to a title search.
+    /// For an unresolved AniList hit the walk is TIER-major across the registry
+    /// (ROD-343), not provider-major: an existing binding on ANY provider beats
+    /// deriving a fresh key on an earlier one, because it respects where the user's
+    /// history for the show already lives (provider-major would shadow a later
+    /// provider's bindings forever, since the first provider's canonicalKey hits
+    /// whenever a mal_id exists). Within a tier, registry order breaks ties.
     /// `scratch` owns any store-read or `canonicalKey` id string; the caller uses it before
     /// `scratch` dies (the fetch spawn dupes it).
-    pub fn browseResolveTarget(provider: SourceProvider, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
+    pub fn browseResolveTarget(registry: Registry, sel: Anime, store: ?*Store, scratch: Allocator) ResolveVerdict {
         const aid = sel.anilist_id orelse return .{ .direct = sel.id };
         const aid_i64 = std.math.cast(i64, aid) orelse return .{ .direct = sel.id };
         var idbuf: [24]u8 = undefined;
         const aid_str = std.fmt.bufPrint(&idbuf, "{d}", .{aid}) catch return .{ .direct = sel.id };
         // A provider-keyed row (id != stringified anilist_id) fetches as-is.
         if (!std.mem.eql(u8, sel.id, aid_str)) return .{ .direct = sel.id };
-        // Tier 0: an existing binding on this provider wins.
+        // Tier 0: an existing binding on any provider wins, registry order on ties.
         if (store) |st| {
-            if (st.bindingSourceId(scratch, provider.name(), aid_i64) catch null) |sid|
-                return .{ .bound = .{ .id = sid, .anilist_id = aid_i64 } };
+            for (registry.providers) |p| {
+                if (st.bindingSourceId(scratch, p.name(), aid_i64) catch null) |sid|
+                    return .{ .bound = .{ .provider = p, .id = sid, .anilist_id = aid_i64 } };
+            }
         }
-        // Tier A: the provider's own key. Tier C: a title search.
-        if (provider.canonicalKey(scratch, sel) catch null) |key|
-            return .{ .tier_a = .{ .id = key, .anilist_id = aid_i64 } };
+        // Tier A: the first provider that keys its own catalog by canonical id.
+        for (registry.providers) |p| {
+            if (p.canonicalKey(scratch, sel) catch null) |key|
+                return .{ .tier_a = .{ .provider = p, .id = key, .anilist_id = aid_i64 } };
+        }
+        // Tier C: a title search (the worker walks the registry).
         return .{ .needs_search = aid_i64 };
     }
 
@@ -2932,31 +2951,34 @@ pub const App = struct {
     /// the tier-A existence probe); `.needs_search` fires the tier-C search worker
     /// first. Shared by Browse (two-pane focus + zoom) and the Discover zoom (ROD-336)
     /// so the routing lives once.
-    fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, sel: Anime) void {
+    fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, sel: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(provider, sel, self.store, arena.allocator())) {
-            .direct => |id| self.fireEpisodesResolved(loop, io, provider, id, null),
+        switch (browseResolveTarget(registry, sel, self.store, arena.allocator())) {
+            .direct => |id| self.fireEpisodesResolved(loop, io, registry, null, id, null),
             // Tier 0: the binding already exists, so fetch by the stored id with no re-bind.
-            .bound => |b| self.fireEpisodesResolved(loop, io, provider, b.id, null),
-            .tier_a => |t| self.fireEpisodesResolved(loop, io, provider, t.id, t.anilist_id),
-            .needs_search => |aid| self.fireResolvePlaySearch(loop, io, provider, sel, aid),
+            .bound => |b| self.fireEpisodesResolved(loop, io, registry, b.provider.name(), b.id, null),
+            .tier_a => |t| self.fireEpisodesResolved(loop, io, registry, t.provider.name(), t.id, t.anilist_id),
+            .needs_search => |aid| self.fireResolvePlaySearch(loop, io, registry, sel, aid),
         }
     }
 
     /// Browse's Enter/l entry into `fireEpisodesCanonical`: resolve the list selection.
-    fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn fireEpisodesBrowse(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         const sel = selection.selectedAnime(self) orelse return;
-        self.fireEpisodesCanonical(loop, io, provider, sel);
+        self.fireEpisodesCanonical(loop, io, registry, sel);
     }
 
     /// Shared tail of a resolved Browse fire (ROD-328): the in-flight guard, the episode
-    /// spawn, and arming `pending_bind`. `bind` is the canonical anilist_id for a tier-A or
-    /// tier-C resolve (minted on `.episodes_done`), or null when the binding needs no minting
-    /// (an already-keyed `.direct` open, or a tier-0 `.bound` hit whose row already exists).
+    /// spawn, and arming `pending_bind`. `origin` is the resolved provider's name (a
+    /// static vtable string) for a `.bound`/`.tier_a` verdict, or null for a `.direct`
+    /// open (no resolve happened, the fetch keys on nav state). `bind` is the canonical
+    /// anilist_id for a tier-A or tier-C resolve (minted on `.episodes_done`), or null
+    /// when the binding needs no minting (an already-keyed `.direct` open, or a tier-0
+    /// `.bound` hit whose row already exists).
     /// Skips a respawn when the same provider id is already fetching: re-firing would
     /// just abandon the in-flight fetch and start an identical one.
-    fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, id: []const u8, bind: ?i64) void {
+    fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, registry: Registry, origin: ?[]const u8, id: []const u8, bind: ?i64) void {
         const in_flight = self.episodes.loading and
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, id);
@@ -2967,7 +2989,7 @@ pub const App = struct {
             self.pending_bind = bind;
             return;
         }
-        self.fireEpisodesForId(loop, io, provider, id);
+        self.fireEpisodesForId(loop, io, registry, id, origin);
         // fireEpisodesForId nulled pending_bind at entry; set the fresh one so only this
         // fire's episodes_done can consume it. A synchronous cache hit posts no
         // episodes_done, so this bind goes unconsumed; that's benign (a warm cache means
@@ -2975,13 +2997,13 @@ pub const App = struct {
         self.pending_bind = bind;
     }
 
-    /// Fire the tier-C Play resolve worker (ROD-328): title-search the play provider for a
+    /// Fire the tier-C Play resolve worker (ROD-328): title-search the registry (in order) for a
     /// Browse hit that could not tier-A (`canonicalKey` returned null). On a confident match
     /// `.resolve_play_target` arms `pending_bind` and fires the episode fetch; a miss toasts.
     /// gpa owns a deep copy of the canonical (the worker frees it). Bounded to one in-flight
     /// search via `play_resolving` (the ROD-309 rate-scoring discipline); accounted via
     /// `play_resolve_drain` so teardown waits it out. Best-effort: a failed dupe/spawn drops it.
-    fn fireResolvePlaySearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, canonical: Anime, anilist_id: i64) void {
+    fn fireResolvePlaySearch(self: *App, loop: *Loop, io: std.Io, registry: Registry, canonical: Anime, anilist_id: i64) void {
         if (self.play_resolving) return;
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
@@ -2989,7 +3011,7 @@ pub const App = struct {
         self.play_resolving = true;
         self.play_resolve_drain.begin();
         const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-            loop, gpa, io, provider, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
+            loop, gpa, io, registry.providers, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
         }) catch {
             self.play_resolve_drain.finish(); // no worker will run, rebalance the count
             self.play_resolving = false;
@@ -3019,7 +3041,7 @@ pub const App = struct {
     /// `resume_landing_pending` (see the `episodes_error` handler). Called after
     /// the initial `setHistory`, so a no-resume case simply leaves us on History
     /// (where the ROD-228 startup map already put `.last_watched`).
-    fn maybeResumeLanding(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn maybeResumeLanding(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         if (self.resume_landing_done) return;
         self.resume_landing_done = true;
         if (self.config.landingEnum() != .last_watched) return;
@@ -3043,9 +3065,9 @@ pub const App = struct {
         // branch, the correct single-surface fallback.
         if (self.term_cols >= pane_split_min) {
             self.active_pane = .detail;
-            self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
+            self.fireEpisodesForHistoryRecord(loop, io, registry, rec);
         } else {
-            self.openHistoryZoom(loop, io, provider, rec);
+            self.openHistoryZoom(loop, io, registry, rec);
         }
         // Arm the demote-on-failure only when the open actually started an async
         // fetch — a synchronous cache hit already has the grid, so there is nothing
@@ -3061,7 +3083,7 @@ pub const App = struct {
     /// branch clears the grid rather than skipping the fetch: a leftover `results`/`for_id`
     /// from a previously-viewed show would let `firePlay` launch THAT show while the pane
     /// displays this one.
-    fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, rec: AnimeRecord) void {
+    fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, registry: Registry, rec: AnimeRecord) void {
         if (std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)) {
             self.episodes.freeResults(self.gpa);
             self.episodes.cursor = 0;
@@ -3073,32 +3095,32 @@ pub const App = struct {
             return;
         }
         // A real binding: the normal fetch, which clears `unbound` at entry.
-        self.fireEpisodesForId(loop, io, provider, rec.source_id);
+        self.fireEpisodesForId(loop, io, registry, rec.source_id, rec.source);
     }
 
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its
     /// episodes. Used below pane_split_min, where there is no two-pane to focus
     /// into, so the zoom is the only detail surface (the grid lives there).
-    fn openHistoryZoom(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, rec: AnimeRecord) void {
+    fn openHistoryZoom(self: *App, loop: *Loop, io: std.Io, registry: Registry, rec: AnimeRecord) void {
         self.detail_origin = .history;
         self.active_view = .detail;
         self.active_pane = .detail;
-        self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
+        self.fireEpisodesForHistoryRecord(loop, io, registry, rec);
     }
 
     /// ROD-194: open the full-screen zoom directly from the Browse list — the
     /// Browse twin of openHistoryZoom. Below pane_split_min there is no detail pane
     /// to focus into, so Enter/Space must reach the grid via the zoom (otherwise
     /// they only flip active_pane to a pane that isn't drawn — the regression).
-    fn openBrowseZoom(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn openBrowseZoom(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         if (self.search.results.items.len == 0) return;
         self.detail_origin = .browse;
         self.active_view = .detail;
         self.active_pane = .detail;
-        self.fireEpisodesBrowse(loop, io, provider);
+        self.fireEpisodesBrowse(loop, io, registry);
     }
 
-    fn firePlay(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn firePlay(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         const eps = self.episodes.results orelse return;
         if (eps.len == 0 or self.episodes.cursor >= eps.len) return;
         if (self.playing) return;
@@ -3110,7 +3132,19 @@ pub const App = struct {
 
         const selected_id = self.episodes.for_id orelse return;
         const ep = eps[self.episodes.cursor];
-        const source_name = selection.currentDetailSourceName(self, provider);
+        // The grid's fire-time source names the show being played (nav state can
+        // have moved on). Round-trip through byName so the session borrows the
+        // vtable's STATIC name string, never gpa-owned for_source (the session
+        // borrow contract, see PlaybackSession.source). An unregistered (retired)
+        // source keeps its true name via nav state, whose borrow the history
+        // arena backs: persistence stays keyed to the row even though the fetch
+        // fell back to the default provider.
+        const source_name = blk: {
+            if (self.episodes.for_source) |src| {
+                if (registry.byName(src)) |p| break :blk p.name();
+            }
+            break :blk selection.currentDetailSourceName(self, registry);
+        };
         const episode_index: u32 = @intCast(self.episodes.cursor + 1);
 
         var start_seconds: u64 = 0;
@@ -3156,7 +3190,7 @@ pub const App = struct {
             loop,
             self.gpa,
             io,
-            provider,
+            registry.byName(source_name) orelse registry.primary(),
             id_copy,
             ep_copy,
             self.translation,
@@ -3178,7 +3212,7 @@ pub const App = struct {
         self.async_start_ms = self.now_ms;
     }
 
-    fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) void {
         // ROD-286: the connect modal is a captured overlay. While it's up it owns esc
         // (cancel) and c (copy URL); every other key is swallowed so nothing switches
         // views mid-connect. Ctrl-C still hard-quits (emergency exit) — its worker is
@@ -3288,7 +3322,7 @@ pub const App = struct {
         }
 
         // Anything past the globals + search dispatch is normal-mode navigation.
-        self.onNormalListKey(key, loop, io, provider);
+        self.onNormalListKey(key, loop, io, registry);
     }
 
     /// Normal-mode (non-search) key dispatch (ROD-218). onKey handles the global
@@ -3297,21 +3331,21 @@ pub const App = struct {
     /// from the original onKey were dropped from the extracted handlers (always true
     /// at this call site, and pure noise inside per-intent functions). Delegates to
     /// the handlers below; the only inline arm is '/' search-mode entry.
-    fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn onNormalListKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) void {
         // Discover owns its full normal-mode key set (grid nav, window toggle,
         // Enter→zoom, P, /) — route there before the Browse/History drill+list
         // chain so a discover keypress can never leak into another view's handler.
         if (self.active_view == .discover) {
-            self.onDiscoverKey(key, loop, io, provider);
+            self.onDiscoverKey(key, loop, io, registry);
             return;
         }
 
         // Spatial pane/zoom navigation (ROD-170 focus model). These keys —
         // l/→/Enter, h/←/Esc, Space — are mutually exclusive by keycode, so the
         // order among the three handlers is immaterial.
-        if (self.onDrillKey(key, loop, io, provider)) return; // l / → / Enter — drill in / play
+        if (self.onDrillKey(key, loop, io, registry)) return; // l / → / Enter: drill in / play
         if (self.onPaneFocusKey(key)) return; // h / ← / Esc — peel focus back one layer
-        if (self.onZoomKey(key, loop, io, provider)) return; // Space — zoom toggle
+        if (self.onZoomKey(key, loop, io, registry)) return; // Space: zoom toggle
 
         // '/' enters search/filter mode in Browse and History.
         if (key.matches('/', .{})) {
@@ -3324,7 +3358,7 @@ pub const App = struct {
         // The P/p/x/c/w/r/u actions sit between them, view-gated.
         if (self.onEpisodeGridKey(key)) return; // j/k/g/G — episode grid (detail surfaces)
         if (self.active_view == .history and self.onHistoryMutationKey(key)) return; // p/x/c/w/P/r/u
-        if (self.onBrowseAddKey(key, loop, io, provider)) return; // P: add result to watchlist
+        if (self.onBrowseAddKey(key, loop, io, registry)) return; // P: add result to watchlist
         self.onListCursorKey(key, loop, io); // j/k/g/G: list cursor + load-more
     }
 
@@ -3332,7 +3366,7 @@ pub const App = struct {
     /// 1-4) and the 2D grid cursor (hjkl + g/G). Entry/exit ride the global F-key
     /// chain in onKey; this intercept owns everything else so a keypress can't leak
     /// into the Browse/History handlers.
-    fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) void {
+    fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) void {
         // Enter → open the full-screen detail zoom for the selected card, exactly
         // like Browse/History (origin=.discover, so the back-nav returns here).
         // Feed rows are anilist_id-keyed canonical rows (`a.id` is the stringified
@@ -3344,7 +3378,7 @@ pub const App = struct {
                 self.detail_origin = .discover;
                 self.active_view = .detail;
                 self.active_pane = .detail;
-                self.fireEpisodesCanonical(loop, io, provider, a);
+                self.fireEpisodesCanonical(loop, io, registry, a);
             }
             return;
         }
@@ -3352,7 +3386,7 @@ pub const App = struct {
         // routing as Browse-P (ROD-336): a direct addToWatchlist would persist a
         // bogus (provider, anilist_id) row.
         if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
-            if (selection.selectedDiscoverAnime(self)) |a| self.addSelectedCanonical(loop, io, provider, a);
+            if (selection.selectedDiscoverAnime(self)) |a| self.addSelectedCanonical(loop, io, registry, a);
             return;
         }
         // / → jump to Browse and open its search prompt (the discovery→search seam).
@@ -3488,7 +3522,7 @@ pub const App = struct {
     /// in single-column. Per-view because each surface drills differently. Returns
     /// true when `key` is l/→/Enter (consumed). Normal mode only (onKey gates
     /// search keys), so no input_mode guard is needed.
-    fn onDrillKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
+    fn onDrillKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) bool {
         if (!(key.matches('l', .{}) or key.matches(vaxis.Key.right, .{}) or key.matches(vaxis.Key.enter, .{}))) return false;
         switch (self.active_view) {
             .browse => {
@@ -3499,17 +3533,17 @@ pub const App = struct {
                         // event; fireEpisodesBrowse's in-flight guard avoids
                         // respawning a fetch already running for this same show.
                         self.active_pane = .detail;
-                        self.fireEpisodesBrowse(loop, io, provider);
+                        self.fireEpisodesBrowse(loop, io, registry);
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         // Single-column (< 60): no pane — Enter opens the zoom
                         // (mirrors History; ROD-194 regression fix). `l`/right
                         // are no-ops here, nothing to focus rightward.
-                        self.openBrowseZoom(loop, io, provider);
+                        self.openBrowseZoom(loop, io, registry);
                     }
                 } else if (self.active_pane == .detail) {
                     // Enter on episode in detail pane: play
                     if (key.matches(vaxis.Key.enter, .{})) {
-                        self.firePlay(loop, io, provider);
+                        self.firePlay(loop, io, registry);
                     }
                     // l in detail: no-op (already rightmost)
                 }
@@ -3525,21 +3559,21 @@ pub const App = struct {
                         if (self.term_cols >= pane_split_min) {
                             // Two-pane: focus the detail pane + fetch its grid.
                             self.active_pane = .detail;
-                            self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
+                            self.fireEpisodesForHistoryRecord(loop, io, registry, rec);
                         } else if (key.matches(vaxis.Key.enter, .{})) {
                             // Single-column (< 60): no pane — Enter opens the zoom.
-                            self.openHistoryZoom(loop, io, provider, rec);
+                            self.openHistoryZoom(loop, io, registry, rec);
                         }
                     }
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     // Detail pane focused: the in-pane grid is present at every
                     // two-pane width now (ROD-259) → play the focused episode.
                     // Space still promotes to the full-screen zoom for a roomier grid.
-                    self.firePlay(loop, io, provider);
+                    self.firePlay(loop, io, registry);
                 }
             },
             .detail => {
-                if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, provider);
+                if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, registry);
             },
             .settings => {},
             // Discover routes its own drill (Enter→zoom) through onDiscoverKey,
@@ -3605,13 +3639,13 @@ pub const App = struct {
         return false;
     }
 
-    /// Space — zoom toggle (ROD-170, §10.2): promote a focused detail pane to the
+    /// Space: zoom toggle (ROD-170, §10.2): promote a focused detail pane to the
     /// full-screen zoom (the surface that always carries the grid), or demote the
     /// zoom back (to the pane if there's room, else the list). At < pane_split_min
     /// there is no pane, so Space opens the zoom straight from the list (same as
     /// Enter). Space is layout-neutral (no Colemak-DH adjacency to p/x/c/w) and
     /// toggle-friendly. Returns true when `key` is Space (consumed).
-    fn onZoomKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
+    fn onZoomKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) bool {
         if (!key.matches(vaxis.Key.space, .{})) return false;
         if (self.active_view == .detail) {
             self.active_view = switch (self.detail_origin) {
@@ -3632,13 +3666,13 @@ pub const App = struct {
             self.term_cols < pane_split_min)
         {
             // Single-column History: no pane to toggle — Space opens the zoom.
-            if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, provider, rec);
+            if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, registry, rec);
         } else if (self.active_view == .browse and self.active_pane == .list and
             self.term_cols < pane_split_min)
         {
             // Single-column Browse: no pane to toggle — Space opens the zoom
             // (mirrors History; ROD-194 regression fix).
-            self.openBrowseZoom(loop, io, provider);
+            self.openBrowseZoom(loop, io, registry);
         }
         return true;
     }
@@ -3680,10 +3714,10 @@ pub const App = struct {
     /// clobbers existing user state. Match shift+'P' and bare 'P' for the same
     /// cross-terminal reason as the G nav. Returns true when P is pressed on a
     /// focused Browse result (consumed), false otherwise.
-    fn onBrowseAddKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, provider: SourceProvider) bool {
+    fn onBrowseAddKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) bool {
         if (!(self.active_view == .browse and self.active_pane == .list and
             (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))) return false;
-        if (selection.selectedAnime(self)) |anime| self.addSelectedCanonical(loop, io, provider, anime);
+        if (selection.selectedAnime(self)) |anime| self.addSelectedCanonical(loop, io, registry, anime);
         return true; // P is consumed in Browse-list focus whether or not a row is selected
     }
 
@@ -3692,15 +3726,16 @@ pub const App = struct {
     /// fetch (`browseResolveTarget`). `.tier_a` fires the async probe; `.needs_search`
     /// fires the tier-C title search; both mint the binding on success. `.direct` (an
     /// already provider-keyed row) adds synchronously.
-    fn addSelectedCanonical(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, anime: Anime) void {
+    fn addSelectedCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, anime: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(provider, anime, self.store, arena.allocator())) {
-            .direct => self.addToWatchlist(provider, anime),
+        switch (browseResolveTarget(registry, anime, self.store, arena.allocator())) {
+            // No resolve happened (already provider-keyed): the default provider owns it.
+            .direct => self.addToWatchlist(registry.primary(), anime),
             // Tier 0: the binding already exists, so reveal it in place (no probe/search).
-            .bound => |b| self.revealBoundFromBrowse(provider, b.id, b.anilist_id),
-            .tier_a => |t| self.fireResolveAdd(loop, io, provider, t.id, t.anilist_id),
-            .needs_search => |aid| self.fireResolveAddSearch(loop, io, provider, anime, aid),
+            .bound => |b| self.revealBoundFromBrowse(b.provider, b.id, b.anilist_id),
+            .tier_a => |t| self.fireResolveAdd(loop, io, t.provider, t.id, t.anilist_id),
+            .needs_search => |aid| self.fireResolveAddSearch(loop, io, registry, anime, aid),
         }
     }
 
@@ -3724,12 +3759,12 @@ pub const App = struct {
         self.pushToast(.success, "added to watchlist", false);
     }
 
-    /// Fire the tier-C Add resolve worker (ROD-328): title-search the play provider for a
+    /// Fire the tier-C Add resolve worker (ROD-328): title-search the registry (in order) for a
     /// Browse-P hit that could not tier-A. On a confident match `.resolve_add_result` mints
     /// the binding revealed; a miss toasts. Mirrors `fireResolvePlaySearch` but binds
     /// visible (Add) rather than firing an episode fetch, and shares the Add path's
     /// `add_resolving` guard + `add_resolve_drain` (`for_play = false`).
-    fn fireResolveAddSearch(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, canonical: Anime, anilist_id: i64) void {
+    fn fireResolveAddSearch(self: *App, loop: *Loop, io: std.Io, registry: Registry, canonical: Anime, anilist_id: i64) void {
         if (self.add_resolving) return;
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
@@ -3737,7 +3772,7 @@ pub const App = struct {
         self.add_resolving = true;
         self.add_resolve_drain.begin();
         const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-            loop, gpa, io, provider, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
+            loop, gpa, io, registry.providers, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
         }) catch {
             self.add_resolve_drain.finish(); // no worker will run, rebalance the count
             self.add_resolving = false;

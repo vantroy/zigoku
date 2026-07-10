@@ -44,6 +44,7 @@ pub const AnimeRecord = store.AnimeRecord;
 
 /// The provider seam and its first implementation.
 pub const SourceProvider = source.SourceProvider;
+pub const Registry = source.Registry;
 pub const SearchOptions = source.SearchOptions;
 pub const AllAnime = @import("providers/allanime.zig").AllAnime;
 pub const Senshi = @import("providers/senshi.zig").Senshi;

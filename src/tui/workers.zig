@@ -346,6 +346,7 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
         .ok = ok,
         .anilist_id = anilist_id,
         .source_id = candidate_id,
+        .source = provider.name(),
     } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         gpa.free(candidate_id);
@@ -353,8 +354,9 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 }
 
 /// Background task: search-then-match binding resolve (ROD-328/342). A Browse search hit
-/// whose play provider does NOT id-key on a canonical (`canonicalKey` returned null) is
-/// resolved by searching the provider's OWN catalog and matching: tier B first
+/// that could not tier-A anywhere is resolved by walking `providers` in registry order
+/// (ROD-343, first confident match wins; the posted event carries the winner's name).
+/// Per provider: search its OWN catalog and match: tier B first
 /// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
 /// in its results, e.g. anipub's MALID backfill), then tier C
 /// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
@@ -373,27 +375,42 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// `.resolve_play_target` vs `.resolve_add_result`.
 /// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
 /// worker can no longer touch loop/gpa.
-pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
+pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
     defer drain.finish();
     defer freeOwnedAnime(gpa, canonical);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const resolved: ?[]const u8 = if (resolveViaSearch(arena.allocator(), io, provider, canonical, translation, for_play)) |m|
-        gpa.dupe(u8, m) catch null
-    else
-        null;
+    const match = resolveAcrossProviders(arena.allocator(), io, providers, canonical, translation, for_play);
+    const resolved: ?[]const u8 = if (match) |m| gpa.dupe(u8, m.id) catch null else null;
 
     const ok = resolved != null;
     const source_id: []const u8 = resolved orelse &.{};
+    const source: []const u8 = if (ok) match.?.source else &.{};
     const posted = if (for_play)
-        loop.postEvent(.{ .resolve_play_target = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id } })
+        loop.postEvent(.{ .resolve_play_target = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source } })
     else
-        loop.postEvent(.{ .resolve_add_result = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id } });
+        loop.postEvent(.{ .resolve_add_result = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source } });
     posted catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         if (resolved) |r| gpa.free(r);
     };
+}
+
+/// A settled cross-provider search resolve: the matched catalog id and the name of
+/// the provider that produced it (a static vtable string).
+const SearchMatch = struct { id: []const u8, source: []const u8 };
+
+/// Walk the registry order through `resolveViaSearch`, first confident match wins
+/// (ROD-343): each provider gets its full two-pass search before the next is tried,
+/// so a strong first-provider match is never preempted by a weaker later one, and
+/// requests stay sequential (one provider at a time, the ROD-309 discipline).
+fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) ?SearchMatch {
+    for (providers) |p| {
+        if (resolveViaSearch(arena, io, p, canonical, translation, for_play)) |id|
+            return .{ .id = id, .source = p.name() };
+    }
+    return null;
 }
 
 /// The search→match→probe core of `resolveSearchTask`, split from the thread/event
@@ -1619,6 +1636,7 @@ const StubCatalog = struct {
     alive_id: []const u8 = "",
     /// Search-call count, for pinning the redundant-pass skip.
     searches: u32 = 0,
+    catalog_name: []const u8 = "stub",
 
     fn provider(self: *StubCatalog) SourceProvider {
         return .{ .ptr = self, .vtable = &stub_vtable };
@@ -1632,8 +1650,9 @@ const StubCatalog = struct {
         .resolve = stubResolve,
         .coverRequest = stubCover,
     };
-    fn stubName(_: *anyopaque) []const u8 {
-        return "stub";
+    fn stubName(ptr: *anyopaque) []const u8 {
+        const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        return self.catalog_name;
     }
     fn stubSearch(ptr: *anyopaque, arena: Allocator, _: std.Io, query: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
@@ -1714,4 +1733,31 @@ test "resolveViaSearch: Play skips the probe; identical English title skips pass
     var stub2 = StubCatalog{};
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true) == null);
     try std.testing.expectEqual(@as(u32, 1), stub2.searches);
+}
+
+test "resolveAcrossProviders: walks registry order, first confident match wins (ROD-343)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .anilist_id = 154587, .mal_id = 52991 };
+
+    // First provider's catalog misses, second's id-matches: the match must carry
+    // the SECOND provider's name (the bind is keyed under it, never the default).
+    var miss = StubCatalog{ .catalog_name = "alpha" };
+    var hit = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }} };
+    const walked = resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ miss.provider(), hit.provider() }, canonical, .sub, true) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("2454", walked.id);
+    try std.testing.expectEqualStrings("beta", walked.source);
+
+    // Both match: first in registry order wins the tie.
+    var hit_first = StubCatalog{ .catalog_name = "alpha", .romaji = &.{.{ .id = "1111", .name = "Romaji Title", .mal_id = 52991 }} };
+    var hit_second = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2222", .name = "Romaji Title", .mal_id = 52991 }} };
+    const tie = resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ hit_first.provider(), hit_second.provider() }, canonical, .sub, true) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("1111", tie.id);
+    try std.testing.expectEqualStrings("alpha", tie.source);
+
+    // Nobody matches → null, and every provider got its shot.
+    var m1 = StubCatalog{ .catalog_name = "alpha" };
+    var m2 = StubCatalog{ .catalog_name = "beta" };
+    try std.testing.expect(resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ m1.provider(), m2.provider() }, canonical, .sub, true) == null);
+    try std.testing.expect(m1.searches > 0 and m2.searches > 0);
 }

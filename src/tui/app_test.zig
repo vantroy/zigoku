@@ -89,6 +89,12 @@ fn dummyProvider() SourceProvider {
     return .{ .ptr = undefined, .vtable = &dummy_vtable };
 }
 
+const dummy_slots = [_]SourceProvider{.{ .ptr = undefined, .vtable = &dummy_vtable }};
+
+fn dummyRegistry() source_mod.Registry {
+    return .{ .providers = &dummy_slots };
+}
+
 /// A provider whose `episodes` fetch parks until the test releases it — a
 /// deterministic stand-in for a slow in-flight network fetch (ROD-179). Per
 /// instance state rides on the vtable's `*anyopaque` self.
@@ -154,7 +160,7 @@ fn testTick(app: *App, event: Event) !void {
     // tty and vaxis are never accessed by postEvent, so undefined is safe there.
     const io = std.testing.io;
     var loop = initTestLoop();
-    try app.tick(event, &loop, io, dummyProvider());
+    try app.tick(event, &loop, io, dummyRegistry());
     // Join any threads spawned during tick so they finish using &loop before the
     // stack frame tears down. Without this the thread dereferences a dangling
     // loop pointer in the next test and triggers an ABRT.
@@ -925,16 +931,16 @@ test "pumpDiscoverCovers starts at most cap new fetches per pump, skipping alrea
     // already marked loading so a wave never re-selects one. This proves the
     // per-frame half of the bound; the cap-minus-in-flight half (`busy` > 0) is
     // proved separately below, since `busy` stays 0 here (no worker decrements it).
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 3), countLoadingCovers(&app)); // wave 1
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 6), countLoadingCovers(&app)); // wave 2
     // Only 2 cards remain — the cap is an upper bound, not a quota.
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
     // Everything is now in flight → a further pump marks nothing new (never exceeds
     // the visible set regardless of how many pumps fire — fast scroll can't pile up).
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 8), countLoadingCovers(&app));
 }
 
@@ -968,12 +974,12 @@ test "pumpDiscoverCovers leaves room for already-in-flight workers (ROD-240)" {
     // tally). With cap 3 the pump may start only ONE more — `budget = cap - busy` —
     // which is the actual guard behind "never more than N downloads at once".
     app.discover_cover_drain.inflight.store(2, .release);
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Already at the cap → the pump starts nothing new this frame.
     app.discover_cover_drain.inflight.store(3, .release);
-    app.pumpDiscoverCovers(&loop, io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, io, dummyRegistry());
     try testing.expectEqual(@as(usize, 1), countLoadingCovers(&app));
 
     // Required before any drain(): no real workers exist to decrement the simulated
@@ -3345,7 +3351,7 @@ test "resolve_add_result binds revealed and toasts success on a hit; clears the 
     app.add_resolving = true; // fireResolveAdd set it; the handler must clear it
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(app.history_dirty);
@@ -3370,7 +3376,7 @@ test "resolve_add_result miss with no canonical row falls back to the error toas
     app.add_resolving = true;
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = &.{} } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(!app.history_dirty);
@@ -3398,7 +3404,7 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     app.add_resolving = true;
 
     // A real miss carries an empty source_id (the worker posts &.{} on no match).
-    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{} } });
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{} } });
 
     try testing.expect(!app.add_resolving);
     try testing.expect(app.history_dirty); // a new marker row → reload so it surfaces this session
@@ -3454,7 +3460,7 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
     // the binding here; pending_bind stays armed, which is the handoff under test.
     const sid = try std.testing.allocator.dupe(u8, "52991");
-    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid } });
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
     try testing.expect(!app.play_resolving);
     try testing.expectEqual(@as(?i64, 154587), app.pending_bind); // armed for the episode fetch
@@ -3467,7 +3473,7 @@ test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-32
     app.gpa = std.testing.allocator;
     app.play_resolving = true;
 
-    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "" } });
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = &.{} } });
 
     try testing.expect(!app.play_resolving);
     try testing.expect(app.pending_bind == null);
@@ -3483,7 +3489,7 @@ test "browseResolveTarget: a provider-keyed row is .direct (ROD-328)" {
     defer arena_inst.deinit();
     // id != stringified anilist_id → not an unresolved AniList hit, fetch as-is.
     const sel: Anime = .{ .id = "52991", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, null, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, null, arena_inst.allocator())) {
         .direct => |id| try testing.expectEqualStrings("52991", id),
         else => return error.TestExpectationFailed,
     }
@@ -3497,7 +3503,7 @@ test "browseResolveTarget: an AniList hit with a mal_id is .tier_a (ROD-328)" {
     // id == stringified anilist_id (an unresolved hit), mal_id present, no binding yet →
     // the provider's canonicalKey derives its id.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
         .tier_a => |t| {
             try testing.expectEqualStrings("52991", t.id);
             try testing.expectEqual(@as(i64, 154587), t.anilist_id);
@@ -3513,7 +3519,7 @@ test "browseResolveTarget: an AniList hit with no mal_id is .needs_search (ROD-3
     defer st.close();
     // No mal_id → canonicalKey returns null → tier-C title search.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
         .needs_search => |aid| try testing.expectEqual(@as(i64, 154587), aid),
         else => return error.TestExpectationFailed,
     }
@@ -3538,10 +3544,70 @@ test "browseResolveTarget: an existing binding is tier 0 and wins over tier A (R
 
     // An AniList hit that is ALSO tier-A eligible (carries a mal_id): tier 0 must still win.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyProvider(), sel, &st, arena)) {
+    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("99999", b.id); // the stored binding, not tier-A's 52991
             try testing.expectEqual(@as(i64, 154587), b.anilist_id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: tier 0 on a later provider beats tier A on the first (ROD-343)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // The binding lives on the SECOND provider; the first is tier-A capable (the
+    // dummy canonicalKey derives the mal_id). Provider-major would verdict .tier_a
+    // on the first and shadow the second's binding forever.
+    var beta = RecordingProvider{ .id = "beta" };
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, 1000, arena));
+
+    const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("beta", b.provider.name());
+            try testing.expectEqualStrings("99999", b.id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: bindings on both providers tie to registry order (ROD-343)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("allanime", "11111", 154587, false, 1000, arena));
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, 1000, arena));
+
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("allanime", b.provider.name());
+            try testing.expectEqualStrings("11111", b.id);
         },
         else => return error.TestExpectationFailed,
     }
@@ -3941,7 +4007,7 @@ test "pumpDiscoverCovers marks visible cards in-flight from borrowed urls (ROD-2
     }
 
     var loop = initTestLoop();
-    app.pumpDiscoverCovers(&loop, std.testing.io, dummyProvider());
+    app.pumpDiscoverCovers(&loop, std.testing.io, dummyRegistry());
 
     // Every visible card's slot is now in-flight, marked from the borrowed thumb.
     for (thumbs) |t| {
@@ -5659,7 +5725,8 @@ test "ROD-238: drainTtyResponses sweeps buffered bytes and leaves the fd non-blo
 
 test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     var gate: GateProvider = .{};
-    const provider = gate.provider();
+    const gate_slots = [_]SourceProvider{gate.provider()};
+    const registry: source_mod.Registry = .{ .providers = &gate_slots };
 
     var app: App = .{};
     app.gpa = std.testing.allocator;
@@ -5675,7 +5742,7 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     app.active_view = .history;
     app.active_pane = .list;
     app.list_cursor = 0;
-    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
     try testing.expectEqual(@as(usize, 1), app.episode_drain.inflight.load(.acquire));
     try testing.expect(app.episodes.loading);
     try testing.expectEqualStrings("a", app.episodes.for_id.?);
@@ -5687,7 +5754,7 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     app.active_view = .history;
     app.active_pane = .list;
     app.list_cursor = 1;
-    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, provider);
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
     try testing.expectEqual(@as(usize, 2), app.episode_drain.inflight.load(.acquire));
     try testing.expectEqualStrings("b", app.episodes.for_id.?);
 
@@ -5701,6 +5768,228 @@ test "ROD-179: a superseded episode prefetch is abandoned, not joined" {
     // the queue — drain + free them (A's is the stale one a live handler would
     // keep-check away; here we just reclaim both). Join any cover worker the detail
     // entry may have spawned so nothing outlives the loop frame.
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+/// A provider that records whether its `episodes` fetch ran; per-instance
+/// state rides on the vtable's `*anyopaque` self (ROD-343 routing tests).
+const RecordingProvider = struct {
+    id: []const u8,
+    hit: std.atomic.Value(bool) = .init(false),
+
+    fn nameFn(ptr: *anyopaque) []const u8 {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        return self.id;
+    }
+    fn displayNameFn(_: *anyopaque) []const u8 {
+        return "Rec";
+    }
+    fn searchFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
+        return &.{};
+    }
+    fn canonicalKeyFn(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
+        return null;
+    }
+    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        self.hit.store(true, .release);
+        const eps = try arena.alloc(domain.EpisodeNumber, 1);
+        eps[0] = .{ .raw = "1" };
+        return eps;
+    }
+    fn resolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
+        return .{ .url = "" };
+    }
+    fn coverRequestFn(_: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source_mod.CoverRequest {
+        return .{ .url = try gpa.dupe(u8, ref) };
+    }
+
+    const vtable: SourceProvider.VTable = .{
+        .name = nameFn,
+        .displayName = displayNameFn,
+        .search = searchFn,
+        .canonicalKey = canonicalKeyFn,
+        .episodes = episodesFn,
+        .resolve = resolveFn,
+        .coverRequest = coverRequestFn,
+    };
+
+    fn provider(self: *RecordingProvider) SourceProvider {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+};
+
+test "ROD-343: a history row fetches episodes on its owning provider, not the default" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "x", .title = "Shibuya", .total_episodes = 12, .progress = 0 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120; // zoom tier: Enter on a history row fires the async fetch
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-343: browse open dispatches the fetch to the provider the verdict bound" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // Canonical stamped fresh so opening it can't fire a refresh-on-view enrich
+    // worker; the binding lives on the SECOND provider.
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 120; // two-pane: l drills into the detail pane and fires the fetch
+    try app.search.results.ensureTotalCapacity(app.gpa, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try app.gpa.dupe(u8, "154587"),
+        .name = try app.gpa.dupe(u8, "Frieren"),
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    });
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('l', .{}), &loop, io, registry);
+
+    // The wiring under test (review H1): the verdict resolved .bound on beta, so the
+    // spawned fetch must run on beta. A registry-primary regression would hit alpha.
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    for (app.search.results.items) |r| freeOwnedAnime(app.gpa, r);
+    app.search.results.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-343: browse P-add reveals the binding under the provider that owns it" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 120;
+    try app.search.results.ensureTotalCapacity(app.gpa, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try app.gpa.dupe(u8, "154587"),
+        .name = try app.gpa.dupe(u8, "Frieren"),
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    });
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('P', .{}), &loop, io, registry);
+
+    // The reveal must persist under the owning provider (beta), and the row must
+    // now surface in History. A registry-primary regression would re-key it alpha.
+    const recs = try st.loadHistory(arena);
+    var found = false;
+    for (recs) |rec| {
+        if (std.mem.eql(u8, rec.source_id, "99999")) {
+            try testing.expectEqualStrings("beta", rec.source);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+    try testing.expect(app.history_dirty);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    for (app.search.results.items) |r| freeOwnedAnime(app.gpa, r);
+    app.search.results.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-343: a history row from an unregistered source falls back to the default provider" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    var recs = [_]AnimeRecord{
+        .{ .source = "retired", .source_id = "y", .title = "Lain", .total_episodes = 13, .progress = 0 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(alpha.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
     app.cover.joinThread();
     app.episodes.freeResults(app.gpa);
