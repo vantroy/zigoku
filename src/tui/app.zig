@@ -1952,9 +1952,29 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
-                    // Resolver miss (provider doesn't stock it, or the probe failed): no
-                    // state written, the unmatched terminal state is ROD-329.
-                    self.pushToast(.@"error", "couldn't add to watchlist", false);
+                    // Resolver miss: no play provider stocks this canonical (tier-A + tier-C
+                    // both missed). Persist the explicit unbound terminal state (ROD-329) so
+                    // the show enters History as a visible marker with Play disabled, rather
+                    // than a dead-end toast. A null store or a false return (no canonical row)
+                    // falls back to the plain error, never a false success.
+                    const st = self.store orelse {
+                        self.pushToast(.@"error", "couldn't add to watchlist", false);
+                        return;
+                    };
+                    var miss_arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer miss_arena.deinit();
+                    const marked = st.markUnbound(ev.anilist_id, Store.nowSecs(), miss_arena.allocator()) catch |e| {
+                        log.debug("markUnbound failed: {s}", .{@errorName(e)});
+                        self.pushToast(.@"error", "couldn't add to watchlist", false);
+                        return;
+                    };
+                    if (!marked) {
+                        self.pushToast(.@"error", "couldn't add to watchlist", false);
+                        return;
+                    }
+                    // Surface it this session (mirrors the success arm's reload flag).
+                    self.history_dirty = true;
+                    self.pushToast(.warn, "added, no source available", false);
                     return;
                 }
                 // Bind + reveal. A thrown error, a null store, or a false return (no canonical
@@ -2952,6 +2972,10 @@ pub const App = struct {
         // open (History/Discover) never inherits a stale one. A resolving Browse fire
         // re-sets it immediately after this returns (fireEpisodesBrowse).
         self.pending_bind = null;
+        // ROD-329: any real fetch clears the unbound marker, so the invariant holds that a
+        // populated grid is never labelled "no source available" (the History gate re-sets
+        // it only for a sentinel row, which never reaches this fetch).
+        self.episodes.unbound = false;
 
         // ROD-130: a synchronous LRU/DB hit opens the pane instantly — no thread.
         // Resolve the source/status/history-record from nav state here and hand
@@ -3172,7 +3196,7 @@ pub const App = struct {
         // branch, the correct single-surface fallback.
         if (self.term_cols >= pane_split_min) {
             self.active_pane = .detail;
-            self.fireEpisodesForId(loop, io, provider, rec.source_id);
+            self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
         } else {
             self.openHistoryZoom(loop, io, provider, rec);
         }
@@ -3183,6 +3207,29 @@ pub const App = struct {
         self.resume_landing_pending = self.episodes.loading;
     }
 
+    /// Open a History/Detail record's episode grid, routing the ROD-329 unbound sentinel to
+    /// the explicit "no source available" terminal instead of a provider fetch. Every
+    /// History-origin open goes through here so the gate lives ONCE. It must key on
+    /// `rec.source` (the `AnimeRecord` carries it; `selection.animeFromHistoryRecord` drops
+    /// it), so it sits before `fireEpisodesForId`'s bare-`source_id` fetch. The unbound
+    /// branch clears the grid rather than merely skipping the fetch: a leftover `results` /
+    /// `for_id` from a previously-viewed show would otherwise let `firePlay` launch THAT
+    /// show while the pane displays this one.
+    fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, rec: AnimeRecord) void {
+        if (std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)) {
+            self.episodes.freeResults(self.gpa);
+            self.episodes.cursor = 0;
+            self.pending_bind = null;
+            self.resume_landing_pending = false;
+            self.async_start_ms = 0; // no async op runs; retire any slow-path spinner
+            self.episodes.loading = false;
+            self.episodes.unbound = true;
+            return;
+        }
+        // A real binding: the normal fetch, which clears `unbound` at entry.
+        self.fireEpisodesForId(loop, io, provider, rec.source_id);
+    }
+
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its
     /// episodes. Used below pane_split_min, where there is no two-pane to focus
     /// into, so the zoom is the only detail surface (the grid lives there).
@@ -3190,7 +3237,7 @@ pub const App = struct {
         self.detail_origin = .history;
         self.active_view = .detail;
         self.active_pane = .detail;
-        self.fireEpisodesForId(loop, io, provider, rec.source_id);
+        self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
     }
 
     /// ROD-194: open the full-screen zoom directly from the Browse list — the
@@ -3646,7 +3693,7 @@ pub const App = struct {
                         if (self.term_cols >= pane_split_min) {
                             // Two-pane: focus the detail pane + fetch its grid.
                             self.active_pane = .detail;
-                            self.fireEpisodesForId(loop, io, provider, rec.source_id);
+                            self.fireEpisodesForHistoryRecord(loop, io, provider, rec);
                         } else if (key.matches(vaxis.Key.enter, .{})) {
                             // Single-column (< 60): no pane — Enter opens the zoom.
                             self.openHistoryZoom(loop, io, provider, rec);
