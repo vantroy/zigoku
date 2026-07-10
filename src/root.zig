@@ -16,6 +16,7 @@ pub const store = @import("store.zig");
 pub const anilist = @import("anilist.zig");
 pub const resolver = @import("resolver.zig");
 pub const jikan = @import("providers/jikan.zig");
+pub const megaplay = @import("providers/megaplay.zig");
 pub const aniskip = @import("aniskip.zig");
 pub const config = @import("config.zig");
 pub const auth = @import("auth.zig");
@@ -102,6 +103,7 @@ test {
     _ = anilist;
     _ = resolver;
     _ = jikan;
+    _ = megaplay; // ROD-341: run the megaplay extractor tests
     _ = aniskip;
     _ = config;
     _ = auth;
