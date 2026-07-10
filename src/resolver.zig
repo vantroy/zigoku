@@ -39,11 +39,16 @@ const match_margin: i32 = 250;
 /// provider-entered metadata, so a candidate whose episode count or year screams
 /// "different work" is treated as a mis-stamped id and skipped, never bound: a
 /// wrong bind is a silently persisted watchlist row, the one outcome this whole
-/// resolver is designed to refuse. A first-hit tie-break among surviving
-/// candidates is safe: same canonical id = same work (the multi-binding case
-/// ROD-313 already collapses). No-op for a provider whose search results carry
-/// no ids (senshi); falls through to fuzzy.
+/// resolver is designed to refuse. Among survivors, a CORROBORATED candidate
+/// (episode count or year positively agrees) beats a bare one regardless of list
+/// order, so a metadata-sparse decoy stamped with the target's id cannot outrank
+/// the corroborated real entry behind it; a bare survivor still binds when no
+/// corroborated one exists (a failed info backfill must not strand a legitimate
+/// bind). Ties within a class break first-hit: same canonical id = same work
+/// (the multi-binding case ROD-313 already collapses). No-op for a provider
+/// whose search results carry no ids (senshi); falls through to fuzzy.
 pub fn bestIdMatch(canonical: Anime, candidates: []const Anime) ?usize {
+    var bare: ?usize = null;
     for (candidates, 0..) |cand, i| {
         const id_agrees =
             (canonical.anilist_id != null and cand.anilist_id != null and
@@ -52,9 +57,10 @@ pub fn bestIdMatch(canonical: Anime, candidates: []const Anime) ?usize {
                 canonical.mal_id.? == cand.mal_id.?);
         if (!id_agrees) continue;
         if (idMatchContradicted(canonical, cand)) continue;
-        return i;
+        if (idMatchCorroborated(canonical, cand)) return i;
+        if (bare == null) bare = i;
     }
-    return null;
+    return bare;
 }
 
 /// Strong-evidence veto on an id agreement. Mirrors the fuzzy path's episode veto
@@ -71,6 +77,18 @@ fn idMatchContradicted(canonical: Anime, cand: Anime) bool {
     if (canonical.year != null and cand.year != null and
         absDiff(canonical.year.?, cand.year.?) > 1)
         return true;
+    return false;
+}
+
+/// Positive metadata agreement beyond the id itself: episode count inside the
+/// veto tolerance, or the year inside its. The uncontradicted-but-unproven
+/// middle (fields absent on either side) is neither corroborated nor vetoed.
+fn idMatchCorroborated(canonical: Anime, cand: Anime) bool {
+    const known_eps = canonical.total_episodes orelse 0;
+    const cand_eps = candidateEpisodes(cand);
+    if (known_eps > 0 and cand_eps > 0 and absDiff(known_eps, cand_eps) <= 3) return true;
+    if (canonical.year != null and cand.year != null and
+        absDiff(canonical.year.?, cand.year.?) <= 1) return true;
     return false;
 }
 
@@ -230,6 +248,25 @@ test "bestIdMatch skips a candidate whose metadata contradicts the id (mis-stamp
     };
     const idx = bestIdMatch(canonical, &with_real) orelse return error.TestExpectationFailed;
     try std.testing.expectEqualStrings("42", with_real[idx].id);
+}
+
+test "bestIdMatch prefers a corroborated survivor over an earlier bare one (sparse decoy)" {
+    // Chaos re-verify find (ROD-342): a minimal hostile stamp ({"MALID":target},
+    // nothing else) is uncontradictable, so first-hit-wins let a sparse decoy
+    // ahead in the list beat the corroborated real entry behind it. Corroboration
+    // now outranks list order.
+    const canonical: Anime = .{ .id = "1", .name = "Fullmetal Alchemist: Brotherhood", .anilist_id = 5114, .mal_id = 5114, .total_episodes = 64, .year = 2009, .status = "FINISHED" };
+    const candidates = [_]Anime{
+        .{ .id = "sparse-decoy", .name = "Totally Different Show", .mal_id = 5114 },
+        .{ .id = "real", .name = "Fullmetal Alchemist: Brotherhood", .mal_id = 5114, .total_episodes = 64, .year = 2009 },
+    };
+    const idx = bestIdMatch(canonical, &candidates) orelse return error.TestExpectationFailed;
+    try std.testing.expectEqualStrings("real", candidates[idx].id);
+
+    // A sparse survivor alone still binds: absence of corroboration is not a veto
+    // (anipub's info backfill legitimately fails per candidate).
+    const sparse_only = [_]Anime{.{ .id = "sparse-decoy", .name = "Totally Different Show", .mal_id = 5114 }};
+    try std.testing.expect(bestIdMatch(canonical, &sparse_only) != null);
 }
 
 test "bestIdMatch veto: bare metadata never contradicts; releasing spares the eps gap" {

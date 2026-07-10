@@ -140,7 +140,7 @@ pub const AniPub = struct {
         _ = self;
         // No server-side pagination or language filter on this endpoint; the full
         // (small) hit list arrives at once and we trim to the caller's limit.
-        const url = try std.fmt.allocPrint(arena, SITE ++ "/api/search/{s}", .{try pathEncode(arena, query)});
+        const url = try std.fmt.allocPrint(arena, SITE ++ "/api/search/{s}", .{try pathEncode(arena, try foldPunct(arena, query))});
         const raw = try request(arena, io, url);
         const hits = try parseSearchHits(arena, raw);
 
@@ -309,8 +309,13 @@ pub const AniPub = struct {
 
         const link = eps[n - 1].link orelse return error.BadEpisodeLink;
         const realid = parseRealId(link) orelse {
-            log.warn("anipub resolve: no realid in ep link for show={s} ep={s}", .{ show_id, ep.raw });
-            return error.BadEpisodeLink;
+            // A well-formed link on a foreign host is a KNOWN catalog reality, not
+            // drift: a large share of anipub's entries embed gogoanime's
+            // streaming.php instead of the megaplay /video/ shape (ROD-350 is the
+            // extractor for those). Name it distinctly and log the link so the
+            // receipt says which host the show actually needs.
+            log.warn("anipub resolve: unsupported ep link for show={s} ep={s}: {s}", .{ show_id, ep.raw, link });
+            return error.UnsupportedStreamHost;
         };
 
         // The megaplay extractor (ROD-341) owns the two-step embed → getSources
@@ -470,6 +475,40 @@ pub const AniPub = struct {
     fn cleanArg(s: []const u8) bool {
         for (s) |c| if (c < 0x21 or c > 0x7e) return false;
         return true;
+    }
+
+    /// Fold typographic punctuation to its ASCII form before a search query hits
+    /// the wire. anipub stores ASCII ("Journey's End") while AniList titles carry
+    /// the Unicode marks (U+2019 etc), and anipub's match is literal: the curly
+    /// form answers found:false for shows it stocks (live-verified, the Frieren
+    /// bind failed on exactly this). Unrecognized bytes pass through untouched.
+    fn foldPunct(arena: Allocator, s: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) {
+            if (i + 2 < s.len and s[i] == 0xE2 and s[i + 1] == 0x80) {
+                const rep: ?[]const u8 = switch (s[i + 2]) {
+                    0x98, 0x99 => "'", // U+2018/2019 single quotes
+                    0x9C, 0x9D => "\"", // U+201C/201D double quotes
+                    0x93, 0x94 => "-", // U+2013/2014 dashes
+                    0xA6 => "...", // U+2026 ellipsis
+                    else => null,
+                };
+                if (rep) |r| {
+                    try out.appendSlice(arena, r);
+                    i += 3;
+                    continue;
+                }
+            }
+            if (i + 1 < s.len and s[i] == 0xC2 and s[i + 1] == 0xA0) { // U+00A0 nbsp
+                try out.append(arena, ' ');
+                i += 2;
+                continue;
+            }
+            try out.append(arena, s[i]);
+            i += 1;
+        }
+        return out.items;
     }
 
     /// Percent-encode a search query for a URL path segment: RFC 3986 unreserved
@@ -644,6 +683,22 @@ test "guardShowId accepts numeric site ids, rejects traversal/injection" {
     try testing.expectError(error.InvalidShowId, AniPub.guardShowId("../etc"));
     try testing.expectError(error.InvalidShowId, AniPub.guardShowId("2454/x"));
     try testing.expectError(error.InvalidShowId, AniPub.guardShowId("frieren-slug")); // slug form omits MALID; never our key
+}
+
+test "foldPunct folds typographic marks to the ASCII forms anipub stores" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The live failure: AniList's curly apostrophe vs anipub's straight one.
+    try testing.expectEqualStrings(
+        "Frieren: Beyond Journey's End",
+        try AniPub.foldPunct(a, "Frieren: Beyond Journey\u{2019}s End"),
+    );
+    try testing.expectEqualStrings("\"x\" - y...", try AniPub.foldPunct(a, "\u{201C}x\u{201D} \u{2013} y\u{2026}"));
+    try testing.expectEqualStrings("a b", try AniPub.foldPunct(a, "a\u{00A0}b"));
+    // Untouched: plain ASCII and unrelated UTF-8 (CJK) pass through byte-exact.
+    try testing.expectEqualStrings("plain 'x'", try AniPub.foldPunct(a, "plain 'x'"));
+    try testing.expectEqualStrings("葬送のフリーレン", try AniPub.foldPunct(a, "葬送のフリーレン"));
 }
 
 test "pathEncode passes unreserved bytes, encodes separators and UTF-8" {
