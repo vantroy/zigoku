@@ -1611,6 +1611,7 @@ Live-editable. Full width. No cover art.
   ─────────────────────────────────────────────────────────────────────────────────
     enrichment sync               automatic                           [dim + italic]
     cover art cache               ~/.cache/zigoku/covers              [dim + italic]
+    provider                      senshi (default)                     hjkl to cycle
 
   Interface
   ─────────────────────────────────────────────────────────────────────────────────
@@ -1632,10 +1633,11 @@ Live-editable. Full width. No cover art.
 > **Reconciled with shipped code (ROD-138, updated ROD-286, ROD-205).** This surface
 > drifted from the M4-era spec across M5/M6, then gained a fourth section in ROD-286.
 > The mock above is what `view/settings.zig` renders today: four sections (Player ·
-> Catalog · Interface · AniList Sync), twelve interactive rows plus three read-only
+> Catalog · Interface · AniList Sync), thirteen interactive rows plus three read-only
 > rows (two Catalog, one AniList Sync). Added since the original spec: `resume offset`
 > (ROD-84), `skip mode` (ROD-83), `palette` (ROD-87), `landing view` (ROD-228),
-> `connect` + `sync` (ROD-286), `title language` (ROD-205, §9.1a). Renamed:
+> `connect` + `sync` (ROD-286), `title language` (ROD-205, §9.1a), `provider`
+> (ROD-344). Renamed:
 > `subtitle language` → `translation` (ROD-138 — it always controlled the sub/dub
 > track, never a language); `preferred title` → `title language` (ROD-205 — shipped
 > with a fallback chain instead of a single hardcoded field, §9.1a). Removed:
@@ -1643,12 +1645,14 @@ Live-editable. Full width. No cover art.
 > no per-language audio tracks), `help line` toggle (replaced by `palette`).
 
 > **AniList Sync section (ROD-286).** `account` renders read-only like the Catalog
-> rows; `connect` and `sync` are real `settings_rows` entries. Row count grew 9 → 11
-> in ROD-286, then 11 → 12 when ROD-205 added `title language` to Interface. The
-> interactive-row split is now Player `0..5`, Interface `5..10`, AniList Sync
-> `10..12` — pinned by a `comptime` assert block in `settings_state.zig` so a future
-> row insertion that shifts a boundary breaks the build instead of silently
-> misattributing a row to the wrong section header.
+> status rows; `connect` and `sync` are real `settings_rows` entries. Row count grew
+> 9 → 11 in ROD-286, 11 → 12 when ROD-205 added `title language` to Interface, then
+> 12 → 13 when ROD-344 added `provider` to Catalog. The interactive-row split is now
+> Player `0..5`, Catalog `5..6` (the lone `provider` row, below the two still-inert
+> status rows), Interface `6..11`, AniList Sync `11..13` — pinned by a `comptime`
+> assert block in `settings_state.zig` so a future row insertion that shifts a
+> boundary breaks the build instead of silently misattributing a row to the wrong
+> section header.
 
 Notes:
 - Focused row: `palette.focus` + bold label over a `palette.bg_surface` row fill.
@@ -1663,10 +1667,13 @@ Notes:
   in `palette.chrome`.
 - Hint column (right): `palette.fg3`, right-anchored at `w-2-len` (ASCII-only, so the
   byte length matches the display width).
-- **Catalog rows are read-only.** `enrichment sync` and `cover art cache` render via
-  `drawInertRow` in `palette.fg3` + italic — no marker, no hint, and skipped by
-  `j`/`k` navigation (they are not in `settings_rows`). The `[dim + italic]`
-  annotation in the mock marks this treatment. `enrichment sync` reads `automatic`
+- **Catalog's status rows are read-only; `provider` (ROD-344) is not.**
+  `enrichment sync` and `cover art cache` render via `drawInertRow` in
+  `palette.fg3` + italic — no marker, no hint, and skipped by `j`/`k` navigation
+  (they are not in `settings_rows`). The `[dim + italic]` annotation in the mock
+  marks this treatment. `provider` is a real `.cycle` row like `palette`, rendered
+  below the status rows (status above controls, matching the AniList Sync section's
+  order). `enrichment sync` reads `automatic`
   (enrichment is live as of M4 — the §9.4 "not available until M4" note is
   superseded). `cover art cache` shows the cache path read-only; it was `enter to
   edit` in the original spec but shipped inert. The path is **resolved at runtime**
@@ -1693,7 +1700,18 @@ Notes:
   direct path has no variants — it always returns its single 1080p URL regardless
   of the setting, so the preference is a silent no-op there (not a dead toggle). The
   picker only bites on m3u8/wixmp long-tail sources.
-- **account** (ROD-286) is read-only, like the Catalog rows — `drawInertRow`,
+- **provider** (ROD-344) cycles unset → each registry provider name → unset (today
+  `senshi · anipub`, construction order; senshi leads). Unset
+  (`preferred_provider = ""`) means "follow the registry's construction leader"
+  and displays as that leader tagged `(default)`, so it stays distinguishable from
+  an explicit pin to the same provider (a pin holds if the leader ever changes; the
+  default follows it), and the wheel keeps a real way back to unset. The preference
+  governs only NEW canonical resolution (tier-0 tie-break, tier-A walk order, the
+  tier-C worker's spawn-time snapshot) via `Registry.ordered`/`preferred`.
+  Unknown-owner fallbacks (`owningProvider`, the play spawn, legacy `.direct` rows)
+  deliberately keep routing to `primary()`: a pre-existing binding never silently
+  migrates provider. Per-show override is future work (ROD-345).
+- **account** (ROD-286) is read-only, like the Catalog status rows — `drawInertRow`,
   `palette.fg3` + italic, not in `settings_rows`, skipped by navigation. Three
   states: the AniList user name once connected; `reconnect — token expired` when a
   token exists but was rejected; otherwise `not connected` (the mock's default).

@@ -109,11 +109,17 @@ pub const SourceProvider = struct {
     }
 };
 
-/// The ordered set of live providers (ROD-343). Order IS resolve precedence:
-/// index 0 is the default, and binding walks the slice first-hit-wins.
-/// Construction keeps senshi at index 0: that ordering is the guarantee that
-/// single-provider behavior stays byte-identical; don't reorder it outside the
-/// (future, ROD-340 slice D/F) user-facing override path.
+/// The ordered set of live providers (ROD-343). Construction order is the
+/// DEFAULT resolve precedence: index 0 (senshi) leads, and that slice is
+/// immutable for the process. Worker threads walk it concurrently, so the
+/// user's order preference (ROD-344) is a VIEW computed per walk via
+/// `ordered`/`preferred`, never an in-place reorder.
+///
+/// The preference applies only to NEW canonical resolution (which provider
+/// gets first shot). A provider-keyed id of unknown owner (legacy `.direct`
+/// rows, a missing `for_source`) must keep falling back to `primary()`:
+/// the historical owner is index 0, and re-routing those by preference
+/// would persist the id under the wrong provider.
 ///
 /// This registry covers the catalog-binding + play axis ONLY. User-facing
 /// discovery/search lives on AniList, off the vtable (see `VTable.search`);
@@ -134,6 +140,66 @@ pub const Registry = struct {
     pub fn byName(self: Registry, source_name: []const u8) ?SourceProvider {
         for (self.providers) |p| {
             if (std.mem.eql(u8, p.name(), source_name)) return p;
+        }
+        return null;
+    }
+
+    /// The provider a preference names, else `primary()`. The default-provider
+    /// accessor for preference-aware flows (ROD-344): an empty or unregistered
+    /// name degrades to construction order, same contract as `ordered`.
+    pub fn preferred(self: Registry, preferred_name: []const u8) SourceProvider {
+        return self.byName(preferred_name) orelse self.primary();
+    }
+
+    /// Effective-order iteration (ROD-344): the preferred provider first, then
+    /// the rest in construction order. `preferred_name` empty or unregistered
+    /// yields plain construction order. The name is read only during `ordered`
+    /// itself, so any lifetime works; per-show overrides (ROD-345) are just a
+    /// different name resolved by the caller before this point.
+    pub fn ordered(self: Registry, preferred_name: []const u8) OrderedIter {
+        return .{ .providers = self.providers, .pref = self.indexOf(preferred_name) };
+    }
+
+    /// `ordered` materialized into a gpa-owned slice, for handing a worker a
+    /// stable snapshot at spawn time (the registry's own slice never mutates,
+    /// but the *order* is per-spawn). Caller (in practice the worker) frees.
+    pub fn orderedAlloc(self: Registry, gpa: Allocator, preferred_name: []const u8) ![]SourceProvider {
+        const out = try gpa.alloc(SourceProvider, self.providers.len);
+        var it = self.ordered(preferred_name);
+        var i: usize = 0;
+        while (it.next()) |p| : (i += 1) out[i] = p;
+        return out;
+    }
+
+    fn indexOf(self: Registry, source_name: []const u8) ?usize {
+        for (self.providers, 0..) |p, i| {
+            if (std.mem.eql(u8, p.name(), source_name)) return i;
+        }
+        return null;
+    }
+};
+
+pub const OrderedIter = struct {
+    providers: []const SourceProvider,
+    /// Construction index of the preferred provider; null = no reordering.
+    pref: ?usize,
+    i: usize = 0,
+    yielded_pref: bool = false,
+
+    pub fn next(it: *OrderedIter) ?SourceProvider {
+        if (it.pref) |p| {
+            if (!it.yielded_pref) {
+                it.yielded_pref = true;
+                return it.providers[p];
+            }
+        }
+        while (it.i < it.providers.len) {
+            const idx = it.i;
+            it.i += 1;
+            if (it.pref) |p| {
+                if (idx == p) continue;
+            }
+            return it.providers[idx];
         }
         return null;
     }
@@ -200,4 +266,52 @@ test "Registry.byName returns null for an unregistered source" {
     var a = TestProvider{ .id = "senshi" };
     const reg = Registry{ .providers = &.{a.provider()} };
     try std.testing.expect(reg.byName("allanime") == null);
+}
+
+fn expectOrder(reg: Registry, preferred_name: []const u8, want: []const []const u8) !void {
+    var it = reg.ordered(preferred_name);
+    for (want) |name| {
+        const p = it.next() orelse return error.TestExpectedMore;
+        try std.testing.expectEqualStrings(name, p.name());
+    }
+    try std.testing.expect(it.next() == null);
+}
+
+test "Registry.ordered promotes the preferred provider, keeps the rest in construction order (ROD-344)" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    var c = TestProvider{ .id = "third" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider(), c.provider() } };
+    try expectOrder(reg, "anipub", &.{ "anipub", "senshi", "third" });
+    try expectOrder(reg, "third", &.{ "third", "senshi", "anipub" });
+    // Preferring the leader is a no-op, not a duplicate yield.
+    try expectOrder(reg, "senshi", &.{ "senshi", "anipub", "third" });
+}
+
+test "Registry.ordered with an empty or unknown preference is construction order (ROD-344)" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider() } };
+    try expectOrder(reg, "", &.{ "senshi", "anipub" });
+    try expectOrder(reg, "allanime", &.{ "senshi", "anipub" });
+}
+
+test "Registry.preferred picks the named provider, degrades to primary (ROD-344)" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider() } };
+    try std.testing.expectEqualStrings("anipub", reg.preferred("anipub").name());
+    try std.testing.expectEqualStrings("senshi", reg.preferred("").name());
+    try std.testing.expectEqualStrings("senshi", reg.preferred("allanime").name());
+}
+
+test "Registry.orderedAlloc materializes the effective order into an owned slice (ROD-344)" {
+    var a = TestProvider{ .id = "senshi" };
+    var b = TestProvider{ .id = "anipub" };
+    const reg = Registry{ .providers = &.{ a.provider(), b.provider() } };
+    const snap = try reg.orderedAlloc(std.testing.allocator, "anipub");
+    defer std.testing.allocator.free(snap);
+    try std.testing.expectEqual(@as(usize, 2), snap.len);
+    try std.testing.expectEqualStrings("anipub", snap[0].name());
+    try std.testing.expectEqualStrings("senshi", snap[1].name());
 }

@@ -38,6 +38,7 @@ pub const SettingId = enum {
     translation,
     resume_offset,
     skip_mode,
+    provider,
     cover_art,
     kanji_chips,
     palette,
@@ -67,6 +68,11 @@ pub const settings_rows = [_]SettingRow{
     .{ .id = .translation, .label = "translation", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .resume_offset, .label = "resume offset", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .skip_mode, .label = "skip mode", .kind = .cycle, .hint = "hjkl to cycle" },
+    // Provider order preference (ROD-344). Rendered under the Catalog header
+    // (see drawSettings), not Player, but the index stays contiguous so the
+    // cursor walks top-to-bottom. Its presets are the registry's provider
+    // names, injected at startup (`provider_names`), never hardcoded here.
+    .{ .id = .provider, .label = "provider", .kind = .cycle, .hint = "hjkl to cycle" },
     .{ .id = .cover_art, .label = "cover art", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .kanji_chips, .label = "kanji chips", .kind = .toggle, .hint = "space to toggle" },
     .{ .id = .palette, .label = "palette", .kind = .cycle, .hint = "hjkl to cycle" },
@@ -84,14 +90,16 @@ pub const settings_rows = [_]SettingRow{
 pub const settings_row_count = settings_rows.len;
 
 comptime {
-    // `drawSettings` splits this table 0..5 = Player, 5..10 = Interface, 10..end =
-    // AniList Sync. Pin the boundaries so inserting/removing a row can't silently
-    // misattribute it to the wrong group header — this breaks the build instead.
-    std.debug.assert(settings_rows.len == 12);
+    // `drawSettings` splits this table 0..5 = Player, 5 = Catalog's provider row,
+    // 6..11 = Interface, 11..end = AniList Sync. Pin the boundaries so
+    // inserting/removing a row can't silently misattribute it to the wrong group
+    // header: this breaks the build instead.
+    std.debug.assert(settings_rows.len == 13);
     std.debug.assert(settings_rows[4].id == .skip_mode); // last Player row
-    std.debug.assert(settings_rows[5].id == .cover_art); // first Interface row
-    std.debug.assert(settings_rows[9].id == .title_language); // last Interface row (ROD-205)
-    std.debug.assert(settings_rows[10].id == .connect); // first AniList Sync row
+    std.debug.assert(settings_rows[5].id == .provider); // the Catalog row (ROD-344)
+    std.debug.assert(settings_rows[6].id == .cover_art); // first Interface row
+    std.debug.assert(settings_rows[10].id == .title_language); // last Interface row (ROD-205)
+    std.debug.assert(settings_rows[11].id == .connect); // first AniList Sync row
 }
 
 const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
@@ -137,7 +145,9 @@ fn cyclePresetU32(presets: []const u32, current: u32, dir: i8) u32 {
 /// Step a cycle-kind setting to its next/previous preset. Writes only `config`;
 /// the controller re-derives any App-live projection (palette/translation) from
 /// the new config value — see `SettingsState.onKey` returning `.config_changed`.
-fn cycle(config: *Config, id: SettingId, dir: i8) void {
+/// `provider_names` backs the one runtime preset list (the provider row); every
+/// other list is a static table above.
+fn cycle(config: *Config, id: SettingId, dir: i8, provider_names: []const []const u8) void {
     switch (id) {
         .default_quality => config.default_quality = cyclePreset(&quality_presets, config.default_quality, dir),
         .translation => config.translation = cyclePreset(&translation_presets, config.translation, dir),
@@ -146,8 +156,33 @@ fn cycle(config: *Config, id: SettingId, dir: i8) void {
         .palette => config.palette = cyclePreset(&palette_presets, config.palette, dir),
         .landing => config.landing = cyclePreset(&landing_presets, config.landing, dir),
         .title_language => config.title_language = cyclePreset(&title_language_presets, config.title_language, dir),
+        // Provider names are `name()` vtable statics, so assigning one into the
+        // config string field is as safe as the preset literals (ROD-344). An
+        // un-injected list (unit tests) makes the row inert rather than a mod-0.
+        .provider => if (provider_names.len > 0) {
+            config.preferred_provider = cycleProvider(provider_names, config.preferred_provider, dir);
+        },
         else => {},
     }
+}
+
+/// Cycle the provider preference through unset ("") then each provider name,
+/// wrapping. Unset is a REAL stop, not a display quirk: "" means "follow the
+/// registry's construction leader", which an explicit pin to the same name
+/// does not (the leader can change under a pin; the review flagged the
+/// one-way door). An unrecognized current value re-enters the wheel at unset.
+fn cycleProvider(names: []const []const u8, current: []const u8, dir: i8) []const u8 {
+    // Positions: 0 = unset, 1..names.len = names[pos - 1].
+    const n = names.len + 1;
+    var idx: usize = 0;
+    for (names, 0..) |p, i| {
+        if (std.mem.eql(u8, p, current)) {
+            idx = i + 1;
+            break;
+        }
+    }
+    const next = if (dir > 0) (idx + 1) % n else (idx + n - 1) % n;
+    return if (next == 0) "" else names[next - 1];
 }
 
 fn toggle(config: *Config, id: SettingId) void {
@@ -180,6 +215,19 @@ pub const SettingsState = struct {
     /// draw-local stack buffer, because vaxis keeps the printed slice by
     /// reference until render — a stack buffer would dangle.
     value_buf: [16]u8 = undefined,
+    /// Scratch for the provider row's "name (default)" form (ROD-344). Its own
+    /// buffer, NOT value_buf: value() runs once per row within a single draw
+    /// pass, so two rows sharing one buffer would clobber each other's slice
+    /// before vx.render() reads them.
+    provider_value_buf: [48]u8 = undefined,
+
+    /// The registry's provider names in construction order, injected once by
+    /// `run()` (ROD-344). The preset list for the provider row: the settings
+    /// subsystem never sees the Registry itself, only this projection. Names
+    /// are static vtable strings; the slice is owned by the caller for the
+    /// app's lifetime. Empty (the default) leaves the row inert, which is the
+    /// state unit tests construct.
+    provider_names: []const []const u8 = &.{},
 
     /// Whether an edit has mutated `config` since the tab was entered or last
     /// saved. The controller persists on leave/quit only when this is set
@@ -230,7 +278,7 @@ pub const SettingsState = struct {
         }
         if (key.matches('l', .{}) or key.matches(vaxis.Key.right, .{})) {
             if (row.kind == .cycle) {
-                cycle(config, row.id, 1);
+                cycle(config, row.id, 1, self.provider_names);
                 self.dirty = true;
                 return .config_changed;
             }
@@ -238,7 +286,7 @@ pub const SettingsState = struct {
         }
         if (key.matches('h', .{}) or key.matches(vaxis.Key.left, .{})) {
             if (row.kind == .cycle) {
-                cycle(config, row.id, -1);
+                cycle(config, row.id, -1, self.provider_names);
                 self.dirty = true;
                 return .config_changed;
             }
@@ -331,6 +379,16 @@ pub const SettingsState = struct {
             .translation => config.translation,
             .skip_mode => config.skip_mode,
             .resume_offset => std.fmt.bufPrint(&self.value_buf, "{d}s", .{config.resume_offset_sec}) catch "?",
+            // An unset preference displays the effective leader tagged
+            // "(default)", so the row never reads blank AND unset stays
+            // distinguishable from an explicit pin to the same provider
+            // (ROD-344 review).
+            .provider => if (config.preferred_provider.len > 0)
+                config.preferred_provider
+            else if (self.provider_names.len > 0)
+                std.fmt.bufPrint(&self.provider_value_buf, "{s} (default)", .{self.provider_names[0]}) catch self.provider_names[0]
+            else
+                "",
             .cover_art => if (config.cover_art) "on" else "off",
             .kanji_chips => if (config.kanji_chips) "on" else "off",
             .palette => config.palette,

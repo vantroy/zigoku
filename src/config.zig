@@ -44,6 +44,13 @@ pub const Config = struct {
     /// thread storm.
     discover_cover_concurrency: u32 = 4,
 
+    /// Provider order preference (ROD-344): the `name()` of the provider that
+    /// leads resolve walks, "" = the registry's construction order. Consumed
+    /// through `Registry.ordered`/`Registry.preferred`, which degrade an
+    /// unrecognized value to construction order, so this never needs
+    /// validation on load.
+    preferred_provider: []const u8 = "",
+
     /// Master switch for the AniList sync side-rail (ROD-286). Off = every sync entry point
     /// no-ops: the action-triggered flush (ROD-291), the pull-on-launch (ROD-293), and the
     /// connect bootstrap (ROD-292) all check this before they arm or spawn, so a user who
@@ -168,6 +175,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqualStrings(want.landing, got.landing);
     try testing.expectEqualStrings(want.title_language, got.title_language);
     try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
+    try testing.expectEqualStrings(want.preferred_provider, got.preferred_provider);
     try testing.expectEqual(want.anilist_sync_enabled, got.anilist_sync_enabled);
 }
 
@@ -220,6 +228,7 @@ test "serialized config round-trips back through parse" {
         .landing = "browse",
         .title_language = "english",
         .discover_cover_concurrency = 8,
+        .preferred_provider = "anipub",
         .anilist_sync_enabled = false,
     };
 
@@ -250,6 +259,16 @@ test "titleLanguageEnum maps english and native, defaults everything else to rom
     try testing.expectEqual(.romaji, (Config{ .title_language = "romaji" }).titleLanguageEnum());
     try testing.expectEqual(.romaji, (Config{ .title_language = "garbage" }).titleLanguageEnum());
     try testing.expectEqual(.romaji, (Config{}).titleLanguageEnum()); // default
+}
+
+test "preferred_provider defaults empty, round-trips a set value (ROD-344)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("", (Config{}).preferred_provider);
+    try testing.expectEqualStrings(
+        "anipub",
+        parse(arena.allocator(), ".{ .preferred_provider = \"anipub\" }").preferred_provider,
+    );
 }
 
 test "anilist_sync_enabled defaults on, round-trips a paused value (ROD-286)" {

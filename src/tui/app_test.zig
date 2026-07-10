@@ -3489,7 +3489,7 @@ test "browseResolveTarget: a provider-keyed row is .direct (ROD-328)" {
     defer arena_inst.deinit();
     // id != stringified anilist_id → not an unresolved AniList hit, fetch as-is.
     const sel: Anime = .{ .id = "52991", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), sel, null, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), "", sel, null, arena_inst.allocator())) {
         .direct => |id| try testing.expectEqualStrings("52991", id),
         else => return error.TestExpectationFailed,
     }
@@ -3503,7 +3503,7 @@ test "browseResolveTarget: an AniList hit with a mal_id is .tier_a (ROD-328)" {
     // id == stringified anilist_id (an unresolved hit), mal_id present, no binding yet →
     // the provider's canonicalKey derives its id.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
         .tier_a => |t| {
             try testing.expectEqualStrings("52991", t.id);
             try testing.expectEqual(@as(i64, 154587), t.anilist_id);
@@ -3519,7 +3519,7 @@ test "browseResolveTarget: an AniList hit with no mal_id is .needs_search (ROD-3
     defer st.close();
     // No mal_id → canonicalKey returns null → tier-C title search.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 };
-    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena_inst.allocator())) {
+    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
         .needs_search => |aid| try testing.expectEqual(@as(i64, 154587), aid),
         else => return error.TestExpectationFailed,
     }
@@ -3544,7 +3544,7 @@ test "browseResolveTarget: an existing binding is tier 0 and wins over tier A (R
 
     // An AniList hit that is ALSO tier-A eligible (carries a mal_id): tier 0 must still win.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), sel, &st, arena)) {
+    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("99999", b.id); // the stored binding, not tier-A's 52991
             try testing.expectEqual(@as(i64, 154587), b.anilist_id);
@@ -3575,7 +3575,7 @@ test "browseResolveTarget: tier 0 on a later provider beats tier A on the first 
     const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
     const registry: source_mod.Registry = .{ .providers = &slots };
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+    switch (App.browseResolveTarget(registry, "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("beta", b.provider.name());
             try testing.expectEqualStrings("99999", b.id);
@@ -3604,11 +3604,47 @@ test "browseResolveTarget: bindings on both providers tie to registry order (ROD
     const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
     const registry: source_mod.Registry = .{ .providers = &slots };
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(registry, sel, &st, arena)) {
+    switch (App.browseResolveTarget(registry, "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("allanime", b.provider.name());
             try testing.expectEqualStrings("11111", b.id);
         },
+        else => return error.TestExpectationFailed,
+    }
+}
+
+test "browseResolveTarget: the provider preference breaks a tier-0 tie (ROD-344)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("allanime", "11111", 154587, false, 1000, arena));
+    try testing.expect(try st.bindCanonical("beta", "99999", 154587, false, 1000, arena));
+
+    // Same double-binding as the tie test above; preferring the LATER provider
+    // must flip the verdict to it without touching the stored rows.
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+    const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    switch (App.browseResolveTarget(registry, "beta", sel, &st, arena)) {
+        .bound => |b| {
+            try testing.expectEqualStrings("beta", b.provider.name());
+            try testing.expectEqualStrings("99999", b.id);
+        },
+        else => return error.TestExpectationFailed,
+    }
+    // An unregistered preference degrades to construction order, not a panic.
+    switch (App.browseResolveTarget(registry, "gone", sel, &st, arena)) {
+        .bound => |b| try testing.expectEqualStrings("allanime", b.provider.name()),
         else => return error.TestExpectationFailed,
     }
 }
@@ -5125,7 +5161,7 @@ test "settings: palette cycle re-points the live app palette" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = 7; // palette, defaults to "terminal_ghost"
+    app.settings.cursor = 8; // palette, defaults to "terminal_ghost"
     try testing.expectEqual(&colors.terminal_ghost, app.palette);
 
     try testTick(&app, keyEv('l', .{})); // terminal_ghost -> phosphor
@@ -5150,10 +5186,10 @@ test "settings: landing cycle steps through all three startup-view presets and w
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    // landing view is the last Interface row — index 8, before the two ROD-286 AniList
-    // Sync rows (connect, sync). The settings_state comptime asserts pin [8] == .landing,
-    // so this index breaks the build, not the test, if the table is reordered.
-    app.settings.cursor = 8;
+    // landing view is Interface row index 9 (the ROD-344 provider row shifted
+    // everything past skip_mode by one). The settings_state comptime asserts pin
+    // the section boundaries, so a reorder breaks the build, not just this test.
+    app.settings.cursor = 9;
     try testing.expectEqualStrings("history", app.config.landing);
 
     try testTick(&app, keyEv('l', .{})); // history -> browse
@@ -5171,11 +5207,62 @@ test "settings: landing cycle steps through all three startup-view presets and w
     try testing.expect(app.settings.dirty);
 }
 
+test "settings: provider row cycles unset -> each registry name -> unset (ROD-344)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.cursor = 5; // the provider row (rendered under Catalog)
+
+    // Unset displays the effective leader tagged (default): distinguishable
+    // from an explicit pin to the same provider, never blank.
+    try testing.expectEqualStrings("", app.config.preferred_provider);
+    try testing.expectEqualStrings("senshi (default)", app.settings.value(&app.config, .provider));
+
+    try testTick(&app, keyEv('l', .{})); // unset -> explicit senshi pin
+    try testing.expectEqualStrings("senshi", app.config.preferred_provider);
+    try testing.expectEqualStrings("senshi", app.settings.value(&app.config, .provider));
+    try testing.expect(app.settings.dirty);
+
+    try testTick(&app, keyEv('l', .{})); // senshi -> anipub
+    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+
+    try testTick(&app, keyEv('l', .{})); // anipub -> unset again: the wheel has a way back
+    try testing.expectEqualStrings("", app.config.preferred_provider);
+    try testing.expectEqualStrings("senshi (default)", app.settings.value(&app.config, .provider));
+
+    try testTick(&app, keyEv('h', .{})); // reverse wrap: unset -> anipub
+    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+}
+
+test "settings: provider row re-enters the wheel at unset from an unrecognized value (ROD-344)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.cursor = 5;
+    app.config.preferred_provider = "garbage"; // hand-edited config
+
+    try testTick(&app, keyEv('l', .{})); // treated as unset -> senshi, not a wedge
+    try testing.expectEqualStrings("senshi", app.config.preferred_provider);
+}
+
+test "settings: provider row with no injected names is inert, not a crash (ROD-344)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = 5;
+
+    try testTick(&app, keyEv('l', .{}));
+    try testing.expectEqualStrings("", app.config.preferred_provider);
+    try testing.expectEqualStrings("", app.settings.value(&app.config, .provider));
+}
+
 test "settings: space toggles a bool field" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = 5; // cover_art, defaults to true
+    app.settings.cursor = 6; // cover_art, defaults to true
 
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(!app.config.cover_art);
@@ -5311,7 +5398,7 @@ test "settings: q with a dirty tab and no config path warns, then quits (ROD-210
     app.config_path = null;
 
     // Make a real change so the tab is dirty (space toggles cover_art).
-    app.settings.cursor = 5; // cover_art toggle row
+    app.settings.cursor = 6; // cover_art toggle row
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(app.settings.dirty);
 
@@ -5432,7 +5519,7 @@ test "B/H/D + F1/F2/F3 from a dirty Settings tab persist on the way out (ROD-210
         app.gpa = testing.allocator;
         app.active_view = .settings;
         app.config_path = null;
-        app.settings.cursor = 5; // cover_art toggle row
+        app.settings.cursor = 6; // cover_art toggle row
         try testTick(&app, keyEv(vaxis.Key.space, .{})); // dirty the tab
         try testing.expect(app.settings.dirty);
 
@@ -5461,7 +5548,7 @@ test "Ctrl-C from a dirty Settings tab saves before quitting (ROD-210 M2)" {
     app.gpa = alloc;
     app.active_view = .settings;
     app.config_path = config_path;
-    app.settings.cursor = 5; // cover_art toggle (default true → false)
+    app.settings.cursor = 6; // cover_art toggle (default true → false)
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(app.settings.dirty);
 
