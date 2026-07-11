@@ -35,7 +35,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 16;
+const SCHEMA_VERSION: c_int = 17;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes share one DB (the TUI
@@ -294,8 +294,8 @@ const MIGRATION_V13 =
     \\);
 ;
 
-// canonical_anime: one row per distinct AniList id. Provider rows (senshi, a
-// future anipub) bind UP to it via `anime.canonical_id`, so identity + enrichment
+// canonical_anime: one row per distinct AniList id. Provider rows (senshi, megaplay,
+// …) bind UP to it via `anime.canonical_id`, so identity + enrichment
 // live once here and survive a provider swap instead of being duplicated per row.
 //
 // PK is anilist_id because AniList is the identity superset: every enriched entity
@@ -436,6 +436,25 @@ const MIGRATION_V16 =
     \\    checked_at   INTEGER NOT NULL,
     \\    PRIMARY KEY (canonical_id, provider)
     \\);
+;
+
+// ROD-359: retire anipub. Its API served episode lists from a collection that had
+// drifted head-first from reality, so every anipub row is suspect: bindings may
+// point at the wrong site id's content and episode_progress labels are provably
+// shifted (+1) on affected shows: poisoned state that the cross-provider union
+// join (ROD-346) would keep spreading onto healthy siblings. DELETE, don't re-key:
+// an anipub binding is no proof megaplay stocks the show (megaplay re-mints via a
+// real probe, ROD-351 pre-warm), and the union join re-derives the true watch
+// state from the surviving siblings. Pins carry user intent about provider
+// PREFERENCE, not stock, so they transfer to megaplay (anipub's successor as the
+// second registered provider); absences don't transfer (a different catalog).
+// Children (progress/cache) go before their FK parent rows.
+const MIGRATION_V17 =
+    \\DELETE FROM episode_progress WHERE source = 'anipub';
+    \\DELETE FROM episode_cache WHERE source = 'anipub';
+    \\DELETE FROM anime WHERE source = 'anipub';
+    \\UPDATE provider_pins SET provider = 'megaplay' WHERE provider = 'anipub';
+    \\DELETE FROM provider_absences WHERE provider = 'anipub';
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1044,8 +1063,8 @@ pub const Store = struct {
         // (canonical_id NULL, the LEFT JOIN yields NULLs). User-state and the binding key
         // stay anime-only; column ORDER is unchanged (the row builder reads by index).
         //
-        // ROD-313: collapse multi-binding shows (senshi sub+dub, or senshi + a future
-        // anipub) to one History card via a ROW_NUMBER representative per group. Two
+        // ROD-313: collapse multi-binding shows (senshi sub+dub, or senshi +
+        // megaplay) to one History card via a ROW_NUMBER representative per group. Two
         // invariants:
         //   1. PARTITION BY COALESCE(canonical_id, -rowid), never bare canonical_id: the
         //      unmatched tail is all NULL, which SQLite groups as one, so bare
@@ -2248,6 +2267,10 @@ pub const Store = struct {
         if (v < 16) {
             try self.exec(MIGRATION_V16);
             v = 16;
+        }
+        if (v < 17) {
+            try self.exec(MIGRATION_V17);
+            v = 17;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -4170,7 +4193,7 @@ test "loadHistory collapses two bindings of one canonical entity to a single car
     defer s.close();
 
     // One show, two provider bindings resolving UP to the same canonical entity — a
-    // senshi sub/dub split, or senshi + a future anipub. Both tracked (visible). The
+    // senshi sub/dub split, or senshi + megaplay. Both tracked (visible). The
     // user watched the sub most recently (last_watched 5000, ep 12); the dub is the
     // older touch (4000, ep 3).
     try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (900, 'Frieren');");
@@ -4752,6 +4775,63 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     // two-provider future is most likely to hit (a freshly-added, un-enriched binding).
     try testing.expectEqualStrings("Has Enrich", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 321;")).?);
     try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
+}
+
+test "MIGRATION_V17 purges poisoned anipub state, transfers pins to megaplay, spares siblings (ROD-359)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Runs the exact SQL the v17 ladder rung runs, in its own transaction
+    // (same pattern as the V12 tests above).
+
+    // One canonical with a senshi + anipub sibling pair (the live shape: every
+    // anipub binding in the wild had a senshi sibling); progress and an episode
+    // cache on BOTH bindings, anipub's carrying the head-rot +1 shift.
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (900, 52701, 'Dungeon Meshi');");
+    try s.upsertAnime(.{ .source = "senshi", .source_id = "52701", .title = "Dungeon Meshi", .anilist_id = 900, .canonical_id = 900, .progress = 14 }, 1000, arena);
+    try s.upsertAnime(.{ .source = "anipub", .source_id = "2475", .title = "Dungeon Meshi", .anilist_id = 900, .canonical_id = 900, .progress = 15 }, 1001, arena);
+    try s.saveProgress("senshi", "52701", .sub, "14", 300, 1400, 2000);
+    try s.saveProgress("anipub", "2475", .sub, "15", 300, 1400, 2001);
+    const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "2" } };
+    try s.putCachedEpisodes("senshi", "52701", .sub, &eps, "FINISHED", 1000, arena);
+    try s.putCachedEpisodes("anipub", "2475", .sub, &eps, "FINISHED", 1000, arena);
+
+    // Pins: an anipub pin transfers (user preference, not stock); senshi's stays.
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (901, 'Other');");
+    try s.setProviderPin(900, "anipub");
+    try s.setProviderPin(901, "senshi");
+
+    // Absences: anipub's verdicts die with its catalog; other providers' survive.
+    try s.markProviderAbsent(901, "anipub", 3000);
+    try s.markProviderAbsent(900, "someprovider", 3000);
+
+    try s.exec(MIGRATION_V17);
+
+    // The anipub binding, its progress and its cache are gone…
+    try testing.expect((try s.getAnime(arena, "anipub", "2475")) == null);
+    try testing.expect((try s.getResume("anipub", "2475", .sub, "15")) == null);
+    try testing.expect((try s.getCachedEpisodes(arena, "anipub", "2475", .sub, 1001)) == null);
+    // …while the senshi sibling keeps everything (binding, resume, cache, card).
+    try testing.expect((try s.getAnime(arena, "senshi", "52701")) != null);
+    try testing.expect((try s.getResume("senshi", "52701", .sub, "14")) != null);
+    try testing.expect((try s.getCachedEpisodes(arena, "senshi", "52701", .sub, 1001)) != null);
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+
+    // Pin transfer: anipub → megaplay; unrelated pin untouched.
+    try testing.expectEqualStrings("megaplay", (try s.getProviderPin(arena, 900)).?);
+    try testing.expectEqualStrings("senshi", (try s.getProviderPin(arena, 901)).?);
+
+    // Absence scoping: anipub rows purged, the foreign provider's verdict kept.
+    try testing.expect(!(try s.providerAbsentFresh(901, "anipub", 3000)));
+    try testing.expect(try s.providerAbsentFresh(900, "someprovider", 3000));
+
+    // Idempotent, and nothing dangles for the FK enforcer.
+    try s.exec(MIGRATION_V17);
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+    try s.exec("PRAGMA foreign_key_check;");
 }
 
 test "loadHistory/getAnime resolve enrichment through canonical: linked row reads canonical (per-column COALESCE), unmatched row falls back to anime-local (ROD-312)" {
