@@ -1546,6 +1546,26 @@ pub const Store = struct {
         return now < checked_at + ABSENCE_TTL_SECONDS;
     }
 
+    /// One provider's read-side availability for a canonical (ROD-348): what the
+    /// detail rail renders per registry provider.
+    pub const ProviderAvailability = enum { unchecked, bound, absent };
+
+    /// Fold the provider picture for one (canonical, provider) pair: `bound` when
+    /// any binding row joins the canonical on that source, else `absent` under a
+    /// fresh negative, else `unchecked`. Bound is checked first, the same
+    /// binding-outranks-negative rule the fallback walk applies; `bindCanonical`
+    /// deletes the negative on mint, so a coexisting pair only appears through
+    /// external DB edits and must still read as bound.
+    pub fn providerAvailability(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!ProviderAvailability {
+        const stmt = try self.prepare("SELECT 1 FROM anime WHERE canonical_id = ? AND source = ? LIMIT 1;");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        try bindText(stmt, 2, provider);
+        if (c.sqlite3_step(stmt) == c.SQLITE_ROW) return .bound;
+        if (try self.providerAbsentFresh(canonical_id, provider, now)) return .absent;
+        return .unchecked;
+    }
+
     /// Drop the absence row for one (canonical, provider) pair. `bindCanonical`
     /// calls this on every real-source mint so bound and absent can never
     /// coexist; the ROD-345 'v' flip's re-probe lands here too via its mint.
@@ -3970,6 +3990,43 @@ test "provider absence: mark, TTL, refresh, isolation; bindCanonical clears it (
     try s.markProviderAbsent(902, "senshi", 7000);
     try testing.expect(try s.markUnbound(902, 7000, arena));
     try testing.expect(try s.providerAbsentFresh(902, "senshi", 7000));
+}
+
+test "providerAvailability folds bound/absent/unchecked, bound first (ROD-348)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (901, 111, 'Frieren');");
+
+    // Virgin identity: nothing known about any provider.
+    try testing.expectEqual(Store.ProviderAvailability.unchecked, try s.providerAvailability(901, "senshi", 1000));
+
+    // A fresh negative reads absent; past the TTL it degrades to unchecked
+    // (stale = indistinguishable from unchecked, the re-probe contract).
+    try s.markProviderAbsent(901, "anipub", 1000);
+    try testing.expectEqual(Store.ProviderAvailability.absent, try s.providerAvailability(901, "anipub", 1000));
+    try testing.expectEqual(Store.ProviderAvailability.unchecked, try s.providerAvailability(901, "anipub", 1000 + Store.ABSENCE_TTL_SECONDS));
+
+    // A binding reads bound, and only for its own source.
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    try testing.expect(try s.bindCanonical("senshi", "111", 901, false, 2000, scratch.allocator()));
+    try testing.expectEqual(Store.ProviderAvailability.bound, try s.providerAvailability(901, "senshi", 2000));
+    try testing.expectEqual(Store.ProviderAvailability.absent, try s.providerAvailability(901, "anipub", 2000));
+
+    // Bound outranks a lingering negative (externally-edited DB shape; the
+    // mint path deletes the negative, so force the row back in by hand).
+    try s.exec("INSERT INTO provider_absences (canonical_id, provider, checked_at) VALUES (901, 'senshi', 2000);");
+    try testing.expectEqual(Store.ProviderAvailability.bound, try s.providerAvailability(901, "senshi", 2000));
+
+    // The unbound sentinel is not a registry provider: a show carrying ONLY the
+    // sentinel still reads unchecked for every real provider.
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (902, 222, 'Apothecary');");
+    try testing.expect(try s.markUnbound(902, 3000, arena));
+    try testing.expectEqual(Store.ProviderAvailability.unchecked, try s.providerAvailability(902, "senshi", 3000));
 }
 
 test "a hidden bindCanonical mint never enters the sync push set (ROD-351)" {

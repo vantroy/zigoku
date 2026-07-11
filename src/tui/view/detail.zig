@@ -507,8 +507,40 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
         row = drawMetaRail(self, win, w, h, fields, row);
     } else if (row < h) {
         row = drawMetaLine(self, win, w, fields, row);
+        // ROD-348/356: the compact form's provider surface. Provider/Pinned
+        // are rail_only (never meta-line segments, Rod's call); this row is
+        // how they survive below the bloom threshold.
+        if (row < h) row = drawProviderLine(self, win, fields, row);
     }
     return row;
+}
+
+/// Dedicated compact-form provider row (ROD-348/356): `▸senshi +anipub · pin anipub`
+/// directly under the meta line. Composed from the SAME field entries the rail
+/// renders (a label scan, no recomputation, so the two surfaces can't drift);
+/// the fixed position anchors the bare tokens, only the pin keeps a `pin `
+/// marker (a bare trailing name would read as one more provider token).
+/// Consumes no row when the show has no canonical identity (no Provider field).
+fn drawProviderLine(self: *App, win: vaxis.Window, fields: []const App.MetaField, start_row: u16) u16 {
+    var provider: ?App.MetaField = null;
+    var pinned: ?App.MetaField = null;
+    for (fields) |f| {
+        if (std.mem.eql(u8, f.label, "Provider")) provider = f;
+        if (std.mem.eql(u8, f.label, "Pinned")) pinned = f;
+    }
+    const p = provider orelse return start_row;
+    const col = win.print(
+        &.{.{ .text = p.value, .style = self.s(if (p.dim) self.palette.fg3 else self.palette.fg2, .{}) }},
+        .{ .row_offset = start_row, .col_offset = 0, .wrap = .none },
+    ).col;
+    if (pinned) |pf| {
+        _ = win.print(&.{
+            .{ .text = " · ", .style = self.s(self.palette.fg3, .{}) },
+            .{ .text = "pin ", .style = self.s(self.palette.fg2, .{}) },
+            .{ .text = pf.value, .style = self.s(self.palette.fg2, .{}) },
+        }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none });
+    }
+    return start_row + 1;
 }
 
 /// Compact metadata line (ROD-260): field values joined by ` · `, one row — the

@@ -664,6 +664,12 @@ pub const ConnectState = struct {
 };
 
 pub const App = struct {
+    /// Ceiling on registry providers the detail rail tracks (ROD-348).
+    /// Providers past it drop off the rail SILENTLY, serving marker included.
+    /// Sized well past the 2-4 the design targets; `detail_provider_buf` is
+    /// the binding constraint and needs widening first (§5.3a).
+    pub const max_rail_providers = 8;
+
     should_quit: bool = false,
 
     /// Landing data. Backed by run()'s history arena — App only reads it.
@@ -717,6 +723,15 @@ pub const App = struct {
     /// and flip time so the render path never reads the DB. Null = unpinned (or no
     /// canonical identity). Refreshed via `refreshShowPin`.
     show_pin: ?[]u8 = null,
+
+    /// ROD-348: per-provider availability for the open show, index-aligned with
+    /// `settings.provider_names` (registry construction order, §5.3a). Cached
+    /// beside the pin for the same reason (render never reads the DB); re-read
+    /// on any bind/absence write for the same show (`noteAvailabilityWrite`).
+    /// A null `show_avail_aid` means no canonical identity: both render forms
+    /// omit the Provider field outright.
+    show_avail: [max_rail_providers]Store.ProviderAvailability = @splat(.unchecked),
+    show_avail_aid: ?i64 = null,
 
     history_filter: [128]u8 = undefined,
     history_filter_len: usize = 0,
@@ -943,10 +958,15 @@ pub const App = struct {
     detail_source_buf: [24]u8 = undefined,
     /// Rank rail value (ROD-261), rail-only "#N rated YYYY". Own buffer.
     detail_rank_buf: [24]u8 = undefined,
+    /// Provider field value (ROD-348/356), "▸senshi +anipub", both render
+    /// forms. Budgeted for 4 providers of marker + ≤16-char name + separators
+    /// (§5.3a); a registry past that needs this widened or the field degrades
+    /// to omission.
+    detail_provider_buf: [96]u8 = undefined,
     /// Airing-countdown chip value (ROD-261), "Ep14 · 3d" — its own frame-lived
     /// buffer alongside the season chip's `detail_season_buf`.
     detail_airing_buf: [24]u8 = undefined,
-    detail_meta_fields: [7]MetaField = undefined,
+    detail_meta_fields: [8]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack
     /// local would dangle by `render()` and emit garbage.
@@ -2063,6 +2083,7 @@ pub const App = struct {
                 // P adds a row not yet in self.history, so flag a reload so it surfaces this
                 // session (mirrors addToWatchlist).
                 self.history_dirty = true;
+                self.noteAvailabilityWrite(ev.anilist_id);
                 self.pushToast(.success, "added to watchlist", false);
                 self.firePrewarm(loop, io, registry, ev.anilist_id); // ROD-351: warm the siblings
             },
@@ -2136,6 +2157,7 @@ pub const App = struct {
                     st.markProviderAbsent(ev.anilist_id, ev.source, Store.nowSecs()) catch |e|
                         log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
                 }
+                self.noteAvailabilityWrite(ev.anilist_id);
             },
 
             .prewarm_done => self.prewarm_active = false,
@@ -2347,6 +2369,7 @@ pub const App = struct {
                                     break :blk 0;
                                 };
                                 if (hw > 0) self.syncEpisodeProgress(source, ev.for_id, hw);
+                                self.noteAvailabilityWrite(aid);
                             }
                         } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
                     }
@@ -3000,6 +3023,39 @@ pub const App = struct {
         return std.math.cast(i64, sel.anilist_id orelse return null);
     }
 
+    /// Re-cache everything the rail holds per open show (pin + provider
+    /// availability). The one funnel every grid open routes through, so the two
+    /// caches can't drift onto different shows (ROD-345/348).
+    fn refreshShowMeta(self: *App, aid: ?i64) void {
+        self.refreshShowPin(aid);
+        self.refreshShowProviders(aid);
+    }
+
+    /// Re-cache `show_avail` for the show identified by `aid` (ROD-348).
+    /// Best-effort like the pin: a store error reads unchecked, which renders
+    /// as `?`. No store at all leaves the aid null, omitting the field, since
+    /// an all-`?` line would claim a knowable state nothing can ever refresh.
+    fn refreshShowProviders(self: *App, aid: ?i64) void {
+        self.show_avail = @splat(.unchecked);
+        self.show_avail_aid = null;
+        const id = aid orelse return;
+        const st = self.store orelse return;
+        self.show_avail_aid = id;
+        const now = Store.nowSecs();
+        for (self.settings.provider_names, 0..) |name, i| {
+            if (i >= self.show_avail.len) break;
+            self.show_avail[i] = st.providerAvailability(id, name, now) catch .unchecked;
+        }
+    }
+
+    /// A bind or absence verdict just landed for `anilist_id`: when that is the
+    /// show on screen, fold it into the cached rail snapshot so the Provider
+    /// field tracks pre-warm/resolve traffic live (ROD-348).
+    fn noteAvailabilityWrite(self: *App, anilist_id: i64) void {
+        const aid = self.show_avail_aid orelse return;
+        if (aid == anilist_id) self.refreshShowProviders(aid);
+    }
+
     /// Re-cache `show_pin` for the show identified by `aid` (ROD-345). Best-effort:
     /// a store error or OOM leaves it null, which renders as unpinned. The pin
     /// itself is authoritative in the DB; this copy only feeds the rail.
@@ -3056,9 +3112,10 @@ pub const App = struct {
         var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer seed_arena.deinit();
         const seed_rec = selection.detailSeedRecord(self, seed_arena.allocator(), source, source_id);
-        // ROD-345: every grid open funnels through here, so this is the one spot
-        // that keeps the rail's cached pin in step with the show on screen.
-        self.refreshShowPin(if (seed_rec) |r| r.anilist_id else null);
+        // ROD-345/348: every grid open funnels through here, so this is the one
+        // spot that keeps the rail's cached per-show state (pin + provider
+        // availability) in step with the show on screen.
+        self.refreshShowMeta(if (seed_rec) |r| r.anilist_id else null);
         // ROD-182: opening a show is the refresh-on-view trigger — re-enrich it when
         // its persisted metadata is stale. Independent of the episode cache hit
         // below, so it runs whether or not the grid is already cached.
@@ -3328,6 +3385,7 @@ pub const App = struct {
             st.markProviderAbsent(anilist_id, n, Store.nowSecs()) catch |e|
                 log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
         }
+        self.noteAvailabilityWrite(anilist_id);
     }
 
     /// Effective-order provider snapshot for a tier-C search walk, minus the
@@ -3735,8 +3793,9 @@ pub const App = struct {
             self.episodes.loading = false;
             self.episodes.unbound = true;
             // No fetch fires, so the funnel in fireEpisodesForId never runs: keep
-            // the rail's pin in step here or the previous show's pin lingers.
-            self.refreshShowPin(rec.anilist_id);
+            // the rail's per-show state in step here or the previous show's
+            // pin/availability lingers.
+            self.refreshShowMeta(rec.anilist_id);
             return;
         }
         // ROD-345: a pinned show opens on the pinned provider's sibling binding when
@@ -4535,6 +4594,7 @@ pub const App = struct {
             return;
         }
         self.history_dirty = true;
+        self.noteAvailabilityWrite(anilist_id);
         self.pushToast(.success, "added to watchlist", false);
         self.firePrewarm(loop, io, registry, anilist_id); // ROD-351: warm the siblings
     }
