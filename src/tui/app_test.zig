@@ -7308,6 +7308,19 @@ test "ROD-355: resumeSeed boundary cases never index out of range" {
     try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", 1, &.{}));
 }
 
+test "ROD-355: seedHistoryCursor parks a stale cursor itself on a null seed" {
+    var es: app_mod.EpisodeState = .{};
+    es.cursor = 99; // stale position a caller forgot to pre-zero
+    es.resume_idx = 99;
+    var eps: [3]domain.EpisodeNumber = .{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    };
+    const rec: AnimeRecord = .{ .source = "s", .source_id = "x", .title = "X", .progress = 0 };
+    es.seedHistoryCursor(null, .sub, rec, &eps);
+    try testing.expectEqual(@as(usize, 0), es.cursor);
+    try testing.expectEqual(@as(?usize, null), es.resume_idx);
+}
+
 test "ROD-355: resumeSeed favors a mid-finale checkpoint over parking" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
