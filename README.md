@@ -74,22 +74,35 @@ app-wide, not just the Settings tab.*
   (kanji metadata chips, reflowed synopsis, episode grid with resume `▸` / watched
   `●` markers), grouped watchlist, toasts, spinner, status bar.
 - **Watchlist & watch-state**: planning / watching / paused / dropped / completed
-  statuses, grouped headers, fuzzy filtering. Add from browse with `P`; move state
-  with `p`/`x`/`c`/`w`/`P`; recompute progress with `r`; undo with `u`. Watchlist
-  refreshes in-session after playback.
-- **Discover**: a ranked feed of what's trending — `Daily` / `Weekly` / `Monthly` /
-  `All-Time` windows of popular titles with real cover art, AniList scores, and view
-  counts; save a pick straight to the watchlist.
+  statuses, grouped headers, fuzzy filtering, one card per show no matter how many
+  providers or languages it's tracked under (a sub and a dub entry collapse to a
+  single card). Add from browse with `P`; move state with `p`/`x`/`c`/`w`/`P`;
+  recompute progress with `r`; undo with `u`. Watchlist refreshes in-session after
+  playback.
+- **Discover**: an AniList-backed ranked feed — `Trending` / `Popular` / `Top Rated`
+  / `This Season` windows of shows with real cover art, score badges, and genre
+  glyphs; save a pick straight to the watchlist.
 - **Cover art** via Kitty graphics where supported, halfblock cells elsewhere —
   fetched asynchronously, behind LRU caches.
-- **Search → resolve → play**: AllAnime catalog search, episode listing, stream
-  resolution, playback in `mpv`.
+- **Search → resolve → play**: catalog search and metadata come from AniList;
+  picking a result resolves it to a streaming provider, lists episodes, and plays
+  in `mpv`.
+- **Multiple streaming providers, with automatic fallback**: senshi.live and
+  megaplay both serve streams — if an episode fails to load on one, zigoku tries
+  the next automatically. A provider-order preference in Settings controls which
+  is tried first, a per-show pin locks a title to one provider, and `v` flips a
+  show to another on demand. The detail view's provider row shows which source is
+  serving the current show and which others have it. Soft-subtitle sidecars are
+  passed to `mpv` as a proper subtitle track.
 - **History & resume** (SQLite, raw C interop): watch history, exact resume
   positions via mpv's IPC socket (checkpointed during playback, persisted on quit),
   status-aware episode-list cache.
-- **AniList enrichment**: AllAnime results mapped to AniList for richer metadata
-  (season, genres, native title, format) and cover art — surfaced as kanji chips,
-  persisted to the store.
+- **AniList enrichment**: richer metadata (season, genres, native title, format)
+  and cover art from AniList — surfaced as kanji chips, persisted to the store.
+- **AniList account sync**: connect from Settings or `zigoku login`, and your
+  watchlist syncs both ways in the background — progress logged locally pushes up,
+  changes made on AniList pull down, each with a small toast. A toggle in Settings
+  turns it off if you'd rather keep your list local.
 - **Config & settings**: live-editable settings tab (mpv path, quality, language,
   AniSkip mode, cover art, themes). Persisted to `~/.config/zigoku/config.zon`.
   Four palettes: `terminal_ghost` (default), `phosphor`, `nord`, `tokyonight`.
@@ -221,8 +234,9 @@ zig build spike-tui           # libvaxis boot smoke test
 - **TUI:** libvaxis (Kitty graphics + halfblock fallback)
 - **Storage:** SQLite via raw C interop
 - **Concurrency:** thread pool + channels
-- **Source:** AllAnime, behind a swappable `SourceProvider` interface
-- **Catalog:** AniList for metadata & cover art
+- **Streaming:** senshi.live + megaplay, both behind the `SourceProvider`
+  interface, with automatic fallback between them
+- **Catalog:** AniList — backs search, Discover, metadata & cover art
 
 ## Why this exists
 
@@ -255,7 +269,7 @@ find online.
 
 ## Acknowledgements
 
-- **[anipy-cli](https://github.com/sdaqo/anipy-cli)** by [sdaqo](https://github.com/sdaqo) (GPL-3.0) — showed us the way on AllAnime streaming when every other source had gone dark. The working recipe (POST instead of GET, Apollo persisted-query hashes, and the AES-256-GCM `tobeparsed` scheme) was learned by studying its `allanime_provider.py`. Zigoku reimplements the wire protocol in Zig from observed behavior — no code is copied — but the trail was theirs. Thank you. 🙏
+- **[anipy-cli](https://github.com/sdaqo/anipy-cli)** by [sdaqo](https://github.com/sdaqo) (GPL-3.0) — zigoku's original streaming source was AllAnime, and anipy-cli showed the way when every other source had gone dark. The working recipe (POST instead of GET, Apollo persisted-query hashes, and the AES-256-GCM `tobeparsed` scheme) was learned by studying its `allanime_provider.py`; zigoku reimplemented the wire protocol in Zig from observed behavior — no code is copied — but the trail was theirs. AllAnime has since been retired as the streaming source, but the credit — and the GPL lineage noted in [License](#license) — stands. Thank you. 🙏
 - **[ani-nexus-tui](https://github.com/OsamuDazai666/ani-nexus-tui)** (CC BY-NC-SA 4.0) — studied for feature/UX inspiration.
 - Catalog metadata & cover art from **[AniList](https://anilist.co/)**.
 

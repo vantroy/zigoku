@@ -17,7 +17,7 @@ grab watchlist.png              # populated watchlist, grouped status + progress
 
 key shift+s
 sleep 1500ms
-key j j j j j j j               # down to the palette row (Interface section)
+key j j j j j j j j             # down to the palette row (Interface section)
 sleep 600ms
 resize 1280x800                 # narrow — good for the settings still AND the tour gif
                                 # (can't resize mid-record, so record the whole tour here)
