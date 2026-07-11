@@ -7026,8 +7026,8 @@ test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stal
     }
     // The sibling binding the tier-0 hop will reuse: its OWN progress column is
     // stale (2), and its episode cache is primed so the hop lands synchronously
-    // (tryCacheHit posts no episodes_done; completeFallback is the only recompute
-    // chance, the gap the review's Critical named).
+    // (tryCacheHit posts no episodes_done; the fire path's landing raise is the
+    // only recompute chance, the gap the ROD-346 review's Critical named).
     try st.upsertAnime(.{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 }, 5001, arena);
     const cached = [_]domain.EpisodeNumber{
         .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" },
@@ -7062,6 +7062,92 @@ test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stal
     try testing.expectEqual(@as(i64, 0), (try st.getAnime(arena, "alpha", "a1")).?.progress);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-352: a plain async landing raises a lagging binding through the canonical union" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, 5000, arena);
+    // The sibling holds the real state: eps 1..8 fully watched.
+    try st.upsertAnime(.{ .source = "alpha", .source_id = "a1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 5000, arena);
+    var ep_buf: [2]u8 = undefined;
+    for (1..9) |n| {
+        const label = try std.fmt.bufPrint(&ep_buf, "{d}", .{n});
+        try st.saveProgress("alpha", "a1", .sub, label, 950, 1000, 5000 + @as(i64, @intCast(n)));
+    }
+    // The binding this PLAIN open lands on (no walk, no pending bind) lags the union.
+    try st.upsertAnime(.{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 }, 5001, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.episodes.for_id = try app.gpa.dupe(u8, "b7");
+    app.episodes.for_source = try app.gpa.dupe(u8, "beta");
+    app.episodes.loading = true;
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    const eps = try std.testing.allocator.alloc(domain.EpisodeNumber, 8);
+    for (eps, 1..) |*e, n| e.* = .{ .raw = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{n}) };
+    const for_id = try std.testing.allocator.dupe(u8, "b7");
+    try testTick(&app, .{ .episodes_done = .{ .episodes = eps, .for_id = for_id } });
+
+    // Grid and store both read the union (8), not the row's stale 2 that the seed
+    // planted and sync would otherwise push (the ROD-323 shape).
+    try testing.expectEqual(@as(u32, 8), app.episodes.progress);
+    try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
+    // Writes stay per-binding: the sibling's own progress column is untouched.
+    try testing.expectEqual(@as(i64, 0), (try st.getAnime(arena, "alpha", "a1")).?.progress);
+}
+
+test "ROD-352: a plain cache-hit open raises a lagging binding (no walk armed)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, 5000, arena);
+    try st.upsertAnime(.{ .source = "alpha", .source_id = "a1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 }, 5000, arena);
+    var ep_buf: [2]u8 = undefined;
+    for (1..9) |n| {
+        const label = try std.fmt.bufPrint(&ep_buf, "{d}", .{n});
+        try st.saveProgress("alpha", "a1", .sub, label, 950, 1000, 5000 + @as(i64, @intCast(n)));
+    }
+    try st.upsertAnime(.{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 }, 5001, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b7", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .progress = 2 },
+    };
+    app.setHistory(&recs);
+    app.active_view = .history;
+    app.term_cols = 120;
+
+    // Prime the LRU so Enter lands the grid synchronously: no episodes_done event,
+    // no walk; the fire path's landing raise is the only recompute chance.
+    const cached = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" },
+        .{ .raw = "5" }, .{ .raw = "6" }, .{ .raw = "7" }, .{ .raw = "8" },
+    });
+    try app.episodes.lru.putOwned(app.gpa, "beta\x00b7\x00sub", .{
+        .episodes = cached,
+        .expires_at = std.math.maxInt(i64),
+    });
+
+    try testTick(&app, keyEv(vaxis.Key.enter, .{}));
+
+    try testing.expect(!app.episodes.loading);
+    try testing.expect(app.fallback == null);
+    try testing.expectEqual(@as(u32, 8), app.episodes.progress);
+    try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
+
+    app.episodes.freeResults(app.gpa);
+    app.episodes.deinit(app.gpa);
 }
 
 test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demotes to History" {
