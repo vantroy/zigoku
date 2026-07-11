@@ -109,6 +109,7 @@ pub const EpisodeState = struct {
     ) void {
         const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
         self.progress = std.math.cast(u32, progress) orelse 0;
+        self.cursor = 0;
         self.resume_idx = null;
         if (resumeSeed(store, translation, rec.source, rec.source_id, progress, episodes)) |idx| {
             self.cursor = idx;
@@ -119,12 +120,11 @@ pub const EpisodeState = struct {
     /// Where the resume cursor belongs for a given watched high-water: the
     /// high-water episode itself when it holds a mid-episode checkpoint, else the
     /// next unwatched cell; null when nothing is in progress (unstarted, or caught
-    /// up with no checkpoint). ROD-355: EVERY cursor re-seed must route through
-    /// this, not just the open-time seed. A progress writer that plants
-    /// `cursor = progress` directly skips the checkpoint branch and walks the
-    /// cursor past the in-progress episode (the provider-flip landing did exactly
-    /// that via syncEpisodeProgress). getResume unions across sibling bindings, so
-    /// the checkpoint is visible from whichever provider the grid landed on.
+    /// up with no checkpoint). ROD-355 invariant: every progress writer must
+    /// route its cursor re-seed through this; planting `cursor = progress`
+    /// directly skips the checkpoint branch and walks past a mid-episode watch.
+    /// getResume unions across sibling bindings, so the checkpoint is visible
+    /// from whichever provider the grid landed on.
     pub fn resumeSeed(
         store: ?*Store,
         translation: domain.Translation,

@@ -7288,6 +7288,43 @@ test "ROD-355: a v flip landing keeps the cursor on the in-progress episode" {
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-355: resumeSeed boundary cases never index out of range" {
+    const resumeSeed = app_mod.EpisodeState.resumeSeed;
+    var eps: [3]domain.EpisodeNumber = .{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    };
+
+    // Nothing watched: nothing to resume.
+    try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", 0, &eps));
+    // Mid-list, no store: next unwatched.
+    try testing.expectEqual(@as(?usize, 1), resumeSeed(null, .sub, "s", "x", 1, &eps));
+    // Caught up, no checkpoint: nothing to resume.
+    try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", 3, &eps));
+    // Progress past the list (a shorter provider list, or the maxInt(u32)
+    // overflow clamp in syncEpisodeProgress): degrade to null, never index OOB.
+    try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", 4, &eps));
+    try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", std.math.maxInt(u32), &eps));
+    // Empty list.
+    try testing.expectEqual(@as(?usize, null), resumeSeed(null, .sub, "s", "x", 1, &.{}));
+}
+
+test "ROD-355: resumeSeed favors a mid-finale checkpoint over parking" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertAnime(.{ .source = "s", .source_id = "x", .title = "X", .progress = 3 }, 1000, arena);
+    // Finale quit mid-episode (40% is below NATURAL_END_RATIO, so the
+    // checkpoint survives startSeconds suppression).
+    try st.saveProgress("s", "x", .sub, "3", 40, 100, 2000);
+
+    var eps: [3]domain.EpisodeNumber = .{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" },
+    };
+    try testing.expectEqual(@as(?usize, 2), app_mod.EpisodeState.resumeSeed(&st, .sub, "s", "x", 3, &eps));
+}
+
 test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint arm): the bound-but-empty rescue" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta", .tier_a = true };
