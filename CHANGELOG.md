@@ -14,6 +14,30 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-11
+
+### Added
+
+- **Multiple streaming providers, with automatic fallback**: zigoku now knows about more than one streaming source (senshi and megaplay) instead of relying on a single one. If an episode fails to load, zigoku automatically tries the next provider that has it rather than just failing the play. A provider order preference in Settings controls which source is tried first; a per-show pin locks an individual show to one provider; and `v` flips a show to another provider on demand. The detail view gains a provider row showing which source is serving the current show and which others have it available. Subtitles served as a separate file by a provider are now passed to mpv as a proper subtitle track. Under the hood, zigoku remembers which providers don't carry a given show (so it stops re-checking) and pre-fetches matches ahead of time so playback starts faster. The default provider also changed: the older anipub API was retired and megaplay was promoted to a primary provider via a sturdier route, with any existing per-show pins carried over automatically.
+
+- **Browse search and Discover now run on AniList**: both were previously tied to the streaming source itself. Browse search now runs against AniList's catalog and resolves a result all the way through to something you can actually press play on; Discover, paused since 0.3.0 for lack of a popularity feed on the new source, is back and populated.
+
+- **A clear "not yet linked" state**: a show that couldn't be confidently matched to a streaming provider now shows an explicit unmatched state in History and its detail view, instead of silently behaving like a normal entry. zigoku is also more careful about when it calls a match confident in the first place, so fewer shows get wrongly bound to the wrong provider. Watch-progress edits are frozen on unmatched rows — you can still remove them — so you don't log progress against a show that isn't actually hooked up to anything playable.
+
+### Changed
+
+- **History shows one card per show, not one per source**: a show tracked under two different sources or languages — a sub and a dub entry, say — used to appear twice. It now collapses to a single card, with details, cover art, and logged progress shared between them, and the title healed to the true AniList name.
+
+### Fixed
+
+- **Provider flips keep your place**: switching a show to another provider used to reset the episode cursor; it now lands back on the episode you were on.
+
+- **Search matches more of what you type**: queries with curly quotes or other typographic punctuation now match correctly, and a confirmed match is ranked above a guess.
+
+- **Discover's page size is capped on large screens**: 0.2.2 made Discover keep loading pages until it filled the viewport; on very large monitors that could over-fetch. Growth per page is now capped.
+
+- **Shows dropped by the anipub retirement don't get lost**: a couple of edge cases in the one-time upgrade that runs after you update zigoku could leave an unmatched show's episode count looking wrong, or let a stale record silently overwrite a legitimately-unmatched one. Both are fixed.
+
 ## [0.3.1] - 2026-07-08
 
 ### Fixed
@@ -224,7 +248,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/vantroy/zigoku/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/vantroy/zigoku/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vantroy/zigoku/compare/v0.2.3...v0.3.0
 [0.2.3]: https://github.com/vantroy/zigoku/compare/v0.2.2...v0.2.3
