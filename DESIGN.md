@@ -1386,8 +1386,8 @@ column, same order, every show" habit the rail is built for:
   unbound provider), `+name` if bound but not the one serving right now,
   `-name` if a fresh negative exists, `?name` if unchecked. At most one `▸`
   ever appears in the line. Tokens are space-joined in registry order, e.g.
-  `▸senshi +anipub` (senshi serving, anipub also bound elsewhere) or
-  `▸senshi ?anipub` (anipub never probed). `▸` is the existing resume/active
+  `▸senshi +megaplay` (senshi serving, megaplay also bound elsewhere) or
+  `▸senshi ?megaplay` (megaplay never probed). `▸` is the existing resume/active
   glyph (§4.6), already proven legible dim; `+`/`-`/`?` are deliberately plain
   ASCII rather than a new pictographic set. ROD-253 is an open ticket about
   `◆`/`◈` and `◐`/`◎` not resolving distinctly at `text.dim`, and this field
@@ -1436,7 +1436,7 @@ the per-show provider pin (`Store.getProviderPin`, the `provider_pins` table),
 set via the `v` key on any detail surface (§10.5). `rail_only` like Rank and
 Provider (never a joined segment on the compact line; also surfaces on the
 compact form's dedicated row, see the addendum below), rail label `Pinned`,
-value the pin's raw provider name (`senshi`, `anipub`), matching the Settings
+value the pin's raw provider name (`senshi`, `megaplay`), matching the Settings
 `provider` row's convention (§5.5, which already echoes the stored preference
 string verbatim) rather than `SourceProvider.displayName()`'s title case
 (reserved for user-facing toast prose, §4.10; §8 logs the split). Omitted
@@ -1474,13 +1474,13 @@ bespoke row, reusing their `value`/`dim` as already computed for the rail; no
 recomputation, no new App-level state.
 
 Grammar: Provider's segment reuses its rail value verbatim (`▸senshi
-+anipub`), no new grammar needed there, the marker glyphs already
++megaplay`), no new grammar needed there, the marker glyphs already
 self-describe. When a pin exists, a `·` separator (`fg3`, matching the meta
 line's own separator) plus a `pin ` prefix plus the pin's raw provider name
-follow: `▸senshi +anipub · pin anipub`. The `pin ` prefix survives even off
+follow: `▸senshi +megaplay · pin megaplay`. The `pin ` prefix survives even off
 the joined meta line, because on this row it sits directly next to Provider's
 own token list, an adjacency at least as ambiguous as the one next to Studios
-that first justified it: without the prefix, a trailing bare `anipub` reads as
+that first justified it: without the prefix, a trailing bare `megaplay` reads as
 an unmarked third provider token rather than the pin. When unpinned, the row
 is just the Provider segment, no trailing separator. Pinned's segment is
 always `fg2` when shown (no dim state, presence or absence, matching its
@@ -1883,7 +1883,7 @@ Notes:
   of the setting, so the preference is a silent no-op there (not a dead toggle). The
   picker only bites on m3u8/wixmp long-tail sources.
 - **provider** (ROD-344) cycles unset → each registry provider name → unset (today
-  `senshi · anipub`, construction order; senshi leads). Unset
+  `senshi · megaplay`, construction order; senshi leads). Unset
   (`preferred_provider = ""`) means "follow the registry's construction leader"
   and displays as that leader tagged `(default)`, so it stays distinguishable from
   an explicit pin to the same provider (a pin holds if the leader ever changes; the
@@ -2402,7 +2402,7 @@ revisited without archaeology.
 | Provider field folds availability and serving into one rail row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that's really one axis per provider (what's known, what's active): one row reads as one fact family. ROD-253 is an open, unresolved ticket that `◆`/`◈` and `◐`/`◎` don't resolve distinctly at `text.dim`; rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family, not a new instance of the same risk. Shape carries the state rather than color because the Phosphor theme (§1) is monochrome, so a color-only distinction would be illegible there. | If ROD-253 lands a fix that makes the diamond/circle-half pairs legible dim, this call doesn't need revisiting: the ASCII set was chosen for its own reasons (font-independence, zero substitution risk), not only as a ROD-253 workaround. |
 | Provider field lists providers in fixed registry (construction) order, not `Registry.ordered`'s per-walk preference view (ROD-348) | `ordered` is a resolve-order hint, recomputed per preference and per walk (ROD-344); using it here would make the same show's rail read in a different column order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." The rail is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order instead. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
 | Provider and Pinned surface in the compact form on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356 compact-line fix) | A smoke test found Provider and Pinned invisible on every compact-width detail pane, since a `rail_only` field never blooms below `detail_two_col_min`. A first attempt folded them into the joined line itself, reordering it so they'd survive clipping; rejected on sight, this is a different category of fact (routing/session state) from the AniList enrichment the joined line otherwise carries, and interleaving muddied both. The `MetaField` list, its order, and every `rail_only` flag revert to the original ROD-348/356/345 shape; the fix lives entirely in a new bespoke compact-form row drawn beneath the joined line, `drawProviderLine`, outside the generic field-list iteration either renderer uses. | If a third field ever needs the same "own row" treatment, generalize `drawProviderLine` into a small family of bespoke compact rows rather than routing a third concept through it by special case. |
-| Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356 compact-line fix) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare `anipub` reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `drawProviderLine` itself, not a generic `MetaField` mechanism, since this row sits outside the field-list iteration; a `prefix` field added to `MetaField` for the rejected joined-line attempt has no consumer once that attempt reverted and is cut. Folding Pinned into Provider's token list instead (a marker on the pinned token) was considered and rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over reviving a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
+| Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356 compact-line fix) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare `megaplay` reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `drawProviderLine` itself, not a generic `MetaField` mechanism, since this row sits outside the field-list iteration; a `prefix` field added to `MetaField` for the rejected joined-line attempt has no consumer once that attempt reverted and is cut. Folding Pinned into Provider's token list instead (a marker on the pinned token) was considered and rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over reviving a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
 
 ---
 
@@ -2457,7 +2457,7 @@ aliases.
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
 | **History · season chip** | — | not rendered | the history row is title + progress bar + meta; no chip |
 | **History · score badge** | — | not rendered | the `[NN]` badge from §5.4 is omitted; the space is reclaimed by the title |
-| **Episode grid** | AllAnime `episodes()` live fetch | the episode-label grid | loading spinner during fetch; absent-state when no results — `total_episodes` is unused, AllAnime provides the actual list |
+| **Episode grid** | AllAnime `episodes()` live fetch | the episode-label grid | loading spinner during fetch; absent-state when no results: true for senshi's live listing; megaplay has no listing endpoint, so its grid mints positional labels from the canonical count instead (`domain.expectedEpisodeCount`) |
 
 Browse / search list rows, History rows, and Discover cards render the
 **resolved primary title** (`title_language`, §9.1a) rather than a hardcoded

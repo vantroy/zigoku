@@ -958,7 +958,7 @@ pub const App = struct {
     detail_source_buf: [24]u8 = undefined,
     /// Rank rail value (ROD-261), rail-only "#N rated YYYY". Own buffer.
     detail_rank_buf: [24]u8 = undefined,
-    /// Provider field value (ROD-348/356), "▸senshi +anipub", both render
+    /// Provider field value (ROD-348/356), "▸senshi +megaplay", both render
     /// forms. Budgeted for 4 providers of marker + ≤16-char name + separators
     /// (§5.3a); a registry past that needs this widened or the field degrades
     /// to omission.
@@ -2148,7 +2148,7 @@ pub const App = struct {
                 // failure must still be able to advance it.
                 const walk = self.fallback;
                 self.fallback = null;
-                self.fireEpisodesForId(loop, io, registry, ev.source_id, ev.source);
+                self.fireEpisodesForId(loop, io, registry, ev.source_id, ev.source, if (walk) |w| domain.expectedEpisodeCount(w.canonical) else null);
                 if (self.episodes.loading) {
                     self.fallback = walk;
                 } else if (walk) |w| {
@@ -3080,7 +3080,12 @@ pub const App = struct {
         self.show_pin = self.gpa.dupe(u8, pin) catch null;
     }
 
-    fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8) void {
+    /// `count_hint` (ROD-359): the canonical's expected episode count for a
+    /// provider with no listing endpoint (megaplay), from a caller that holds
+    /// the canonical (a resolve verdict's `sel`, a walk's `canonical`). Null
+    /// derives it from the seed record below, which covers every open of an
+    /// already-persisted binding; only a virgin resolve has no row to read.
+    fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8, count_hint: ?u32) void {
         // ROD-179: do NOT join a prior in-flight episode fetch here — that would
         // block the main loop on a slow network when a settled-then-resumed scroll
         // supersedes it (ROD-156). The old worker is already detached + accounted
@@ -3165,11 +3170,16 @@ pub const App = struct {
         self.episodes.loading = true;
         self.async_start_ms = self.now_ms;
 
+        const hint = count_hint orelse if (seed_rec) |r|
+            domain.expectedEpisodeCount(selection.animeFromHistoryRecord(r))
+        else
+            null;
+
         // Account before the spawn so teardown's drain can never observe a gap;
         // detach so a later supersede never has to join this one (ROD-179).
         self.episode_drain.begin();
         const t = std.Thread.spawn(.{}, episodesTask, .{
-            loop, self.gpa, io, registry.byName(source) orelse registry.primary(), id_for_task, self.translation, &self.episode_drain,
+            loop, self.gpa, io, registry.byName(source) orelse registry.primary(), id_for_task, self.translation, hint, &self.episode_drain,
         }) catch {
             self.episode_drain.finish(); // no worker will run — rebalance the count
             self.gpa.free(id_for_task);
@@ -3251,11 +3261,14 @@ pub const App = struct {
         self.play_resolve_aid = null;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
+        // The selection is the canonical entity (fully enriched on the AniList
+        // paths), so it carries the count hint for listing-less providers.
+        const hint = domain.expectedEpisodeCount(sel);
         switch (browseResolveTarget(registry, self.effectivePreference(arena.allocator(), canonicalAid(sel)), sel, self.store, arena.allocator())) {
-            .direct => |id| self.fireEpisodesResolved(loop, io, registry, null, id, null),
+            .direct => |id| self.fireEpisodesResolved(loop, io, registry, null, id, null, hint),
             // Tier 0: the binding already exists, so fetch by the stored id with no re-bind.
-            .bound => |b| self.fireEpisodesResolved(loop, io, registry, b.provider.name(), b.id, null),
-            .tier_a => |t| self.fireEpisodesResolved(loop, io, registry, t.provider.name(), t.id, t.anilist_id),
+            .bound => |b| self.fireEpisodesResolved(loop, io, registry, b.provider.name(), b.id, null, hint),
+            .tier_a => |t| self.fireEpisodesResolved(loop, io, registry, t.provider.name(), t.id, t.anilist_id, hint),
             .needs_search => |aid| self.fireResolvePlaySearch(loop, io, registry, sel, aid),
         }
     }
@@ -3275,7 +3288,7 @@ pub const App = struct {
     /// `.bound` hit whose row already exists).
     /// Skips a respawn when the same provider id is already fetching: re-firing would
     /// just abandon the in-flight fetch and start an identical one.
-    fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, registry: Registry, origin: ?[]const u8, id: []const u8, bind: ?i64) void {
+    fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, registry: Registry, origin: ?[]const u8, id: []const u8, bind: ?i64, count_hint: ?u32) void {
         const in_flight = self.episodes.loading and
             self.episodes.for_id != null and
             std.mem.eql(u8, self.episodes.for_id.?, id);
@@ -3286,7 +3299,7 @@ pub const App = struct {
             self.pending_bind = bind;
             return;
         }
-        self.fireEpisodesForId(loop, io, registry, id, origin);
+        self.fireEpisodesForId(loop, io, registry, id, origin, count_hint);
         // fireEpisodesForId nulled pending_bind at entry; set the fresh one so only this
         // fire's episodes_done can consume it. A synchronous cache hit posts no
         // episodes_done, so this bind goes unconsumed; that's benign (a warm cache means
@@ -3369,7 +3382,7 @@ pub const App = struct {
 
     /// Map the failed episode onto a hop provider's grid (ROD-346): exact raw-label
     /// match first, same 1-based ordinal as fallback (providers label positionally,
-    /// senshi and anipub both), null when the grid is too short for either.
+    /// senshi and megaplay both), null when the grid is too short for either.
     pub fn mapEpisodeIndex(episodes: []const domain.EpisodeNumber, raw: []const u8, ordinal: u32) ?usize {
         for (episodes, 0..) |ep, i| {
             if (std.mem.eql(u8, ep.raw, raw)) return i;
@@ -3612,7 +3625,7 @@ pub const App = struct {
     fn fireFallbackFetch(self: *App, loop: *Loop, io: std.Io, registry: Registry, walk: Fallback, p: SourceProvider, id: []const u8, bind: ?i64, failed_name: ?[]const u8) void {
         self.toastFallbackHop(p, failed_name);
         const landing = self.resume_landing_pending;
-        self.fireEpisodesResolved(loop, io, registry, p.name(), id, bind);
+        self.fireEpisodesResolved(loop, io, registry, p.name(), id, bind, domain.expectedEpisodeCount(walk.canonical));
         self.resume_landing_pending = landing and self.episodes.loading;
         self.fallback = walk;
         // A synchronous cache hit already landed the grid: no episodes_done will
@@ -3808,11 +3821,11 @@ pub const App = struct {
             const pin = (st.getProviderPin(arena.allocator(), aid) catch null) orelse break :pin;
             if (std.mem.eql(u8, pin, rec.source) or registry.byName(pin) == null) break :pin;
             const sid = (st.bindingSourceId(arena.allocator(), pin, aid) catch null) orelse break :pin;
-            self.fireEpisodesForId(loop, io, registry, sid, pin);
+            self.fireEpisodesForId(loop, io, registry, sid, pin, null);
             return;
         }
         // A real binding: the normal fetch, which clears `unbound` at entry.
-        self.fireEpisodesForId(loop, io, registry, rec.source_id, rec.source);
+        self.fireEpisodesForId(loop, io, registry, rec.source_id, rec.source, null);
     }
 
     /// ROD-170: open the full-screen zoom directly on a history record + fetch its

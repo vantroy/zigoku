@@ -53,7 +53,7 @@ fn dummyCanonicalKeyFn(_: *anyopaque, arena: Allocator, canonical: Anime) anyerr
     const mal = canonical.mal_id orelse return null;
     return try std.fmt.allocPrint(arena, "{d}", .{mal});
 }
-fn dummyEpisodesFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+fn dummyEpisodesFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
     return &.{};
 }
 fn dummyResolveFn(_: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {
@@ -101,7 +101,7 @@ fn dummyRegistry() source_mod.Registry {
 const GateProvider = struct {
     release: std.atomic.Value(bool) = .init(false),
 
-    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *GateProvider = @ptrCast(@alignCast(ptr));
         // yield() keeps the park from starving the test thread on a single core.
         while (!self.release.load(.acquire)) std.Thread.yield() catch {};
@@ -2492,7 +2492,7 @@ test "Provider/Pinned append at the tail, rail-only, full base intact (ROD-348/3
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
     app.show_avail_aid = 901;
     app.show_avail[0] = .bound;
     app.show_pin = try std.testing.allocator.dupe(u8, "senshi");
@@ -2533,7 +2533,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
     app.active_pane = .list;
-    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
 
     // No canonical identity: the field is omitted outright (same gate as Pinned).
     try testing.expectEqual(@as(usize, 1), app.detailMetaFields().len); // Episodes floor only
@@ -2544,7 +2544,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
         const fields = app.detailMetaFields();
         try testing.expectEqual(@as(usize, 2), fields.len);
         try testing.expectEqualStrings("Provider", fields[1].label);
-        try testing.expectEqualStrings("?senshi ?anipub", fields[1].value);
+        try testing.expectEqualStrings("?senshi ?megaplay", fields[1].value);
         try testing.expect(fields[1].dim);
         try testing.expect(fields[1].rail_only); // meta line never carries it; the provider row does
     }
@@ -2554,22 +2554,22 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
     app.show_avail[1] = .absent;
     {
         const fields = app.detailMetaFields();
-        try testing.expectEqualStrings("+senshi -anipub", fields[1].value);
+        try testing.expectEqualStrings("+senshi -megaplay", fields[1].value);
         try testing.expect(!fields[1].dim);
     }
 
     // The open grid's fetch identity wins the serving marker; at most one '▸'.
     app.episodes.for_source = "senshi";
     app.show_avail[1] = .bound;
-    try testing.expectEqualStrings("▸senshi +anipub", app.detailMetaFields()[1].value);
+    try testing.expectEqualStrings("▸senshi +megaplay", app.detailMetaFields()[1].value);
 
     // A retired provider's grid (fetch identity no longer registered) hangs no
     // marker anywhere: availability renders, serving degrades silently.
     app.episodes.for_source = "allanime";
-    try testing.expectEqualStrings("+senshi +anipub", app.detailMetaFields()[1].value);
+    try testing.expectEqualStrings("+senshi +megaplay", app.detailMetaFields()[1].value);
 
     // Pinned still appends, after Provider (shed order: Pinned drops first).
-    app.show_pin = try std.testing.allocator.dupe(u8, "anipub");
+    app.show_pin = try std.testing.allocator.dupe(u8, "megaplay");
     defer if (app.show_pin) |p| std.testing.allocator.free(p);
     {
         const fields = app.detailMetaFields();
@@ -3537,12 +3537,12 @@ test "resolve events cache definitive absences on every arm, even a stale one (R
     app.store = &st;
     app.add_resolving = true;
 
-    // Add miss whose walk ruled anipub definitively absent: the arm caches the
+    // Add miss whose walk ruled megaplay definitively absent: the arm caches the
     // negative alongside the unbound marker (both facts, independently).
     const absent_add = try std.testing.allocator.alloc([]const u8, 1);
-    absent_add[0] = "anipub";
+    absent_add[0] = "megaplay";
     try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_add } });
-    try testing.expect(try st.providerAbsentFresh(154587, "anipub", store_mod.Store.nowSecs()));
+    try testing.expect(try st.providerAbsentFresh(154587, "megaplay", store_mod.Store.nowSecs()));
 
     // A play result the staleness gate drops (play_resolve_aid is null: the user
     // moved on) still banks the catalog fact before the drop.
@@ -5354,7 +5354,7 @@ test "settings: provider row cycles unset -> each registry name -> unset (ROD-34
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
     app.settings.cursor = 5; // the provider row (rendered under Catalog)
 
     // Unset displays the effective leader tagged (default): distinguishable
@@ -5367,22 +5367,22 @@ test "settings: provider row cycles unset -> each registry name -> unset (ROD-34
     try testing.expectEqualStrings("senshi", app.settings.value(&app.config, .provider));
     try testing.expect(app.settings.dirty);
 
-    try testTick(&app, keyEv('l', .{})); // senshi -> anipub
-    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+    try testTick(&app, keyEv('l', .{})); // senshi -> megaplay
+    try testing.expectEqualStrings("megaplay", app.config.preferred_provider);
 
-    try testTick(&app, keyEv('l', .{})); // anipub -> unset again: the wheel has a way back
+    try testTick(&app, keyEv('l', .{})); // megaplay -> unset again: the wheel has a way back
     try testing.expectEqualStrings("", app.config.preferred_provider);
     try testing.expectEqualStrings("senshi (default)", app.settings.value(&app.config, .provider));
 
-    try testTick(&app, keyEv('h', .{})); // reverse wrap: unset -> anipub
-    try testing.expectEqualStrings("anipub", app.config.preferred_provider);
+    try testTick(&app, keyEv('h', .{})); // reverse wrap: unset -> megaplay
+    try testing.expectEqualStrings("megaplay", app.config.preferred_provider);
 }
 
 test "settings: provider row re-enters the wheel at unset from an unrecognized value (ROD-344)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.provider_names = &.{ "senshi", "anipub" };
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
     app.settings.cursor = 5;
     app.config.preferred_provider = "garbage"; // hand-edited config
 
@@ -6032,7 +6032,7 @@ const RecordingProvider = struct {
         const mal = canonical.mal_id orelse return null;
         return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
-    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn episodesFn(ptr: *anyopaque, arena: Allocator, _: std.Io, _: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
         self.hit.store(true, .release);
         const eps = try arena.alloc(domain.EpisodeNumber, 1);

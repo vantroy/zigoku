@@ -22,24 +22,24 @@ pub const std_options: std.Options = .{
 };
 
 /// The one place the live provider set and its order are defined (ROD-343):
-/// senshi first, anipub second. The registry's fat pointers alias `self`, so
-/// call `registry()` on a variable that outlives every use of the result and
-/// don't move it afterwards.
+/// senshi first, megaplay second (ROD-359 retired anipub). The registry's fat
+/// pointers alias `self`, so call `registry()` on a variable that outlives
+/// every use of the result and don't move it afterwards.
 const LiveProviders = struct {
     senshi: zigoku.Senshi,
-    anipub: zigoku.AniPub,
+    megaplay: zigoku.MegaPlay,
     slots: [2]zigoku.SourceProvider,
 
     fn init() LiveProviders {
         return .{
             .senshi = zigoku.Senshi.init(),
-            .anipub = zigoku.AniPub.init(),
+            .megaplay = zigoku.MegaPlay.init(),
             .slots = undefined,
         };
     }
 
     fn registry(self: *LiveProviders) zigoku.Registry {
-        self.slots = .{ self.senshi.provider(), self.anipub.provider() };
+        self.slots = .{ self.senshi.provider(), self.megaplay.provider() };
         return .{ .providers = &self.slots };
     }
 };
@@ -600,7 +600,9 @@ fn loadEpisodes(
 
     try out.print("\n→ fetching episodes for \"{s}\"…\n", .{show.name});
     try out.flush();
-    const fetched = try provider.episodes(arena, io, show.id, tt);
+    // CLI catalog picks come straight off the provider's own search results, so
+    // the show carries its catalog metadata: the count hint is right here.
+    const fetched = try provider.episodes(arena, io, show.id, tt, zigoku.domain.expectedEpisodeCount(show));
 
     if (store) |st| {
         if (fetched.len > 0)

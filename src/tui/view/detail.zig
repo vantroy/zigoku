@@ -515,7 +515,7 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
     return row;
 }
 
-/// Dedicated compact-form provider row (ROD-348/356): `▸senshi +anipub · pin anipub`
+/// Dedicated compact-form provider row (ROD-348/356): `▸senshi +megaplay · pin megaplay`
 /// directly under the meta line. Composed from the SAME field entries the rail
 /// renders (a label scan, no recomputation, so the two surfaces can't drift);
 /// the fixed position anchors the bare tokens, only the pin keeps a `pin `

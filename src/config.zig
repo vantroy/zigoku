@@ -228,7 +228,7 @@ test "serialized config round-trips back through parse" {
         .landing = "browse",
         .title_language = "english",
         .discover_cover_concurrency = 8,
-        .preferred_provider = "anipub",
+        .preferred_provider = "megaplay",
         .anilist_sync_enabled = false,
     };
 
@@ -266,8 +266,8 @@ test "preferred_provider defaults empty, round-trips a set value (ROD-344)" {
     defer arena.deinit();
     try testing.expectEqualStrings("", (Config{}).preferred_provider);
     try testing.expectEqualStrings(
-        "anipub",
-        parse(arena.allocator(), ".{ .preferred_provider = \"anipub\" }").preferred_provider,
+        "megaplay",
+        parse(arena.allocator(), ".{ .preferred_provider = \"megaplay\" }").preferred_provider,
     );
 }
 

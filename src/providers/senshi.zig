@@ -87,8 +87,9 @@ pub const Senshi = struct {
         const mal = canonical.mal_id orelse return null;
         return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
-    fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
+        _ = count_hint; // real listing endpoint; the canonical count plays no part
         return self.episodes(arena, io, show_id, tt);
     }
     fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {

@@ -113,8 +113,9 @@ pub const AllAnime = struct {
         // id lives in the cover thumbnail, tier B, out of this resolver's scope), hence null.
         return null;
     }
-    fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *AllAnime = @ptrCast(@alignCast(ptr));
+        _ = count_hint; // real listing endpoint; the canonical count plays no part
         return self.episodes(arena, io, show_id, tt);
     }
     fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {

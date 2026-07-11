@@ -126,6 +126,36 @@ pub fn isStillAiring(status: ?[]const u8) bool {
     return true;
 }
 
+/// Ceiling on a derived episode-grid count (ROD-359). `total_episodes` /
+/// `next_airing_episode` ride in from AniList, a crowd-editable database, and feed
+/// a listing-less provider's `arena.alloc(n)` for the label grid; a vandalized or
+/// corrupt count (up to u32 max) would otherwise size a multi-gigabyte allocation
+/// off one bad wiki edit (the ROD-92 unbounded-off-untrusted-data class). No real
+/// streamable MAL entry approaches this, so clipping here can't hide a legitimate
+/// episode.
+pub const max_episode_hint: u32 = 10_000;
+
+/// The episode count a play grid should offer for a show, derived from canonical
+/// (AniList) data (ROD-359). This is the `count_hint` a provider with no listing
+/// endpoint of its own (megaplay: per-episode MAL-keyed routes only) turns into
+/// positional labels; providers with real listings ignore it.
+///
+/// While airing, `next_airing_episode - 1` is the aired-so-far count, a floor:
+/// stale enrichment can lag the broadcast (refresh-on-view catches it up, ROD-182).
+/// Without that signal the planned total stands even mid-broadcast: over-listing
+/// degrades to a clean per-episode resolve miss, under-listing would hide aired
+/// episodes with no recovery. Null = nothing aired / nothing known. Clamped to
+/// `max_episode_hint` against a hostile count.
+pub fn expectedEpisodeCount(a: Anime) ?u32 {
+    const raw: ?u32 = if (isStillAiring(a.status)) blk: {
+        const next = a.next_airing_episode orelse break :blk a.total_episodes;
+        if (next <= 1) return null; // next to air is ep 1: nothing aired yet
+        const aired = next - 1;
+        break :blk if (a.total_episodes) |total| @min(aired, total) else aired;
+    } else a.total_episodes;
+    return if (raw) |n| @min(n, max_episode_hint) else null;
+}
+
 /// The user's stream-quality preference (ROD-152). `best`/`worst` are the
 /// open-ended sentinels; the rungs name a vertical-pixel ceiling. The provider
 /// applies a *cap* policy against whatever variants a source actually exposes —
@@ -697,6 +727,25 @@ test "isStillAiring settles only on FINISHED/CANCELLED, else keeps airing (ROD-2
     try std.testing.expect(isStillAiring("SOME_FUTURE_STATUS"));
     try std.testing.expect(isStillAiring(""));
     try std.testing.expect(isStillAiring(null));
+}
+
+test "expectedEpisodeCount: aired floor while airing, total when settled (ROD-359)" {
+    // Finished show: the total is the finale.
+    try std.testing.expectEqual(@as(?u32, 28), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "FINISHED", .total_episodes = 28 }));
+    // Airing with a next-episode signal: aired-so-far, not the planned total.
+    try std.testing.expectEqual(@as(?u32, 13), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 24, .next_airing_episode = 14 }));
+    // Airing, no next-episode signal: the planned total stands (over-list, clean miss).
+    try std.testing.expectEqual(@as(?u32, 24), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 24 }));
+    // Corrupt/duplicate data: the aired floor never exceeds a known total.
+    try std.testing.expectEqual(@as(?u32, 12), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 12, .next_airing_episode = 99 }));
+    // Nothing aired yet (next to air is ep 1), and the fully-unknown case.
+    try std.testing.expectEqual(@as(?u32, null), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "NOT_YET_RELEASED", .next_airing_episode = 1 }));
+    try std.testing.expectEqual(@as(?u32, null), expectedEpisodeCount(.{ .id = "x", .name = "x" }));
+    // Null status reads as airing (the isStillAiring denylist), so the floor applies.
+    try std.testing.expectEqual(@as(?u32, 5), expectedEpisodeCount(.{ .id = "x", .name = "x", .next_airing_episode = 6 }));
+    // A hostile/corrupt count (crowd-edited AniList) is clamped, not passed to an alloc.
+    try std.testing.expectEqual(@as(?u32, max_episode_hint), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "FINISHED", .total_episodes = 4_294_967_295 }));
+    try std.testing.expectEqual(@as(?u32, max_episode_hint), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .next_airing_episode = 4_000_000_000 }));
 }
 
 test "ListStatus.groupRank orders watching → planning → paused → completed → dropped" {
