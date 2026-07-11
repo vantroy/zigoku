@@ -22,6 +22,7 @@ const Io = std.Io;
 const domain = @import("../domain.zig");
 const source = @import("../source.zig");
 const log = @import("../log.zig");
+const http = @import("http.zig");
 
 const API = "https://senshi.live";
 // A current Chrome UA. senshi's Cloudflare edge serves a plain client with this
@@ -336,78 +337,22 @@ pub const Senshi = struct {
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
-    // NOTE (ROD-301 stage 3): the HTTP helper + transport/status error taxonomy
-    // below mirror allanime.zig's. Both get lifted into a shared providers/http.zig
-    // in stage 3 (deferred so this stage touches no other file). Keep the two in
-    // step until then.
-
     /// One request to the senshi API. `body` non-null → POST that JSON; null → GET.
-    /// Returns the response body (lives in `arena`). Failures split into the same
-    /// actionable classes AllAnime uses (ROD-173) — and, applying the ROD-300
-    /// lesson, the diagnostics are ALWAYS-ON (`warn`), not gated behind `--debug`,
-    /// so the next time senshi shifts, zigoku.log names it without a flag.
+    /// senshi is REST-shaped (write endpoints answer 201), so any 2xx is success. The
+    /// transport + status error taxonomy lives in the shared http.zig (ROD-349).
     fn request(arena: Allocator, io: Io, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
-        var client: std.http.Client = .{ .allocator = arena, .io = io };
-        defer client.deinit();
-        var aw: std.Io.Writer.Allocating = .init(arena);
         const extra: []const std.http.Header = if (body != null)
             &.{ .{ .name = "Content-Type", .value = "application/json" }, .{ .name = "Accept", .value = "application/json" } }
         else
             &.{.{ .name = "Accept", .value = "application/json" }};
-        const res = client.fetch(.{
-            .location = .{ .url = url },
+        return http.request(arena, io, .{
             .method = method,
+            .url = url,
             .payload = body,
-            .response_writer = &aw.writer,
-            .headers = .{ .user_agent = .{ .override = UA } },
+            .user_agent = UA,
             .extra_headers = extra,
-        }) catch |e| {
-            log.warn("senshi {s} {s}: transport {s}", .{ @tagName(method), url, @errorName(e) });
-            return mapTransportError(e);
-        };
-        // senshi's write endpoints answer 201; treat any 2xx as success.
-        if (res.status.class() != .success) {
-            log.warn("senshi {s} {s}: HTTP {d}", .{ @tagName(method), url, @intFromEnum(res.status) });
-            return statusToError(res.status);
-        }
-        return aw.writer.buffered();
-    }
-
-    /// Classify a non-2xx status (ROD-173): 403/451 = blocked; 5xx = source down;
-    /// anything else = the undifferentiated `HttpNotOk` (likely API drift).
-    fn statusToError(status: std.http.Status) error{ Forbidden, ServerError, HttpNotOk } {
-        return switch (status) {
-            .forbidden, .unavailable_for_legal_reasons => error.Forbidden,
-            else => switch (status.class()) {
-                .server_error => error.ServerError,
-                else => error.HttpNotOk,
-            },
-        };
-    }
-
-    /// Map a transport-layer failure to `NetworkDown` when "check your connection"
-    /// is the right advice; everything else propagates unchanged. Mirrors
-    /// allanime.mapTransportError (kept in step until the stage-3 extraction).
-    fn mapTransportError(e: anyerror) anyerror {
-        return switch (e) {
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.HostUnreachable,
-            error.NetworkUnreachable,
-            error.NetworkDown,
-            error.Timeout,
-            error.TlsInitializationFailed,
-            error.UnknownHostName,
-            error.NameServerFailure,
-            error.NoAddressReturned,
-            error.ResolvConfParseFailed,
-            error.DetectingNetworkConfigurationFailed,
-            error.InvalidDnsARecord,
-            error.InvalidDnsAAAARecord,
-            error.InvalidDnsCnameRecord,
-            => error.NetworkDown,
-            else => e,
-        };
+            .tag = "senshi",
+        });
     }
 
     /// senshi's `ani_status` ("Finished Airing"/"Currently Airing"/"Not yet aired")

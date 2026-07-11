@@ -37,6 +37,7 @@ const Io = std.Io;
 const domain = @import("../domain.zig");
 const source = @import("../source.zig");
 const log = @import("../log.zig");
+const http = @import("http.zig");
 
 const HOST = "https://megaplay.buzz";
 // Every downstream CDN host gates on this exact origin.
@@ -343,17 +344,14 @@ pub const MegaPlay = struct {
     }
 
     // ── HTTP ────────────────────────────────────────────────────────────────────────
-    // Same helper + error taxonomy as senshi/allanime (ROD-173), pending the shared
-    // providers/http.zig extraction (ROD-349). Keep the three in step until then.
 
     /// What the request is for; picks the header set. Both need the UA + referer
     /// gate; getSources additionally wants the XHR marker its endpoint checks.
     const Kind = enum { embed, xhr };
 
+    /// One GET to megaplay. The transport + status error taxonomy lives in the shared
+    /// http.zig (ROD-349); megaplay is REST-shaped, so any 2xx is success.
     fn request(arena: Allocator, io: Io, url: []const u8, kind: Kind) ![]u8 {
-        var client: std.http.Client = .{ .allocator = arena, .io = io };
-        defer client.deinit();
-        var aw: std.Io.Writer.Allocating = .init(arena);
         const extra: []const std.http.Header = switch (kind) {
             .embed => &.{.{ .name = "Referer", .value = STREAM_REFERER }},
             .xhr => &.{
@@ -362,57 +360,13 @@ pub const MegaPlay = struct {
                 .{ .name = "Accept", .value = "application/json" },
             },
         };
-        const res = client.fetch(.{
-            .location = .{ .url = url },
+        return http.request(arena, io, .{
             .method = .GET,
-            .response_writer = &aw.writer,
-            .headers = .{ .user_agent = .{ .override = UA } },
+            .url = url,
+            .user_agent = UA,
             .extra_headers = extra,
-        }) catch |e| {
-            log.warn("megaplay GET {s}: transport {s}", .{ url, @errorName(e) });
-            return mapTransportError(e);
-        };
-        if (res.status.class() != .success) {
-            log.warn("megaplay GET {s}: HTTP {d}", .{ url, @intFromEnum(res.status) });
-            return statusToError(res.status);
-        }
-        return aw.writer.buffered();
-    }
-
-    /// Classify a non-2xx status (ROD-173): 403/451 = blocked; 5xx = source down;
-    /// anything else = the undifferentiated `HttpNotOk` (likely host drift).
-    fn statusToError(status: std.http.Status) error{ Forbidden, ServerError, HttpNotOk } {
-        return switch (status) {
-            .forbidden, .unavailable_for_legal_reasons => error.Forbidden,
-            else => switch (status.class()) {
-                .server_error => error.ServerError,
-                else => error.HttpNotOk,
-            },
-        };
-    }
-
-    /// Map a transport-layer failure to `NetworkDown` when "check your connection"
-    /// is the right advice; everything else propagates unchanged.
-    fn mapTransportError(e: anyerror) anyerror {
-        return switch (e) {
-            error.ConnectionRefused,
-            error.ConnectionResetByPeer,
-            error.HostUnreachable,
-            error.NetworkUnreachable,
-            error.NetworkDown,
-            error.Timeout,
-            error.TlsInitializationFailed,
-            error.UnknownHostName,
-            error.NameServerFailure,
-            error.NoAddressReturned,
-            error.ResolvConfParseFailed,
-            error.DetectingNetworkConfigurationFailed,
-            error.InvalidDnsARecord,
-            error.InvalidDnsAAAARecord,
-            error.InvalidDnsCnameRecord,
-            => error.NetworkDown,
-            else => e,
-        };
+            .tag = "megaplay",
+        });
     }
 };
 
