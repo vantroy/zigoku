@@ -843,9 +843,22 @@ pub const App = struct {
     /// every play of the same show. A fixed ring, not a map: allocation-free (an
     /// `App{}` stays trivially constructible, nothing to free) and eviction is
     /// harmless because the dedup is soft: a re-fire past the ring hits the
-    /// store-backed candidate filter and no-ops. 0 = empty slot (no AniList id).
-    prewarm_attempted: [32]i64 = @splat(0),
+    /// store-backed candidate filter and no-ops. Optionals, not a 0 sentinel:
+    /// nothing enforces anilist_id > 0, and an id equal to the sentinel would
+    /// silently read as always-attempted (chaos-pass repro).
+    prewarm_attempted: [32]?i64 = @splat(null),
     prewarm_attempted_next: usize = 0,
+    /// ROD-351: wall-clock of the last pre-warm walk START. Floors the spacing
+    /// between walks app-wide: the per-show ring alone would let ring-eviction
+    /// replay (33+ shows churned, then re-played) drip request bursts at a
+    /// rate-scoring CDN (the ROD-309 class). A floored fire is NOT marked
+    /// attempted, so the show retries on a later trigger.
+    prewarm_last_start_ms: ?i64 = null,
+    /// ROD-351: cooperative cancel for an in-flight pre-warm walk, checked by
+    /// the worker between provider hops. Any advancing fallback walk sets it: a
+    /// user fighting a broken provider must not compete with a background warm
+    /// for the same CDN budget. Re-armed (false) on the next walk start.
+    prewarm_cancel: std.atomic.Value(bool) = .init(false),
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
     /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
@@ -1994,7 +2007,9 @@ pub const App = struct {
                 defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
                 defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
                 // ROD-347: cache the walk's definitive misses on both arms, before any
-                // early return (the widen below learns from them too, via tier 0).
+                // early return. The widen below filters its provider snapshot through
+                // providerAbsentFresh, so this persist must run first or a just-learned
+                // absence isn't excluded from the re-search.
                 self.persistProviderAbsences(ev.anilist_id, ev.absent_sources);
                 self.async_start_ms = 0;
                 self.add_resolving = false;
@@ -3219,10 +3234,11 @@ pub const App = struct {
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
         // Effective-order snapshot for the walk (ROD-344), owned by the worker:
-        // the preference can change mid-flight, the snapshot can't.
+        // the preference can change mid-flight, the snapshot can't. Filtered
+        // through the ROD-347 cache: known-absent providers aren't re-searched.
         var pref_arena = std.heap.ArenaAllocator.init(gpa);
         defer pref_arena.deinit();
-        const providers = registry.orderedAlloc(gpa, self.effectivePreference(pref_arena.allocator(), anilist_id)) catch {
+        const providers = self.orderedSearchProviders(gpa, registry, self.effectivePreference(pref_arena.allocator(), anilist_id), anilist_id) catch {
             workers.freeOwnedAnime(gpa, snap);
             return;
         };
@@ -3314,6 +3330,29 @@ pub const App = struct {
         }
     }
 
+    /// Effective-order provider snapshot for a tier-C search walk, minus the
+    /// providers holding a fresh ROD-347 absence verdict for this show: sparing
+    /// exactly these searches is what the cache is for. gpa-owned; the worker
+    /// frees it. An all-absent show yields an EMPTY slice; the worker then posts
+    /// the plain miss, which routes the caller's normal dead-end arm (unbound
+    /// marker on add, toast on play) with no bespoke handling.
+    fn orderedSearchProviders(self: *App, gpa: Allocator, registry: Registry, preferred: []const u8, anilist_id: i64) ![]SourceProvider {
+        const full = try registry.orderedAlloc(gpa, preferred);
+        const st = self.store orelse return full;
+        const now = Store.nowSecs();
+        var kept: usize = 0;
+        for (full) |p| {
+            if (st.providerAbsentFresh(anilist_id, p.name(), now) catch false) continue;
+            full[kept] = p;
+            kept += 1;
+        }
+        if (kept == full.len) return full;
+        // Exact-fit copy: the worker frees with gpa.free, so it must own a whole
+        // allocation, never a shortened view of one.
+        defer gpa.free(full);
+        return try gpa.dupe(SourceProvider, full[0..kept]);
+    }
+
     /// The providers a pre-warm walk should try for one canonical entity (ROD-351):
     /// every registered provider with no existing binding (tier 0 already covers
     /// those) and no fresh absence verdict (ROD-347). Registry construction order:
@@ -3347,11 +3386,17 @@ pub const App = struct {
     /// teardown race), so tests pin the candidate filter (`prewarmCandidates`),
     /// the attempted-mark, and the event arms; the thread glue mirrors
     /// `fireResolveAddSearch` and is exercised live.
+    /// Minimum spacing between pre-warm walk starts, app-wide (see
+    /// `prewarm_last_start_ms`). Generous against the replay drip, small enough
+    /// that a short add-burst's later shows still warm on their first play.
+    const prewarm_spacing_ms: i64 = 30_000;
+
     fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64) void {
         if (self.prewarm_active or self.add_resolving or self.play_resolving) return;
         if (self.fallback != null) return; // mid-rescue is exactly the wrong time
         const st = self.store orelse return;
-        for (self.prewarm_attempted) |a| if (a == anilist_id) return;
+        for (self.prewarm_attempted) |a| if (a != null and a.? == anilist_id) return;
+        if (self.prewarm_last_start_ms) |t| if (self.now_ms - t < prewarm_spacing_ms) return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
         const candidates = prewarmCandidates(st, registry, anilist_id, arena.allocator()) catch return;
@@ -3367,10 +3412,11 @@ pub const App = struct {
             workers.freeOwnedAnime(gpa, canonical);
             return;
         };
+        self.prewarm_cancel.store(false, .release);
         self.prewarm_active = true;
         self.prewarm_drain.begin();
         const t = std.Thread.spawn(.{}, workers.prewarmTask, .{
-            loop, gpa, io, providers, canonical, anilist_id, self.translation, &self.prewarm_drain,
+            loop, gpa, io, providers, canonical, anilist_id, self.translation, &self.prewarm_cancel, &self.prewarm_drain,
         }) catch {
             self.prewarm_drain.finish(); // no worker will run, rebalance the count
             self.prewarm_active = false;
@@ -3385,6 +3431,7 @@ pub const App = struct {
     fn markPrewarmAttempted(self: *App, anilist_id: i64) void {
         self.prewarm_attempted[self.prewarm_attempted_next] = anilist_id;
         self.prewarm_attempted_next = (self.prewarm_attempted_next + 1) % self.prewarm_attempted.len;
+        self.prewarm_last_start_ms = self.now_ms;
     }
 
     /// pub for the app_test teardowns (a test that arms a walk must free it).
@@ -3437,6 +3484,10 @@ pub const App = struct {
     /// Sequential single-flight by construction: one hop fires per failure event, and
     /// each hop rides the existing episode-fetch / `play_resolving` guards.
     fn advanceFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, pending_aid: ?i64, failed_name: ?[]const u8) bool {
+        // ROD-351: a rescue in motion owns the CDN budget; wind down any
+        // in-flight background warm rather than compete with it (checked by
+        // prewarmTask between hops).
+        self.prewarm_cancel.store(true, .release);
         if (self.fallback == null and !self.beginFallback(registry, pending_aid)) return false;
         var walk = self.fallback.?;
         self.fallback = null; // taken: hop fires re-enter fireEpisodesForId, which clears the field
@@ -4497,10 +4548,11 @@ pub const App = struct {
         if (self.add_resolving) return;
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
-        // Effective-order snapshot, worker-owned; mirrors fireResolvePlaySearch.
+        // Effective-order snapshot, worker-owned; mirrors fireResolvePlaySearch,
+        // including the ROD-347 known-absent filter.
         var pref_arena = std.heap.ArenaAllocator.init(gpa);
         defer pref_arena.deinit();
-        const providers = registry.orderedAlloc(gpa, self.effectivePreference(pref_arena.allocator(), anilist_id)) catch {
+        const providers = self.orderedSearchProviders(gpa, registry, self.effectivePreference(pref_arena.allocator(), anilist_id), anilist_id) catch {
             workers.freeOwnedAnime(gpa, snap);
             return;
         };
@@ -4534,9 +4586,13 @@ pub const App = struct {
         defer arena.deinit();
         const rec = (st.getCanonicalByAnilistId(arena.allocator(), anilist_id) catch null) orelse return false;
         const all = registry.orderedAlloc(gpa, self.effectivePreference(arena.allocator(), anilist_id)) catch return false;
+        const now = Store.nowSecs();
         var n: usize = 0;
         for (all) |p| {
             if (std.mem.eql(u8, p.name(), failed_source)) continue;
+            // ROD-347: a fresh cached absence spares the whole two-pass search;
+            // the n == 0 return below then routes the caller's unbound arm.
+            if (st.providerAbsentFresh(anilist_id, p.name(), now) catch false) continue;
             all[n] = p;
             n += 1;
         }

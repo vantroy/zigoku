@@ -6432,17 +6432,19 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     // stays an unbound candidate worth warming.
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "senshi" } });
-    try testing.expectEqual(@as(i64, 154587), app.prewarm_attempted[0]);
+    try testing.expectEqual(@as(?i64, 154587), app.prewarm_attempted[0]);
 
     // Session dedup: a second add/play of the same show doesn't re-mark (the
     // ring would show a duplicate).
     app.add_resolving = true;
     const sid2 = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid2, .source = "senshi" } });
-    try testing.expectEqual(@as(i64, 0), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
 
     // An armed fallback walk suppresses the warm outright: mid-rescue the
-    // providers are exactly what's failing.
+    // providers are exactly what's failing. now_ms sits past the spacing floor
+    // so the fallback guard, not the floor, is what this pins.
+    app.now_ms = 100_000;
     const canonical: Anime = .{ .id = "999", .name = "Other", .anilist_id = 999 };
     const snap = try workers.dupeOwnedAnime(app.gpa, canonical);
     const provs = try app.gpa.alloc(SourceProvider, 0);
@@ -6452,7 +6454,32 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     app.add_resolving = true;
     const sid3 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid3, .source = "senshi" } });
-    try testing.expectEqual(@as(i64, 0), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+
+    // Spacing floor: with the walk gone, a fire inside the 30s window since the
+    // last walk START stays silent AND unmarked (so the show retries later);
+    // past the window it runs.
+    app.clearFallback();
+    app.now_ms = app.prewarm_last_start_ms.? + 1_000;
+    app.add_resolving = true;
+    const sid4 = try std.testing.allocator.dupe(u8, "111");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid4, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    app.add_resolving = true;
+    const sid5 = try std.testing.allocator.dupe(u8, "111");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid5, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, 999), app.prewarm_attempted[1]);
+
+    // anilist_id 0 is a real value, not the ring's empty state (chaos-pass
+    // repro: an i64-with-0-sentinel ring read aid 0 as always-attempted and
+    // silently never warmed it).
+    try st.upsertCanonicalOnly(.{ .id = "0", .name = "Zero", .anilist_id = 0, .mal_id = 222 }, true, 5000, arena);
+    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    app.add_resolving = true;
+    const sid6 = try std.testing.allocator.dupe(u8, "222");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 0, .source_id = sid6, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, 0), app.prewarm_attempted[2]);
 }
 
 test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {
@@ -6645,6 +6672,92 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-347: the add widen skips a fresh-absent provider and goes straight to unbound" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // A prior walk already proved beta doesn't stock this: the widen must not
+    // burn beta's two-pass search on it (the whole point of the cache).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const sid = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = "alpha" } }, &loop, io, registry);
+
+    // beta filtered out leaves the widen with nothing: no search fired, the
+    // unbound marker persists synchronously on this same arm.
+    app.add_resolve_drain.drain();
+    try testing.expect(!beta.search_hit.load(.acquire));
+    try testing.expect(!app.add_resolving);
+    try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-351: prewarmTask posts per-provider verdicts and honors the cancel flag" {
+    const gpa = std.testing.allocator;
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta" };
+    var loop = initTestLoop();
+
+    // Run the worker body synchronously (no spawn): alpha tier-A probes alive
+    // (match), beta's catalog searches clean and empty (definitive absent).
+    const canonical: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    {
+        var cancel = std.atomic.Value(bool).init(false);
+        var drain: workers.ThreadDrain = .{};
+        drain.begin();
+        const provs = try gpa.dupe(SourceProvider, &.{ alpha.provider(), beta.provider() });
+        const snap = try workers.dupeOwnedAnime(gpa, canonical);
+        workers.prewarmTask(&loop, gpa, std.testing.io, provs, snap, 154587, .sub, &cancel, &drain);
+
+        const first = (loop.queue.tryPop() catch null).?;
+        try testing.expectEqualStrings("alpha", first.prewarm_result.source);
+        try testing.expectEqualStrings("52991", first.prewarm_result.source_id);
+        try testing.expect(!first.prewarm_result.absent);
+        freeTestEvent(gpa, first);
+        const second = (loop.queue.tryPop() catch null).?;
+        try testing.expectEqualStrings("beta", second.prewarm_result.source);
+        try testing.expect(second.prewarm_result.absent);
+        try testing.expect((loop.queue.tryPop() catch null).? == .prewarm_done);
+        try testing.expect((loop.queue.tryPop() catch null) == null);
+    }
+
+    // Cancel pre-set (a fallback walk armed): the walk winds down before any
+    // provider is touched, but prewarm_done still posts so the guard clears.
+    {
+        var cancel = std.atomic.Value(bool).init(true);
+        var drain: workers.ThreadDrain = .{};
+        drain.begin();
+        var gamma = RecordingProvider{ .id = "gamma", .tier_a = true };
+        const provs = try gpa.dupe(SourceProvider, &.{gamma.provider()});
+        const snap = try workers.dupeOwnedAnime(gpa, canonical);
+        workers.prewarmTask(&loop, gpa, std.testing.io, provs, snap, 154587, .sub, &cancel, &drain);
+        try testing.expect(!gamma.hit.load(.acquire));
+        try testing.expect((loop.queue.tryPop() catch null).? == .prewarm_done);
+        try testing.expect((loop.queue.tryPop() catch null) == null);
+    }
 }
 
 test "ROD-346: mapEpisodeIndex prefers the raw label, falls back to ordinal, else null" {

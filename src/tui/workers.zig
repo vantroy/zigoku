@@ -515,7 +515,10 @@ const prewarm_gap_ms: u64 = 1500;
 ///
 /// `providers` and `canonical` are gpa-owned by this task and freed here. A
 /// matched id is duped into gpa and transferred to the event (UI thread frees).
-pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, drain: *ThreadDrain) void {
+/// `cancel` (App.prewarm_cancel) is polled between hops: an advancing fallback
+/// walk winds this walk down early rather than compete for the CDN budget;
+/// `.prewarm_done` still posts so the single-flight guard clears.
+pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, cancel: *const std.atomic.Value(bool), drain: *ThreadDrain) void {
     defer drain.finish();
     defer gpa.free(providers);
     defer freeOwnedAnime(gpa, canonical);
@@ -523,7 +526,9 @@ pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const S
     defer arena.deinit();
 
     for (providers, 0..) |p, i| {
+        if (cancel.load(.acquire)) break;
         if (i > 0) nanosleepMs(prewarm_gap_ms);
+        if (cancel.load(.acquire)) break;
         const verdict: SearchVerdict = blk: {
             if (p.canonicalKey(arena.allocator(), canonical) catch null) |key| {
                 // Tier A: the probe is the existence check, same bar as Add's
