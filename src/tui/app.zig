@@ -728,8 +728,8 @@ pub const App = struct {
     /// `settings.provider_names` (registry construction order, §5.3a). Cached
     /// beside the pin for the same reason (render never reads the DB); re-read
     /// on any bind/absence write for the same show (`noteAvailabilityWrite`).
-    /// A null `show_avail_aid` means no canonical identity: the rail omits the
-    /// Provider field outright.
+    /// A null `show_avail_aid` means no canonical identity: both render forms
+    /// omit the Provider field outright.
     show_avail: [max_rail_providers]Store.ProviderAvailability = @splat(.unchecked),
     show_avail_aid: ?i64 = null,
 
@@ -958,9 +958,10 @@ pub const App = struct {
     detail_source_buf: [24]u8 = undefined,
     /// Rank rail value (ROD-261), rail-only "#N rated YYYY". Own buffer.
     detail_rank_buf: [24]u8 = undefined,
-    /// Provider rail value (ROD-348/356), rail-only "▸senshi +anipub". Budgeted
-    /// for 4 providers of marker + ≤16-char name + separators (§5.3a); a
-    /// registry past that needs this widened or the field degrades to omission.
+    /// Provider field value (ROD-348/356), "▸senshi +anipub", both render
+    /// forms. Budgeted for 4 providers of marker + ≤16-char name + separators
+    /// (§5.3a); a registry past that needs this widened or the field degrades
+    /// to omission.
     detail_provider_buf: [96]u8 = undefined,
     /// Airing-countdown chip value (ROD-261), "Ep14 · 3d" — its own frame-lived
     /// buffer alongside the season chip's `detail_season_buf`.
