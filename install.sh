@@ -16,7 +16,7 @@ REPO="vantroy/zigoku"
 BIN="zigoku"
 
 say()  { printf '%s\n' "$*"; }
-err()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+err()  { printf 'error: %s\n' "$1" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ── One download tool, curl or wget ──────────────────────────────────────────
@@ -55,13 +55,20 @@ case "$arch" in
   *) err "unsupported architecture '$arch'; zigoku publishes x86_64 and aarch64 builds only" ;;
 esac
 
+# Rosetta 2 reports x86_64 on Apple Silicon; hand it the native aarch64 build,
+# which the release ships anyway, not the emulated Intel one.
+if [ "$plat" = "macos" ] && [ "$cpu" = "x86_64" ] \
+   && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+  cpu="aarch64"
+fi
+
 target="${cpu}-${plat}"
 
 # ── Resolve the version ───────────────────────────────────────────────────────
 if [ "${ZIGOKU_VERSION:-}" != "" ]; then
   ver="${ZIGOKU_VERSION#v}"   # accept 0.4.0 or v0.4.0
 else
-  # GitHub's latest-release endpoint redirects tag_name into the JSON body.
+  # The API's /releases/latest response carries tag_name directly in its JSON body.
   ver=$(dl_stdout "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' | head -1 \
         | sed -E 's/.*"tag_name" *: *"v?([^"]+)".*/\1/')
@@ -77,6 +84,7 @@ if [ "${BINDIR:-}" != "" ]; then
 elif [ "${PREFIX:-}" != "" ]; then
   bindir="$PREFIX/bin"
 else
+  [ "${HOME:-}" != "" ] || err "HOME is unset; set BINDIR to choose an install dir"
   bindir="$HOME/.local/bin"
 fi
 

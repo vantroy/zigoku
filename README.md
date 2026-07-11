@@ -125,11 +125,15 @@ Detects your OS and architecture, downloads the matching release tarball,
 verifies it against the published `sha256sums.txt`, and installs the `zigoku`
 binary to `~/.local/bin`. Works on x86_64 and aarch64, Linux and macOS.
 
-Knobs (all optional):
+Knobs (all optional) go on `sh`, not on `curl`, since that's the process the
+script runs in:
 
 ```sh
-ZIGOKU_VERSION=0.3.1 ...   # pin a release instead of taking the latest
-BINDIR=/usr/local/bin ...  # install somewhere else (PREFIX also honored)
+# pin a release instead of taking the latest:
+curl -fsS https://raw.githubusercontent.com/vantroy/zigoku/master/install.sh | ZIGOKU_VERSION=0.3.1 sh
+
+# install somewhere other than ~/.local/bin (PREFIX is also honored):
+curl -fsS https://raw.githubusercontent.com/vantroy/zigoku/master/install.sh | BINDIR=/usr/local/bin sh
 ```
 
 Piping a script into a shell is trust-on-first-use, so if you'd rather read it
