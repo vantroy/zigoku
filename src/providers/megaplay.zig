@@ -175,7 +175,10 @@ pub const MegaPlay = struct {
     /// unenriched canonical) degrades to one episode, never zero: zero would
     /// collide with megaplay's "not stocked" signal (ROD-347).
     fn labels(arena: Allocator, n: u32) ![]domain.EpisodeNumber {
-        const count = @max(n, 1);
+        // Callers hint through domain.expectedEpisodeCount, which already clamps;
+        // re-clamp here so a provider never sizes an alloc off an unbounded value
+        // regardless of how the hint arrived (defense in depth, ROD-359).
+        const count = @max(@min(n, domain.max_episode_hint), 1);
         const out = try arena.alloc(domain.EpisodeNumber, count);
         for (out, 1..) |*ep, i| ep.* = .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{i}) };
         return out;
@@ -481,6 +484,8 @@ test "labels mints positional 1..N; a hint-less caller degrades to one episode" 
     try testing.expectEqualStrings("28", eps[27].raw);
     // Zero normalizes to one episode, never zero (ROD-347: empty means not-stocked).
     try testing.expectEqual(@as(usize, 1), (try MegaPlay.labels(a, 0)).len);
+    // A hostile count clamps to the ceiling rather than sizing a giant alloc (ROD-359).
+    try testing.expectEqual(@as(usize, domain.max_episode_hint), (try MegaPlay.labels(a, 4_294_967_295)).len);
 }
 
 test "canonicalKey derives the stringified mal_id; null without one (ROD-359)" {
