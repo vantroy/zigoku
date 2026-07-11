@@ -1,4 +1,5 @@
-//! megaplay.buzz: a tier-A `SourceProvider` (ROD-359; extractor-only since ROD-341).
+//! megaplay.buzz: a tier-A `SourceProvider` (ROD-359), promoted from a bare
+//! stream extractor (ROD-341).
 //!
 //! megaplay indexes its catalog by MyAnimeList id: `/stream/mal/{mal}/{ep}/{lang}`
 //! answers the embed page for that exact MAL episode number (live-verified across
@@ -7,11 +8,10 @@
 //! true MAL numbering by construction, which keeps the cross-provider watch-state
 //! label join (`getResume`/`unionHighWater`) safe with no matching at all.
 //!
-//! This module replaced the AniPub catalog (ROD-342/350; retired by ROD-359):
-//! anipub's public API read a Mongo collection that had drifted from the site's
-//! own (episode arrays rot head-first, shifting every label by one and writing
-//! corrupt watch state through the union join). The direct MAL route needs no
-//! third-party catalog at all.
+//! This module replaces the AniPub catalog (ROD-342/350, retired by ROD-359):
+//! that third-party catalog had drifted from source truth, corrupting watch
+//! state (see the ROD-359 migration comment in store.zig for the mechanism).
+//! The direct MAL route needs no third-party catalog at all.
 //!
 //! The two-step resolve (spike-verified on ROD-340; MAL route on ROD-359):
 //!   1. GET /stream/mal/{mal}/{ep}/{sub|dub} → embed HTML; scrape `data-id="N"`,
@@ -165,17 +165,15 @@ pub const MegaPlay = struct {
         _ = tt;
         try guardShowId(show_id);
         const html = try request(arena, io, try embedUrl(arena, show_id, "1", .sub), .embed);
-        // 200 with no data-id = megaplay doesn't stock this MAL id: the
-        // authoritative empty (probe callers cache it, ROD-347).
+        // 200 with no data-id = megaplay doesn't stock this MAL id (the
+        // vtable's empty-is-authoritative contract, ROD-347).
         if (parseDataId(html) == null) return try arena.alloc(domain.EpisodeNumber, 0);
         return labels(arena, count_hint orelse 1);
     }
 
-    /// Positional labels "1".."n". With no listing endpoint the count comes from
-    /// the canonical hint; a hint-less caller (existence probes, a canonical with
-    /// no usable count) degrades to the single probed episode rather than none:
-    /// playable, and the grid self-heals on the next open once the canonical is
-    /// enriched.
+    /// Positional labels "1".."n". A hint-less caller (existence probes, an
+    /// unenriched canonical) degrades to one episode, never zero: zero would
+    /// collide with megaplay's "not stocked" signal (ROD-347).
     fn labels(arena: Allocator, n: u32) ![]domain.EpisodeNumber {
         const count = @max(n, 1);
         const out = try arena.alloc(domain.EpisodeNumber, count);
@@ -481,8 +479,7 @@ test "labels mints positional 1..N; a hint-less caller degrades to one episode" 
     try testing.expectEqual(@as(usize, 28), eps.len);
     try testing.expectEqualStrings("1", eps[0].raw);
     try testing.expectEqualStrings("28", eps[27].raw);
-    // Zero normalizes to the single probed episode, never an empty list (an
-    // empty return means "not stocked" to probe callers, ROD-347).
+    // Zero normalizes to one episode, never zero (ROD-347: empty means not-stocked).
     try testing.expectEqual(@as(usize, 1), (try MegaPlay.labels(a, 0)).len);
 }
 

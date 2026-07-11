@@ -446,9 +446,8 @@ const MIGRATION_V16 =
 // an anipub binding is no proof megaplay stocks the show (megaplay re-mints via a
 // real probe, ROD-351 pre-warm), and the union join re-derives the true watch
 // state from the surviving siblings. Pins carry user intent about provider
-// PREFERENCE, not stock, so they transfer to megaplay (anipub's successor as the
-// second registered provider); absences don't transfer (a different catalog).
-// Children (progress/cache) go before their FK parent rows.
+// PREFERENCE, not stock, so they transfer to megaplay; absences don't transfer
+// (a different catalog). Children (progress/cache) go before their FK parent rows.
 const MIGRATION_V17 =
     \\DELETE FROM episode_progress WHERE source = 'anipub';
     \\DELETE FROM episode_cache WHERE source = 'anipub';
