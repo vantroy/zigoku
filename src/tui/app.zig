@@ -664,9 +664,10 @@ pub const ConnectState = struct {
 };
 
 pub const App = struct {
-    /// Ceiling on registry providers the detail rail tracks (ROD-348). Sized
-    /// well past the 2-4 the design targets; `detail_provider_buf` is the
-    /// binding constraint and needs widening first (§5.3a).
+    /// Ceiling on registry providers the detail rail tracks (ROD-348).
+    /// Providers past it drop off the rail SILENTLY, serving marker included.
+    /// Sized well past the 2-4 the design targets; `detail_provider_buf` is
+    /// the binding constraint and needs widening first (§5.3a).
     pub const max_rail_providers = 8;
 
     should_quit: bool = false,

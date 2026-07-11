@@ -366,13 +366,11 @@ pub fn detailMetaFields(self: *App) []const MetaField {
 
 /// The Provider rail value (ROD-348/356): one token per registry provider in
 /// construction order (never the preference view, §5.3a: a stable reference
-/// list, not a resolve-order hint), `▸name` for the provider serving the open
-/// grid (`episodes.for_source`, the fetch identity), else `+`/`-`/`?` from the
-/// cached availability. Dim only when every token is `?` (nothing known); a
-/// fresh negative is real information and renders full-strength. Omitted when
-/// the show has no canonical identity, when no registry names were injected,
-/// or when the value overflows its buffer (a registry past ~4 providers needs
-/// `detail_provider_buf` widened).
+/// list, not a resolve-order hint). Dim only when every token is `?` (nothing
+/// known); a fresh negative is real information and renders full-strength.
+/// Omitted when the show has no canonical identity, when no registry names
+/// were injected, or when the value overflows its buffer (a registry past
+/// ~4 providers needs `detail_provider_buf` widened).
 fn providerField(self: *App) ?MetaField {
     if (self.show_avail_aid == null) return null;
     const names = self.settings.provider_names;
@@ -380,9 +378,6 @@ fn providerField(self: *App) ?MetaField {
     var w: usize = 0;
     var informative = false;
     for (names, 0..) |name, i| {
-        // Providers past max_rail_providers drop SILENTLY, serving marker
-        // included; widen the ceiling (and the buffer) before the registry
-        // grows there.
         if (i >= self.show_avail.len) break;
         const is_serving = if (self.episodes.for_source) |s| std.mem.eql(u8, s, name) else false;
         const marker: []const u8 = if (is_serving) "▸" else switch (self.show_avail[i]) {
