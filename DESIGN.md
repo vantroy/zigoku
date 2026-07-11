@@ -1413,9 +1413,9 @@ column, same order, every show" habit the rail is built for:
   providers this design targets, worst case 4 tokens of a 1-char marker plus a
   ≤16-char raw name, joined by 3 single-space separators (4×17 + 3 = 71),
   double the `detail_studios_buf` precedent's 64 bytes for headroom against a
-  longer future provider name. A `bufPrint` overflow degrades to an empty
-  value string per the existing pattern (`formatRank` et al. catch `""`),
-  acceptable, but a registry past 4 providers needs this buffer widened, and
+  longer future provider name. A `bufPrint` overflow omits the whole field
+  outright (no partial token list renders), acceptable, but a registry past 4
+  providers needs this buffer widened, and
   `App.detail_meta_fields` (currently `[7]MetaField`, `app.zig`) widened to
   `[8]MetaField` for this eighth-and-final slot.
 

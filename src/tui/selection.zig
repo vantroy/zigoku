@@ -380,6 +380,9 @@ fn providerField(self: *App) ?MetaField {
     var w: usize = 0;
     var informative = false;
     for (names, 0..) |name, i| {
+        // Providers past max_rail_providers drop SILENTLY, serving marker
+        // included; widen the ceiling (and the buffer) before the registry
+        // grows there.
         if (i >= self.show_avail.len) break;
         const is_serving = if (self.episodes.for_source) |s| std.mem.eql(u8, s, name) else false;
         const marker: []const u8 = if (is_serving) "▸" else switch (self.show_avail[i]) {
@@ -392,7 +395,6 @@ fn providerField(self: *App) ?MetaField {
         const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, name }) catch return null;
         w += written.len;
     }
-    if (w == 0) return null;
     return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
 }
 
