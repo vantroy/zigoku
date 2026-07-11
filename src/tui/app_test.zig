@@ -2487,6 +2487,60 @@ test "detail meta fields degrade episodes to a dim '?' for an unenriched show (R
     app.search.results.deinit(std.testing.allocator);
 }
 
+test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-348/356)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.settings.provider_names = &.{ "senshi", "anipub" };
+
+    // No canonical identity: the field is omitted outright (same gate as Pinned).
+    try testing.expectEqual(@as(usize, 1), app.detailMetaFields().len); // Episodes floor only
+
+    // Identity known, nothing probed: every token '?', whole value dim.
+    app.show_avail_aid = 901;
+    {
+        const fields = app.detailMetaFields();
+        try testing.expectEqual(@as(usize, 2), fields.len);
+        try testing.expectEqualStrings("Provider", fields[1].label);
+        try testing.expectEqualStrings("?senshi ?anipub", fields[1].value);
+        try testing.expect(fields[1].dim);
+        try testing.expect(fields[1].rail_only);
+    }
+
+    // Bound + fresh negative: real information, full-strength, registry order.
+    app.show_avail[0] = .bound;
+    app.show_avail[1] = .absent;
+    {
+        const fields = app.detailMetaFields();
+        try testing.expectEqualStrings("+senshi -anipub", fields[1].value);
+        try testing.expect(!fields[1].dim);
+    }
+
+    // The open grid's fetch identity wins the serving marker; at most one '▸'.
+    app.episodes.for_source = "senshi";
+    app.show_avail[1] = .bound;
+    try testing.expectEqualStrings("▸senshi +anipub", app.detailMetaFields()[1].value);
+
+    // A retired provider's grid (fetch identity no longer registered) hangs no
+    // marker anywhere: availability renders, serving degrades silently.
+    app.episodes.for_source = "allanime";
+    try testing.expectEqualStrings("+senshi +anipub", app.detailMetaFields()[1].value);
+
+    // Pinned still appends, after Provider (shed order: Pinned drops first).
+    app.show_pin = try std.testing.allocator.dupe(u8, "anipub");
+    defer if (app.show_pin) |p| std.testing.allocator.free(p);
+    {
+        const fields = app.detailMetaFields();
+        try testing.expectEqual(@as(usize, 3), fields.len);
+        try testing.expectEqualStrings("Provider", fields[1].label);
+        try testing.expectEqualStrings("Pinned", fields[2].label);
+    }
+
+    // The explicit-record form (History preview) never carries either field.
+    try testing.expectEqual(@as(usize, 1), app.detailMetaFieldsFor(null).len);
+}
+
 test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
     // Repro: a focused History detail loads an episode grid; pressing B switches to
     // Browse and resets pane focus to .list, but leaves episodes.results loaded
@@ -6406,6 +6460,50 @@ test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done c
     try testing.expect(app.prewarm_active);
     try testTick(&app, .prewarm_done);
     try testing.expect(!app.prewarm_active);
+}
+
+test "ROD-348: a prewarm write refreshes the open show's rail snapshot in place" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try st.upsertCanonicalOnly(.{
+        .id = "999",
+        .name = "Other",
+        .anilist_id = 999,
+        .mal_id = 111,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.settings.provider_names = &.{ "beta", "gamma" };
+    // As if a grid open funneled through refreshShowMeta for this show.
+    app.show_avail_aid = 154587;
+
+    // A mint for the OPEN show folds into the cached snapshot without a re-open;
+    // the sibling provider stays untouched.
+    const sid = try std.testing.allocator.dupe(u8, "b7");
+    try testTick(&app, .{ .prewarm_result = .{ .anilist_id = 154587, .source = "beta", .source_id = sid, .absent = false } });
+    try testing.expectEqual(store_mod.Store.ProviderAvailability.bound, app.show_avail[0]);
+    try testing.expectEqual(store_mod.Store.ProviderAvailability.unchecked, app.show_avail[1]);
+
+    // A definitive miss flips its provider to absent.
+    try testTick(&app, .{ .prewarm_result = .{ .anilist_id = 154587, .source = "gamma", .source_id = &.{}, .absent = true } });
+    try testing.expectEqual(store_mod.Store.ProviderAvailability.absent, app.show_avail[1]);
+
+    // A write for a DIFFERENT show leaves the open show's snapshot alone.
+    try testTick(&app, .{ .prewarm_result = .{ .anilist_id = 999, .source = "beta", .source_id = &.{}, .absent = true } });
+    try testing.expectEqual(store_mod.Store.ProviderAvailability.bound, app.show_avail[0]);
+    try testing.expectEqual(store_mod.Store.ProviderAvailability.absent, app.show_avail[1]);
+    try testing.expectEqual(@as(?i64, 154587), app.show_avail_aid);
 }
 
 test "ROD-351: an add success triggers the warm; a busy or repeat fire stays silent" {

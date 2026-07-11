@@ -347,16 +347,53 @@ pub const MetaField = struct {
 /// degrading to a dim "?" so neither form renders empty.
 pub fn detailMetaFields(self: *App) []const MetaField {
     const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
-    // Pinned (ROD-345): the open show's provider pin, rail-only like Rank and
-    // last in shed order (user state, not enrichment; the rail is about the
-    // show). Nav-state form only: the History preview renders the CURSOR row's
-    // record, whose pin isn't the cached one, so it must not inherit this field.
-    if (self.show_pin) |pin| {
-        const n = base.len;
-        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
-        return self.detail_meta_fields[0 .. n + 1];
+    var n = base.len;
+    // Provider then Pinned (ROD-348/345): session/user state, not enrichment,
+    // so both trail the sextet and shed first, Pinned before Provider (real DB
+    // state outranks a manual override, §5.3a). Nav-state form only: the
+    // History preview renders the CURSOR row's record, whose pin/availability
+    // isn't the cached one, so it must not inherit either field.
+    if (providerField(self)) |f| {
+        self.detail_meta_fields[n] = f;
+        n += 1;
     }
-    return base;
+    if (self.show_pin) |pin| {
+        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
+        n += 1;
+    }
+    return self.detail_meta_fields[0..n];
+}
+
+/// The Provider rail value (ROD-348/356): one token per registry provider in
+/// construction order (never the preference view, §5.3a: a stable reference
+/// list, not a resolve-order hint), `▸name` for the provider serving the open
+/// grid (`episodes.for_source`, the fetch identity), else `+`/`-`/`?` from the
+/// cached availability. Dim only when every token is `?` (nothing known); a
+/// fresh negative is real information and renders full-strength. Omitted when
+/// the show has no canonical identity, when no registry names were injected,
+/// or when the value overflows its buffer (a registry past ~4 providers needs
+/// `detail_provider_buf` widened).
+fn providerField(self: *App) ?MetaField {
+    if (self.show_avail_aid == null) return null;
+    const names = self.settings.provider_names;
+    if (names.len == 0) return null;
+    var w: usize = 0;
+    var informative = false;
+    for (names, 0..) |name, i| {
+        if (i >= self.show_avail.len) break;
+        const is_serving = if (self.episodes.for_source) |s| std.mem.eql(u8, s, name) else false;
+        const marker: []const u8 = if (is_serving) "▸" else switch (self.show_avail[i]) {
+            .bound => "+",
+            .absent => "-",
+            .unchecked => "?",
+        };
+        if (is_serving or self.show_avail[i] != .unchecked) informative = true;
+        const sep: []const u8 = if (w > 0) " " else "";
+        const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, name }) catch return null;
+        w += written.len;
+    }
+    if (w == 0) return null;
+    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
 }
 
 /// Same ordered field list, but for an explicitly-supplied anime rather than the
