@@ -1273,6 +1273,25 @@ pub const App = struct {
         }
     }
 
+    /// Raise the landed binding's progress through the canonical union and patch
+    /// the open grid (ROD-352, generalizing ROD-346's walk-landing raise to every
+    /// grid landing). A plain open of a multi-binding show seeds dimming from the
+    /// landed binding's own progress column, which can lag the union until
+    /// afterPlay recomputes: the grid under-dims and sync is handed the lower
+    /// number (the ROD-323 shape). Raise-only, so landing on a force-completed
+    /// sibling can't un-complete it. Deliberate cost: one extra write per grid
+    /// landing, moving the union catch-up from play-time to view-time.
+    fn raiseLandingProgress(self: *App, source: []const u8, source_id: []const u8) void {
+        const st = self.store orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const hw = st.raiseProgressToUnion(arena.allocator(), source, source_id, self.translation) catch |e| {
+            log.debug("landing raise failed: {s}", .{@errorName(e)});
+            return;
+        };
+        if (hw > 0) self.syncEpisodeProgress(source, source_id, hw);
+    }
+
     /// Store `entry` in the single-level undo slot (ROD-193 §B). If a prior entry
     /// exists, free it first so we never leak GPA memory at depth > 1.
     fn pushUndo(self: *App, entry: UndoEntry) void {
@@ -2356,22 +2375,15 @@ pub const App = struct {
                             // A false bind leaves this show unbindable: the grid still renders
                             // from the event payload, but a later recordPlay would FK-fail.
                             if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
-                            // ROD-346: a fresh mint starts at progress 0, but its siblings may
-                            // hold real watch state; recompute through the canonical union so
-                            // the grid dims (and the History/sync number reads) correctly
-                            // before the first play on this binding. The seed pass above ran
-                            // pre-mint and saw no row, so patch the in-memory grid too.
-                            if (bound) {
-                                const hw = st.raiseProgressToUnion(arena.allocator(), source, ev.for_id, self.translation) catch |e| blk: {
-                                    log.debug("mint-time recompute failed: {s}", .{@errorName(e)});
-                                    break :blk 0;
-                                };
-                                if (hw > 0) self.syncEpisodeProgress(source, ev.for_id, hw);
-                                self.noteAvailabilityWrite(aid);
-                            }
+                            if (bound) self.noteAvailabilityWrite(aid);
                         } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
                     }
                 }
+                // ROD-352: every async landing (fresh mint, walk hop, plain open) raises
+                // through the canonical union. Must run after the mint above so a fresh
+                // binding has a row to raise; the seed pass ran on the stale (or pre-mint)
+                // value, so the raise patches the in-memory grid too.
+                self.raiseLandingProgress(source, ev.for_id);
                 self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
                 // ROD-346: the grid landed, so any fallback walk delivered: retire
                 // it, or run its play continuation (which keeps the walk armed
@@ -3120,6 +3132,10 @@ pub const App = struct {
         self.maybeRefreshEnrichment(loop, io, source, source_id, seed_rec);
         if (self.episodes.tryCacheHit(self.gpa, self.store, source, source_id, self.translation, status, seed_rec)) {
             self.async_start_ms = 0;
+            // ROD-352: a synchronous hit posts no episodes_done, so the landing
+            // raise fires here (covers plain cached opens AND a walk hop's
+            // cache-hit landing, which used to rely on completeFallback).
+            self.raiseLandingProgress(source, source_id);
             return;
         }
 
@@ -3612,26 +3628,9 @@ pub const App = struct {
     /// walks between two broken providers.
     fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         var walk = self.fallback orelse return;
-        // EVERY walk landing raises the landed binding's progress through the
-        // canonical union, not just a fresh mint: a tier-0 hop reuses an existing
-        // sibling row whose own progress can lag the union, which would under-dim
-        // the grid AND hand sync a stale (lower) number to push (the ROD-323
-        // shape). Raise-only, so landing on a force-completed sibling can't
-        // un-complete it. The mint path's raise in episodes_done ran pre-seed;
-        // this one patches the in-memory grid for the tier-0 shape.
-        if (self.store) |st| {
-            if (self.episodes.for_id) |fid| {
-                if (self.episodes.for_source) |fsrc| {
-                    var arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer arena.deinit();
-                    const hw = st.raiseProgressToUnion(arena.allocator(), fsrc, fid, self.translation) catch |e| blk: {
-                        log.debug("walk-landing raise failed: {s}", .{@errorName(e)});
-                        break :blk 0;
-                    };
-                    if (hw > 0) self.syncEpisodeProgress(fsrc, fid, hw);
-                }
-            }
-        }
+        // The landing already raised progress through the canonical union:
+        // raiseLandingProgress fires on every grid landing, async (episodes_done)
+        // and synchronous (cache hit) alike, so no raise belongs here (ROD-352).
         const cont = walk.play orelse {
             self.fallback = null;
             walk.deinit(self.gpa);
