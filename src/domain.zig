@@ -453,6 +453,12 @@ pub const StreamLink = struct {
     /// must relax that gate for such a stream. False for sources whose segments
     /// carry their true extension (AllAnime), keeping the default strict.
     cloaked_segments: bool = false,
+    /// Sidecar subtitle URL (WebVTT) to load alongside the stream, or null when
+    /// the video carries its subs itself (senshi hardsubs) or has none. megaplay
+    /// 'sub' streams are softsub (clean video + external vtts), so without this
+    /// the sub track never reaches mpv (ROD-354). Same untrusted-bytes contract
+    /// as `url`: the provider vets the bytes before they touch argv.
+    sub_url: ?[]const u8 = null,
 };
 
 test "episode numeric sort handles decimals and specials" {

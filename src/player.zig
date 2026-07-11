@@ -213,6 +213,14 @@ pub fn play(
         // literal, protocol-layer options only (guarded to http(s) urls), no untrusted data.
         try argv.append(arena, "--stream-lavf-o=multiple_requests=1,icy=0");
     }
+    if (link.sub_url) |s| {
+        // Softsub sidecar (megaplay 'sub' streams are clean video + external vtt,
+        // ROD-354). mpv fetches it over the same http stack as the video, so the
+        // global --user-agent / Referer args above cover the vtt host's gate too
+        // (spike-verified: lostproject.club 200s under the megaplay referer).
+        // Same untrusted-bytes contract as `url`: cleanArg-vetted upstream.
+        try argv.append(arena, try std.fmt.allocPrint(arena, "--sub-file={s}", .{s}));
+    }
     if (link.cloaked_segments) {
         // The stream's HLS segments use a disguised extension (senshi serves `.ts` as `.jpg`;
         // ROD-301). ffmpeg's HLS demuxer gates on a segment-extension allowlist a stock build

@@ -319,10 +319,10 @@ pub const AniPub = struct {
         };
 
         // The megaplay extractor (ROD-341) owns the two-step embed → getSources
-        // dance, including the sub/dub fork and the whole referer/UA gate.
+        // dance, including the sub/dub fork, the whole referer/UA gate, and the
+        // softsub pick (link.sub_url, ROD-354). Intro/outro skip stamps still
+        // ride `stream` unused, parked until a player seam exists (ROD-340).
         const stream = try megaplay.resolve(arena, io, realid, tt);
-        // Softsub tracks + intro/outro skip stamps ride `stream` too, parked
-        // until the player grows a seam for them (ROD-340).
         return stream.link;
     }
 
