@@ -4190,6 +4190,7 @@ test "deinitOwnedState releases app-owned runtime resources" {
     app.cover.for_id = try std.testing.allocator.dupe(u8, "anime1");
     app.cover.failed_for_id = try std.testing.allocator.dupe(u8, "anime1");
     app.cover.loading = true;
+    app.show_pin = try std.testing.allocator.dupe(u8, "senshi");
 
     var vx: vaxis.Vaxis = undefined;
     var writer: std.Io.Writer = undefined;
@@ -4203,6 +4204,7 @@ test "deinitOwnedState releases app-owned runtime resources" {
     try testing.expect(app.cover.for_id == null);
     try testing.expect(app.cover.failed_for_id == null);
     try testing.expect(!app.cover.loading);
+    try testing.expect(app.show_pin == null); // ROD-345: freed AND nulled
 }
 
 test "search mode: char appends and arms debounce, does not fire immediately" {
@@ -6848,6 +6850,51 @@ test "ROD-345: the pin leads the automatic fallback walk's order (effectivePrefe
     try testing.expect(gamma.hit.load(.acquire));
     try testing.expect(!beta.hit.load(.acquire));
     try testing.expectEqualStrings("gamma", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-345: v with a retired (unregistered) pin name wraps to unpinned, no re-route" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    const slots = [_]SourceProvider{alpha.provider()};
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // A pin persisted by a build that still registered this provider.
+    try st.setProviderPin(154587, "gone");
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .detail;
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+
+    // The unknown name matches no registry slot, so the cycle wraps to unpinned
+    // rather than indexing past the roster; the open grid stands untouched.
+    try testing.expect((try st.getProviderPin(arena, 154587)) == null);
+    try testing.expect(app.show_pin == null);
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expectEqualStrings("a1", app.episodes.for_id.?);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }

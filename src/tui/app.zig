@@ -4178,7 +4178,13 @@ pub const App = struct {
         const fid = self.episodes.for_id orelse return true;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        const rec = (st.getAnime(arena.allocator(), src, fid) catch null) orelse return true;
+        const rec = (st.getAnime(arena.allocator(), src, fid) catch null) orelse {
+            // A tier-A probe's row mints only on episodes_done; a flip inside
+            // that window has no persisted identity yet. Say so rather than
+            // eating the key.
+            self.pushToast(.info, "still resolving, try again shortly", false);
+            return true;
+        };
         const aid = rec.anilist_id orelse {
             self.pushToast(.info, "no canonical identity: can't pin a provider", false);
             return true;
