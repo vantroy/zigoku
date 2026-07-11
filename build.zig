@@ -239,12 +239,12 @@ pub fn build(b: *std.Build) void {
     const spike_retry_step = b.step("spike-retry", "ROD-310: fake-mpv repro of the retry-path panic");
     spike_retry_step.dependOn(&run_spike_retry.step);
 
-    // spike-megaplay: drive the real megaplay extractor against the live host
-    // (ROD-341); the only live-path check while the module is inert in-app.
+    // spike-megaplay: drive the real MegaPlay provider vtable against the live
+    // host (ROD-359): MAL-route existence probe → resolve, minus mpv.
     const spike_megaplay = b.addExecutable(.{
         .name = "spike-megaplay",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/spikes/megaplay_stream.zig"),
+            .root_source_file = b.path("src/spikes/megaplay_provider.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -253,25 +253,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_spike_megaplay = b.addRunArtifact(spike_megaplay);
     if (b.args) |args| run_spike_megaplay.addArgs(args);
-    const spike_megaplay_step = b.step("spike-megaplay", "ROD-341: live megaplay extractor check");
+    const spike_megaplay_step = b.step("spike-megaplay", "ROD-359: live megaplay provider check");
     spike_megaplay_step.dependOn(&run_spike_megaplay.step);
-
-    // spike-anipub: drive the real AniPub provider vtable against the live host
-    // (ROD-342): search + MALID backfill → episodes → resolve, minus mpv.
-    const spike_anipub = b.addExecutable(.{
-        .name = "spike-anipub",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/spikes/anipub_provider.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-            .imports = &.{.{ .name = "zigoku", .module = mod }},
-        }),
-    });
-    const run_spike_anipub = b.addRunArtifact(spike_anipub);
-    if (b.args) |args| run_spike_anipub.addArgs(args);
-    const spike_anipub_step = b.step("spike-anipub", "ROD-342: live anipub provider check");
-    spike_anipub_step.dependOn(&run_spike_anipub.step);
 
     // spike-tui: prove libvaxis boots under Zig 0.16 (ROD-71). Renders a
     // Terminal Ghost frame + event loop in a real terminal.

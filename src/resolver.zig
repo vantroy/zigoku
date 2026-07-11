@@ -31,8 +31,9 @@ const best_floor: i32 = 1200;
 const match_margin: i32 = 250;
 
 /// Tier-B exact-id match (ROD-342): the first candidate whose embedded canonical id
-/// (anilist_id or mal_id, backfilled by a tier-B provider's catalog search, e.g. anipub's
-/// /api/info MALID) agrees with the canonical's, and whose other metadata does not
+/// (anilist_id or mal_id, backfilled by a tier-B provider's catalog search; the
+/// retired anipub's /api/info MALID was the first, kept for future tier-B
+/// catalogs) agrees with the canonical's, and whose other metadata does not
 /// contradict it. It is tried BEFORE `bestProviderMatch` and needs no title
 /// floor/margin (the whole point: a romaji canonical vs an English catalog title
 /// fails every fuzzy floor while the id still binds). But the id rides
@@ -209,8 +210,8 @@ fn absDiff(a: u32, b: u32) u32 {
 // ── tests ──────────────────────────────────────────────────────────────────────
 
 test "bestIdMatch binds on mal_id agreement regardless of title (ROD-342)" {
-    // The tier-B point: an id match needs no title agreement at all; anipub's
-    // English Name vs the canonical romaji would fail every fuzzy floor.
+    // The tier-B point: an id match needs no title agreement at all; an
+    // English-titled catalog vs the canonical romaji fails every fuzzy floor.
     const canonical: Anime = .{ .id = "154587", .name = "Sousou no Frieren", .anilist_id = 154587, .mal_id = 52991 };
     const candidates = [_]Anime{
         .{ .id = "1443", .name = "Frieren: Beyond Journey's End Season 2", .mal_id = 58305 },
@@ -264,13 +265,13 @@ test "bestIdMatch prefers a corroborated survivor over an earlier bare one (spar
     try std.testing.expectEqualStrings("real", candidates[idx].id);
 
     // A sparse survivor alone still binds: absence of corroboration is not a veto
-    // (anipub's info backfill legitimately fails per candidate).
+    // (the retired anipub's info backfill legitimately failed per candidate; kept for future tier-B catalogs).
     const sparse_only = [_]Anime{.{ .id = "sparse-decoy", .name = "Totally Different Show", .mal_id = 5114 }};
     try std.testing.expect(bestIdMatch(canonical, &sparse_only) != null);
 }
 
 test "bestIdMatch veto: bare metadata never contradicts; releasing spares the eps gap" {
-    // A candidate with ONLY the id (anipub info fetch failed for eps/year) still binds.
+    // A candidate with ONLY the id (a failed per-candidate info fetch) still binds.
     const canonical: Anime = .{ .id = "1", .name = "X", .mal_id = 52991, .total_episodes = 28, .year = 2023, .status = "FINISHED" };
     const bare = [_]Anime{.{ .id = "2454", .name = "Y", .mal_id = 52991 }};
     try std.testing.expect(bestIdMatch(canonical, &bare) != null);

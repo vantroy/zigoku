@@ -340,7 +340,7 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
     // stocked" (the ROD-346 banking) and earns an absence row; a transport error
     // proves nothing and must not (ROD-278).
     const Probe = enum { hit, absent, unknown };
-    const probe: Probe = if (provider.episodes(arena.allocator(), io, candidate_id, translation)) |eps|
+    const probe: Probe = if (provider.episodes(arena.allocator(), io, candidate_id, translation, null)) |eps|
         (if (eps.len > 0) Probe.hit else Probe.absent)
     else |e| blk: {
         log.debug("resolve-add probe failed: {s}", .{@errorName(e)});
@@ -373,10 +373,11 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// a walk already underway.
 /// Per provider: search its OWN catalog and match: tier B first
 /// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
-/// in its results, e.g. anipub's MALID backfill), then tier C
+/// in its results; the retired anipub's MALID backfill shape, kept for future
+/// tier-B providers), then tier C
 /// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
 /// query passes: the canonical (romaji) title, then the English title, since an
-/// English-titled catalog (anipub) misses a romaji query entirely, and a confident
+/// English-titled catalog misses a romaji query entirely, and a confident
 /// match on the first pass skips the second. A confident match yields the provider's
 /// opaque id; no match or a failed search both collapse to `ok = false` (the add path
 /// then persists the unbound marker, ROD-329; Play just toasts), and each provider's
@@ -483,7 +484,7 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         // through to the next pass (bounded at 2): a dead listing on one title must not
         // also deny the other title's legitimate match.
         if (!for_play) {
-            const eps = provider.episodes(arena, io, matched_id, translation) catch |e| {
+            const eps = provider.episodes(arena, io, matched_id, translation, null) catch |e| {
                 log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
                 transport_failed = true;
                 continue;
@@ -533,7 +534,7 @@ pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const S
             if (p.canonicalKey(arena.allocator(), canonical) catch null) |key| {
                 // Tier A: the probe is the existence check, same bar as Add's
                 // (a 200-empty is an authoritative "not stocked", ROD-346).
-                const eps = p.episodes(arena.allocator(), io, key, translation) catch |e| {
+                const eps = p.episodes(arena.allocator(), io, key, translation, null) catch |e| {
                     log.debug("prewarm probe failed on {s}: {s}", .{ p.name(), @errorName(e) });
                     break :blk .unknown;
                 };
@@ -1008,12 +1009,12 @@ pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
 /// it; freed here only if the event can't be posted. `drain.finish()` runs last
 /// (after the final postEvent), so once the barrier drains this worker can no
 /// longer touch loop/gpa (ROD-179).
-pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation, drain: *ThreadDrain) void {
+pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation, count_hint: ?u32, drain: *ThreadDrain) void {
     defer drain.finish();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const raw = provider.episodes(arena.allocator(), io, id, translation) catch |e| {
+    const raw = provider.episodes(arena.allocator(), io, id, translation, count_hint) catch |e| {
         log.debug("episodes fetch failed: {s}", .{@errorName(e)});
         // Hand `id` to the event so the UI can keep-check a superseded failure
         // (ROD-179); the handler frees it. Free here only if the post fails.
@@ -1775,7 +1776,7 @@ const StubCatalog = struct {
     fn stubCanonicalKey(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
         return null;
     }
-    fn stubEpisodes(ptr: *anyopaque, arena: Allocator, _: std.Io, show_id: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn stubEpisodes(ptr: *anyopaque, arena: Allocator, _: std.Io, show_id: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
         if (self.episodes_fail) return error.NoAnswer;
         if (!std.mem.eql(u8, show_id, self.alive_id)) return arena.alloc(domain.EpisodeNumber, 0);
@@ -1794,7 +1795,7 @@ const StubCatalog = struct {
 test "resolveViaSearch: English retry pass binds when the romaji pass misses (ROD-342)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // The anipub shape: an English-only-searchable catalog embedding mal ids.
+    // An English-only-searchable catalog embedding mal ids (the retired anipub's shape).
     const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 154587, .mal_id = 52991 };
     var stub = StubCatalog{
         .english = &.{.{ .id = "2454", .name = "English Title", .mal_id = 52991 }},

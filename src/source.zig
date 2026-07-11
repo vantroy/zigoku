@@ -73,7 +73,14 @@ pub const SourceProvider = struct {
         /// owned by `arena`.
         canonicalKey: *const fn (ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8,
         /// List a show's episode numbers in the given track, numerically sorted.
-        episodes: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber,
+        /// An EMPTY list is authoritative "not stocked" (probe callers cache it,
+        /// ROD-347); a provider that can't answer must error instead.
+        /// `count_hint` is the canonical's expected episode count
+        /// (`domain.expectedEpisodeCount`, ROD-359), for a provider whose catalog
+        /// has no listing endpoint (megaplay: per-episode MAL-keyed routes only)
+        /// to mint positional labels from; providers with real listings ignore
+        /// it, and probe callers that only need existence pass null.
+        episodes: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber,
         /// Resolve a playable stream for one episode at the requested quality.
         /// `quality` is the user's preference (ROD-152); a source with no variants
         /// is free to ignore it.
@@ -98,8 +105,8 @@ pub const SourceProvider = struct {
     pub fn canonicalKey(self: SourceProvider, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
         return self.vtable.canonicalKey(self.ptr, arena, canonical);
     }
-    pub fn episodes(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) anyerror![]domain.EpisodeNumber {
-        return self.vtable.episodes(self.ptr, arena, io, show_id, tt);
+    pub fn episodes(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber {
+        return self.vtable.episodes(self.ptr, arena, io, show_id, tt, count_hint);
     }
     pub fn resolve(self: SourceProvider, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
         return self.vtable.resolve(self.ptr, arena, io, show_id, episode, tt, quality);
@@ -236,7 +243,7 @@ const TestProvider = struct {
     fn canonicalKeyFn(_: *anyopaque, _: Allocator, _: domain.Anime) anyerror!?[]const u8 {
         return null;
     }
-    fn episodesFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
+    fn episodesFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
         return error.Unsupported;
     }
     fn resolveFn(_: *anyopaque, _: Allocator, _: Io, _: []const u8, _: domain.EpisodeNumber, _: domain.Translation, _: domain.Quality) anyerror!domain.StreamLink {

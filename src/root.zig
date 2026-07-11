@@ -48,7 +48,7 @@ pub const Registry = source.Registry;
 pub const SearchOptions = source.SearchOptions;
 pub const AllAnime = @import("providers/allanime.zig").AllAnime;
 pub const Senshi = @import("providers/senshi.zig").Senshi;
-pub const AniPub = @import("providers/anipub.zig").AniPub;
+pub const MegaPlay = @import("providers/megaplay.zig").MegaPlay;
 
 // Re-export the domain vocabulary at the top level for ergonomic call sites.
 pub const Anime = domain.Anime;
@@ -105,7 +105,7 @@ test {
     _ = anilist;
     _ = resolver;
     _ = jikan;
-    _ = megaplay; // ROD-341: run the megaplay extractor tests
+    _ = megaplay; // ROD-341/359: run the megaplay provider tests
     _ = aniskip;
     _ = config;
     _ = auth;
@@ -126,6 +126,5 @@ test {
 
     _ = @import("providers/allanime.zig");
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests
-    _ = @import("providers/anipub.zig"); // ROD-342: run the anipub provider tests
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
 }
