@@ -289,6 +289,7 @@ pub fn run(
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view workers
     defer app.add_resolve_drain.drain(); // ROD-327 tier-A add-resolve workers
     defer app.play_resolve_drain.drain(); // ROD-328 tier-C Play resolve workers
+    defer app.prewarm_drain.drain(); // ROD-351 eager pre-warm walk
     // Cover worker must be joined on both the normal shutdown path and any
     // error unwind path before `loop`, `gpa`, or the caches are torn down.
     defer app.cover.joinThread();
@@ -829,6 +830,22 @@ pub const App = struct {
     /// (`fireEpisodesForId` has no keep-check of its own). Set beside
     /// `play_resolving`; cleared by the handler and by any user-driven fire.
     play_resolve_aid: ?i64 = null,
+    /// ROD-351: drain barrier for the eager pre-warm walk. Detached + accounted
+    /// like `episode_drain`; posts `.prewarm_result` per provider + `.prewarm_done`.
+    prewarm_drain: workers.ThreadDrain = .{},
+    /// ROD-351: true while a pre-warm walk is in flight. ONE walk at a time,
+    /// app-wide (the walk itself is already sequential per ROD-309); cleared by
+    /// `.prewarm_done`. Distinct from `add_resolving`/`play_resolving`: a
+    /// background warm must never block a user-facing resolve, or vice versa.
+    prewarm_active: bool = false,
+    /// ROD-351: canonical ids a pre-warm already ran for this session. Stops an
+    /// `unknown`-heavy walk (network flake, nothing persisted) from re-firing on
+    /// every play of the same show. A fixed ring, not a map: allocation-free (an
+    /// `App{}` stays trivially constructible, nothing to free) and eviction is
+    /// harmless because the dedup is soft: a re-fire past the ring hits the
+    /// store-backed candidate filter and no-ops. 0 = empty slot (no AniList id).
+    prewarm_attempted: [32]i64 = @splat(0),
+    prewarm_attempted_next: usize = 0,
     /// Episode cache + detail-grid subsystem (ROD-180): the fetched episode list,
     /// the show it belongs to, the grid cursor + watched high-water mark, and the
     /// two-tier episode cache. Transport (episode_drain/async_start_ms) stays on
@@ -2032,6 +2049,7 @@ pub const App = struct {
                 // session (mirrors addToWatchlist).
                 self.history_dirty = true;
                 self.pushToast(.success, "added to watchlist", false);
+                self.firePrewarm(loop, io, registry, ev.anilist_id); // ROD-351: warm the siblings
             },
 
             .resolve_play_target => |ev| {
@@ -2086,6 +2104,26 @@ pub const App = struct {
                 }
                 self.pending_bind = ev.anilist_id;
             },
+
+            .prewarm_result => |ev| {
+                // ROD-351: one provider settled. Mint HIDDEN (a play reveals it;
+                // History must not grow rows the user never engaged) or cache the
+                // negative (ROD-347). Best-effort on every branch: the warm is an
+                // optimization, and the next resolve self-heals anything dropped.
+                defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+                const st = self.store orelse return;
+                if (ev.source_id.len > 0) {
+                    var arena = std.heap.ArenaAllocator.init(self.gpa);
+                    defer arena.deinit();
+                    _ = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, false, Store.nowSecs(), arena.allocator()) catch |e|
+                        log.debug("prewarm bind failed: {s}", .{@errorName(e)});
+                } else if (ev.absent) {
+                    st.markProviderAbsent(ev.anilist_id, ev.source, Store.nowSecs()) catch |e|
+                        log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
+                }
+            },
+
+            .prewarm_done => self.prewarm_active = false,
 
             .discover_feed => |ev| {
                 // Land the page into ITS OWN axis slot (by ev.axis), never the
@@ -3276,6 +3314,79 @@ pub const App = struct {
         }
     }
 
+    /// The providers a pre-warm walk should try for one canonical entity (ROD-351):
+    /// every registered provider with no existing binding (tier 0 already covers
+    /// those) and no fresh absence verdict (ROD-347). Registry construction order:
+    /// the warm tries everyone it can learn about, so preference (a resolution
+    /// concern) plays no part. Result borrows `arena`. pub for the app_test pins.
+    pub fn prewarmCandidates(st: *Store, registry: Registry, anilist_id: i64, arena: Allocator) ![]SourceProvider {
+        var out: std.ArrayListUnmanaged(SourceProvider) = .empty;
+        const now = Store.nowSecs();
+        for (registry.providers) |p| {
+            if ((st.bindingSourceId(arena, p.name(), anilist_id) catch null) != null) continue;
+            if (st.providerAbsentFresh(anilist_id, p.name(), now) catch false) continue;
+            try out.append(arena, p);
+        }
+        return out.toOwnedSlice(arena);
+    }
+
+    /// Fire the eager pre-warm walk (ROD-351) for a show the user just added or
+    /// started playing: mint sibling bindings in the background so a later
+    /// provider flip (auto fallback or the 'v' pin) is instant tier-0 routing
+    /// instead of a slow first-time resolve. Silent by design: no toast, no
+    /// spinner; the walk's only user-visible trace is faster flips later.
+    ///
+    /// Yields to the foreground: never fires while a fallback walk is armed or a
+    /// user-facing resolve is in flight (those flags clear quickly and the next
+    /// add/play re-triggers). Once per canonical per session (`prewarm_attempted`);
+    /// an empty candidate set marks nothing, so a show that gains a canonical id
+    /// or ages out an absence verdict later still gets its warm.
+    ///
+    /// Tested-debt, same shape as `fireSyncFlush`: the spawn is gated under
+    /// `builtin.is_test` (a detached thread posting into the loop mid-test is a
+    /// teardown race), so tests pin the candidate filter (`prewarmCandidates`),
+    /// the attempted-mark, and the event arms; the thread glue mirrors
+    /// `fireResolveAddSearch` and is exercised live.
+    fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64) void {
+        if (self.prewarm_active or self.add_resolving or self.play_resolving) return;
+        if (self.fallback != null) return; // mid-rescue is exactly the wrong time
+        const st = self.store orelse return;
+        for (self.prewarm_attempted) |a| if (a == anilist_id) return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const candidates = prewarmCandidates(st, registry, anilist_id, arena.allocator()) catch return;
+        if (candidates.len == 0) return;
+        const canon_rec = (st.getCanonicalByAnilistId(arena.allocator(), anilist_id) catch null) orelse return;
+        if (builtin.is_test) {
+            self.markPrewarmAttempted(anilist_id);
+            return;
+        }
+        const gpa = self.gpa;
+        const canonical = workers.dupeOwnedAnime(gpa, selection.animeFromHistoryRecord(canon_rec)) catch return;
+        const providers = gpa.dupe(SourceProvider, candidates) catch {
+            workers.freeOwnedAnime(gpa, canonical);
+            return;
+        };
+        self.prewarm_active = true;
+        self.prewarm_drain.begin();
+        const t = std.Thread.spawn(.{}, workers.prewarmTask, .{
+            loop, gpa, io, providers, canonical, anilist_id, self.translation, &self.prewarm_drain,
+        }) catch {
+            self.prewarm_drain.finish(); // no worker will run, rebalance the count
+            self.prewarm_active = false;
+            gpa.free(providers);
+            workers.freeOwnedAnime(gpa, canonical);
+            return;
+        };
+        t.detach();
+        self.markPrewarmAttempted(anilist_id); // only a walk that actually ran counts
+    }
+
+    fn markPrewarmAttempted(self: *App, anilist_id: i64) void {
+        self.prewarm_attempted[self.prewarm_attempted_next] = anilist_id;
+        self.prewarm_attempted_next = (self.prewarm_attempted_next + 1) % self.prewarm_attempted.len;
+    }
+
     /// pub for the app_test teardowns (a test that arms a walk must free it).
     pub fn clearFallback(self: *App) void {
         if (self.fallback) |*w| w.deinit(self.gpa);
@@ -3709,6 +3820,16 @@ pub const App = struct {
         };
         self.playing = true;
         self.async_start_ms = self.now_ms;
+
+        // ROD-351: while mpv runs, warm the sibling providers in the background so
+        // a flip away from a mid-episode failure (or a 'v' pin) routes tier-0.
+        if (self.store) |st| {
+            var warm_arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer warm_arena.deinit();
+            if (st.getAnime(warm_arena.allocator(), source_name, selected_id) catch null) |rec| {
+                if (rec.anilist_id) |aid| self.firePrewarm(loop, io, registry, aid);
+            }
+        }
     }
 
     fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) void {
@@ -4340,7 +4461,7 @@ pub const App = struct {
             // No resolve happened (already provider-keyed): the default provider owns it.
             .direct => self.addToWatchlist(registry.primary(), anime),
             // Tier 0: the binding already exists, so reveal it in place (no probe/search).
-            .bound => |b| self.revealBoundFromBrowse(b.provider, b.id, b.anilist_id),
+            .bound => |b| self.revealBoundFromBrowse(loop, io, registry, b.provider, b.id, b.anilist_id),
             .tier_a => |t| self.fireResolveAdd(loop, io, t.provider, t.id, t.anilist_id),
             .needs_search => |aid| self.fireResolveAddSearch(loop, io, registry, anime, aid),
         }
@@ -4349,7 +4470,7 @@ pub const App = struct {
     /// Reveal an already-bound tier-0 hit synchronously (ROD-328): the binding exists from a
     /// prior resolve, so Add just flips it visible via `bindCanonical` (idempotent, MAX-merges
     /// `history_visible`), no probe or search. Mirrors the `.resolve_add_result` success arm.
-    fn revealBoundFromBrowse(self: *App, provider: SourceProvider, id: []const u8, anilist_id: i64) void {
+    fn revealBoundFromBrowse(self: *App, loop: *Loop, io: std.Io, registry: Registry, provider: SourceProvider, id: []const u8, anilist_id: i64) void {
         const st = self.store orelse return;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
@@ -4364,6 +4485,7 @@ pub const App = struct {
         }
         self.history_dirty = true;
         self.pushToast(.success, "added to watchlist", false);
+        self.firePrewarm(loop, io, registry, anilist_id); // ROD-351: warm the siblings
     }
 
     /// Fire the tier-C Add resolve worker (ROD-328): title-search the providers (effective order, ROD-344) for a

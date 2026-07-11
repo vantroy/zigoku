@@ -119,6 +119,21 @@ pub const Event = union(enum) {
         /// absence is a fact about the catalog, not about which show is on screen.
         absent_sources: []const []const u8 = &.{},
     },
+    /// One provider settled by the eager pre-warm walk (ROD-351). Non-empty
+    /// `source_id` (gpa-owned, freed by the UI thread): the provider stocks the
+    /// show, mint the binding HIDDEN (a play reveals it; History must not grow
+    /// rows the user never engaged). Empty + `absent`: cache the negative
+    /// (ROD-347). Empty + !absent never posts (unknown verdicts stay silent).
+    /// `source` is a static vtable `name()` string, never freed.
+    prewarm_result: struct {
+        anilist_id: i64,
+        source: []const u8,
+        source_id: []const u8,
+        absent: bool,
+    },
+    /// The pre-warm walk finished (every provider settled or skipped): clears the
+    /// single-flight guard so the next add/play may warm another show.
+    prewarm_done,
     /// One Discover feed page from a background thread (ROD-336): AniList rows for
     /// `axis`, fully enriched (full GQL_FIELDS; no follow-up enrich pass exists).
     /// `results` is gpa-allocated (each Anime's strings owned); App takes ownership

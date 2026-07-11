@@ -498,6 +498,59 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
     return .absent;
 }
 
+/// Polite spacing between a pre-warm's per-provider passes (ROD-351): the walk is
+/// pure background, so unlike the user-blocking resolve walk it can afford to not
+/// even LOOK like a burst to a rate-scoring CDN (ROD-309).
+const prewarm_gap_ms: u64 = 1500;
+
+/// Background task: eager sibling pre-warm (ROD-351). For one canonical entity,
+/// walk `providers` (already filtered by the UI thread: no binding, no fresh
+/// absence) and try to establish where else the show is stocked: tier-A
+/// `canonicalKey` + episode probe where the provider id-keys its catalog, the
+/// tier-C two-pass search otherwise. One `.prewarm_result` per settled provider
+/// (the UI thread mints hidden bindings / caches negatives incrementally, so a
+/// quit mid-walk loses only the tail); `.unknown` verdicts post nothing. Strictly
+/// sequential with a gap between providers (ROD-309), and `.prewarm_done` always
+/// closes the walk (clears the single-flight guard).
+///
+/// `providers` and `canonical` are gpa-owned by this task and freed here. A
+/// matched id is duped into gpa and transferred to the event (UI thread frees).
+pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, drain: *ThreadDrain) void {
+    defer drain.finish();
+    defer gpa.free(providers);
+    defer freeOwnedAnime(gpa, canonical);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    for (providers, 0..) |p, i| {
+        if (i > 0) nanosleepMs(prewarm_gap_ms);
+        const verdict: SearchVerdict = blk: {
+            if (p.canonicalKey(arena.allocator(), canonical) catch null) |key| {
+                // Tier A: the probe is the existence check, same bar as Add's
+                // (a 200-empty is an authoritative "not stocked", ROD-346).
+                const eps = p.episodes(arena.allocator(), io, key, translation) catch |e| {
+                    log.debug("prewarm probe failed on {s}: {s}", .{ p.name(), @errorName(e) });
+                    break :blk .unknown;
+                };
+                break :blk if (eps.len > 0) .{ .match = key } else .absent;
+            }
+            break :blk resolveViaSearch(arena.allocator(), io, p, canonical, translation, false);
+        };
+        switch (verdict) {
+            .match => |id| {
+                const owned = gpa.dupe(u8, id) catch continue;
+                loop.postEvent(.{ .prewarm_result = .{ .anilist_id = anilist_id, .source = p.name(), .source_id = owned, .absent = false } }) catch |pe| {
+                    log.debug("postEvent failed: {s}", .{@errorName(pe)});
+                    gpa.free(owned);
+                };
+            },
+            .absent => loop.postEvent(.{ .prewarm_result = .{ .anilist_id = anilist_id, .source = p.name(), .source_id = &.{}, .absent = true } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)}),
+            .unknown => {},
+        }
+    }
+    loop.postEvent(.prewarm_done) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+}
+
 /// Background task: fetch one Discover feed page for `axis` from AniList (ROD-336).
 /// Off the vtable like `searchTask` (ROD-324): rows are anilist_id-keyed canonical
 /// entities, fully enriched (full GQL_FIELDS), so no follow-up enrich pass exists.
