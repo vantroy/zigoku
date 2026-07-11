@@ -108,30 +108,44 @@ pub const EpisodeState = struct {
         episodes: []domain.EpisodeNumber,
     ) void {
         const progress: usize = if (rec.progress > 0) @intCast(rec.progress) else 0;
-        // Dim already-watched cells on open, consistent with the post-playback
-        // treatment (ROD-131). Browse-origin detail does not seed progress today
-        // — same scope line as the resume-cursor seed below.
         self.progress = std.math.cast(u32, progress) orelse 0;
         self.resume_idx = null;
-        if (progress == 0) return;
+        if (resumeSeed(store, translation, rec.source, rec.source_id, progress, episodes)) |idx| {
+            self.cursor = idx;
+            self.resume_idx = idx;
+        }
+    }
+
+    /// Where the resume cursor belongs for a given watched high-water: the
+    /// high-water episode itself when it holds a mid-episode checkpoint, else the
+    /// next unwatched cell; null when nothing is in progress (unstarted, or caught
+    /// up with no checkpoint). ROD-355: EVERY cursor re-seed must route through
+    /// this, not just the open-time seed. A progress writer that plants
+    /// `cursor = progress` directly skips the checkpoint branch and walks the
+    /// cursor past the in-progress episode (the provider-flip landing did exactly
+    /// that via syncEpisodeProgress). getResume unions across sibling bindings, so
+    /// the checkpoint is visible from whichever provider the grid landed on.
+    pub fn resumeSeed(
+        store: ?*Store,
+        translation: domain.Translation,
+        source: []const u8,
+        source_id: []const u8,
+        progress: usize,
+        episodes: []const domain.EpisodeNumber,
+    ) ?usize {
+        if (progress == 0) return null;
 
         const current_idx = progress - 1;
         if (current_idx < episodes.len) {
             if (store) |st| {
-                if (st.getResume(rec.source, rec.source_id, translation, episodes[current_idx].raw) catch null) |saved_resume| {
-                    if (saved_resume.startSeconds() > 0) {
-                        self.cursor = current_idx;
-                        self.resume_idx = current_idx;
-                        return;
-                    }
+                if (st.getResume(source, source_id, translation, episodes[current_idx].raw) catch null) |saved_resume| {
+                    if (saved_resume.startSeconds() > 0) return current_idx;
                 }
             }
         }
 
-        if (progress < episodes.len) {
-            self.cursor = progress;
-            self.resume_idx = progress;
-        }
+        if (progress < episodes.len) return progress;
+        return null;
     }
 
     /// Install a cache-sourced episode list as the live detail state (ROD-130): no thread,

@@ -7222,6 +7222,72 @@ test "ROD-345: v cycles unpinned -> alpha -> beta (tier-0 re-route) -> unpinned"
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-355: a v flip landing keeps the cursor on the in-progress episode" {
+    // The divergence: progress can lead the union high-water (natural-end 0.80
+    // bumps progress; fully_watched needs 0.95; the AniList pull max-merges), so
+    // the high-water episode itself can hold a mid checkpoint. The open-time seed
+    // (seedHistoryCursor) favors that episode; the flip landing's raise-then-sync
+    // used to plant cursor = progress, walking one past it. Both writers must
+    // agree via resumeSeed.
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+    try st.setProviderPin(154587, "alpha"); // one v earlier in the cycle
+
+    // Watch state on alpha: eps 1-2 watched through, ep 3 quit mid-episode.
+    // Beta's row says progress 3 (an AniList pull ran ahead of the union).
+    try st.saveProgress("alpha", "a1", .sub, "1", 96, 100, 6000);
+    try st.saveProgress("alpha", "a1", .sub, "2", 96, 100, 6001);
+    try st.saveProgress("alpha", "a1", .sub, "3", 40, 100, 6002);
+    try st.recordPlay("beta", "b7", 3, 6003, true);
+
+    // Pre-warm beta's episode cache so the flip lands synchronously (tier-0 hit
+    // -> applyCached -> completeFallback in one tick), the same pipeline a live
+    // flip runs, minus the worker thread.
+    var eps_buf: [6]domain.EpisodeNumber = undefined;
+    for (&eps_buf, 0..) |*ep, i| ep.* = .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{i + 1}) };
+    try st.putCachedEpisodes("beta", "b7", .sub, &eps_buf, "FINISHED", store_mod.Store.nowSecs(), arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .detail;
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    try testing.expectEqual(@as(u32, 3), app.episodes.progress);
+    // Ep 3 (idx 2) is mid-watch: the landing parks ON it, not one past it.
+    try testing.expectEqual(@as(usize, 2), app.episodes.cursor);
+    try testing.expectEqual(@as(?usize, 2), app.episodes.resume_idx);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
 test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint arm): the bound-but-empty rescue" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta", .tier_a = true };

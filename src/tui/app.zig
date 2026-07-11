@@ -1258,15 +1258,14 @@ pub const App = struct {
         if (!std.mem.eql(u8, bound_source, source)) return;
         const clamped: u32 = if (new_progress > 0) std.math.cast(u32, new_progress) orelse std.math.maxInt(u32) else 0;
         self.episodes.progress = clamped;
-        // Re-seed the cursor + resume marker exactly as seedHistoryCursor does:
-        // progress 0 means nothing watched, so DON'T plant a resume glyph — the old
-        // `0 < eps.len` branch wrongly marked episode 0 as resumable (ROD-193
-        // review). Only move when results are loaded; else the next open re-seeds.
+        // Re-seed through the shared resumeSeed so a mid-episode checkpoint keeps
+        // the cursor ON the in-progress episode (ROD-355: the flip landing's raise
+        // used to plant cursor = progress here, walking past it). Only move when
+        // results are loaded; else the next open re-seeds.
         if (self.episodes.results) |eps| {
-            const progress: usize = @intCast(clamped);
-            if (progress > 0 and progress < eps.len) {
-                self.episodes.cursor = progress;
-                self.episodes.resume_idx = progress;
+            if (EpisodeState.resumeSeed(self.store, self.translation, source, source_id, @intCast(clamped), eps)) |idx| {
+                self.episodes.cursor = idx;
+                self.episodes.resume_idx = idx;
             } else {
                 // Nothing watched (0) or fully caught up: park cursor, no resume.
                 self.episodes.cursor = 0;
