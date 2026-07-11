@@ -2487,7 +2487,7 @@ test "detail meta fields degrade episodes to a dim '?' for an unenriched show (R
     app.search.results.deinit(std.testing.allocator);
 }
 
-test "Provider/Pinned splice after the identity run, ahead of Duration/Studios/Rank (ROD-348/356)" {
+test "Provider/Pinned append at the tail, rail-only, full base intact (ROD-348/356)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
@@ -2514,31 +2514,15 @@ test "Provider/Pinned splice after the identity run, ahead of Duration/Studios/R
         .rank_year = 2016,
     });
 
-    // Full order with everything present: the splice sits between the identity
-    // run and the enrichment tail (one order = compact clip priority AND rail
-    // shed priority, so Duration/Studios clip before Provider/Pinned).
+    // The §5.3a base order is untouched; Provider then Pinned trail it,
+    // rail-only (the compact form carries them on the dedicated provider row
+    // instead, never as meta-line segments: Rod's call, DESIGN.md §8).
     const fields = app.detailMetaFields();
-    const want = [_][]const u8{ "Episodes", "Format", "Source", "Provider", "Pinned", "Duration", "Studios", "Rank" };
+    const want = [_][]const u8{ "Episodes", "Format", "Source", "Duration", "Studios", "Rank", "Provider", "Pinned" };
     try testing.expectEqual(want.len, fields.len);
     for (want, fields) |label, f| try testing.expectEqualStrings(label, f.label);
-    // Rank is the sole remaining rail-only field.
-    for (fields[0..7]) |f| try testing.expect(!f.rail_only);
-    try testing.expect(fields[7].rail_only);
-
-    // The count-scan lead, not a fixed index: with Format and Source absent the
-    // splice lands right after Episodes, never mid-tail.
-    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.search.results.clearRetainingCapacity();
-    app.search.results.appendAssumeCapacity(.{
-        .id = try std.testing.allocator.dupe(u8, "y"),
-        .name = try std.testing.allocator.dupe(u8, "Y"),
-        .eps_sub = 12,
-        .duration = 24,
-    });
-    const sparse = app.detailMetaFields();
-    const want_sparse = [_][]const u8{ "Episodes", "Provider", "Pinned", "Duration" };
-    try testing.expectEqual(want_sparse.len, sparse.len);
-    for (want_sparse, sparse) |label, f| try testing.expectEqualStrings(label, f.label);
+    for (fields[0..5]) |f| try testing.expect(!f.rail_only);
+    for (fields[5..8]) |f| try testing.expect(f.rail_only);
 
     for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.search.results.deinit(std.testing.allocator);
@@ -2562,7 +2546,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
         try testing.expectEqualStrings("Provider", fields[1].label);
         try testing.expectEqualStrings("?senshi ?anipub", fields[1].value);
         try testing.expect(fields[1].dim);
-        try testing.expect(!fields[1].rail_only); // compact line carries it too
+        try testing.expect(fields[1].rail_only); // meta line never carries it; the provider row does
     }
 
     // Bound + fresh negative: real information, full-strength, registry order.
@@ -2584,8 +2568,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
     app.episodes.for_source = "allanime";
     try testing.expectEqualStrings("+senshi +anipub", app.detailMetaFields()[1].value);
 
-    // Pinned follows Provider, with the compact line's disambiguating prefix
-    // (a bare provider name would read like a studio there).
+    // Pinned still appends, after Provider (shed order: Pinned drops first).
     app.show_pin = try std.testing.allocator.dupe(u8, "anipub");
     defer if (app.show_pin) |p| std.testing.allocator.free(p);
     {
@@ -2593,8 +2576,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
         try testing.expectEqual(@as(usize, 3), fields.len);
         try testing.expectEqualStrings("Provider", fields[1].label);
         try testing.expectEqualStrings("Pinned", fields[2].label);
-        try testing.expectEqualStrings("pin ", fields[2].prefix);
-        try testing.expect(!fields[2].rail_only);
+        try testing.expect(fields[2].rail_only);
     }
 
     // The explicit-record form (History preview) never carries either field.

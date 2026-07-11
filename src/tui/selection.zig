@@ -328,11 +328,6 @@ pub const MetaField = struct {
     /// already implies the unit — empty for everything else. Lets `Episodes 13`
     /// (rail) and `13 eps` (line) share one `value` without a second string.
     unit: []const u8 = "",
-    /// Compact-line-only value prefix, the mirror of `unit` ("pin " for
-    /// Pinned): anchors a value that reads ambiguous on the label-less line
-    /// (a bare provider name next to a studio name). The rail ignores it, its
-    /// label already anchors the value.
-    prefix: []const u8 = "",
     /// Render `value` in `fg3` (dim) rather than `fg2` — the "? eps" count
     /// degrade only; present enrichment is always `fg2`.
     dim: bool = false,
@@ -352,37 +347,23 @@ pub const MetaField = struct {
 /// degrading to a dim "?" so neither form renders empty.
 pub fn detailMetaFields(self: *App) []const MetaField {
     const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
-    // Provider then Pinned (ROD-348/345) splice in after the identity run
-    // (Episodes/Format/Source), ahead of Duration/Studios/Rank: one order is
-    // BOTH the compact line's clip priority and the rail's shed priority, and
-    // routing truth + active intent outrank decorative enrichment under space
-    // pressure (§5.3a). The lead is a count-scan, not a fixed index: Format
-    // and Source can each be absent. Nav-state form only: the History preview
-    // renders the CURSOR row's record, whose pin/availability isn't the
-    // cached one, so it must not inherit either field.
-    var extras: [2]MetaField = undefined;
-    var k: usize = 0;
+    var n = base.len;
+    // Provider then Pinned (ROD-348/345): session/user state, not enrichment,
+    // so both trail the sextet and shed first, Pinned before Provider (real DB
+    // state outranks a manual override, §5.3a). rail_only keeps them off the
+    // meta LINE; the compact form surfaces them on a dedicated row instead
+    // (drawProviderLine). Nav-state form only: the History preview renders
+    // the CURSOR row's record, whose pin/availability isn't the cached one,
+    // so it must not inherit either field.
     if (providerField(self)) |f| {
-        extras[k] = f;
-        k += 1;
+        self.detail_meta_fields[n] = f;
+        n += 1;
     }
     if (self.show_pin) |pin| {
-        extras[k] = .{ .label = "Pinned", .value = pin, .prefix = "pin " };
-        k += 1;
+        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
+        n += 1;
     }
-    if (k == 0) return base;
-    var lead: usize = 0;
-    for (base) |f| {
-        const identity = std.mem.eql(u8, f.label, "Episodes") or
-            std.mem.eql(u8, f.label, "Format") or std.mem.eql(u8, f.label, "Source");
-        if (!identity) break;
-        lead += 1;
-    }
-    // base aliases detail_meta_fields, so shift its tail right in place.
-    const total = base.len + k;
-    std.mem.copyBackwards(MetaField, self.detail_meta_fields[lead + k .. total], base[lead..]);
-    for (extras[0..k], 0..) |f, i| self.detail_meta_fields[lead + i] = f;
-    return self.detail_meta_fields[0..total];
+    return self.detail_meta_fields[0..n];
 }
 
 /// The Provider field value (ROD-348/356), shared by both render forms: one
@@ -412,7 +393,7 @@ fn providerField(self: *App) ?MetaField {
         const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, name }) catch return null;
         w += written.len;
     }
-    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative };
+    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
 }
 
 /// Same ordered field list, but for an explicitly-supplied anime rather than the
