@@ -712,6 +712,11 @@ pub const App = struct {
     /// it back once the hop is in flight.
     fallback: ?Fallback = null,
 
+    /// ROD-345: the open show's provider pin (gpa-owned copy), cached at grid-open
+    /// and flip time so the render path never reads the DB. Null = unpinned (or no
+    /// canonical identity). Refreshed via `refreshShowPin`.
+    show_pin: ?[]u8 = null,
+
     history_filter: [128]u8 = undefined,
     history_filter_len: usize = 0,
 
@@ -911,7 +916,7 @@ pub const App = struct {
     /// Airing-countdown chip value (ROD-261), "Ep14 · 3d" — its own frame-lived
     /// buffer alongside the season chip's `detail_season_buf`.
     detail_airing_buf: [24]u8 = undefined,
-    detail_meta_fields: [6]MetaField = undefined,
+    detail_meta_fields: [7]MetaField = undefined,
     /// Stable storage for the "冬 2026" season chip (ROD-141). Must outlive the
     /// frame: vaxis cells hold a slice into this buffer, not a copy, so a stack
     /// local would dangle by `render()` and emit garbage.
@@ -1152,6 +1157,10 @@ pub const App = struct {
     /// still reference.
     pub fn deinitOwnedState(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
         self.clearFallback();
+        if (self.show_pin) |p| {
+            self.gpa.free(p);
+            self.show_pin = null;
+        }
         self.search.deinit(self.gpa);
         self.discover.deinit(self.gpa);
         self.episodes.freeResults(self.gpa);
@@ -2907,14 +2916,41 @@ pub const App = struct {
     }
 
     /// The provider preference in force for NEW canonical resolution (ROD-344):
-    /// tier walk order and the tier-C worker's snapshot. Today the global
-    /// setting alone; the per-show override (ROD-345) layers in HERE (show
-    /// orelse global), never at the walk sites. Deliberately NOT consulted by
-    /// the unknown-owner fallbacks (`owningProvider`, the play spawn, `.direct`
-    /// adds): those ids historically belong to `primary()`, and re-routing them
-    /// by preference would persist them under the wrong provider.
-    fn effectivePreference(self: *const App) []const u8 {
+    /// tier walk order and the tier-C worker's snapshot. The per-show pin
+    /// (ROD-345) layers over the global setting here (show orelse global),
+    /// never at the walk sites. `scratch` owns the pin string; every caller
+    /// consumes it before the arena dies (Registry.ordered reads the name only
+    /// during the call). Deliberately NOT consulted by the unknown-owner
+    /// fallbacks (`owningProvider`, the play spawn, `.direct` adds): those ids
+    /// historically belong to `primary()`, and re-routing them by preference
+    /// would persist them under the wrong provider.
+    fn effectivePreference(self: *const App, scratch: Allocator, aid: ?i64) []const u8 {
+        if (aid) |id| {
+            if (self.store) |st| {
+                if (st.getProviderPin(scratch, id) catch null) |pin| return pin;
+            }
+        }
         return self.config.preferred_provider;
+    }
+
+    /// The canonical id of a selection as the store's i64 key, or null for a
+    /// non-canonical row (no AniList identity → no pin, no binding spine).
+    fn canonicalAid(sel: Anime) ?i64 {
+        return std.math.cast(i64, sel.anilist_id orelse return null);
+    }
+
+    /// Re-cache `show_pin` for the show identified by `aid` (ROD-345). Best-effort:
+    /// a store error or OOM leaves it null, which renders as unpinned. The pin
+    /// itself is authoritative in the DB; this copy only feeds the rail.
+    fn refreshShowPin(self: *App, aid: ?i64) void {
+        if (self.show_pin) |p| self.gpa.free(p);
+        self.show_pin = null;
+        const id = aid orelse return;
+        const st = self.store orelse return;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const pin = (st.getProviderPin(arena.allocator(), id) catch null) orelse return;
+        self.show_pin = self.gpa.dupe(u8, pin) catch null;
     }
 
     fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8) void {
@@ -2959,6 +2995,9 @@ pub const App = struct {
         var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer seed_arena.deinit();
         const seed_rec = selection.detailSeedRecord(self, seed_arena.allocator(), source, source_id);
+        // ROD-345: every grid open funnels through here, so this is the one spot
+        // that keeps the rail's cached pin in step with the show on screen.
+        self.refreshShowPin(if (seed_rec) |r| r.anilist_id else null);
         // ROD-182: opening a show is the refresh-on-view trigger — re-enrich it when
         // its persisted metadata is stale. Independent of the episode cache hit
         // below, so it runs whether or not the grid is already cached.
@@ -3080,7 +3119,7 @@ pub const App = struct {
         self.play_resolve_aid = null;
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(registry, self.effectivePreference(), sel, self.store, arena.allocator())) {
+        switch (browseResolveTarget(registry, self.effectivePreference(arena.allocator(), canonicalAid(sel)), sel, self.store, arena.allocator())) {
             .direct => |id| self.fireEpisodesResolved(loop, io, registry, null, id, null),
             // Tier 0: the binding already exists, so fetch by the stored id with no re-bind.
             .bound => |b| self.fireEpisodesResolved(loop, io, registry, b.provider.name(), b.id, null),
@@ -3135,7 +3174,9 @@ pub const App = struct {
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
         // Effective-order snapshot for the walk (ROD-344), owned by the worker:
         // the preference can change mid-flight, the snapshot can't.
-        const providers = registry.orderedAlloc(gpa, self.effectivePreference()) catch {
+        var pref_arena = std.heap.ArenaAllocator.init(gpa);
+        defer pref_arena.deinit();
+        const providers = registry.orderedAlloc(gpa, self.effectivePreference(pref_arena.allocator(), anilist_id)) catch {
             workers.freeOwnedAnime(gpa, snap);
             return;
         };
@@ -3234,7 +3275,7 @@ pub const App = struct {
         const aid = looked_up orelse return false;
         const canon_rec = (st.getCanonicalByAnilistId(arena.allocator(), aid) catch null) orelse return false;
         const canonical = workers.dupeOwnedAnime(self.gpa, selection.animeFromHistoryRecord(canon_rec)) catch return false;
-        const providers = registry.orderedAlloc(self.gpa, self.effectivePreference()) catch {
+        const providers = registry.orderedAlloc(self.gpa, self.effectivePreference(arena.allocator(), aid)) catch {
             workers.freeOwnedAnime(self.gpa, canonical);
             return false;
         };
@@ -3497,6 +3538,25 @@ pub const App = struct {
             self.async_start_ms = 0; // no async op runs; retire any slow-path spinner
             self.episodes.loading = false;
             self.episodes.unbound = true;
+            // No fetch fires, so the funnel in fireEpisodesForId never runs: keep
+            // the rail's pin in step here or the previous show's pin lingers.
+            self.refreshShowPin(rec.anilist_id);
+            return;
+        }
+        // ROD-345: a pinned show opens on the pinned provider's sibling binding when
+        // one exists. DB-only, no fresh resolve on an open; the flip affordance is
+        // where resolve-and-mint happens. Needed because History's visible row is the
+        // most-recently-watched sibling, which right after a flip (or before the first
+        // post-flip play) is still the old provider's row. The byName gate keeps a
+        // retired provider's pin from fetching its foreign id on primary() (mis-key).
+        if (rec.anilist_id) |aid| pin: {
+            const st = self.store orelse break :pin;
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const pin = (st.getProviderPin(arena.allocator(), aid) catch null) orelse break :pin;
+            if (std.mem.eql(u8, pin, rec.source) or registry.byName(pin) == null) break :pin;
+            const sid = (st.bindingSourceId(arena.allocator(), pin, aid) catch null) orelse break :pin;
+            self.fireEpisodesForId(loop, io, registry, sid, pin);
             return;
         }
         // A real binding: the normal fetch, which clears `unbound` at entry.
@@ -3761,6 +3821,7 @@ pub const App = struct {
         // j/k/g/G is shared by the episode grid and the list, so the grid (any
         // focused detail surface) must run before the list-cursor fallthrough.
         // The P/p/x/c/w/r/u actions sit between them, view-gated.
+        if (self.onProviderPinKey(key, loop, io, registry)) return; // v: per-show provider pin (ROD-345)
         if (self.onEpisodeGridKey(key)) return; // j/k/g/G — episode grid (detail surfaces)
         if (self.active_view == .history and self.onHistoryMutationKey(key)) return; // p/x/c/w/P/r/u
         if (self.onBrowseAddKey(key, loop, io, registry)) return; // P: add result to watchlist
@@ -4089,11 +4150,118 @@ pub const App = struct {
     /// whenever episodes are loaded; while they are still loading (ep_len == 0) the
     /// keys are inert but still consumed. Returns false when no detail surface is
     /// focused, leaving j/k/g/G to onListCursorKey.
-    fn onEpisodeGridKey(self: *App, key: vaxis.Key) bool {
-        const in_grid = (self.active_view == .browse and self.active_pane == .detail) or
+    /// A focused detail surface: the in-pane grid (Browse/History detail focus)
+    /// or the full-screen zoom. The gate shared by every grid-scoped key
+    /// (j/k/g/G nav, the v provider pin) so the surfaces can't drift apart.
+    fn onDetailSurface(self: *const App) bool {
+        return (self.active_view == .browse and self.active_pane == .detail) or
             self.active_view == .detail or
             (self.active_view == .history and self.active_pane == .detail);
-        if (!in_grid) return false;
+    }
+
+    /// ROD-345: 'v' on a detail surface cycles the open show's provider pin:
+    /// unpinned → each provider in construction order → unpinned. Setting a pin
+    /// re-routes the grid immediately through a one-provider ROD-346 walk (tier-0
+    /// sibling binding, else tier-A/tier-C resolve-and-mint): the manual rescue
+    /// for the bound-but-empty shape the automatic fallback never sees (an
+    /// authoritative 200-empty grid is not a fetch failure). Clearing a pin only
+    /// persists; the open grid stands. Runs BEFORE onEpisodeGridKey in dispatch:
+    /// that handler consumes every key on an empty grid, and empty is exactly the
+    /// state this key rescues.
+    fn onProviderPinKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) bool {
+        if (!self.onDetailSurface() or !key.matches('v', .{})) return false;
+        const st = self.store orelse return true;
+        const src = self.episodes.for_source orelse {
+            self.pushToast(.info, "no source: nothing to pin", false);
+            return true;
+        };
+        const fid = self.episodes.for_id orelse return true;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const rec = (st.getAnime(arena.allocator(), src, fid) catch null) orelse {
+            // A tier-A probe's row mints only on episodes_done; a flip inside
+            // that window has no persisted identity yet. Say so rather than
+            // eating the key.
+            self.pushToast(.info, "still resolving, try again shortly", false);
+            return true;
+        };
+        const aid = rec.anilist_id orelse {
+            self.pushToast(.info, "no canonical identity: can't pin a provider", false);
+            return true;
+        };
+
+        // Next stop in the cycle: construction order, one past the current pin.
+        var order = registry.ordered("");
+        var providers_buf: [16]SourceProvider = undefined;
+        var count: usize = 0;
+        while (order.next()) |p| : (count += 1) {
+            if (count >= providers_buf.len) break;
+            providers_buf[count] = p;
+        }
+        const cur = st.getProviderPin(arena.allocator(), aid) catch null;
+        var next_idx: usize = 0;
+        if (cur) |name| {
+            for (providers_buf[0..count], 0..) |p, i| {
+                if (std.mem.eql(u8, p.name(), name)) {
+                    next_idx = i + 1;
+                    break;
+                }
+            } else next_idx = count; // unknown (retired) pin cycles to unpinned
+        }
+
+        if (next_idx >= count) {
+            // Wrap to unpinned: the show returns to the global order.
+            st.setProviderPin(aid, null) catch {
+                self.pushToast(.@"error", "couldn't clear the provider pin", false);
+                return true;
+            };
+            self.refreshShowPin(aid);
+            self.pushToast(.info, "provider pin cleared", false);
+            return true;
+        }
+
+        const target = providers_buf[next_idx];
+        // The pin write needs the canonical row (FK target), and the walk below
+        // needs the canonical entity anyway, so resolve it first and gate both.
+        const canon_rec = (st.getCanonicalByAnilistId(arena.allocator(), aid) catch null) orelse {
+            self.pushToast(.info, "no canonical identity: can't pin a provider", false);
+            return true;
+        };
+        st.setProviderPin(aid, target.name()) catch {
+            self.pushToast(.@"error", "couldn't save the provider pin", false);
+            return true;
+        };
+        self.refreshShowPin(aid);
+
+        if (std.mem.eql(u8, target.name(), src)) {
+            // Already on the pinned provider: nothing to re-route.
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "pinned to {s}", .{target.displayName()}) catch "provider pinned";
+            self.pushToast(.success, msg, false);
+            return true;
+        }
+
+        // Re-route the open grid through a one-provider ROD-346 walk. The hop
+        // toast ("trying X…") is the user feedback; a second "pinned" toast on
+        // top would just be noise.
+        const canonical = workers.dupeOwnedAnime(self.gpa, selection.animeFromHistoryRecord(canon_rec)) catch return true;
+        const providers = self.gpa.alloc(SourceProvider, 1) catch {
+            workers.freeOwnedAnime(self.gpa, canonical);
+            return true;
+        };
+        providers[0] = target;
+        self.clearFallback();
+        self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0 };
+        if (!self.advanceFallback(loop, io, registry, null, null)) {
+            var buf: [96]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "couldn't reach {s}", .{target.displayName()}) catch "couldn't switch provider";
+            self.pushToast(.warn, msg, false);
+        }
+        return true;
+    }
+
+    fn onEpisodeGridKey(self: *App, key: vaxis.Key) bool {
+        if (!self.onDetailSurface()) return false;
         const ep_len: usize = if (self.episodes.results) |eps| eps.len else 0;
         if (ep_len == 0) return true;
         if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
@@ -4134,7 +4302,7 @@ pub const App = struct {
     fn addSelectedCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, anime: Anime) void {
         var arena = std.heap.ArenaAllocator.init(self.gpa);
         defer arena.deinit();
-        switch (browseResolveTarget(registry, self.effectivePreference(), anime, self.store, arena.allocator())) {
+        switch (browseResolveTarget(registry, self.effectivePreference(arena.allocator(), canonicalAid(anime)), anime, self.store, arena.allocator())) {
             // No resolve happened (already provider-keyed): the default provider owns it.
             .direct => self.addToWatchlist(registry.primary(), anime),
             // Tier 0: the binding already exists, so reveal it in place (no probe/search).
@@ -4174,7 +4342,9 @@ pub const App = struct {
         const gpa = self.gpa;
         const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
         // Effective-order snapshot, worker-owned; mirrors fireResolvePlaySearch.
-        const providers = registry.orderedAlloc(gpa, self.effectivePreference()) catch {
+        var pref_arena = std.heap.ArenaAllocator.init(gpa);
+        defer pref_arena.deinit();
+        const providers = registry.orderedAlloc(gpa, self.effectivePreference(pref_arena.allocator(), anilist_id)) catch {
             workers.freeOwnedAnime(gpa, snap);
             return;
         };
@@ -4207,7 +4377,7 @@ pub const App = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const rec = (st.getCanonicalByAnilistId(arena.allocator(), anilist_id) catch null) orelse return false;
-        const all = registry.orderedAlloc(gpa, self.effectivePreference()) catch return false;
+        const all = registry.orderedAlloc(gpa, self.effectivePreference(arena.allocator(), anilist_id)) catch return false;
         var n: usize = 0;
         for (all) |p| {
             if (std.mem.eql(u8, p.name(), failed_source)) continue;

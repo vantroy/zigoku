@@ -180,7 +180,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .browse => switch (self.active_pane) {
             .list => "hjkl · / find anime · P save · q quit",
             // ROD-170: detail pane can promote to the full-screen zoom with Space.
-            .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
+            .detail => "hjkl scroll · h back · enter play · v pin · space zoom · q quit",
         },
         // ROD-170: History is a two-pane like Browse. List focus keeps the
         // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
@@ -190,10 +190,10 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
             "D discover · B browse · q quit"
         else switch (self.active_pane) {
             .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit",
-            .detail => "hjkl scroll · h back · enter play · space zoom · q quit",
+            .detail => "hjkl scroll · h back · enter play · v pin · space zoom · q quit",
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
-        .detail => "hjkl scroll · enter play · space/esc back · q quit",
+        .detail => "hjkl scroll · enter play · v pin · space/esc back · q quit",
         .discover => "hjkl move · enter open · P save · [ ] axis · / search · q quit",
         .settings => if (self.settings.editing)
             "type to edit · enter confirm · esc cancel"
