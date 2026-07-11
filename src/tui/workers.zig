@@ -323,8 +323,9 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, pa
 /// is anilist_id-keyed; the play provider keys by the stringified mal_id (`candidate_id`).
 /// Probes `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
 /// the show, so the UI thread can mint the binding. A transport failure and an empty list
-/// both collapse to `ok = false`; the UI thread turns that miss into the explicit unbound
-/// marker (ROD-329, add path), so this worker writes no state itself.
+/// both collapse to `ok = false` (the UI thread turns that miss into the explicit unbound
+/// marker, ROD-329, add path), but only the authoritative empty rides `absent_sources`
+/// into the ROD-347 negative cache. This worker writes no state itself.
 ///
 /// `candidate_id` ownership transfers to the `resolve_add_result` event on a successful
 /// post (the UI thread frees it on either arm); freed here only if the post fails.
@@ -335,21 +336,32 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const ok = if (provider.episodes(arena.allocator(), io, candidate_id, translation)) |eps|
-        eps.len > 0
+    // Three-state (ROD-347): a 200-with-empty listing is an authoritative "not
+    // stocked" (the ROD-346 banking) and earns an absence row; a transport error
+    // proves nothing and must not (ROD-278).
+    const Probe = enum { hit, absent, unknown };
+    const probe: Probe = if (provider.episodes(arena.allocator(), io, candidate_id, translation)) |eps|
+        (if (eps.len > 0) Probe.hit else Probe.absent)
     else |e| blk: {
         log.debug("resolve-add probe failed: {s}", .{@errorName(e)});
-        break :blk false;
+        break :blk Probe.unknown;
     };
+    const absent: []const []const u8 = if (probe == .absent) blk: {
+        const one = gpa.alloc([]const u8, 1) catch break :blk &.{};
+        one[0] = provider.name();
+        break :blk one;
+    } else &.{};
 
     loop.postEvent(.{ .resolve_add_result = .{
-        .ok = ok,
+        .ok = probe == .hit,
         .anilist_id = anilist_id,
         .source_id = candidate_id,
         .source = provider.name(),
+        .absent_sources = absent,
     } }) catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         gpa.free(candidate_id);
+        if (absent.len > 0) gpa.free(absent);
     };
 }
 
@@ -367,7 +379,9 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// English-titled catalog (anipub) misses a romaji query entirely, and a confident
 /// match on the first pass skips the second. A confident match yields the provider's
 /// opaque id; no match or a failed search both collapse to `ok = false` (the add path
-/// then persists the unbound marker, ROD-329; Play just toasts). Add (`for_play` false)
+/// then persists the unbound marker, ROD-329; Play just toasts), and each provider's
+/// definitive "not stocked" verdict rides `absent_sources` into the ROD-347 negative
+/// cache. Add (`for_play` false)
 /// then probes `episodes` to confirm the match has playable episodes, the same bar
 /// tier-A Add holds; Play skips that probe because its own downstream episode fetch is
 /// the confirmation.
@@ -385,19 +399,26 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []c
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const match = resolveAcrossProviders(arena.allocator(), io, providers, canonical, translation, for_play);
+    var absent_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    const match = resolveAcrossProviders(arena.allocator(), io, providers, canonical, translation, for_play, &absent_names);
     const resolved: ?[]const u8 = if (match) |m| gpa.dupe(u8, m.id) catch null else null;
+    // Only the slice is duped: the names are static vtable strings.
+    const absent: []const []const u8 = if (absent_names.items.len > 0)
+        gpa.dupe([]const u8, absent_names.items) catch &.{}
+    else
+        &.{};
 
     const ok = resolved != null;
     const source_id: []const u8 = resolved orelse &.{};
     const source: []const u8 = if (ok) match.?.source else &.{};
     const posted = if (for_play)
-        loop.postEvent(.{ .resolve_play_target = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source } })
+        loop.postEvent(.{ .resolve_play_target = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source, .absent_sources = absent } })
     else
-        loop.postEvent(.{ .resolve_add_result = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source } });
+        loop.postEvent(.{ .resolve_add_result = .{ .ok = ok, .anilist_id = anilist_id, .source_id = source_id, .source = source, .absent_sources = absent } });
     posted catch |pe| {
         log.debug("postEvent failed: {s}", .{@errorName(pe)});
         if (resolved) |r| gpa.free(r);
+        if (absent.len > 0) gpa.free(absent);
     };
 }
 
@@ -405,27 +426,41 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []c
 /// the provider that produced it (a static vtable string).
 const SearchMatch = struct { id: []const u8, source: []const u8 };
 
+/// One provider's search-resolve verdict (ROD-347). `.match` carries the catalog id
+/// (borrowing from the search arena). `.absent` is definitive: every runnable query
+/// pass completed and none produced a confident playable match, so the provider does
+/// not stock the show; the UI thread may cache it. `.unknown` means a transport
+/// failure tainted the walk (or no pass could run at all): nothing was learned, and
+/// nothing may be cached (the ROD-278 contract).
+const SearchVerdict = union(enum) { match: []const u8, absent, unknown };
+
 /// Walk the effective provider order through `resolveViaSearch`, first confident match
 /// wins (ROD-343/344): each provider gets its full two-pass search before the next is tried,
 /// so a strong first-provider match is never preempted by a weaker later one, and
 /// requests stay sequential (one provider at a time, the ROD-309 discipline).
-fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) ?SearchMatch {
+/// Providers that returned a definitive `.absent` before the walk settled are appended
+/// to `absent_out` (arena-backed; static vtable names) for the ROD-347 negative cache.
+fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool, absent_out: *std.ArrayListUnmanaged([]const u8)) ?SearchMatch {
     for (providers) |p| {
-        if (resolveViaSearch(arena, io, p, canonical, translation, for_play)) |id|
-            return .{ .id = id, .source = p.name() };
+        switch (resolveViaSearch(arena, io, p, canonical, translation, for_play)) {
+            .match => |id| return .{ .id = id, .source = p.name() },
+            .absent => absent_out.append(arena, p.name()) catch {},
+            .unknown => {},
+        }
     }
     return null;
 }
 
 /// The search→match→probe core of `resolveSearchTask`, split from the thread/event
-/// glue so the pass control flow is unit-testable with a stub provider. Returns the
-/// matched provider id (borrowing from `arena` via the provider's results) or null.
-fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) ?[]const u8 {
+/// glue so the pass control flow is unit-testable with a stub provider.
+fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) SearchVerdict {
     const opts: source_mod.SearchOptions = .{
         .translation = translation,
         .limit = source_mod.search_page_size,
         .page = 1,
     };
+    var transport_failed = false;
+    var searched = false;
     const passes = [_]?[]const u8{ canonical.name, canonical.english_name };
     for (passes, 0..) |pass, pi| {
         const query = pass orelse continue;
@@ -434,8 +469,10 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
         const results = provider.search(arena, io, query, opts) catch |e| {
             log.debug("resolve-search failed: {s}", .{@errorName(e)});
+            transport_failed = true;
             continue;
         };
+        searched = true;
         const idx = resolver.bestIdMatch(canonical, results) orelse
             resolver.bestProviderMatch(canonical, results) orelse continue;
         const matched_id = results[idx].id;
@@ -448,13 +485,17 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         if (!for_play) {
             const eps = provider.episodes(arena, io, matched_id, translation) catch |e| {
                 log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
+                transport_failed = true;
                 continue;
             };
             if (eps.len == 0) continue;
         }
-        return matched_id;
+        return .{ .match = matched_id };
     }
-    return null;
+    // A clean miss is definitive only when at least one pass ran AND no transport
+    // failure could have hidden a hit (a CF-diva day must never poison the cache).
+    if (transport_failed or !searched) return .unknown;
+    return .absent;
 }
 
 /// Background task: fetch one Discover feed page for `axis` from AniList (ROD-336).
@@ -1641,6 +1682,9 @@ const StubCatalog = struct {
     /// Search-call count, for pinning the redundant-pass skip.
     searches: u32 = 0,
     catalog_name: []const u8 = "stub",
+    /// Transport-failure knobs (ROD-347): fail the search / the episode probe.
+    search_fails: bool = false,
+    episodes_fail: bool = false,
 
     fn provider(self: *StubCatalog) SourceProvider {
         return .{ .ptr = self, .vtable = &stub_vtable };
@@ -1661,6 +1705,7 @@ const StubCatalog = struct {
     fn stubSearch(ptr: *anyopaque, arena: Allocator, _: std.Io, query: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
         self.searches += 1;
+        if (self.search_fails) return error.NoAnswer;
         const rows: []const Anime = if (std.mem.eql(u8, query, "Romaji Title"))
             self.romaji
         else if (std.mem.eql(u8, query, "English Title"))
@@ -1674,6 +1719,7 @@ const StubCatalog = struct {
     }
     fn stubEpisodes(ptr: *anyopaque, arena: Allocator, _: std.Io, show_id: []const u8, _: domain.Translation) anyerror![]domain.EpisodeNumber {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        if (self.episodes_fail) return error.NoAnswer;
         if (!std.mem.eql(u8, show_id, self.alive_id)) return arena.alloc(domain.EpisodeNumber, 0);
         const eps = try arena.alloc(domain.EpisodeNumber, 1);
         eps[0] = .{ .raw = "1" };
@@ -1695,8 +1741,8 @@ test "resolveViaSearch: English retry pass binds when the romaji pass misses (RO
     var stub = StubCatalog{
         .english = &.{.{ .id = "2454", .name = "English Title", .mal_id = 52991 }},
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true) orelse return error.TestExpectationFailed;
-    try std.testing.expectEqualStrings("2454", got);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true);
+    try std.testing.expectEqualStrings("2454", got.match);
 }
 
 test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add probe" {
@@ -1710,12 +1756,13 @@ test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add
         .english = &.{.{ .id = "alive", .name = "English Title", .mal_id = 52991 }},
         .alive_id = "alive",
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) orelse return error.TestExpectationFailed;
-    try std.testing.expectEqualStrings("alive", got);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false);
+    try std.testing.expectEqualStrings("alive", got.match);
 
-    // Both passes dead → null, never a bind on an unplayable listing.
+    // Both passes dead → a definitive absent (never a bind on an unplayable
+    // listing): the searches ran clean, so the miss is a catalog fact.
     stub.alive_id = "";
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) == null);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) == .absent);
 }
 
 test "resolveViaSearch: Play skips the probe; identical English title skips pass 2" {
@@ -1727,41 +1774,81 @@ test "resolveViaSearch: Play skips the probe; identical English title skips pass
     var stub = StubCatalog{
         .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true) orelse return error.TestExpectationFailed;
-    try std.testing.expectEqualStrings("dead", got);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true);
+    try std.testing.expectEqualStrings("dead", got.match);
     try std.testing.expectEqual(@as(u32, 1), stub.searches); // pass-1 hit → pass 2 never fired
 
     // english_name == name: the second pass is a redundant query and must not fire
-    // even when pass 1 misses (one search total, resolve collapses to null).
+    // even when pass 1 misses (one search total, resolve collapses to absent).
     const same_title: Anime = .{ .id = "2", .name = "No Such Show", .english_name = "No Such Show", .anilist_id = 2 };
     var stub2 = StubCatalog{};
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true) == null);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true) == .absent);
     try std.testing.expectEqual(@as(u32, 1), stub2.searches);
+}
+
+test "resolveViaSearch three-state: transport failures read unknown, never absent (ROD-347)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
+
+    // A failed search proves nothing about the catalog (the ROD-278 contract):
+    // caching absent here would blind the fallback to a healthy provider for a
+    // whole TTL just because the network blinked.
+    var down = StubCatalog{ .search_fails = true };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, down.provider(), canonical, .sub, true) == .unknown);
+
+    // A matched listing whose Add probe dies on transport taints the whole walk:
+    // even though pass 2 misses clean, the hit the error may have hidden forbids
+    // a definitive verdict.
+    var flaky = StubCatalog{
+        .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }},
+        .episodes_fail = true,
+    };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, flaky.provider(), canonical, .sub, false) == .unknown);
+
+    // No runnable query pass (a canonical with no usable titles) also learned
+    // nothing: unknown, not absent.
+    const untitled: Anime = .{ .id = "3", .name = "", .anilist_id = 3 };
+    var idle = StubCatalog{};
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, idle.provider(), untitled, .sub, true) == .unknown);
+    try std.testing.expectEqual(@as(u32, 0), idle.searches);
 }
 
 test "resolveAcrossProviders: walks registry order, first confident match wins (ROD-343)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
+    const arena = arena_state.allocator();
     const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .anilist_id = 154587, .mal_id = 52991 };
 
     // First provider's catalog misses, second's id-matches: the match must carry
     // the SECOND provider's name (the bind is keyed under it, never the default).
+    // The clean miss before the winner is a learned fact and lands in absent_out.
     var miss = StubCatalog{ .catalog_name = "alpha" };
     var hit = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }} };
-    const walked = resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ miss.provider(), hit.provider() }, canonical, .sub, true) orelse return error.TestExpectationFailed;
+    var absent: std.ArrayListUnmanaged([]const u8) = .empty;
+    const walked = resolveAcrossProviders(arena, std.testing.io, &.{ miss.provider(), hit.provider() }, canonical, .sub, true, &absent) orelse return error.TestExpectationFailed;
     try std.testing.expectEqualStrings("2454", walked.id);
     try std.testing.expectEqualStrings("beta", walked.source);
+    try std.testing.expectEqual(@as(usize, 1), absent.items.len);
+    try std.testing.expectEqualStrings("alpha", absent.items[0]);
 
-    // Both match: first in registry order wins the tie.
+    // Both match: first in registry order wins the tie; nothing was ruled absent
+    // (the runner-up was never even searched).
     var hit_first = StubCatalog{ .catalog_name = "alpha", .romaji = &.{.{ .id = "1111", .name = "Romaji Title", .mal_id = 52991 }} };
     var hit_second = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2222", .name = "Romaji Title", .mal_id = 52991 }} };
-    const tie = resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ hit_first.provider(), hit_second.provider() }, canonical, .sub, true) orelse return error.TestExpectationFailed;
+    var absent_tie: std.ArrayListUnmanaged([]const u8) = .empty;
+    const tie = resolveAcrossProviders(arena, std.testing.io, &.{ hit_first.provider(), hit_second.provider() }, canonical, .sub, true, &absent_tie) orelse return error.TestExpectationFailed;
     try std.testing.expectEqualStrings("1111", tie.id);
     try std.testing.expectEqualStrings("alpha", tie.source);
+    try std.testing.expectEqual(@as(usize, 0), absent_tie.items.len);
 
-    // Nobody matches → null, and every provider got its shot.
+    // Nobody matches → null, every provider got its shot, and only the CLEAN
+    // misses are collected: the transport-dead provider stays unknown (ROD-347).
     var m1 = StubCatalog{ .catalog_name = "alpha" };
-    var m2 = StubCatalog{ .catalog_name = "beta" };
-    try std.testing.expect(resolveAcrossProviders(arena_state.allocator(), std.testing.io, &.{ m1.provider(), m2.provider() }, canonical, .sub, true) == null);
+    var m2 = StubCatalog{ .catalog_name = "beta", .search_fails = true };
+    var absent_miss: std.ArrayListUnmanaged([]const u8) = .empty;
+    try std.testing.expect(resolveAcrossProviders(arena, std.testing.io, &.{ m1.provider(), m2.provider() }, canonical, .sub, true, &absent_miss) == null);
     try std.testing.expect(m1.searches > 0 and m2.searches > 0);
+    try std.testing.expectEqual(@as(usize, 1), absent_miss.items.len);
+    try std.testing.expectEqualStrings("alpha", absent_miss.items[0]);
 }

@@ -224,8 +224,14 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
         },
         .cover_error => |id| alloc.free(id),
         .episodes_error => |e| alloc.free(e.for_id),
-        .resolve_add_result => |d| alloc.free(d.source_id),
-        .resolve_play_target => |d| if (d.source_id.len > 0) alloc.free(d.source_id),
+        .resolve_add_result => |d| {
+            alloc.free(d.source_id);
+            if (d.absent_sources.len > 0) alloc.free(d.absent_sources);
+        },
+        .resolve_play_target => |d| {
+            if (d.source_id.len > 0) alloc.free(d.source_id);
+            if (d.absent_sources.len > 0) alloc.free(d.absent_sources);
+        },
         .enrichment_refreshed => |d| {
             freeOwnedAnime(alloc, d.result);
             alloc.free(d.source);
@@ -3413,6 +3419,42 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     const rec = (try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")).?;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
     try testing.expect(rec.history_visible);
+}
+
+test "resolve events cache definitive absences on every arm, even a stale one (ROD-347)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    // Add miss whose walk ruled anipub definitively absent: the arm caches the
+    // negative alongside the unbound marker (both facts, independently).
+    const absent_add = try std.testing.allocator.alloc([]const u8, 1);
+    absent_add[0] = "anipub";
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_add } });
+    try testing.expect(try st.providerAbsentFresh(154587, "anipub", store_mod.Store.nowSecs()));
+
+    // A play result the staleness gate drops (play_resolve_aid is null: the user
+    // moved on) still banks the catalog fact before the drop.
+    app.play_resolving = true;
+    const absent_play = try std.testing.allocator.alloc([]const u8, 1);
+    absent_play[0] = "senshi";
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_play } });
+    try testing.expect(!app.play_resolving);
+    try testing.expect(try st.providerAbsentFresh(154587, "senshi", store_mod.Store.nowSecs()));
 }
 
 test "opening an unbound row clears a prior show's grid so firePlay can't launch it (ROD-329)" {

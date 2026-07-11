@@ -1975,6 +1975,10 @@ pub const App = struct {
                 // ROD-327/328: add-resolve settled; free the id (a tier-C miss carries an
                 // empty, non-owned slice) and clear the in-flight guard on both arms.
                 defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+                defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
+                // ROD-347: cache the walk's definitive misses on both arms, before any
+                // early return (the widen below learns from them too, via tier 0).
+                self.persistProviderAbsences(ev.anilist_id, ev.absent_sources);
                 self.async_start_ms = 0;
                 self.add_resolving = false;
                 if (!ev.ok) {
@@ -2034,6 +2038,10 @@ pub const App = struct {
                 // ROD-328: tier-C Play resolve settled. Free the resolved id (empty on a
                 // miss) and clear the in-flight guard.
                 defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+                defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
+                // ROD-347: a definitive absence is a fact about the catalog, so it is
+                // cached even when the staleness gate below drops the result itself.
+                self.persistProviderAbsences(ev.anilist_id, ev.absent_sources);
                 self.async_start_ms = 0;
                 self.play_resolving = false;
                 // ROD-346: drop a result the user has superseded (they fired another
@@ -3249,6 +3257,19 @@ pub const App = struct {
         self.active_view = .history;
         self.active_pane = .list;
         self.resume_landing_pending = false;
+    }
+
+    /// Persist a resolve walk's definitive per-provider misses into the ROD-347
+    /// negative cache. Best-effort: a missing canonical row FK-fails the insert
+    /// (nothing to key the verdict on) and is logged, never surfaced. The cache
+    /// is an optimization; no user path may fail on it.
+    fn persistProviderAbsences(self: *App, anilist_id: i64, names: []const []const u8) void {
+        if (names.len == 0) return;
+        const st = self.store orelse return;
+        for (names) |n| {
+            st.markProviderAbsent(anilist_id, n, Store.nowSecs()) catch |e|
+                log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
+        }
     }
 
     /// pub for the app_test teardowns (a test that arms a walk must free it).
