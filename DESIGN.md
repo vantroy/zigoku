@@ -1245,11 +1245,12 @@ Notes:
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
 - The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
-  ROD-260/261 rail form — see §5.3a for the full seven-field grammar (Episodes,
-  Format, Source, Duration, Studios, Rank, and a rail-only Pinned, ROD-345), all
-  shipped; this mock keeps the two-row ROD-260 baseline for brevity rather than
-  redrawing the full rail. The `nextAiringEpisode` countdown lands on the chips
-  row (§4.4), not here — also shipped (ROD-261). `v pin` in the help line cycles
+  ROD-260/261 rail form (see §5.3a for the full eight-field grammar: Episodes,
+  Format, Source, Duration, Studios, Rank, a rail-only Provider (ROD-348/356),
+  and a rail-only Pinned, ROD-345, all shipped); this mock keeps the two-row
+  ROD-260 baseline for brevity rather than redrawing the full rail. The
+  `nextAiringEpisode` countdown lands on the chips row (§4.4), not here,
+  shipped separately under the same ROD-261 ticket. `v pin` in the help line cycles
   the provider pin (ROD-345); it's live on this zoom surface, same as the
   in-pane grid.
 
@@ -1259,10 +1260,13 @@ One ordered field list, two render densities. `App.detailMetaFields()` (`app.zig
 returns `[]const MetaField` — `{label, value, unit, dim, rail_only}` —
 highest-priority field first: **Episodes**, **Format**, **Source**, **Duration**,
 **Studios**, **Rank** (ROD-261 widens the list to these six; see below), then a
-rail-only **Pinned** (ROD-345) appended last, present only when the open show
-carries a per-show provider pin. Pinned is user state (the `provider_pins` DB
-table), not AniList enrichment like the six fields ahead of it; see the
-ROD-345 note after the Phase 2 breakdown below.
+rail-only **Provider** (ROD-348/356) and a rail-only **Pinned** (ROD-345),
+appended in that order: Provider only when the open show carries a canonical
+identity, Pinned only when it also carries a per-show provider pin. Neither is
+AniList enrichment like the six fields ahead of them. Provider reads
+`provider_absences` and the `anime` binding rows plus the live session's
+serving provider; Pinned reads the `provider_pins` table. See the ROD-348/356
+and ROD-345 addenda after the Phase 2 breakdown below.
 `drawHeader` (`view/detail.zig`) renders that list through one of two functions,
 selected by a `bloom: bool` parameter, so the two forms can't drift apart — same
 source, same order, same value strings:
@@ -1271,14 +1275,15 @@ source, same order, same value strings:
   (separator `fg3`, values `fg2`, `fg3` when a value's `dim` flag is set). A unit
   suffix renders only here (`13 eps`; Format carries no unit). A separator sits
   only *between* two emitted fields — an absent field never leaves an orphan `·`
-  (§9.1). It also skips any field flagged `rail_only` (Rank, Pinned) outright —
-  the one shared conditional the ROD-261 widening adds, not a per-field branch.
+  (§9.1). It also skips any field flagged `rail_only` (Rank, Provider, Pinned)
+  outright: the one shared conditional the ROD-261 widening adds, not a
+  per-field branch.
 - **`drawMetaRail`** — the roomy form: `Label  Value` stacked one field per row,
   an 8-col label gutter (`fg3`) with values aligned at column 10 (`fg2`, `fg3`
   when `dim`). The rail walks the same priority order top-down, so a pane too
   short to hold every row drops the **lowest**-priority rows first — Episodes,
   emitted first, never drops; Pinned, appended last (ROD-345), is the first to
-  shed.
+  shed, then Provider (ROD-348/356) just ahead of it.
 
 **Episodes is the floor.** It always renders, never omitted: when neither the
 per-track count (`eps_sub`/`eps_dub`) nor `total_episodes` is known — no show
@@ -1346,8 +1351,76 @@ Rank.** Formatting for each:
   picks the best ranking once at enrich time, so render just composes the
   stored values.
 
-**ROD-345 addendum: Pinned.** A seventh field, appended after Rank by
-`selection.detailMetaFields`. It is not part of the ROD-260/261
+**ROD-348/356 addendum: Provider.** A seventh field, appended after Rank and
+before Pinned by `selection.detailMetaFields`. Rail-only (never on the compact
+line: a per-provider glyph list needs the rail's room), rail label `Provider`
+(8 chars, fills the gutter with no truncation). It folds two related but
+distinct signals into one value string, one token per registry provider in
+fixed **registry (construction) order**, not the `Registry.ordered`
+preference view, which is a per-walk resolve-order hint, not a stable
+reference list. Reordering this line per session preference would make the
+same show's rail read differently across sessions, fighting the "scan the same
+column, same order, every show" habit the rail is built for:
+
+  - **availability** (ROD-348): does a binding exist for this provider
+    (`anime.canonical_id` joins the canonical row on that source), does a fresh
+    negative exist (`provider_absences`, 7-day TTL, ROD-347), or is neither
+    known (never probed, or the negative went stale)
+  - **serving** (ROD-356): which provider the *currently loaded* episode grid
+    was actually fetched from (`episodes.for_source`, the fetch identity plays
+    fire on), routing truth, distinct from the Pinned field's intent
+
+  Each provider renders as one marker glyph plus its raw name (same raw-name
+  convention as Pinned, not `displayName()`): `▸name` if that provider is
+  serving the open grid (implies bound, since a fetch can't succeed against an
+  unbound provider), `+name` if bound but not the one serving right now,
+  `-name` if a fresh negative exists, `?name` if unchecked. At most one `▸`
+  ever appears in the line. Tokens are space-joined in registry order, e.g.
+  `▸senshi +anipub` (senshi serving, anipub also bound elsewhere) or
+  `▸senshi ?anipub` (anipub never probed). `▸` is the existing resume/active
+  glyph (§4.6), already proven legible dim; `+`/`-`/`?` are deliberately plain
+  ASCII rather than a new pictographic set. ROD-253 is an open ticket about
+  `◆`/`◈` and `◐`/`◎` not resolving distinctly at `text.dim`, and this field
+  sidesteps that class of glyph entirely rather than risking a fourth
+  ambiguous pair (§8 logs the call). Shape, not color, carries the state: the
+  Phosphor theme is monochrome (§1, `focus`/`fg` share one hue), so any UI
+  state that only color could tell apart is illegible there by construction,
+  and the four markers are distinct shapes for exactly this reason. The whole
+  value dims to `fg3` only when every provider is `?` (nothing known about any
+  of them, mirroring the Episodes-floor "we know nothing yet" degrade); it
+  renders `fg2` as soon as at least one provider is bound or confirmed absent,
+  since a fresh negative is real information, not a gap.
+
+  Gated on canonical identity only, same floor as Pinned's pin-target check:
+  omitted outright when the show has no `aid` (no `provider_pins`/
+  `provider_absences` FK target either), emitted otherwise even if every
+  provider comes back `?` (a genuinely fresh, unresolved identity). A grid
+  loaded from a provider no longer present in the registry (a retired source)
+  degrades silently: no registry slot to hang a `▸` on, so the line renders
+  the live providers' availability with no serving marker at all until a later
+  resolve lands on a still-registered one. Not an error, not a crash, just an
+  honest "nothing current is confirmed serving." Nav-state only, same rule as
+  Pinned below and for the same reason: `detailMetaFieldsFor` (fed an explicit
+  record, e.g. the History list preview) never appends it, because the serving
+  half needs `App.episodes.for_source`, which belongs to the currently
+  *focused* grid, not a cursor row a preview might be scrolled past. Keeping
+  that exclusion on the whole field, not just the serving half, keeps the rule
+  one clean boundary ("session-derived fields live in the wrapper") rather
+  than splitting Provider's two halves across two different availability
+  rules.
+
+  Buffer: `App.detail_provider_buf: [96]u8`. Budgeted for the 2-4 registry
+  providers this design targets, worst case 4 tokens of a 1-char marker plus a
+  ≤16-char raw name, joined by 3 single-space separators (4×17 + 3 = 71),
+  double the `detail_studios_buf` precedent's 64 bytes for headroom against a
+  longer future provider name. A `bufPrint` overflow degrades to an empty
+  value string per the existing pattern (`formatRank` et al. catch `""`),
+  acceptable, but a registry past 4 providers needs this buffer widened, and
+  `App.detail_meta_fields` (currently `[7]MetaField`, `app.zig`) widened to
+  `[8]MetaField` for this eighth-and-final slot.
+
+**ROD-345 addendum: Pinned.** The eighth and last field, appended after
+Provider by `selection.detailMetaFields`. It is not part of the ROD-260/261
 AniList-enrichment sextet above, and it isn't phased the same way: it surfaces
 the per-show provider pin (`Store.getProviderPin`, the `provider_pins` table),
 set via the `v` key on any detail surface (§10.5). Rail-only like Rank (never
@@ -1357,10 +1430,14 @@ which already echoes the stored preference string verbatim) rather than
 `SourceProvider.displayName()`'s title case (reserved for user-facing toast
 prose, §4.10; §8 logs the split). Omitted outright when the show is unpinned:
 presence or absence, not a §9.1 enrichment degrade; there is no "still
-fetching" state for a pin. Nav-state only: `detailMetaFieldsFor` (fed an
-explicit record, e.g. the History list preview) never appends it, because the
-cached `App.show_pin` belongs to the currently *focused* grid, not a cursor row
-a preview might be scrolled past.
+fetching" state for a pin. Nav-state only, same reasoning as Provider above:
+`detailMetaFieldsFor` (fed an explicit record, e.g. the History list preview)
+never appends it, because the cached `App.show_pin` belongs to the currently
+*focused* grid, not a cursor row a preview might be scrolled past. Pinned
+stays the lowest-priority field (first to shed) because it is pure per-show
+user override; Provider ranks one step above it because it reflects real
+DB/session state rather than a manual choice, but both still sit below the
+AniList enrichment sextet, which describes the show itself.
 
 The `nextAiringEpisode` countdown is a fifth ROD-261 field but does **not** join
 this list — it renders on the **chips row** (`state.now`, §4.4) instead, because
@@ -1576,8 +1653,9 @@ Notes:
   (§5.3a) — `detail_w ≈ 70` at 120 cols is below `detail_two_col_min` (100), so
   the rail doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`,
   below). Source, Duration, Studios, and a rail-only Rank have shipped alongside
-  Episodes/Format (ROD-261, §5.3a/§5.3b), as has a rail-only Pinned (ROD-345,
-  shown only when the show is pinned) and the chips-row airing countdown (§4.4);
+  Episodes/Format (ROD-261, §5.3a/§5.3b), as has a rail-only Provider (ROD-348/356,
+  the per-provider availability + serving line) and a rail-only Pinned (ROD-345,
+  shown only when the show is pinned), plus the chips-row airing countdown (§4.4);
   this mock keeps the two-field ROD-260 baseline for brevity rather than
   redrawing a fully-enriched compact line. `v pin` in the help line is new
   (ROD-345, §5.3a); it's live on this in-pane surface, same as the zoom.
@@ -1623,10 +1701,11 @@ ROD-260/261) — but only because this is a **History-origin** zoom, which is th
 one surface that sets `two_col = true` unconditionally; a Browse-origin zoom at
 the same 160 cols still renders the compact `28 eps · TV` line. Source, Duration,
 Studios, and a rail-only Rank have shipped in the same rail (§5.3a/§5.3b,
-ROD-261), a rail-only Pinned has shipped alongside them (ROD-345, shown only
-when the show is pinned), and the airing countdown has shipped on the chips row
-instead (§4.4); this mock keeps the `Episodes` / `Format` two-row ROD-260
-baseline for brevity rather than redrawing the full seven-row rail.
+ROD-261), a rail-only Provider (ROD-348/356) and a rail-only Pinned (ROD-345)
+have shipped alongside them (Pinned shown only when the show is pinned), and
+the airing countdown has shipped on the chips row instead (§4.4); this mock
+keeps the `Episodes` / `Format` two-row ROD-260 baseline for brevity rather
+than redrawing the full eight-row rail.
 
 ### 5.5 Settings
 
@@ -2253,6 +2332,9 @@ revisited without archaeology.
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row — not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information — honoring Rod's "low-noise, JP shows nothing" ruling. | If CN/KR-origin shows are common enough in a user's library that the marker starts feeling load-bearing rather than incidental, promote it to `text.muted` or a small dedicated icon. |
 | Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§9.1a) | Generalizing italic to "any non-primary title row" would make the English alt row start rendering italic under the **default** `romaji` preference (today it renders plain `fg2`) — a real visual change on an unconfigured upgrade, which the ROD-205 brief locks against ("zero behavior change on upgrade"). Keeping italic keyed to the native/Japanese-script field specifically preserves today's rendering exactly when `title_language = romaji`, while still generalizing correctly for the other two preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider — but only as a fresh value judgment, not to chase "zero behavior change," which native-only italic already satisfies. |
 | Rail's Pinned field shows the raw provider name (`senshi`), not `SourceProvider.displayName()` (ROD-345) | Matches the existing Settings `provider` row (§5.5), which already renders the raw stored preference string. Pinned is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}`/`{source}` = `displayName()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users in the rail (e.g. a future provider with a cryptic key), reconsider, but as a rail-specific formatting fix, not by changing the Settings row's convention. |
+| Provider field folds availability and serving into one rail row, ASCII markers (`▸ + - ?`) instead of a new pictographic set (ROD-348/356) | A separate serving row plus a separate availability row would put three provider-ish rows next to each other (Pinned already there) for information that's really one axis per provider (what's known, what's active): one row reads as one fact family. ROD-253 is an open, unresolved ticket that `◆`/`◈` and `◐`/`◎` don't resolve distinctly at `text.dim`; rather than risk a fourth confusable pair, the tri-state (plus "serving") uses plain ASCII shapes and reuses the already-proven `▸` resume glyph for "serving", a genuinely different glyph family, not a new instance of the same risk. Shape carries the state rather than color because the Phosphor theme (§1) is monochrome, so a color-only distinction would be illegible there. | If ROD-253 lands a fix that makes the diamond/circle-half pairs legible dim, this call doesn't need revisiting: the ASCII set was chosen for its own reasons (font-independence, zero substitution risk), not only as a ROD-253 workaround. |
+| Provider field lists providers in fixed registry (construction) order, not `Registry.ordered`'s per-walk preference view (ROD-348) | `ordered` is a resolve-order hint, recomputed per preference and per walk (ROD-344); using it here would make the same show's rail read in a different column order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." The rail is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order instead. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
+| Provider ranks one step above Pinned in shed priority, sheds second-to-last rather than last (ROD-348/356) | Pinned is a pure per-show manual override (arbitrary user choice); Provider reflects real DB/session state (bindings, negatives, the live serving source) even though both are non-enrichment, non-AniList fields appended after Rank. Real state slightly outranks a manual override when the rail is starved for room. | If Rod finds himself wanting Provider visible in a starved rail *instead of* Pinned rather than in addition, swap their order: it's a one-line append-order change in `selection.detailMetaFields`, not a renderer change. |
 
 ---
 
@@ -2301,7 +2383,7 @@ aliases.
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, shipped); DB `provider_pins` (ROD-345, per-show pin, shipped) | `App.detailMetaFields()` (§5.3a, ROD-260/261/345) emits an ordered field list — Episodes, Format, Source, Duration, Studios, Rank, then a rail-only Pinned — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank and Pinned excluded) or the `Label  Value` rail (two-column surfaces, up to all seven) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). Pinned omits outright when the show carries no pin: not an enrichment degrade, just absence. The `nextAiringEpisode` countdown ships under the same ROD-261 ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
+| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, shipped); DB `provider_pins` (ROD-345, per-show pin, shipped); DB `anime` bindings + `provider_absences` + live `episodes.for_source` (ROD-348/356, per-provider availability + serving, shipped) | `App.detailMetaFields()` (§5.3a, ROD-260/261/345/348/356) emits an ordered field list (Episodes, Format, Source, Duration, Studios, Rank, then a rail-only Provider, then a rail-only Pinned), rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank/Provider/Pinned excluded) or the `Label  Value` rail (two-column surfaces, up to all eight) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count, never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null, no orphan `·`, no bare rail row (full survey: §5.3b). Provider omits outright when the show has no canonical identity, otherwise always renders (even all-`?`), dimming only when every provider is unchecked. Pinned omits outright when the show carries no pin: not an enrichment degrade, just absence. The `nextAiringEpisode` countdown ships under the same ROD-261 ticket but renders on the **chips row** (§4.4) instead, a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
