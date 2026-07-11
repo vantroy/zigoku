@@ -1032,6 +1032,13 @@ state.now` escalation.
 | `add_to_watchlist` | P on a browse result (upsert failed) | error | `couldn't add to watchlist` | no |
 | `sync_flushed` | pull reconciled remote changes (`reconciled > 0`) | info | `↓ N from AniList` | no |
 | `sync_flushed` | push landed (`pushed > 0`) | info | `↑ N to AniList` | no |
+| Provider pin: hop (ROD-346's fallback-hop toast, reused by the `v` key) | pinning a different provider than the one serving the grid re-routes it through a one-provider ROD-346 walk | warn | `trying {provider}…` (or `{prev} failed, trying {provider}…`) | no |
+| Provider pin: set, no hop needed (ROD-345) | `v` pins the provider already serving the grid | success | `pinned to {provider}` | no |
+| Provider pin: cleared (ROD-345) | `v` cycles past the last provider back to unpinned | info | `provider pin cleared` | no |
+| Provider pin: hop failed (ROD-345) | the pin's one-provider walk can't reach the target | warn | `couldn't reach {provider}` | no |
+| Provider pin: nothing to pin (ROD-345) | `v` pressed with no focused episode source | info | `no source: nothing to pin` | no |
+| Provider pin: no canonical identity (ROD-345) | `v` pressed on a show with no AniList identity (no `provider_pins` FK target) | info | `no canonical identity: can't pin a provider` | no |
+| Provider pin: store write failed (ROD-345) | `setProviderPin` errors on set or clear | error | `couldn't save the provider pin` / `couldn't clear the provider pin` | no |
 
 Copy: single line, lowercase, no terminal punctuation — status, not prose, and
 within the §4.7 36-column copy budget (the box is 40 cols incl. the 4-col glyph
@@ -1047,7 +1054,9 @@ vtable hardcodes the site name, since the source is swappable. It's distinct fro
 `name()`, the stable persistence key. The name is formatted in at runtime; a
 short name keeps these within the 36-column budget, and a long-named future
 provider is truncated by `pushToast` (ROD-166). `network unreachable` carries no
-`{source}` — it names the user's own connectivity, not the source.
+`{source}` — it names the user's own connectivity, not the source. `{provider}`
+in the provider-pin rows above is the same `displayName()` convention, not the
+`name()` the rail's Pinned field shows (§5.3a, §8 logs the split).
 
 The four source cause classes (`network-down`, `blocked`, `server-down`,
 `generic-http`) share copy between `play_error` (resolve path) and
@@ -1206,7 +1215,7 @@ metadata stays the compact `28 eps · TV` line):
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
 
-  ▌  hjkl scroll · enter play · space/esc back                                          [h▌, d help, m+underline keys]
+  ▌  hjkl scroll · enter play · v pin · space/esc back                                  [h▌, d help, m+underline keys]
 ```
 
 Notes:
@@ -1235,18 +1244,24 @@ Notes:
   `left_w = max(20, pane_w * 38 / 100)` formula. At ≥ 160-col the layout gains
   density (§5.4a) with `right_w ≈ 95` giving ≈ 19 grid columns.
 - The metadata block (`Episodes` / `Format` above the synopsis hairline) is the
-  ROD-260/261 rail form — see §5.3a for the full six-field grammar (Episodes,
-  Format, Source, Duration, Studios, and a rail-only Rank), all shipped; this
-  mock keeps the two-row ROD-260 baseline for brevity rather than redrawing the
-  full rail. The `nextAiringEpisode` countdown lands on the chips row (§4.4), not
-  here — also shipped (ROD-261).
+  ROD-260/261 rail form — see §5.3a for the full seven-field grammar (Episodes,
+  Format, Source, Duration, Studios, Rank, and a rail-only Pinned, ROD-345), all
+  shipped; this mock keeps the two-row ROD-260 baseline for brevity rather than
+  redrawing the full rail. The `nextAiringEpisode` countdown lands on the chips
+  row (§4.4), not here — also shipped (ROD-261). `v pin` in the help line cycles
+  the provider pin (ROD-345); it's live on this zoom surface, same as the
+  in-pane grid.
 
 ### 5.3a Detail Metadata — Compact Line vs. Labeled Rail (ROD-260)
 
 One ordered field list, two render densities. `App.detailMetaFields()` (`app.zig`)
 returns `[]const MetaField` — `{label, value, unit, dim, rail_only}` —
 highest-priority field first: **Episodes**, **Format**, **Source**, **Duration**,
-**Studios**, then a rail-only **Rank** (ROD-261 widens the list; see below).
+**Studios**, **Rank** (ROD-261 widens the list to these six; see below), then a
+rail-only **Pinned** (ROD-345) appended last, present only when the open show
+carries a per-show provider pin. Pinned is user state (the `provider_pins` DB
+table), not AniList enrichment like the six fields ahead of it; see the
+ROD-345 note after the Phase 2 breakdown below.
 `drawHeader` (`view/detail.zig`) renders that list through one of two functions,
 selected by a `bloom: bool` parameter, so the two forms can't drift apart — same
 source, same order, same value strings:
@@ -1255,13 +1270,14 @@ source, same order, same value strings:
   (separator `fg3`, values `fg2`, `fg3` when a value's `dim` flag is set). A unit
   suffix renders only here (`13 eps`; Format carries no unit). A separator sits
   only *between* two emitted fields — an absent field never leaves an orphan `·`
-  (§9.1). It also skips any field flagged `rail_only` (Rank) outright — the one
-  shared conditional the ROD-261 widening adds, not a per-field branch.
+  (§9.1). It also skips any field flagged `rail_only` (Rank, Pinned) outright —
+  the one shared conditional the ROD-261 widening adds, not a per-field branch.
 - **`drawMetaRail`** — the roomy form: `Label  Value` stacked one field per row,
   an 8-col label gutter (`fg3`) with values aligned at column 10 (`fg2`, `fg3`
   when `dim`). The rail walks the same priority order top-down, so a pane too
   short to hold every row drops the **lowest**-priority rows first — Episodes,
-  emitted first, never drops.
+  emitted first, never drops; Pinned, appended last (ROD-345), is the first to
+  shed.
 
 **Episodes is the floor.** It always renders, never omitted: when neither the
 per-track count (`eps_sub`/`eps_dub`) nor `total_episodes` is known — no show
@@ -1328,6 +1344,22 @@ Rank.** Formatting for each:
   — `rank`, `rank_type`, `rank_year` — rather than a raw blob: `selectRank`
   picks the best ranking once at enrich time, so render just composes the
   stored values.
+
+**ROD-345 addendum: Pinned.** A seventh field, appended after Rank by
+`selection.detailMetaFields`. It is not part of the ROD-260/261
+AniList-enrichment sextet above, and it isn't phased the same way: it surfaces
+the per-show provider pin (`Store.getProviderPin`, the `provider_pins` table),
+set via the `v` key on any detail surface (§10.5). Rail-only like Rank (never
+on the compact line), rail label `Pinned`, value the pin's raw provider name
+(`senshi`, `anipub`), matching the Settings `provider` row's convention (§5.5,
+which already echoes the stored preference string verbatim) rather than
+`SourceProvider.displayName()`'s title case (reserved for user-facing toast
+prose, §4.10; §8 logs the split). Omitted outright when the show is unpinned:
+presence or absence, not a §9.1 enrichment degrade; there is no "still
+fetching" state for a pin. Nav-state only: `detailMetaFieldsFor` (fed an
+explicit record, e.g. the History list preview) never appends it, because the
+cached `App.show_pin` belongs to the currently *focused* grid, not a cursor row
+a preview might be scrolled past.
 
 The `nextAiringEpisode` countdown is a fifth ROD-261 field but does **not** join
 this list — it renders on the **chips row** (`state.now`, §4.4) instead, because
@@ -1516,7 +1548,7 @@ same per-field styling.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  hjkl scroll · h back · enter play · space zoom · q quit                           [detail pane focused; space promotes to zoom §5.3]
+  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit                   [detail pane focused; space promotes to zoom §5.3]
 ```
 
 Notes:
@@ -1543,9 +1575,11 @@ Notes:
   (§5.3a) — `detail_w ≈ 70` at 120 cols is below `detail_two_col_min` (100), so
   the rail doesn't bloom here; it does once the pane clears 100 (`term ≥ 168`,
   below). Source, Duration, Studios, and a rail-only Rank have shipped alongside
-  Episodes/Format (ROD-261, §5.3a/§5.3b), as has the chips-row airing countdown
-  (§4.4); this mock keeps the two-field ROD-260 baseline for brevity rather than
-  redrawing a fully-enriched compact line.
+  Episodes/Format (ROD-261, §5.3a/§5.3b), as has a rail-only Pinned (ROD-345,
+  shown only when the show is pinned) and the chips-row airing countdown (§4.4);
+  this mock keeps the two-field ROD-260 baseline for brevity rather than
+  redrawing a fully-enriched compact line. `v pin` in the help line is new
+  (ROD-345, §5.3a); it's live on this in-pane surface, same as the zoom.
 
 ---
 
@@ -1571,7 +1605,7 @@ focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
                       [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12][13][14][15][16][17][18][19]
                       [20][21][22][23][24][25][26][27][28]
 
-  ▌  hjkl scroll · enter play · space/esc back
+  ▌  hjkl scroll · enter play · v pin · space/esc back
 ```
 
 The two-column internal split (`left_w / right_w`) uses `detail_two_col_min = 100`,
@@ -1588,9 +1622,10 @@ ROD-260/261) — but only because this is a **History-origin** zoom, which is th
 one surface that sets `two_col = true` unconditionally; a Browse-origin zoom at
 the same 160 cols still renders the compact `28 eps · TV` line. Source, Duration,
 Studios, and a rail-only Rank have shipped in the same rail (§5.3a/§5.3b,
-ROD-261), and the airing countdown has shipped on the chips row instead (§4.4);
-this mock keeps the `Episodes` / `Format` two-row ROD-260 baseline for brevity
-rather than redrawing the full six-row rail.
+ROD-261), a rail-only Pinned has shipped alongside them (ROD-345, shown only
+when the show is pinned), and the airing countdown has shipped on the chips row
+instead (§4.4); this mock keeps the `Episodes` / `Format` two-row ROD-260
+baseline for brevity rather than redrawing the full seven-row rail.
 
 ### 5.5 Settings
 
@@ -1710,7 +1745,13 @@ Notes:
   tier-C worker's spawn-time snapshot) via `Registry.ordered`/`preferred`.
   Unknown-owner fallbacks (`owningProvider`, the play spawn, legacy `.direct` rows)
   deliberately keep routing to `primary()`: a pre-existing binding never silently
-  migrates provider. Per-show override is future work (ROD-345).
+  migrates provider. **Per-show override has shipped** as the `v` key on any
+  detail surface (ROD-345, §5.3a rail / §10.5 keybinds): a separate
+  `provider_pins` DB table keyed on canonical id, layered over this row's global
+  setting only (`App.effectivePreference`: show pin orelse global) and never
+  writing back to it. The pin cycles the same construction order as this row
+  (unpinned → each registry provider → unpinned); there is no Settings-surface
+  control for the per-show pin, only the in-grid key.
 - **account** (ROD-286) is read-only, like the Catalog status rows — `drawInertRow`,
   `palette.fg3` + italic, not in `settings_rows`, skipped by navigation. Three
   states: the AniList user name once connected; `reconnect — token expired` when a
@@ -2210,6 +2251,7 @@ revisited without archaeology.
 | Airing countdown collapses to one coarsest unit and omits itself once stale, rather than showing a negative/zero value (ROD-261) | A combined `Nd Nh` value doesn't fit the chips row's terse register, and a countdown that has silently lapsed (a stale `nextAiringEpisode` in the window between the real airing time and the next enrichment refresh) would read as a bug if shown as `-2h` or `0d`. Omitting it instead degrades to the same "no countdown" state a not-yet-enriched show already renders — a known-good degrade (§9.1), not a new one. | If users want confirmation an episode aired without waiting for refresh, consider a distinct "just aired" state instead of silent omission. |
 | Non-JP origin marker is a bare two-letter country code in `text.dim`, trailing last on the chips row — not a flag glyph (ROD-261) | An actual flag emoji is a Supplementary-Plane regional-indicator pair, outside the §2 "glyphs must fall inside the BMP" contract, and wouldn't render deterministically across this app's terminal targets. The dimmest available tier plus last-in-order placement keeps a rare, static fact from competing with the row's live status/season/countdown information — honoring Rod's "low-noise, JP shows nothing" ruling. | If CN/KR-origin shows are common enough in a user's library that the marker starts feeling load-bearing rather than incidental, promote it to `text.muted` or a small dedicated icon. |
 | Italic stays pinned to the native-language title field, not to "whichever row is currently an alt" (ROD-205, §1.3/§9.1a) | Generalizing italic to "any non-primary title row" would make the English alt row start rendering italic under the **default** `romaji` preference (today it renders plain `fg2`) — a real visual change on an unconfigured upgrade, which the ROD-205 brief locks against ("zero behavior change on upgrade"). Keeping italic keyed to the native/Japanese-script field specifically preserves today's rendering exactly when `title_language = romaji`, while still generalizing correctly for the other two preferences: native gets italic whenever it lands in an alt slot and loses the treatment once it becomes primary (every primary line is bold, never italic). | If an English alt row reads too flat next to an italic native row in practice, reconsider — but only as a fresh value judgment, not to chase "zero behavior change," which native-only italic already satisfies. |
+| Rail's Pinned field shows the raw provider name (`senshi`), not `SourceProvider.displayName()` (ROD-345) | Matches the existing Settings `provider` row (§5.5), which already renders the raw stored preference string. Pinned is the same persisted identifier, just scoped per-show instead of globally, so consistency with that precedent outranks matching the toast-prose convention (`{provider}`/`{source}` = `displayName()` everywhere a sentence names a provider, §4.10). The split is deliberate: config-surface rows echo the stored identifier; user-facing prose speaks the display name. | If a provider's stored name and display name diverge enough to confuse users in the rail (e.g. a future provider with a cryptic key), reconsider, but as a rail-specific formatting fix, not by changing the Settings row's convention. |
 
 ---
 
@@ -2258,7 +2300,7 @@ aliases.
 | **Detail · score line** | AllAnime `score` (rescaled 0–10 → 0–100); AniList fills if null | `[NN/100]`, `✦` prefix when ≥ 91 | `[--/100]` in `[d]` |
 | **Detail · genres** | AniList `genres` (enrichment-only) | ` · Genre · Genre` appended to the score line | omitted — no row, no `·` separator |
 | **Detail · cover art** | AllAnime / AniList `thumb` | the §3.3 cover image (Kitty / half-block) | `no art yet` in `[d]` + italic when `thumb` is null; the block keeps its reserved cell dimensions |
-| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, shipped) | `App.detailMetaFields()` (§5.3a, ROD-260/261) emits an ordered field list — Episodes, Format, Source, Duration, Studios, then a rail-only Rank — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank excluded) or the `Label  Value` rail (two-column surfaces, all six) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). The `nextAiringEpisode` countdown ships under the same ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
+| **Detail · metadata line/rail** | AllAnime `eps_sub` / `eps_dub` and `kind`; AniList `total_episodes` fills if null; AniList `source` / `duration` / `studios` / `rankings` (ROD-261, shipped); DB `provider_pins` (ROD-345, per-show pin, shipped) | `App.detailMetaFields()` (§5.3a, ROD-260/261/345) emits an ordered field list — Episodes, Format, Source, Duration, Studios, Rank, then a rail-only Pinned — rendered as the compact `N eps · kind · …` line (single-column surfaces, Rank and Pinned excluded) or the `Label  Value` rail (two-column surfaces, up to all seven) | Episodes is the floor: `? eps` / `Episodes  ?` in `[d]` when neither source has a count — never omitted, so neither form is ever empty. Format/Source/Duration/Studios/Rank each omit outright when their field is null — no orphan `·`, no bare rail row (full survey: §5.3b). Pinned omits outright when the show carries no pin: not an enrichment degrade, just absence. The `nextAiringEpisode` countdown ships under the same ROD-261 ticket but renders on the **chips row** (§4.4) instead — a live signal, not a stored snapshot |
 | **Detail · synopsis** | AniList `description` | word-wrapped synopsis | `no synopsis yet` in `[m]` + italic |
 | **History · row meta** | DB `progress`, `total_episodes`, `list_status` | row 1 is title-only; the episode count renders on the row-2 progress bar (`drawProgressBar`), not duplicated here (ROD-227) | count degrades to `N / ? eps` on the bar when `total_episodes` is null; §5.4's richer row-1 meta (resume/season/status) is deferred — see the N7 note |
 | **History · progress bar** | DB `progress`, `total_episodes` | bar proportional to `progress / total_episodes`, with `N / M eps` | `N / ? eps`; the bar fills to ⅓ width as a non-zero signal when total is null |
@@ -3029,21 +3071,21 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
 #### Browse — normal, detail pane focused
 
 ```
-  ▌  hjkl scroll · h back · enter play · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
 Note: `q` quits the app (ROD-210) — `h`/`Esc` return focus to the list. Browse uses this string at all two-pane
 widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. The
 in-pane grid renders at every two-pane width (narrower at `60 ≤ w < 100`:
 `detail_w ≈ 25` at `w = 60` → ≈ 5 columns) — Browse has always shown it there;
 `Enter` plays the focused episode and `Space` promotes to the full-screen zoom.
-Episodes load on detail
+`v` cycles the open show's provider pin (ROD-345, §5.3a). Episodes load on detail
 entry, not on list hover (ROD-202: parity with History — scrolling Browse never
-fires a fetch). At 80 cols the string fits
-within the ~74-char budget:
-`hjkl scroll · h back · enter play · space zoom · q quit` = 52 chars + `▌ ` = 54.
+fires a fetch). At 80 cols the string fits comfortably within the ~74-char
+budget: `hjkl scroll · h back · enter play · v pin · space zoom · q quit` is 63
+characters.
 
 #### History — normal, list pane focused
 
@@ -3064,22 +3106,23 @@ catalogue search) isn't obvious in a watchlist without the hint. Over budget at
 #### History — normal, detail pane focused (w ≥ 100)
 
 ```
-  ▌  hjkl scroll · h back · enter play · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
-Identical to Browse detail pane focused — symmetric two-pane grammar. Also
-identical, since ROD-259, to History's `60 ≤ w < 100` tier below — the
-bottom-bar hint no longer varies within History's two-pane range.
+Identical to Browse detail pane focused — symmetric two-pane grammar,
+including `v` (ROD-345, §5.3a). Also identical, since ROD-259, to History's
+`60 ≤ w < 100` tier below — the bottom-bar hint no longer varies within
+History's two-pane range.
 
 #### History — normal, detail pane focused (60 ≤ w < 100)
 
 ```
-  ▌  hjkl scroll · h back · enter play · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `space`, `q`.
+Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
 The in-pane grid renders at this width too now (ROD-259) — narrower
 (`detail_w ≈ 25` at `w = 60` → ≈ 5 columns) but real. `Enter` plays the focused
@@ -3090,13 +3133,15 @@ longer has a mid-tier variant.
 #### Detail (zoom) — normal
 
 ```
-  ▌  hjkl scroll · enter play · space/esc back
+  ▌  hjkl scroll · enter play · v pin · space/esc back
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `enter`, `space`, `esc`.
+Underlined: `h`, `j`, `k`, `l`, `enter`, `v`, `space`, `esc`.
 
-`space/esc back` reinforces that both keys demote from zoom. `q` quits the app
-(ROD-210); it is not shown — the line stays within budget.
+`space/esc back` reinforces that both keys demote from zoom. `v` cycles the
+provider pin (ROD-345, §5.3a); the zoom is a detail surface like the in-pane
+grid. `q` quits the app (ROD-210); it is not shown — the line stays within
+budget.
 
 #### History — empty (no records)
 
