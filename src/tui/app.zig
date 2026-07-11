@@ -845,7 +845,7 @@ pub const App = struct {
     /// harmless because the dedup is soft: a re-fire past the ring hits the
     /// store-backed candidate filter and no-ops. Optionals, not a 0 sentinel:
     /// nothing enforces anilist_id > 0, and an id equal to the sentinel would
-    /// silently read as always-attempted (chaos-pass repro).
+    /// silently read as always-attempted.
     prewarm_attempted: [32]?i64 = @splat(null),
     prewarm_attempted_next: usize = 0,
     /// ROD-351: wall-clock of the last pre-warm walk START. Floors the spacing
@@ -3369,6 +3369,11 @@ pub const App = struct {
         return out.toOwnedSlice(arena);
     }
 
+    /// Minimum spacing between pre-warm walk starts, app-wide (see
+    /// `prewarm_last_start_ms`). Generous against the replay drip, small enough
+    /// that a short add-burst's later shows still warm on their first play.
+    const prewarm_spacing_ms: i64 = 30_000;
+
     /// Fire the eager pre-warm walk (ROD-351) for a show the user just added or
     /// started playing: mint sibling bindings in the background so a later
     /// provider flip (auto fallback or the 'v' pin) is instant tier-0 routing
@@ -3386,11 +3391,6 @@ pub const App = struct {
     /// teardown race), so tests pin the candidate filter (`prewarmCandidates`),
     /// the attempted-mark, and the event arms; the thread glue mirrors
     /// `fireResolveAddSearch` and is exercised live.
-    /// Minimum spacing between pre-warm walk starts, app-wide (see
-    /// `prewarm_last_start_ms`). Generous against the replay drip, small enough
-    /// that a short add-burst's later shows still warm on their first play.
-    const prewarm_spacing_ms: i64 = 30_000;
-
     fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64) void {
         if (self.prewarm_active or self.add_resolving or self.play_resolving) return;
         if (self.fallback != null) return; // mid-rescue is exactly the wrong time

@@ -6471,9 +6471,9 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid5, .source = "senshi" } });
     try testing.expectEqual(@as(?i64, 999), app.prewarm_attempted[1]);
 
-    // anilist_id 0 is a real value, not the ring's empty state (chaos-pass
-    // repro: an i64-with-0-sentinel ring read aid 0 as always-attempted and
-    // silently never warmed it).
+    // anilist_id 0 is a real value, not the ring's empty state: an
+    // i64-with-0-sentinel ring would read aid 0 as always-attempted and
+    // silently never warm it.
     try st.upsertCanonicalOnly(.{ .id = "0", .name = "Zero", .anilist_id = 0, .mal_id = 222 }, true, 5000, arena);
     app.now_ms = app.prewarm_last_start_ms.? + 60_000;
     app.add_resolving = true;
