@@ -6234,6 +6234,106 @@ test "ROD-346: a fallback hop reuses an existing sibling binding (tier 0) before
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-347: the walk skips a fresh-absent provider; a stale verdict re-probes" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // A fresh "beta doesn't stock this" verdict: the walk must not burn beta's
+    // tier-A probe on it, so alpha's failure dead-ends instead of hopping.
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(!beta.hit.load(.acquire));
+    try testing.expect(app.fallback == null); // exhausted and freed
+    try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
+
+    // Past the TTL the verdict is just history: the same failure now hops to
+    // beta's tier-A probe (catalogs move; a week-old miss can't strand a show).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs() - store_mod.Store.ABSENCE_TTL_SECONDS - 1);
+    const for_id2 = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id2 } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-347: a tier-0 sibling binding outranks even a fresh negative" {
+    // bindCanonical clears the absence row, so this pair shouldn't coexist; the
+    // ordering (binding checked BEFORE the cache) makes the walk correct even if
+    // a code path ever mints one without the clear. Belt and suspenders, pinned.
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
 test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {
     var alpha = RecordingProvider{ .id = "alpha" };
     const slots = [_]SourceProvider{alpha.provider()};
@@ -6770,6 +6870,10 @@ test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint ar
     // this manual flip is the rescue path and must work from exactly this state.
     try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
     try st.setProviderPin(154587, "alpha"); // one v earlier in the cycle
+    // ROD-347: even a fresh "beta doesn't stock this" verdict must not gate the
+    // flip; an explicit v is the user overriding the cache, and the re-probe's
+    // mint clears the negative (bindCanonical's invariant).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
 
     var app: App = .{};
     app.gpa = std.testing.allocator;

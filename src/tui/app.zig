@@ -3228,6 +3228,10 @@ pub const App = struct {
         /// the positional fallback when the hop provider labels episodes
         /// differently. Null for a plain episode-fetch walk.
         play: ?PlayCont = null,
+        /// ROD-347: a user-armed walk (the 'v' pin flip) probes through a fresh
+        /// absence verdict instead of skipping on it; an explicit flip is the
+        /// override, and its re-probe refreshes or clears the cached negative.
+        manual: bool = false,
 
         pub const PlayCont = struct { episode_raw: []const u8, ordinal: u32 };
 
@@ -3341,6 +3345,15 @@ pub const App = struct {
             if (bound_id) |sid| {
                 self.fireFallbackFetch(loop, io, registry, walk, p, sid, null, failed_name);
                 return true;
+            }
+            // ROD-347: no binding and a fresh "not stocked" verdict: don't burn a
+            // probe or a tier-C search on a provider known to miss. A binding always
+            // wins over a stale negative (checked above), and a manual walk probes
+            // anyway. Read errors fail open: the cache is an optimization.
+            if (!walk.manual) {
+                if (self.store) |st| {
+                    if (st.providerAbsentFresh(walk.anilist_id, p.name(), Store.nowSecs()) catch false) continue;
+                }
             }
             // Tier A: the provider derives its own catalog key from the canonical.
             if (p.canonicalKey(scratch, walk.canonical) catch null) |key| {
@@ -4272,7 +4285,7 @@ pub const App = struct {
         };
         providers[0] = target;
         self.clearFallback();
-        self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0 };
+        self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0, .manual = true };
         if (!self.advanceFallback(loop, io, registry, null, null)) {
             var buf: [96]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "couldn't reach {s}", .{target.displayName()}) catch "couldn't switch provider";
