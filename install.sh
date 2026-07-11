@@ -75,6 +75,13 @@ else
   [ -n "$ver" ] || err "could not resolve the latest release tag (rate-limited? set ZIGOKU_VERSION to pin one)"
 fi
 
+# The version string gets baked into both the download URL and a local file
+# path, so pin its shape before it touches either. Anything with a slash,
+# whitespace, or a shell/URL metacharacter is not a release tag we publish.
+case "$ver" in
+  ''|*[!0-9A-Za-z.+-]*) err "invalid version '$ver'; expected a release like 0.4.0" ;;
+esac
+
 tarball="${BIN}-v${ver}-${target}.tar.gz"
 base="https://github.com/${REPO}/releases/download/v${ver}"
 

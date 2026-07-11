@@ -144,8 +144,10 @@ curl -fsSO https://raw.githubusercontent.com/vantroy/zigoku/master/install.sh
 less install.sh && sh install.sh
 ```
 
-The installer never installs an unverified download: a checksum mismatch aborts
-before anything is unpacked.
+The installer checks the download against the published `sha256sums.txt` before
+it unpacks anything: a mismatch aborts and nothing installs. As with other
+`curl | sh` installers, that verifies integrity in transit, not source
+authenticity, since the checksums ride the same channel as the release.
 
 ### AUR (Arch Linux)
 
