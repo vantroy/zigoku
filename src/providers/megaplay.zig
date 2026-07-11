@@ -148,14 +148,16 @@ fn mapSources(arena: Allocator, raw: []const u8, tt: domain.Translation) !Stream
 
 /// Pick the one subtitle track to hand mpv: the host's `default` flag wins
 /// (live it marks English), else an English-labeled track, else the first
-/// subtitle at all. "thumbnails" tracks (the seekbar sprite sheet) are never
-/// subtitles. Null when nothing qualifies. Tracks reach here already
+/// subtitle at all. Only a `captions` or kind-less track qualifies (both
+/// live-observed as subs); an unknown future kind fails safe as "no pick",
+/// never as a wrong `--sub-file` (the seekbar's "thumbnails" sprite sheet is
+/// the known non-sub). Null when nothing qualifies. Tracks reach here already
 /// argv-vetted by `mapSources`.
 pub fn pickSubtitle(tracks: []const Track) ?[]const u8 {
     var english: ?[]const u8 = null;
     var first: ?[]const u8 = null;
     for (tracks) |t| {
-        if (t.kind) |k| if (std.mem.eql(u8, k, "thumbnails")) continue;
+        if (t.kind) |k| if (!std.mem.eql(u8, k, "captions")) continue;
         if (t.default) return t.file;
         const label = t.label orelse "";
         if (english == null and std.ascii.startsWithIgnoreCase(label, "english")) english = t.file;
@@ -365,6 +367,10 @@ test "pickSubtitle: default wins, english next, first as fallback, thumbnails ne
     // nothing but the sprite sheet, or nothing at all: no pick.
     try testing.expect(pickSubtitle(&.{thumbs}) == null);
     try testing.expect(pickSubtitle(&.{}) == null);
+    // an unknown future kind fails safe (never picked), even flagged default.
+    const alien: Track = .{ .file = "https://c/alien.vtt", .kind = "chapters", .default = true };
+    try testing.expect(pickSubtitle(&.{alien}) == null);
+    try testing.expectEqualStrings("https://c/spa.vtt", pickSubtitle(&.{ alien, spanish }).?);
 }
 
 test "mapSources: missing or unsafe stream url is a clean error" {
