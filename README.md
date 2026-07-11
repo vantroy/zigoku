@@ -115,6 +115,34 @@ app-wide, not just the Settings tab.*
 The binary shells out to whatever `mpv` is on your `PATH` to play video.
 Without it, you get a browser. A very nice browser, but still.
 
+### Quick install (Linux & macOS)
+
+```sh
+curl -fsS https://raw.githubusercontent.com/vantroy/zigoku/master/install.sh | sh
+```
+
+Detects your OS and architecture, downloads the matching release tarball,
+verifies it against the published `sha256sums.txt`, and installs the `zigoku`
+binary to `~/.local/bin`. Works on x86_64 and aarch64, Linux and macOS.
+
+Knobs (all optional):
+
+```sh
+ZIGOKU_VERSION=0.3.1 ...   # pin a release instead of taking the latest
+BINDIR=/usr/local/bin ...  # install somewhere else (PREFIX also honored)
+```
+
+Piping a script into a shell is trust-on-first-use, so if you'd rather read it
+first, download and run it in two steps:
+
+```sh
+curl -fsSO https://raw.githubusercontent.com/vantroy/zigoku/master/install.sh
+less install.sh && sh install.sh
+```
+
+The installer never installs an unverified download: a checksum mismatch aborts
+before anything is unpacked.
+
 ### AUR (Arch Linux)
 
 `paru -S zigoku` (or `yay`) is the goal, but AUR new-account registration has
