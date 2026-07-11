@@ -331,10 +331,11 @@ pub const MetaField = struct {
     /// Render `value` in `fg3` (dim) rather than `fg2` — the "? eps" count
     /// degrade only; present enrichment is always `fg2`.
     dim: bool = false,
-    /// ROD-261: this field appears ONLY in the labeled rail, never on the compact
-    /// line — `drawMetaLine` skips it. Rank is the sole rail-only field (verbose,
-    /// lowest priority); it still rides the one ordered list, so the two forms
-    /// stay in sync everywhere else.
+    /// ROD-261/348: skipped by `drawMetaLine`, never a meta-LINE segment. Rank,
+    /// Provider, and Pinned are today's rail-only fields; Provider/Pinned still
+    /// reach the compact form via the dedicated `drawProviderLine` row
+    /// (ROD-348/356), just not the joined line. All rail-only fields still ride
+    /// the one ordered list, so the two forms stay in sync everywhere else.
     rail_only: bool = false,
 };
 
