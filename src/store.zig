@@ -456,15 +456,27 @@ const MIGRATION_V16 =
 // supersedes the sentinel. FK is ON DELETE CASCADE only, so the progress/cache
 // deletes MUST precede the re-key (no children may dangle across the key change).
 //
+// A stale unbound sentinel may ALREADY sit on such a canonical (not reachable via
+// app code, which supersedes a sentinel on any real bind, but a pre-ROD-329 or
+// hand-edited DB can carry it). Left alone it would block the re-key and leave the
+// poorer no-provider stub as the surviving card while the orphan's real state is
+// deleted. So drop that sentinel first and let the orphan (real user-state) take
+// its place. Orphan-ness is judged against REAL providers only, so the sibling
+// checks exclude both 'anipub' and 'unbound'.
+//
 // Pins carry provider PREFERENCE, not stock, so they transfer to megaplay;
 // absences don't (a different catalog).
 const MIGRATION_V17 =
     \\DELETE FROM episode_progress WHERE source = 'anipub';
     \\DELETE FROM episode_cache WHERE source = 'anipub';
+    \\DELETE FROM anime WHERE source = 'unbound' AND source_id IN (
+    \\  SELECT CAST(canonical_id AS TEXT) FROM anime a
+    \\  WHERE a.source = 'anipub' AND a.canonical_id IS NOT NULL AND a.history_visible = 1
+    \\    AND NOT EXISTS (SELECT 1 FROM anime sib WHERE sib.canonical_id = a.canonical_id AND sib.source <> 'anipub' AND sib.source <> 'unbound')
+    \\);
     \\UPDATE anime SET source = 'unbound', source_id = CAST(canonical_id AS TEXT)
     \\WHERE source = 'anipub' AND canonical_id IS NOT NULL AND history_visible = 1
-    \\  AND NOT EXISTS (SELECT 1 FROM anime sib WHERE sib.canonical_id = anime.canonical_id AND sib.source <> 'anipub')
-    \\  AND NOT EXISTS (SELECT 1 FROM anime u WHERE u.source = 'unbound' AND u.source_id = CAST(anime.canonical_id AS TEXT))
+    \\  AND NOT EXISTS (SELECT 1 FROM anime sib WHERE sib.canonical_id = anime.canonical_id AND sib.source <> 'anipub' AND sib.source <> 'unbound')
     \\  AND rowid = (SELECT MIN(rowid) FROM anime a2 WHERE a2.canonical_id = anime.canonical_id AND a2.source = 'anipub' AND a2.history_visible = 1);
     \\DELETE FROM anime WHERE source = 'anipub';
     \\UPDATE provider_pins SET provider = 'megaplay' WHERE provider = 'anipub';
@@ -4791,6 +4803,32 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
 }
 
+/// Fail if the DB has any foreign-key violation. `PRAGMA foreign_key_check`
+/// reports violations as RESULT ROWS, not as an error, so running it through
+/// `Store.exec` (null row callback) discards them and proves nothing: step it by
+/// hand so a migration test's FK-clean assertion actually verifies the graph
+/// (ROD-359).
+fn expectNoForeignKeyViolations(s: *Store) !void {
+    const stmt = try s.prepare("PRAGMA foreign_key_check;");
+    defer _ = c.sqlite3_finalize(stmt);
+    if (c.sqlite3_step(stmt) == c.SQLITE_ROW) return error.ForeignKeyViolation;
+}
+
+test "expectNoForeignKeyViolations catches a dangling FK exec would silently pass" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    var s = try Store.openMemory();
+    defer s.close();
+    // Insert a child whose (source, source_id) parent doesn't exist, with FK
+    // enforcement briefly off (models pre-existing drift / an out-of-band edit).
+    try s.exec("PRAGMA foreign_keys = OFF;");
+    try s.exec("INSERT INTO episode_progress (source, source_id, translation, episode, updated_at) VALUES ('ghost', 'x', 'sub', '1', 0);");
+    try s.exec("PRAGMA foreign_keys = ON;");
+    // exec swallows the violation rows (the bug); the helper surfaces them.
+    try s.exec("PRAGMA foreign_key_check;");
+    try testing.expectError(error.ForeignKeyViolation, expectNoForeignKeyViolations(&s));
+}
+
 test "MIGRATION_V17 purges poisoned anipub state, transfers pins to megaplay, spares siblings (ROD-359)" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
@@ -4845,7 +4883,7 @@ test "MIGRATION_V17 purges poisoned anipub state, transfers pins to megaplay, sp
     // Idempotent, and nothing dangles for the FK enforcer.
     try s.exec(MIGRATION_V17);
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
-    try s.exec("PRAGMA foreign_key_check;");
+    try expectNoForeignKeyViolations(&s);
 }
 
 test "MIGRATION_V17 re-keys a sibling-less anipub card to the unbound sentinel, not oblivion (ROD-359)" {
@@ -4885,11 +4923,39 @@ test "MIGRATION_V17 re-keys a sibling-less anipub card to the unbound sentinel, 
     try testing.expect((try s.getResume(SOURCE_UNBOUND, "950", .sub, "9")) == null);
     // One visible History card (the re-keyed sentinel), and the FK enforcer is clean.
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
-    try s.exec("PRAGMA foreign_key_check;");
+    try expectNoForeignKeyViolations(&s);
 
     // Idempotent: a second pass finds no anipub rows and changes nothing.
     try s.exec(MIGRATION_V17);
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+}
+
+test "MIGRATION_V17: a stale unbound sentinel yields to the anipub orphan's real state, not vice versa (ROD-359)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A canonical carrying BOTH a stale unbound sentinel (a no-provider stub:
+    // planning, no rating) AND an anipub orphan with real user-state. Not
+    // reachable through app code (bindCanonical supersedes a sentinel on any real
+    // bind), but a pre-ROD-329 or hand-edited DB can. The sentinel must not win.
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (960, 4224, 'Toradora');");
+    // Sentinel first (lower rowid), so a naive "keep what exists" would pick it.
+    try s.upsertAnime(.{ .source = SOURCE_UNBOUND, .source_id = "960", .title = "Toradora", .anilist_id = 960, .canonical_id = 960, .list_status = .planning }, 1000, arena);
+    try s.upsertAnime(.{ .source = "anipub", .source_id = "962", .title = "Toradora", .anilist_id = 960, .canonical_id = 960, .progress = 9, .list_status = .watching, .user_rating = 9 }, 1001, arena);
+
+    try s.exec(MIGRATION_V17);
+
+    // The surviving card carries the orphan's real state, not the stub's planning.
+    const card = (try s.getAnime(arena, SOURCE_UNBOUND, "960")).?;
+    try testing.expectEqual(domain.ListStatus.watching, card.list_status);
+    try testing.expectEqual(@as(?f64, 9), card.user_rating);
+    // Exactly one row for the canonical (no lingering stub, no PK collision).
+    try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
+    try testing.expect((try s.getAnime(arena, "anipub", "962")) == null);
+    try expectNoForeignKeyViolations(&s);
 }
 
 test "loadHistory/getAnime resolve enrichment through canonical: linked row reads canonical (per-column COALESCE), unmatched row falls back to anime-local (ROD-312)" {
