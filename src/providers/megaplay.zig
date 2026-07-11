@@ -40,8 +40,9 @@ const max_data_id_len = 20;
 
 /// One subtitle/thumbnail track from getSources `tracks[]`. Softsubs arrive as
 /// external vtts (multi-language); a `kind` of "thumbnails" is the seekbar
-/// sprite sheet, not a subtitle. Carried through for the player to pick from;
-/// unused until softsub selection lands (parked, ROD-340).
+/// sprite sheet, not a subtitle. `pickSubtitle` selects one onto the
+/// StreamLink (ROD-354); the full list is carried through for a future
+/// language preference.
 pub const Track = struct {
     file: []const u8,
     label: ?[]const u8 = null,
@@ -87,7 +88,7 @@ pub fn resolve(arena: Allocator, io: Io, realid: []const u8, tt: domain.Translat
     // Step 2: the sources JSON for that data-id.
     const src_url = try std.fmt.allocPrint(arena, HOST ++ "/stream/getSources?id={s}", .{data_id});
     const raw = try request(arena, io, src_url, .xhr);
-    return mapSources(arena, raw);
+    return mapSources(arena, raw, tt);
 }
 
 // ── the getSources JSON shape ───────────────────────────────────────────────────
@@ -110,8 +111,11 @@ const SourcesResp = struct {
 };
 
 /// Map a raw getSources body onto a `Stream`. Pure over the response bytes so
-/// it's unit-testable without the network.
-fn mapSources(arena: Allocator, raw: []const u8) !Stream {
+/// it's unit-testable without the network. `tt` gates the softsub pick: only a
+/// `sub` resolve attaches a subtitle url (a dub is voiced; auto-loading full
+/// dialogue subs over it would be wrong, and a signs-only pick needs the
+/// language preference this deliberately isn't yet).
+fn mapSources(arena: Allocator, raw: []const u8, tt: domain.Translation) !Stream {
     const parsed = try std.json.parseFromSlice(SourcesResp, arena, raw, .{ .ignore_unknown_fields = true });
     const src = parsed.value.sources orelse return error.NoStreamSource;
     const file = src.file orelse return error.NoStreamSource;
@@ -134,11 +138,30 @@ fn mapSources(arena: Allocator, raw: []const u8) !Stream {
             // The segment CDN serves its .ts as .jpg (same content-filter dodge
             // as senshi, ROD-301); relax ffmpeg's HLS extension gate.
             .cloaked_segments = true,
+            .sub_url = if (tt == .sub) pickSubtitle(tracks.items) else null,
         },
         .tracks = tracks.items,
         .intro = skipFrom(parsed.value.intro),
         .outro = skipFrom(parsed.value.outro),
     };
+}
+
+/// Pick the one subtitle track to hand mpv: the host's `default` flag wins
+/// (live it marks English), else an English-labeled track, else the first
+/// subtitle at all. "thumbnails" tracks (the seekbar sprite sheet) are never
+/// subtitles. Null when nothing qualifies. Tracks reach here already
+/// argv-vetted by `mapSources`.
+pub fn pickSubtitle(tracks: []const Track) ?[]const u8 {
+    var english: ?[]const u8 = null;
+    var first: ?[]const u8 = null;
+    for (tracks) |t| {
+        if (t.kind) |k| if (std.mem.eql(u8, k, "thumbnails")) continue;
+        if (t.default) return t.file;
+        const label = t.label orelse "";
+        if (english == null and std.ascii.startsWithIgnoreCase(label, "english")) english = t.file;
+        if (first == null) first = t.file;
+    }
+    return english orelse first;
 }
 
 /// Normalize a raw skip stamp: both ends present, finite, and a positive-width
@@ -307,7 +330,7 @@ test "mapSources maps a live-shaped getSources body (ROD-341)" {
         \\ "outro":{"start":1300,"end":1390},
         \\ "server":2}
     ;
-    const s = try mapSources(a, raw);
+    const s = try mapSources(a, raw, .sub);
     try testing.expectEqualStrings("https://cdn.mewstream.buzz/x/master.m3u8", s.link.url);
     try testing.expectEqualStrings(STREAM_REFERER, s.link.referer.?);
     try testing.expect(s.link.user_agent != null);
@@ -318,6 +341,30 @@ test "mapSources maps a live-shaped getSources body (ROD-341)" {
     try testing.expectEqualStrings("thumbnails", s.tracks[1].kind.?);
     try testing.expectEqual(@as(f64, 100), s.intro.?.start);
     try testing.expectEqual(@as(f64, 1390), s.outro.?.end);
+    // The softsub seam (ROD-354): sub resolve carries the default vtt…
+    try testing.expectEqualStrings("https://1oe.lostproject.club/eng.vtt", s.link.sub_url.?);
+    // …a dub resolve never auto-loads one.
+    const d = try mapSources(a, raw, .dub);
+    try testing.expect(d.link.sub_url == null);
+}
+
+test "pickSubtitle: default wins, english next, first as fallback, thumbnails never (ROD-354)" {
+    const thumbs: Track = .{ .file = "https://c/thumbs.vtt", .kind = "thumbnails", .default = true };
+    const spanish: Track = .{ .file = "https://c/spa.vtt", .label = "Spanish", .kind = "captions" };
+    const english: Track = .{ .file = "https://c/eng.vtt", .label = "English - CR", .kind = "captions" };
+    const eng_default: Track = .{ .file = "https://c/eng2.vtt", .label = "English", .kind = "captions", .default = true };
+    const bare: Track = .{ .file = "https://c/bare.vtt" }; // no label/kind, live-observed shape
+
+    // default beats an earlier english label; a default thumbnails track is not a sub.
+    try testing.expectEqualStrings("https://c/eng2.vtt", pickSubtitle(&.{ thumbs, english, eng_default }).?);
+    // no default: the english label wins over an earlier other language.
+    try testing.expectEqualStrings("https://c/eng.vtt", pickSubtitle(&.{ spanish, english }).?);
+    // no default, no english: first subtitle-shaped track.
+    try testing.expectEqualStrings("https://c/spa.vtt", pickSubtitle(&.{ thumbs, spanish }).?);
+    try testing.expectEqualStrings("https://c/bare.vtt", pickSubtitle(&.{bare}).?);
+    // nothing but the sprite sheet, or nothing at all: no pick.
+    try testing.expect(pickSubtitle(&.{thumbs}) == null);
+    try testing.expect(pickSubtitle(&.{}) == null);
 }
 
 test "mapSources: missing or unsafe stream url is a clean error" {
@@ -325,23 +372,25 @@ test "mapSources: missing or unsafe stream url is a clean error" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    try testing.expectError(error.NoStreamSource, mapSources(a, "{}"));
+    try testing.expectError(error.NoStreamSource, mapSources(a, "{}", .sub));
     try testing.expectError(error.NoStreamSource, mapSources(a,
         \\{"sources":{}}
-    ));
+    , .sub));
     // Relative url and an argv-unsafe url both refuse to reach mpv.
     try testing.expectError(error.BadStreamUrl, mapSources(a,
         \\{"sources":{"file":"/x/master.m3u8"}}
-    ));
+    , .sub));
     try testing.expectError(error.BadStreamUrl, mapSources(a,
         \\{"sources":{"file":"https://cdn/x master.m3u8"}}
-    ));
-    // An unsafe TRACK url is dropped, not fatal; the stream still resolves.
+    , .sub));
+    // An unsafe TRACK url is dropped, not fatal; the stream still resolves,
+    // and the dropped track can never become the sub pick.
     const s = try mapSources(a,
         \\{"sources":{"file":"https://cdn/ok.m3u8"},
         \\ "tracks":[{"file":"/relative.vtt","kind":"captions"}]}
-    );
+    , .sub);
     try testing.expectEqual(@as(usize, 0), s.tracks.len);
+    try testing.expect(s.link.sub_url == null);
 }
 
 test "skipFrom rejects degenerate windows, keeps real ones" {

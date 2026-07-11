@@ -36,6 +36,7 @@ pub fn main(init: std.process.Init) !void {
     try w.print("  referer {s}\n", .{stream.link.referer.?});
     try w.print("  ua      {s}\n", .{stream.link.user_agent.?});
     try w.print("  cloaked {}\n", .{stream.link.cloaked_segments});
+    try w.print("  sub     {s}\n", .{stream.link.sub_url orelse "-"});
     for (stream.tracks) |t| {
         try w.print("  track   [{s}] {s} {s}{s}\n", .{
             t.kind orelse "?",
