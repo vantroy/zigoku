@@ -224,8 +224,15 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
         },
         .cover_error => |id| alloc.free(id),
         .episodes_error => |e| alloc.free(e.for_id),
-        .resolve_add_result => |d| alloc.free(d.source_id),
-        .resolve_play_target => |d| if (d.source_id.len > 0) alloc.free(d.source_id),
+        .resolve_add_result => |d| {
+            alloc.free(d.source_id);
+            if (d.absent_sources.len > 0) alloc.free(d.absent_sources);
+        },
+        .resolve_play_target => |d| {
+            if (d.source_id.len > 0) alloc.free(d.source_id);
+            if (d.absent_sources.len > 0) alloc.free(d.absent_sources);
+        },
+        .prewarm_result => |d| if (d.source_id.len > 0) alloc.free(d.source_id),
         .enrichment_refreshed => |d| {
             freeOwnedAnime(alloc, d.result);
             alloc.free(d.source);
@@ -3415,6 +3422,42 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     try testing.expect(rec.history_visible);
 }
 
+test "resolve events cache definitive absences on every arm, even a stale one (ROD-347)" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .title_romaji = "Sousou no Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    // Add miss whose walk ruled anipub definitively absent: the arm caches the
+    // negative alongside the unbound marker (both facts, independently).
+    const absent_add = try std.testing.allocator.alloc([]const u8, 1);
+    absent_add[0] = "anipub";
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_add } });
+    try testing.expect(try st.providerAbsentFresh(154587, "anipub", store_mod.Store.nowSecs()));
+
+    // A play result the staleness gate drops (play_resolve_aid is null: the user
+    // moved on) still banks the catalog fact before the drop.
+    app.play_resolving = true;
+    const absent_play = try std.testing.allocator.alloc([]const u8, 1);
+    absent_play[0] = "senshi";
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_play } });
+    try testing.expect(!app.play_resolving);
+    try testing.expect(try st.providerAbsentFresh(154587, "senshi", store_mod.Store.nowSecs()));
+}
+
 test "opening an unbound row clears a prior show's grid so firePlay can't launch it (ROD-329)" {
     var st = try store_mod.Store.openMemory();
     defer st.close();
@@ -6192,6 +6235,253 @@ test "ROD-346: a fallback hop reuses an existing sibling binding (tier 0) before
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-347: the walk skips a fresh-absent provider; a stale verdict re-probes" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // A fresh "beta doesn't stock this" verdict: the walk must not burn beta's
+    // tier-A probe on it, so alpha's failure dead-ends instead of hopping.
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(!beta.hit.load(.acquire));
+    try testing.expect(app.fallback == null); // exhausted and freed
+    try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
+
+    // Past the TTL the verdict is just history: the same failure now hops to
+    // beta's tier-A probe (catalogs move; a week-old miss can't strand a show).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs() - store_mod.Store.ABSENCE_TTL_SECONDS - 1);
+    const for_id2 = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id2 } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-347: a tier-0 sibling binding outranks even a fresh negative" {
+    // bindCanonical clears the absence row, so this pair shouldn't coexist; the
+    // ordering (binding checked BEFORE the cache) makes the walk correct even if
+    // a code path ever mints one without the clear. Belt and suspenders, pinned.
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-351: prewarmCandidates keeps only unchecked providers (bound and fresh-absent drop)" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    var gamma = RecordingProvider{ .id = "gamma" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider(), gamma.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    // alpha is bound (tier 0 already routes there), beta has a fresh negative:
+    // only gamma is worth a probe.
+    const c1 = try App.prewarmCandidates(&st, registry, 154587, arena);
+    try testing.expectEqual(@as(usize, 1), c1.len);
+    try testing.expectEqualStrings("gamma", c1[0].name());
+
+    // An aged-out verdict reads unchecked again: beta rejoins the walk.
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs() - store_mod.Store.ABSENCE_TTL_SECONDS - 1);
+    const c2 = try App.prewarmCandidates(&st, registry, 154587, arena);
+    try testing.expectEqual(@as(usize, 2), c2.len);
+    try testing.expectEqualStrings("beta", c2[0].name());
+    try testing.expectEqualStrings("gamma", c2[1].name());
+}
+
+test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done clears the guard" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.prewarm_active = true;
+
+    // A stocked verdict mints the sibling binding HIDDEN: the store row exists
+    // for tier-0 routing, but History gains nothing until a play reveals it.
+    const sid = try std.testing.allocator.dupe(u8, "b7");
+    try testTick(&app, .{ .prewarm_result = .{ .anilist_id = 154587, .source = "beta", .source_id = sid, .absent = false } });
+    const rec = (try st.getAnime(arena, "beta", "b7")).?;
+    try testing.expect(!rec.history_visible);
+    try testing.expectEqual(@as(usize, 0), (try st.loadHistory(arena)).len);
+    // The canonical link is live: tier 0 resolves the sibling id through it.
+    try testing.expectEqualStrings("b7", (try st.bindingSourceId(arena, "beta", 154587)).?);
+
+    // A definitive miss lands in the ROD-347 negative cache.
+    try testTick(&app, .{ .prewarm_result = .{ .anilist_id = 154587, .source = "gamma", .source_id = &.{}, .absent = true } });
+    try testing.expect(try st.providerAbsentFresh(154587, "gamma", store_mod.Store.nowSecs()));
+
+    // The walk's close clears the single-flight guard.
+    try testing.expect(app.prewarm_active);
+    try testTick(&app, .prewarm_done);
+    try testing.expect(!app.prewarm_active);
+}
+
+test "ROD-351: an add success triggers the warm; a busy or repeat fire stays silent" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    // The tier-A add success arm fires the warm (under test the spawn is gated;
+    // the attempted mark is the observable trace that it would have run). The
+    // binding mints under "senshi" so the dummy registry's provider ("allanime")
+    // stays an unbound candidate worth warming.
+    const sid = try std.testing.allocator.dupe(u8, "52991");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, 154587), app.prewarm_attempted[0]);
+
+    // Session dedup: a second add/play of the same show doesn't re-mark (the
+    // ring would show a duplicate).
+    app.add_resolving = true;
+    const sid2 = try std.testing.allocator.dupe(u8, "52991");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid2, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+
+    // An armed fallback walk suppresses the warm outright: mid-rescue the
+    // providers are exactly what's failing. now_ms sits past the spacing floor
+    // so the fallback guard, not the floor, is what this pins.
+    app.now_ms = 100_000;
+    const canonical: Anime = .{ .id = "999", .name = "Other", .anilist_id = 999 };
+    const snap = try workers.dupeOwnedAnime(app.gpa, canonical);
+    const provs = try app.gpa.alloc(SourceProvider, 0);
+    app.fallback = .{ .canonical = snap, .anilist_id = 999, .providers = provs, .tried = 0 };
+    defer app.clearFallback();
+    try st.upsertCanonicalOnly(.{ .id = "999", .name = "Other", .anilist_id = 999, .mal_id = 111 }, true, 5000, arena);
+    app.add_resolving = true;
+    const sid3 = try std.testing.allocator.dupe(u8, "111");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid3, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+
+    // Spacing floor: with the walk gone, a fire inside the 30s window since the
+    // last walk START stays silent AND unmarked (so the show retries later);
+    // past the window it runs.
+    app.clearFallback();
+    app.now_ms = app.prewarm_last_start_ms.? + 1_000;
+    app.add_resolving = true;
+    const sid4 = try std.testing.allocator.dupe(u8, "111");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid4, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    app.add_resolving = true;
+    const sid5 = try std.testing.allocator.dupe(u8, "111");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid5, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, 999), app.prewarm_attempted[1]);
+
+    // anilist_id 0 is a real value, not the ring's empty state: an
+    // i64-with-0-sentinel ring would read aid 0 as always-attempted and
+    // silently never warm it.
+    try st.upsertCanonicalOnly(.{ .id = "0", .name = "Zero", .anilist_id = 0, .mal_id = 222 }, true, 5000, arena);
+    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    app.add_resolving = true;
+    const sid6 = try std.testing.allocator.dupe(u8, "222");
+    try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 0, .source_id = sid6, .source = "senshi" } });
+    try testing.expectEqual(@as(?i64, 0), app.prewarm_attempted[2]);
+}
+
 test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {
     var alpha = RecordingProvider{ .id = "alpha" };
     const slots = [_]SourceProvider{alpha.provider()};
@@ -6382,6 +6672,92 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-347: the add widen skips a fresh-absent provider and goes straight to unbound" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // A prior walk already proved beta doesn't stock this: the widen must not
+    // burn beta's two-pass search on it (the whole point of the cache).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.add_resolving = true;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const sid = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = "alpha" } }, &loop, io, registry);
+
+    // beta filtered out leaves the widen with nothing: no search fired, the
+    // unbound marker persists synchronously on this same arm.
+    app.add_resolve_drain.drain();
+    try testing.expect(!beta.search_hit.load(.acquire));
+    try testing.expect(!app.add_resolving);
+    try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-351: prewarmTask posts per-provider verdicts and honors the cancel flag" {
+    const gpa = std.testing.allocator;
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta" };
+    var loop = initTestLoop();
+
+    // Run the worker body synchronously (no spawn): alpha tier-A probes alive
+    // (match), beta's catalog searches clean and empty (definitive absent).
+    const canonical: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
+    {
+        var cancel = std.atomic.Value(bool).init(false);
+        var drain: workers.ThreadDrain = .{};
+        drain.begin();
+        const provs = try gpa.dupe(SourceProvider, &.{ alpha.provider(), beta.provider() });
+        const snap = try workers.dupeOwnedAnime(gpa, canonical);
+        workers.prewarmTask(&loop, gpa, std.testing.io, provs, snap, 154587, .sub, &cancel, &drain);
+
+        const first = (loop.queue.tryPop() catch null).?;
+        try testing.expectEqualStrings("alpha", first.prewarm_result.source);
+        try testing.expectEqualStrings("52991", first.prewarm_result.source_id);
+        try testing.expect(!first.prewarm_result.absent);
+        freeTestEvent(gpa, first);
+        const second = (loop.queue.tryPop() catch null).?;
+        try testing.expectEqualStrings("beta", second.prewarm_result.source);
+        try testing.expect(second.prewarm_result.absent);
+        try testing.expect((loop.queue.tryPop() catch null).? == .prewarm_done);
+        try testing.expect((loop.queue.tryPop() catch null) == null);
+    }
+
+    // Cancel pre-set (a fallback walk armed): the walk winds down before any
+    // provider is touched, but prewarm_done still posts so the guard clears.
+    {
+        var cancel = std.atomic.Value(bool).init(true);
+        var drain: workers.ThreadDrain = .{};
+        drain.begin();
+        var gamma = RecordingProvider{ .id = "gamma", .tier_a = true };
+        const provs = try gpa.dupe(SourceProvider, &.{gamma.provider()});
+        const snap = try workers.dupeOwnedAnime(gpa, canonical);
+        workers.prewarmTask(&loop, gpa, std.testing.io, provs, snap, 154587, .sub, &cancel, &drain);
+        try testing.expect(!gamma.hit.load(.acquire));
+        try testing.expect((loop.queue.tryPop() catch null).? == .prewarm_done);
+        try testing.expect((loop.queue.tryPop() catch null) == null);
+    }
 }
 
 test "ROD-346: mapEpisodeIndex prefers the raw label, falls back to ordinal, else null" {
@@ -6728,6 +7104,10 @@ test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint ar
     // this manual flip is the rescue path and must work from exactly this state.
     try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
     try st.setProviderPin(154587, "alpha"); // one v earlier in the cycle
+    // ROD-347: even a fresh "beta doesn't stock this" verdict must not gate the
+    // flip; an explicit v is the user overriding the cache, and the re-probe's
+    // mint clears the negative (bindCanonical's invariant).
+    try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs());
 
     var app: App = .{};
     app.gpa = std.testing.allocator;

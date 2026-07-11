@@ -35,7 +35,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 15;
+const SCHEMA_VERSION: c_int = 16;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes share one DB (the TUI
@@ -421,6 +421,20 @@ const MIGRATION_V15 =
     \\CREATE TABLE provider_pins (
     \\    canonical_id INTEGER PRIMARY KEY REFERENCES canonical_anime(anilist_id),
     \\    provider     TEXT NOT NULL
+    \\);
+;
+
+// ROD-347: the negative arm of the per-(canonical, provider) availability
+// tri-state. Only definitive "searched, not stocked" verdicts are persisted;
+// "bound" is derived from the anime table and "unchecked" is the absence of a
+// row, so this table never mirrors either. Own table for the same reason as
+// provider_pins: the enrichment upsert must never be able to touch it.
+const MIGRATION_V16 =
+    \\CREATE TABLE provider_absences (
+    \\    canonical_id INTEGER NOT NULL REFERENCES canonical_anime(anilist_id),
+    \\    provider     TEXT NOT NULL,
+    \\    checked_at   INTEGER NOT NULL,
+    \\    PRIMARY KEY (canonical_id, provider)
     \\);
 ;
 
@@ -944,6 +958,12 @@ pub const Store = struct {
             .history_visible = effective_visible,
         };
         try self.upsertAnime(rec, now, scratch);
+        // ROD-347 invariant: bound and absent never coexist. A real mint proves the
+        // provider stocks the show, so it supersedes any cached negative. The unbound
+        // sentinel is not a provider verdict and clears nothing.
+        if (!std.mem.eql(u8, source, SOURCE_UNBOUND)) {
+            try self.clearProviderAbsence(anilist_id, source);
+        }
         return true;
     }
 
@@ -1487,6 +1507,54 @@ pub const Store = struct {
         try bindOptI64(stmt, 1, canonical_id);
         if (provider) |p| try bindText(stmt, 2, p);
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+    }
+
+    // ── ROD-347: provider-absence negative cache ─────────────────────────────
+
+    /// How long a persisted "not stocked" verdict stays authoritative. Catalogs
+    /// move (a currently-airing show can appear on a provider days after
+    /// premiere), so an absence past this window reads as unchecked and the next
+    /// resolve or pre-warm re-probes.
+    pub const ABSENCE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+    /// Persist (or refresh) a definitive "this provider doesn't stock this show"
+    /// verdict (ROD-347). Callers must hold the ROD-278 line: only a completed
+    /// search/probe with no confident match earns a row here. A transport
+    /// failure proves nothing and must not poison the cache.
+    pub fn markProviderAbsent(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT INTO provider_absences (canonical_id, provider, checked_at) VALUES (?, ?, ?)
+            \\ON CONFLICT(canonical_id, provider) DO UPDATE SET checked_at = excluded.checked_at
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        try bindText(stmt, 2, provider);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 3, now));
+        try self.stepDone(stmt);
+    }
+
+    /// Whether a fresh (within-TTL) absence verdict exists for this
+    /// (canonical, provider) pair. A stale row reads false, indistinguishable
+    /// from unchecked by design, so consumers re-probe naturally.
+    pub fn providerAbsentFresh(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!bool {
+        const stmt = try self.prepare("SELECT checked_at FROM provider_absences WHERE canonical_id = ? AND provider = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        try bindText(stmt, 2, provider);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return false;
+        const checked_at = c.sqlite3_column_int64(stmt, 0);
+        return now < checked_at + ABSENCE_TTL_SECONDS;
+    }
+
+    /// Drop the absence row for one (canonical, provider) pair. `bindCanonical`
+    /// calls this on every real-source mint so bound and absent can never
+    /// coexist; the ROD-345 'v' flip's re-probe lands here too via its mint.
+    fn clearProviderAbsence(self: *Store, canonical_id: i64, provider: []const u8) Error!void {
+        const stmt = try self.prepare("DELETE FROM provider_absences WHERE canonical_id = ? AND provider = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        try bindText(stmt, 2, provider);
+        try self.stepDone(stmt);
     }
 
     /// (list_status, progress high-water, total episodes, still-airing) for one
@@ -2156,6 +2224,10 @@ pub const Store = struct {
         if (v < 15) {
             try self.exec(MIGRATION_V15);
             v = 15;
+        }
+        if (v < 16) {
+            try self.exec(MIGRATION_V16);
+            v = 16;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -3852,6 +3924,74 @@ test "provider pin: set, overwrite, clear, and per-canonical isolation (ROD-345)
     try testing.expect((try s.getProviderPin(arena, 901)) == null);
     try s.setProviderPin(901, null);
     try testing.expect((try s.getProviderPin(arena, 901)) == null);
+}
+
+test "provider absence: mark, TTL, refresh, isolation; bindCanonical clears it (ROD-347)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (901, 111, 'Frieren');");
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (902, 222, 'Apothecary');");
+
+    // No row reads unchecked.
+    try testing.expect(!(try s.providerAbsentFresh(901, "anipub", 1000)));
+
+    // A verdict is fresh strictly inside the TTL window and stale at the edge;
+    // stale is indistinguishable from unchecked, so consumers re-probe.
+    try s.markProviderAbsent(901, "anipub", 1000);
+    try testing.expect(try s.providerAbsentFresh(901, "anipub", 1000));
+    try testing.expect(try s.providerAbsentFresh(901, "anipub", 1000 + Store.ABSENCE_TTL_SECONDS - 1));
+    try testing.expect(!(try s.providerAbsentFresh(901, "anipub", 1000 + Store.ABSENCE_TTL_SECONDS)));
+
+    // Re-marking refreshes the clock (a re-probe that misses again re-arms the TTL).
+    try s.markProviderAbsent(901, "anipub", 5000);
+    try testing.expect(try s.providerAbsentFresh(901, "anipub", 5000 + Store.ABSENCE_TTL_SECONDS - 1));
+
+    // Keyed per (canonical, provider): neither the sibling show nor a sibling
+    // provider inherits the verdict.
+    try testing.expect(!(try s.providerAbsentFresh(902, "anipub", 5000)));
+    try testing.expect(!(try s.providerAbsentFresh(901, "senshi", 5000)));
+
+    // A real mint proves stock: bindCanonical deletes the negative (the
+    // bound-and-absent-never-coexist invariant), including the 'v' flip's
+    // successful re-probe.
+    try testing.expect(try s.bindCanonical("anipub", "2454", 901, false, 6000, arena));
+    try testing.expect(!(try s.providerAbsentFresh(901, "anipub", 6000)));
+    const stmt = try s.prepare("SELECT COUNT(*) FROM provider_absences WHERE canonical_id = 901;");
+    defer _ = c.sqlite3_finalize(stmt);
+    try testing.expect(c.sqlite3_step(stmt) == c.SQLITE_ROW);
+    try testing.expectEqual(@as(i64, 0), c.sqlite3_column_int64(stmt, 0));
+
+    // The unbound sentinel is not a provider verdict: marking a show unbound
+    // leaves every provider's negative standing.
+    try s.markProviderAbsent(902, "senshi", 7000);
+    try testing.expect(try s.markUnbound(902, 7000, arena));
+    try testing.expect(try s.providerAbsentFresh(902, "senshi", 7000));
+}
+
+test "a hidden bindCanonical mint never enters the sync push set (ROD-351)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, mal_id, title) VALUES (901, 111, 'Frieren');");
+
+    // The pre-warm's sibling mint is hidden; loadDirtyForSync gates on
+    // history_visible, so a background mint can never push a default status
+    // over the user's real AniList entry (the ROD-323 shape stays dormant
+    // until a play reveals the row).
+    try testing.expect(try s.bindCanonical("anipub", "2454", 901, false, 1000, arena));
+    try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len);
+
+    // Contrast pin: the same binding revealed IS push-eligible. Visibility is
+    // the gate, not anything about how the row was minted.
+    try testing.expect(try s.bindCanonical("anipub", "2454", 901, true, 2000, arena));
+    try testing.expectEqual(@as(usize, 1), (try s.loadDirtyForSync(arena)).len);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {

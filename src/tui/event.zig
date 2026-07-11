@@ -91,6 +91,11 @@ pub const Event = union(enum) {
         /// under THIS name, never the registry default. A static vtable `name()`
         /// string, never freed. Meaningful only when `ok`.
         source: []const u8,
+        /// Providers whose walk verdict was a definitive "not stocked" (ROD-347):
+        /// the UI thread persists each as an absence row, on BOTH arms (a walk
+        /// that found a match later still learned these). Names are static vtable
+        /// strings; the slice itself is gpa-owned and freed by the UI thread.
+        absent_sources: []const []const u8 = &.{},
     },
     /// A tier-C Play resolve settled (ROD-328): the worker title-searched the play provider
     /// for an anilist_id-keyed Browse hit that could not tier-A (`canonicalKey` returned
@@ -109,7 +114,26 @@ pub const Event = union(enum) {
         /// it and the eventual bind is keyed under it. Static vtable `name()`
         /// string, never freed. Meaningful only when `ok`.
         source: []const u8,
+        /// Same contract as `resolve_add_result.absent_sources` (ROD-347); persisted
+        /// even when the staleness gate drops the result itself, since a definitive
+        /// absence is a fact about the catalog, not about which show is on screen.
+        absent_sources: []const []const u8 = &.{},
     },
+    /// One provider settled by the eager pre-warm walk (ROD-351). Non-empty
+    /// `source_id` (gpa-owned, freed by the UI thread): the provider stocks the
+    /// show, mint the binding HIDDEN (a play reveals it; History must not grow
+    /// rows the user never engaged). Empty + `absent`: cache the negative
+    /// (ROD-347). Empty + !absent never posts (unknown verdicts stay silent).
+    /// `source` is a static vtable `name()` string, never freed.
+    prewarm_result: struct {
+        anilist_id: i64,
+        source: []const u8,
+        source_id: []const u8,
+        absent: bool,
+    },
+    /// The pre-warm walk finished (every provider settled or skipped): clears the
+    /// single-flight guard so the next add/play may warm another show.
+    prewarm_done,
     /// One Discover feed page from a background thread (ROD-336): AniList rows for
     /// `axis`, fully enriched (full GQL_FIELDS; no follow-up enrich pass exists).
     /// `results` is gpa-allocated (each Anime's strings owned); App takes ownership
