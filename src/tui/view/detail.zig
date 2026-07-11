@@ -534,6 +534,7 @@ fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaF
         }
         const val_style = self.s(if (f.dim) self.palette.fg3 else self.palette.fg2, .{});
         col = win.print(&.{
+            .{ .text = f.prefix, .style = val_style },
             .{ .text = f.value, .style = val_style },
             .{ .text = f.unit, .style = val_style },
         }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none }).col;
