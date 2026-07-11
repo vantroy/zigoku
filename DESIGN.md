@@ -1037,6 +1037,7 @@ state.now` escalation.
 | Provider pin: cleared (ROD-345) | `v` cycles past the last provider back to unpinned | info | `provider pin cleared` | no |
 | Provider pin: hop failed (ROD-345) | the pin's one-provider walk can't reach the target | warn | `couldn't reach {provider}` | no |
 | Provider pin: nothing to pin (ROD-345) | `v` pressed with no focused episode source | info | `no source: nothing to pin` | no |
+| Provider pin: row not minted yet (ROD-345) | `v` pressed before a tier-A probe's row is minted (only happens on `episodes_done`) | info | `still resolving, try again shortly` | no |
 | Provider pin: no canonical identity (ROD-345) | `v` pressed on a show with no AniList identity (no `provider_pins` FK target) | info | `no canonical identity: can't pin a provider` | no |
 | Provider pin: store write failed (ROD-345) | `setProviderPin` errors on set or clear | error | `couldn't save the provider pin` / `couldn't clear the provider pin` | no |
 
