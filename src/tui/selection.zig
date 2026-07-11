@@ -346,7 +346,17 @@ pub const MetaField = struct {
 /// (§9.1: no empty segment, no orphan `·`, no bare rail row); Episodes is the floor,
 /// degrading to a dim "?" so neither form renders empty.
 pub fn detailMetaFields(self: *App) []const MetaField {
-    return detailMetaFieldsFor(self, renderedDetailAnime(self));
+    const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
+    // Pinned (ROD-345): the open show's provider pin, rail-only like Rank and
+    // last in shed order (user state, not enrichment; the rail is about the
+    // show). Nav-state form only: the History preview renders the CURSOR row's
+    // record, whose pin isn't the cached one, so it must not inherit this field.
+    if (self.show_pin) |pin| {
+        const n = base.len;
+        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
+        return self.detail_meta_fields[0 .. n + 1];
+    }
+    return base;
 }
 
 /// Same ordered field list, but for an explicitly-supplied anime rather than the

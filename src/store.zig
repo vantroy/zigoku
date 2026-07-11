@@ -35,7 +35,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
 /// `migrate` when the shape changes — never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 14;
+const SCHEMA_VERSION: c_int = 15;
 
 /// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
 /// set once per connection in `open` (ROD-287). Two processes share one DB (the TUI
@@ -412,6 +412,16 @@ const MIGRATION_V14_BACKFILL =
     \\-- NULL — the three-state contract (canonical_id + enrichment_fetched_at) reads
     \\-- them as pending / confirmed-unmatched.
     \\UPDATE anime SET canonical_id = anilist_id WHERE anilist_id IS NOT NULL;
+;
+
+// ROD-345: per-show preferred-provider pin, keyed on the canonical spine. User
+// state, so it gets its own table rather than a column on canonical_anime: the
+// enrichment upsert must never be able to touch it (the V14 INVARIANT).
+const MIGRATION_V15 =
+    \\CREATE TABLE provider_pins (
+    \\    canonical_id INTEGER PRIMARY KEY REFERENCES canonical_anime(anilist_id),
+    \\    provider     TEXT NOT NULL
+    \\);
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1452,6 +1462,33 @@ pub const Store = struct {
         return try dupeText(arena, stmt, 0);
     }
 
+    /// ROD-345: the per-show provider pin, or null when unpinned. Callers layer
+    /// this over the global preference (App.effectivePreference); a pin naming a
+    /// provider that is no longer registered degrades there via Registry.ordered's
+    /// unknown-name contract, so it is returned verbatim here.
+    pub fn getProviderPin(self: *Store, arena: Allocator, canonical_id: i64) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT provider FROM provider_pins WHERE canonical_id = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try dupeText(arena, stmt, 0);
+    }
+
+    /// Set (upsert) or clear (null) the per-show provider pin (ROD-345).
+    pub fn setProviderPin(self: *Store, canonical_id: i64, provider: ?[]const u8) Error!void {
+        const stmt = if (provider == null)
+            try self.prepare("DELETE FROM provider_pins WHERE canonical_id = ?;")
+        else
+            try self.prepare(
+                \\INSERT INTO provider_pins (canonical_id, provider) VALUES (?, ?)
+                \\ON CONFLICT(canonical_id) DO UPDATE SET provider = excluded.provider
+            );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        if (provider) |p| try bindText(stmt, 2, p);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+    }
+
     /// (list_status, progress high-water, total episodes, still-airing) for one
     /// show, or null if it isn't tracked. `airing` folds the airing-status column
     /// via `domain.isStillAiring` (ROD-296). The minimal read the watch-state
@@ -2115,6 +2152,10 @@ pub const Store = struct {
             try self.exec(MIGRATION_V14_DDL);
             try self.exec(MIGRATION_V14_BACKFILL);
             v = 14;
+        }
+        if (v < 15) {
+            try self.exec(MIGRATION_V15);
+            v = 15;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -3782,6 +3823,35 @@ test "bindingSourceId picks loadHistory's representative when a canonical has se
         .history_visible = false,
     }, 1002, arena);
     try testing.expectEqualStrings("cour2", (try s.bindingSourceId(arena, "senshi", 901)).?);
+}
+
+test "provider pin: set, overwrite, clear, and per-canonical isolation (ROD-345)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (901, 'Frieren');");
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (902, 'Apothecary');");
+
+    // Unpinned reads null; the caller falls through to the global preference.
+    try testing.expect((try s.getProviderPin(arena, 901)) == null);
+
+    try s.setProviderPin(901, "anipub");
+    try testing.expectEqualStrings("anipub", (try s.getProviderPin(arena, 901)).?);
+    // Keyed per canonical: the sibling show stays unpinned.
+    try testing.expect((try s.getProviderPin(arena, 902)) == null);
+
+    // Re-pin overwrites (the cycle affordance flips through providers).
+    try s.setProviderPin(901, "senshi");
+    try testing.expectEqualStrings("senshi", (try s.getProviderPin(arena, 901)).?);
+
+    // Clear returns the show to the global order; clearing twice is a no-op.
+    try s.setProviderPin(901, null);
+    try testing.expect((try s.getProviderPin(arena, 901)) == null);
+    try s.setProviderPin(901, null);
+    try testing.expect((try s.getProviderPin(arena, 901)) == null);
 }
 
 test "romaji heals canonical.title; anime-local title stays the provider seed; no-romaji falls back to seed (ROD-312)" {

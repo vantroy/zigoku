@@ -6639,3 +6639,215 @@ test "ROD-346 review: a superseded resolve_play_target success is dropped, never
     try testing.expectEqualStrings("current-show", app.episodes.for_id.?);
     try testing.expectEqualStrings("senshi", app.episodes.for_source.?);
 }
+
+// ── ROD-345: per-show provider pin ───────────────────────────────────────────
+
+test "ROD-345: v cycles unpinned -> alpha -> beta (tier-0 re-route) -> unpinned" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // The sibling binding the flip re-routes to, under its own opaque id.
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .detail; // the zoom: a detail surface, v applies
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+
+    // v #1: pins alpha, the provider already on screen, so no re-route fires.
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    try testing.expectEqualStrings("alpha", (try st.getProviderPin(arena, 154587)).?);
+    try testing.expectEqualStrings("alpha", app.show_pin.?);
+    try testing.expectEqualStrings("a1", app.episodes.for_id.?);
+    try testing.expect(!beta.hit.load(.acquire));
+
+    // v #2: pins beta and re-routes the open grid through its existing binding
+    // (tier 0 of the one-provider walk): no probe key derivation, the stored id.
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+    try testing.expectEqualStrings("beta", (try st.getProviderPin(arena, 154587)).?);
+    try testing.expectEqualStrings("beta", app.show_pin.?);
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    try testing.expect(app.pending_bind == null); // tier 0 mints nothing
+
+    // v #3: past the last provider wraps to unpinned; the open grid stands.
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    try testing.expect((try st.getProviderPin(arena, 154587)) == null);
+    try testing.expect(app.show_pin == null);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint arm): the bound-but-empty rescue" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    // Only the (wrong-but-numeric-id shaped) alpha binding exists. The grid it
+    // yields is authoritative-empty, so the ROD-346 automatic walk never arms;
+    // this manual flip is the rescue path and must work from exactly this state.
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try st.setProviderPin(154587, "alpha"); // one v earlier in the cycle
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .detail;
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // beta had no binding: the walk fell through tier 0 to the tier-A probe,
+    // fetching the derived key with the mint armed for episodes_done.
+    try testing.expectEqualStrings("beta", (try st.getProviderPin(arena, 154587)).?);
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("52991", app.episodes.for_id.?);
+    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-345: a History open redirects to the pinned provider's sibling binding" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    try testing.expect(try st.bindCanonical("beta", "b7", 154587, false, 5001, arena));
+    try st.setProviderPin(154587, "beta");
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.term_cols = 100; // two-pane: l focuses the detail pane + fires the fetch
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    // The visible History row is still alpha's (most-recently-watched sibling);
+    // the redirect must open beta's binding anyway.
+    var recs = [_]AnimeRecord{
+        .{ .source = "alpha", .source_id = "a1", .title = "Frieren", .anilist_id = 154587 },
+    };
+    app.history = recs[0..];
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('l', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expectEqualStrings("b7", app.episodes.for_id.?);
+    try testing.expectEqualStrings("beta", app.show_pin.?); // rail cache follows the open
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-345: the pin leads the automatic fallback walk's order (effectivePreference layering)" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    var gamma = RecordingProvider{ .id = "gamma", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider(), gamma.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, 5000, arena));
+    // Without the pin, construction order would hop to beta first. The pin must
+    // reorder the walk snapshot through effectivePreference (show orelse global).
+    try st.setProviderPin(154587, "gamma");
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "a1");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const for_id = try app.gpa.dupe(u8, "a1");
+    try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    try testing.expect(gamma.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+    try testing.expectEqualStrings("gamma", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
