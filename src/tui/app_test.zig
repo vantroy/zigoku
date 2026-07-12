@@ -7547,6 +7547,67 @@ test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint ar
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-357: v off an unbound failed-flip provider recovers via the focused show (no dead-end)" {
+    // Regression: a flip to a provider that can't carry the show (mega for a
+    // sen-only title) leaves for_source/for_id parked on an unbound provider whose
+    // binding never minted, so getAnime(for_source, for_id) returns null. The flip
+    // must recover the canonical id from the FOCUSED detail show rather than
+    // dead-ending on "still resolving", so the cycle can always walk back off the
+    // miss and onto a provider that stocks the show.
+    var mega = RecordingProvider{ .id = "mega" }; // pinned but doesn't carry it
+    var sen = RecordingProvider{ .id = "sen" }; // the sibling binding that does
+    const slots = [_]SourceProvider{ mega.provider(), sen.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("sen", "s1", 154587, true, 5000, arena));
+    try st.setProviderPin(154587, "mega"); // a prior v flipped to mega, which came up empty
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    // Focused on the show through Browse detail: identity lives in nav state, NOT in
+    // a mega row (there isn't one). selectedAnime indexes search.results directly.
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    app.list_cursor = 0;
+    try app.search.results.append(app.gpa, .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 });
+    defer app.search.results.deinit(app.gpa);
+    defer resolve.clearFallback(&app);
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    // Parked on the unbound mega attempt: there is deliberately NO getAnime row for it.
+    app.episodes.for_id = try app.gpa.dupe(u8, "mega-key");
+    app.episodes.for_source = try app.gpa.dupe(u8, "mega");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    // The dead-end precondition: the current provider binding does not resolve.
+    try testing.expect((st.getAnime(arena, "mega", "mega-key") catch null) == null);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // Recovered identity from the focused show and advanced the pin mega -> sen (its
+    // sibling binding), re-routing the grid instead of bailing on "still resolving".
+    try testing.expectEqualStrings("sen", (try st.getProviderPin(arena, 154587)).?);
+    try testing.expect(sen.hit.load(.acquire));
+    try testing.expectEqualStrings("sen", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
 test "ROD-345: a History open redirects to the pinned provider's sibling binding" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta" };
