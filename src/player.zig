@@ -224,7 +224,7 @@ pub fn play(
         // bottom edge (sub-pos < 100 raises it) and render bold so thin glyphs hold
         // up over bright frames. Constant literals, no untrusted data. External subs
         // only (this block); burned-in hardsubs are pixels and untouchable.
-        try argv.append(arena, "--sub-pos=90");
+        try argv.append(arena, "--sub-pos=92");
         try argv.append(arena, "--sub-bold=yes");
     }
     if (link.cloaked_segments) {
