@@ -14,6 +14,16 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-07-12
+
+### Fixed
+
+- **A manual flip to a source that can't carry the show no longer
+  dead-ends**: flipping a show onto a source that turns out not to carry it
+  used to leave it stuck resolving. The flip now keeps your pinned choice,
+  falls back to a source that has the show, and tells you which one came up
+  empty.
+
 ## [0.4.3] - 2026-07-12
 
 ### Changed
@@ -296,7 +306,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/vantroy/zigoku/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/vantroy/zigoku/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/vantroy/zigoku/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/vantroy/zigoku/compare/v0.4.0...v0.4.1

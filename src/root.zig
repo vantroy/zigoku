@@ -61,7 +61,7 @@ pub const Translation = domain.Translation;
 pub const Quality = domain.Quality;
 
 /// Zigoku version. Keep in sync with `build.zig.zon`.
-pub const version = "0.4.3";
+pub const version = "0.4.4";
 
 const banner =
     \\  ╋ zigoku · 地獄
@@ -95,7 +95,7 @@ test "version matches build.zig.zon" {
     // Pin the literal so a bump here without the matching `.version` edit in
     // build.zig.zon (or vice versa) trips CI — the "keep in sync" comment above
     // otherwise has no teeth.
-    try std.testing.expectEqualStrings("0.4.3", version);
+    try std.testing.expectEqualStrings("0.4.4", version);
 }
 
 // Pull in the unit tests from every module so `zig build test` covers them all.
