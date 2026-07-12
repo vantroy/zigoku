@@ -158,17 +158,6 @@ pub const Event = union(enum) {
         axis: anilist.DiscoverAxis,
         cause: anyerror,
     },
-    /// AniList-enriched metadata for a page slice. `results` is gpa-allocated;
-    /// app takes ownership and merges fields into the live search results.
-    /// `answered` (ROD-278): true only if EVERY row in the page got an answer; false
-    /// if any row's enrich hit a transport failure — the handler stamps the page's
-    /// freshness clock only when `answered`, so a failed fetch doesn't advance it.
-    search_enriched: struct {
-        results: []Anime,
-        for_query: []const u8,
-        offset: usize,
-        answered: bool,
-    },
     /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned identity
     /// stub filled with fresh AniList metadata (or unchanged on a miss); `source` is
     /// gpa-owned. `answered` (ROD-278) is true on a confirmed answer (match or confirmed

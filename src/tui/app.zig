@@ -62,7 +62,6 @@ const dupeOwnedStrList = workers.dupeOwnedStrList;
 const dupeOwnedAnime = workers.dupeOwnedAnime;
 const freeOwnedAnime = workers.freeOwnedAnime;
 const searchTask = workers.searchTask;
-const enrichTask = workers.enrichTask;
 const loadHistoryTask = workers.loadHistoryTask;
 const reloadHistoryTask = workers.reloadHistoryTask;
 const episodesTask = workers.episodesTask;
@@ -105,7 +104,7 @@ pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 /// Search + enrich controller subsystem (ROD-219). Owns the catalogue-search
 /// record (query / results / page / loading + the queued enrich request) in its
 /// own module; transport (the worker threads, `async_start_ms`, debounce) and
-/// the `fireSearch` / `fireEnrich` spawns stay on App, matching the EpisodeState
+/// the `fireSearch` spawn stay on App, matching the EpisodeState
 /// carve. Re-exported here so existing `app_mod.SearchController` references keep
 /// resolving.
 pub const SearchController = @import("search_state.zig").SearchController;
@@ -249,7 +248,7 @@ pub fn run(
     // join returns at once, the discarded result is never read. (The episode-prefetch
     // half of ROD-179 detaches a superseded fetch instead; see `episode_drain`.)
     //
-    // Declared before the search/enrich joins and episode drain, so by LIFO it runs
+    // Declared before the search join and episode drain, so by LIFO it runs
     // AFTER them: every other worker is already reaped when interrupt fires, so it can
     // only hit loadHistory's statement, never one another worker started.
     defer if (hist_thread) |t| {
@@ -274,10 +273,9 @@ pub fn run(
     // can't dereference a torn-down loop or gpa. Declared after loop.stop()'s
     // defer so it executes first (Zig defers are LIFO).
     defer if (app.search_thread) |t| t.join();
-    defer if (app.enrich_thread) |t| t.join();
     // ROD-291: join an in-flight AniList flush on the error-unwind / test teardown path
     // so it can't touch a torn-down loop/store/gpa or the freed token arena. Like the
-    // search/enrich/cover joins above, this defer is SKIPPED on the ordinary quit path
+    // search/cover joins above, this defer is SKIPPED on the ordinary quit path
     // (q/Ctrl-C fall through to the ROD-232 fast-exit `_exit(0)`). Safe for this writer:
     // the DB is WAL crash-safe and SaveMediaListEntry is idempotent, so a push abandoned
     // before its markSynced leaves the row dirty and re-flushes next session.
@@ -799,11 +797,6 @@ pub const App = struct {
     /// spawn, and in run() teardown. This bounds concurrent search threads to 1,
     /// preventing use-after-free of `loop` and `gpa` on fast quit.
     search_thread: ?std.Thread = null,
-    /// Handle for the most recent AniList enrichment thread.
-    /// At most one joinable AniList enrichment worker is active at a time; a later
-    /// search queues one follow-up via `search.pending_enrich` without blocking
-    /// the UI.
-    enrich_thread: ?std.Thread = null,
 
     /// Drain barrier for the Discover feed fetches (down from three worker kinds:
     /// the enrich passes died with the AniList cutover, ROD-336). Before ROD-251 the
@@ -1866,50 +1859,6 @@ pub const App = struct {
         }
     }
 
-    fn fireEnrich(self: *App, loop: *Loop, io: std.Io, offset: usize, count: usize) void {
-        if (builtin.is_test) return;
-        if (count == 0 or offset >= self.search.results.items.len) return;
-
-        if (self.enrich_thread != null) {
-            self.search.pending_enrich = .{ .offset = offset, .count = count };
-            return;
-        }
-
-        const slice = self.search.results.items[offset..@min(self.search.results.items.len, offset + count)];
-        var unresolved: usize = 0;
-        for (slice) |a| {
-            if (a.anilist_id == null or a.thumb == null or a.description == null or a.score == null) unresolved += 1;
-        }
-        if (unresolved == 0) return;
-
-        const q_copy = self.gpa.dupe(u8, self.search.querySlice()) catch return;
-        var copied = std.ArrayListUnmanaged(Anime).empty;
-        copied.ensureTotalCapacity(self.gpa, slice.len) catch {
-            self.gpa.free(q_copy);
-            return;
-        };
-        for (slice) |a| {
-            const duped = dupeOwnedAnime(self.gpa, a) catch continue;
-            copied.appendAssumeCapacity(duped);
-        }
-        const exact = copied.toOwnedSlice(self.gpa) catch {
-            for (copied.items) |a| freeOwnedAnime(self.gpa, a);
-            copied.deinit(self.gpa);
-            self.gpa.free(q_copy);
-            return;
-        };
-
-        self.enrich_thread = std.Thread.spawn(.{}, enrichTask, .{
-            loop, self.gpa, io, exact, q_copy, offset,
-        }) catch {
-            self.enrich_thread = null;
-            for (exact) |a| freeOwnedAnime(self.gpa, a);
-            self.gpa.free(exact);
-            self.gpa.free(q_copy);
-            return;
-        };
-    }
-
     pub fn setHistory(self: *App, recs: []AnimeRecord) void {
         self.history = recs;
         self.history_loading = false;
@@ -2055,7 +2004,7 @@ pub const App = struct {
                     self.list_top = 0;
                 }
                 const added = self.search.results.items.len - offset;
-                // ROD-327: AniList hits arrive fully enriched, so no fireEnrich pass is
+                // ROD-327: AniList hits arrive fully enriched, so no second enrich pass is
                 // needed. Hydrate warms from the canonical spine; persist mirrors each hit
                 // as a canonical entity only (binding to a play provider is the resolver's job).
                 self.search.hydrateResultsFromStore(self.gpa, self.store, offset, added);
@@ -2266,48 +2215,6 @@ pub const App = struct {
                 if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
                 log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
                 self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
-            },
-            .search_enriched => |ev| {
-                if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
-                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
-                    self.gpa.free(ev.results);
-                    self.gpa.free(ev.for_query);
-                    if (self.enrich_thread) |t| {
-                        t.join();
-                        self.enrich_thread = null;
-                    }
-                    if (self.search.pending_enrich) |p| {
-                        self.search.pending_enrich = null;
-                        self.fireEnrich(loop, io, p.offset, p.count);
-                    }
-                    return;
-                }
-                for (ev.results) |enriched| {
-                    var replaced = false;
-                    for (self.search.results.items[ev.offset..@min(self.search.results.items.len, ev.offset + ev.results.len)]) |*live| {
-                        if (std.mem.eql(u8, live.id, enriched.id)) {
-                            freeOwnedAnime(self.gpa, live.*);
-                            live.* = enriched;
-                            replaced = true;
-                            break;
-                        }
-                    }
-                    if (!replaced) freeOwnedAnime(self.gpa, enriched);
-                }
-                self.gpa.free(ev.results);
-                self.gpa.free(ev.for_query);
-                // ROD-327: dormant. Browse search is now a single AniList pass (.search_done);
-                // nothing spawns the enrich worker that posts this event. This arm only drains
-                // the payload and joins the (never-spawned) thread; it deliberately does NOT
-                // persist, since the canonical persist would assert on an id-less row.
-                if (self.enrich_thread) |t| {
-                    t.join();
-                    self.enrich_thread = null;
-                }
-                if (self.search.pending_enrich) |p| {
-                    self.search.pending_enrich = null;
-                    self.fireEnrich(loop, io, p.offset, p.count);
-                }
             },
             .enrichment_refreshed => |ev| {
                 // ROD-182: a stale show was re-enriched on view. ROD-278: only persist
@@ -2959,7 +2866,9 @@ pub const App = struct {
     /// STALE show UNLESS a competing enrich path already covers it:
     ///   * `discover_inflight`:    a Discover feed fetch is running (its rows arrive
     ///                             fully enriched and persist fresh, ROD-336),
-    ///   * `search_enrich_active`: a live Browse search-page enrich is running,
+    ///   * `search_enrich_active`: a live Browse search-page enrich is running (fed a
+    ///                             constant false since ROD-330 excised that path; kept
+    ///                             as the guard seam for a future search-side enrich),
     ///   * `refresh_inflight`:     another refresh-on-view is already in flight.
     ///
     /// Only tracked rows refresh here: a hidden Browse/Discover cache row has its OWN
@@ -2992,8 +2901,8 @@ pub const App = struct {
         // Never fire a live network refresh under `zig build test` — this runs before
         // the episode cache-hit early-return in fireEpisodesForId, so without the
         // guard even a synchronous cache-hit test spawns a detached network thread
-        // (leak + dangling thread). Same guard every sibling here carries (fireEnrich,
-        // fireDiscoverFeed); tests exercise `shouldRefreshOnView` directly.
+        // (leak + dangling thread). Same guard every sibling here carries
+        // (fireDiscoverFeed); tests exercise `shouldRefreshOnView` directly.
         if (builtin.is_test) return;
         if (self.store == null) return;
         const r = rec orelse return;
@@ -3002,7 +2911,9 @@ pub const App = struct {
             r,
             Store.nowSecs(),
             self.discover_drain.inflight.load(.acquire) > 0,
-            self.enrich_thread != null,
+            // ROD-330: the Browse second-pass enrich was excised, so no live search-enrich
+            // competes here. The param stays as the guard seam for a future search-side enrich.
+            false,
             self.enrich_refresh_drain.inflight.load(.acquire) > 0,
         )) return;
         self.fireRefreshEnrich(loop, io, src, source_id, r);

@@ -189,11 +189,11 @@ const MediaResp = struct {
     data: ?MediaData = null,
 };
 
-// NOTE: the show ← Metadata fill-if-null mapping lives in `workers.enrichTask`,
+// NOTE: the show ← Metadata fill-if-null mapping lives in `workers.applyMetadata`,
 // not here. It has to: each filled field is deep-copied into GPA as it goes, so
-// nothing aliases the parse arena that `Metadata`'s slices borrow from. A
-// standalone `apply(show, meta)` helper would hand back a struct pointing into
-// that soon-dead arena — a UAF trap — so there deliberately isn't one.
+// nothing aliases the parse arena that `Metadata`'s slices borrow from. Doing it in
+// anilist.zig would hand back a struct pointing into that soon-dead arena, a UAF
+// trap, so the mapping stays where the GPA-owning copy happens.
 
 /// The three-state enrich contract (ROD-278). Callers that stamp an enrichment freshness
 /// clock (the refresh-on-view path) MUST distinguish a confirmed answer from a failed fetch:

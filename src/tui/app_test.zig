@@ -184,10 +184,6 @@ fn testTick(app: *App, event: Event) !void {
     // defensively so a future test driving the spawn path can't strand one on a torn-down loop.
     app.add_resolve_drain.drain();
     app.play_resolve_drain.drain();
-    if (app.enrich_thread) |t| {
-        t.join();
-        app.enrich_thread = null;
-    }
     if (app.play_thread) |t| {
         t.join();
         app.play_thread = null;
@@ -205,11 +201,6 @@ fn freeTestEvent(alloc: Allocator, ev: Event) void {
             alloc.free(d.for_id);
         },
         .search_done => |d| {
-            for (d.results) |r| freeOwnedAnime(alloc, r);
-            alloc.free(d.results);
-            alloc.free(d.for_query);
-        },
-        .search_enriched => |d| {
             for (d.results) |r| freeOwnedAnime(alloc, r);
             alloc.free(d.results);
             alloc.free(d.for_query);
@@ -3352,54 +3343,14 @@ test "SearchController.clearResults frees owned anime (leak-clean under testing.
         .name = try std.testing.allocator.dupe(u8, "Owned Two"),
     });
     search.page = 3;
-    search.pending_enrich = .{ .offset = 0, .count = 2 };
 
     search.clearResults(std.testing.allocator);
 
-    // Buffer emptied + page/enrich reset. The freed elements are gone — the
-    // testing allocator would already have flagged a leak if clearResults skipped
-    // any owned field above.
+    // Buffer emptied + page reset. The freed elements are gone; the testing
+    // allocator would already have flagged a leak if clearResults skipped any owned
+    // field above.
     try testing.expectEqual(@as(usize, 0), search.results.items.len);
     try testing.expectEqual(@as(u32, 0), search.page);
-    try testing.expect(search.pending_enrich == null);
-}
-
-test "search_enriched merges metadata into matching live result" {
-    var app: App = .{};
-    app.gpa = std.testing.allocator;
-    app.active_view = .browse;
-    app.search.len = 7;
-    @memcpy(app.search.query[0..7], "frieren");
-
-    try app.search.results.ensureTotalCapacity(std.testing.allocator, 1);
-    app.search.results.appendAssumeCapacity(.{
-        .id = try std.testing.allocator.dupe(u8, "id1"),
-        .name = try std.testing.allocator.dupe(u8, "Frieren"),
-        .eps_sub = 28,
-    });
-
-    const query_copy = try std.testing.allocator.dupe(u8, "frieren");
-    const enriched = try std.testing.allocator.alloc(Anime, 1);
-    enriched[0] = .{
-        .id = try std.testing.allocator.dupe(u8, "id1"),
-        .name = try std.testing.allocator.dupe(u8, "Frieren"),
-        .eps_sub = 28,
-        .anilist_id = 154587,
-        .thumb = try std.testing.allocator.dupe(u8, "https://img.anili.st/frieren.jpg"),
-        .description = try std.testing.allocator.dupe(u8, "Elf mage grief hour"),
-        .score = 91,
-        .total_episodes = 28,
-        .year = 2023,
-        .status = try std.testing.allocator.dupe(u8, "FINISHED"),
-    };
-
-    try testTick(&app, .{ .search_enriched = .{ .results = enriched, .for_query = query_copy, .offset = 0, .answered = true } });
-    try testing.expectEqual(@as(?u64, 154587), app.search.results.items[0].anilist_id);
-    try testing.expectEqual(@as(?u32, 91), app.search.results.items[0].score);
-    try testing.expectEqualStrings("Elf mage grief hour", app.search.results.items[0].description orelse "");
-
-    for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
-    app.search.results.deinit(std.testing.allocator);
 }
 
 test "episodes_done binds the canonical before caching so the FK holds on first resolve (ROD-327)" {

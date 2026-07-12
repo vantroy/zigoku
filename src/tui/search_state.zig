@@ -1,13 +1,13 @@
 //! Zigoku — search + enrich controller subsystem (ROD-219).
 //!
 //! Owns the RECORD of the catalogue-search lifecycle: the query buffer, the accumulated
-//! results, the loaded-page count, the in-flight flag, and the queued follow-up enrichment.
+//! results, the loaded-page count, and the in-flight flag.
 //! The pure helpers (clear / hydrate / persist) and the query-edit key handler take explicit
 //! dependencies (`gpa`/`store`/`source`/`translation`) and report a `KeyResult` verdict; this
 //! struct never reaches back into App.
 //!
 //! Boundary (mirroring EpisodeState): this struct owns the search record, not the transport.
-//! The worker threads (`search_thread`/`enrich_thread`, joined on teardown), the shared
+//! The worker thread (`search_thread`, joined on teardown), the shared
 //! slow-path timer (`async_start_ms`), and the search debounce stay on App. App owns the
 //! thread spawns and resolves source/translation from nav state. Mode/nav transitions
 //! (`input_mode`, the list cursor, the history filter) are PROJECTIONS App applies from the
@@ -34,9 +34,9 @@ const hydrateAnimeFromRecord = workers.hydrateAnimeFromRecord;
 const freeOwnedAnime = workers.freeOwnedAnime;
 
 /// The catalogue-search controller (ROD-219). Holds the query buffer, the
-/// accumulated (and owned) results, the loaded-page count, the in-flight flag,
-/// and the queued follow-up enrich request. Transport (`search_thread` /
-/// `enrich_thread` / `async_start_ms` / debounce) lives on App, not here.
+/// accumulated (and owned) results, the loaded-page count, and the in-flight
+/// flag. Transport (`search_thread` / `async_start_ms` / debounce) lives on App,
+/// not here.
 pub const SearchController = struct {
     /// Fixed-width query buffer: 127 usable bytes (the append guard caps `len` at
     /// 127). Not null-terminated — the 128th byte is never written; readers always
@@ -53,11 +53,6 @@ pub const SearchController = struct {
     /// Accumulated search results. Backed by gpa — strings owned, must be freed on
     /// query reset. Access via `self.search.results.items`.
     results: std.ArrayListUnmanaged(Anime) = .empty,
-
-    /// Queued follow-up AniList enrichment request: set when an enrich worker is
-    /// already in flight so a later page can chain one without blocking the UI.
-    /// Drained by the `.search_enriched` tick arm after the active worker joins.
-    pending_enrich: ?struct { offset: usize, count: usize } = null,
 
     /// Current query as a slice (may be empty).
     pub fn querySlice(self: *const SearchController) []const u8 {
@@ -128,7 +123,6 @@ pub const SearchController = struct {
     /// new page-1 search and when Esc clears the query. `gpa` is the same
     /// allocator the results were appended with (App's `gpa`).
     pub fn clearResults(self: *SearchController, gpa: Allocator) void {
-        self.pending_enrich = null;
         for (self.results.items) |r| freeOwnedAnime(gpa, r);
         self.results.clearRetainingCapacity();
         self.page = 0;

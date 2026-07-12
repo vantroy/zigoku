@@ -660,8 +660,9 @@ pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.D
 /// Fill an Anime's blank fields from AniList metadata — AllAnime is the source of
 /// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
 /// before the arena `meta` came from is torn down; a failed copy keeps the prior
-/// (blank) value rather than aliasing the soon-dead arena. Shared by the
-/// search-page enrich and the ROD-182 refresh-on-view.
+/// (blank) value rather than aliasing the soon-dead arena. Called by the ROD-182
+/// refresh-on-view (refreshEnrichTask); the search-page enrich that shared it was
+/// excised in ROD-330.
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
     // ROD-312: stash true romaji alongside the provider `name` (never overwritten
@@ -735,50 +736,6 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.next_airing_at == null) a.next_airing_at = rec.next_airing_at;
     if (a.next_airing_episode == null) a.next_airing_episode = if (rec.next_airing_episode) |x| std.math.cast(u32, x) else null;
     if (a.country == null) a.country = dupeOptText(gpa, rec.country) catch a.country;
-}
-
-/// Background task: enrich one page of search results from AniList. `results` and
-/// `query` are GPA-owned by this task and transferred to the `.search_enriched`
-/// event on success (freed here on failure). Fills each row via `applyMetadata`.
-pub fn enrichTask(
-    loop: *Loop,
-    gpa: Allocator,
-    io: std.Io,
-    results: []Anime,
-    query: []const u8,
-    offset: usize,
-) void {
-    var posted = false;
-    defer if (!posted) {
-        for (results) |a| freeOwnedAnime(gpa, a);
-        gpa.free(results);
-        gpa.free(query);
-    };
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-
-    // ROD-278: page-level answered signal — the handler stamps the freshness clock
-    // only if EVERY row got an answer (a match or a confirmed no-match). If any row's
-    // enrich hit a transport failure (error.NoAnswer / OOM), leave the whole page
-    // un-stamped so those rows retry on next view instead of burning the clock on a
-    // failed fetch. Conservative: a partial-failure page also re-enriches its answered
-    // rows next view (harmless waste), but never stamps a row AniList never reached.
-    var all_answered = true;
-    for (results) |*a| {
-        if (anilist.enrich(arena.allocator(), io, a.*)) |maybe_meta| {
-            if (maybe_meta) |meta| applyMetadata(gpa, a, meta);
-        } else |err| {
-            all_answered = false;
-            log.debug("search enrich got no answer: {s}", .{@errorName(err)});
-        }
-    }
-
-    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset, .answered = all_answered } }) catch |pe| {
-        log.debug("postEvent failed: {s}", .{@errorName(pe)});
-        return; // `posted` stays false → the defer frees results/query
-    };
-    posted = true;
 }
 
 /// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read stale, so
