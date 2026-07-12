@@ -3101,9 +3101,6 @@ pub const App = struct {
         self.resume_landing_pending = false;
     }
 
-    /// Minimum spacing between pre-warm walk starts, app-wide (see
-    /// `prewarm_last_start_ms`). Generous against the replay drip, small enough
-    /// that a short add-burst's later shows still warm on their first play.
     /// ROD-229: index of the show to resume — the most-recently-watched row, i.e.
     /// the first with a non-null `last_watched_at`. `loadHistory` sorts those rows
     /// first (DESC NULLS LAST), so this is normally index 0; the scan keeps it
