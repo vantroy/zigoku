@@ -22,9 +22,12 @@ pub const std_options: std.Options = .{
 };
 
 /// The one place the live provider set and its order are defined (ROD-343):
-/// senshi first, megaplay second (ROD-359 retired anipub). The registry's fat
-/// pointers alias `self`, so call `registry()` on a variable that outlives
-/// every use of the result and don't move it afterwards.
+/// megaplay first, senshi second (ROD-380). Construction order IS the default
+/// (unset `preferred_provider` degrades to it), so leading with megaplay makes
+/// it the default provider over senshi's touchier CDN (ROD-309/359); a
+/// senshi-only show still resolves via the fallback walk (ROD-366/368). The
+/// registry's fat pointers alias `self`, so call `registry()` on a variable
+/// that outlives every use of the result and don't move it afterwards.
 const LiveProviders = struct {
     senshi: zigoku.Senshi,
     megaplay: zigoku.MegaPlay,
@@ -39,7 +42,7 @@ const LiveProviders = struct {
     }
 
     fn registry(self: *LiveProviders) zigoku.Registry {
-        self.slots = .{ self.senshi.provider(), self.megaplay.provider() };
+        self.slots = .{ self.megaplay.provider(), self.senshi.provider() };
         return .{ .providers = &self.slots };
     }
 };
@@ -573,6 +576,17 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     }
 
     try out.print("\n✓ done. That was Zigoku, end to end.\n", .{});
+}
+
+test "live registry leads with megaplay as the default provider (ROD-380)" {
+    // Construction order IS the default an unset preference degrades to, so the
+    // leader is the shipped default provider. Pins the ROD-380 decision: megaplay
+    // ahead of senshi, with senshi still registered as the fallback.
+    var live = LiveProviders.init();
+    const reg = live.registry();
+    try std.testing.expectEqualStrings("megaplay", reg.primary().name());
+    try std.testing.expectEqualStrings("megaplay", reg.preferred("").name());
+    try std.testing.expect(reg.byName("senshi") != null);
 }
 
 test "observedPlaybackWasMeaningful requires positive observed position" {
