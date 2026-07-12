@@ -14,6 +14,36 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-07-12
+
+### Changed
+
+- **Soft subtitles sit higher and read bolder**: subtitles served as a separate
+  file now render a little further off the bottom edge, in a bolder font, so
+  they're easier to read against a busy frame.
+
+- **The default streaming source changed to the more reliable one**: a show only
+  the other source carries still plays, resolved automatically through the
+  existing fallback.
+
+### Fixed
+
+- **Soft subtitles now show up where they used to be silent, and load reliably**:
+  some shows played with no subtitles at all when they were served as a separate
+  file; that gap is closed. Subtitles that did load were only getting through
+  about half the time, because of a flaky fetch; they're now retried so they land
+  reliably.
+
+- **The right subtitle track gets picked, not just the first one**: when a source
+  offers several subtitle tracks, zigoku used to trust a flag to find the dialogue
+  track, and that flag sometimes pointed at a signs-only track instead, leaving
+  you with subtitles that stayed blank through the actual dialogue. It now checks
+  the track's content, so the dialogue track loads.
+
+- **Your quality cap is honored on the backup source too**: falling back to a
+  secondary streaming source used to ignore your configured quality cap; it now
+  respects it the same way the primary source does.
+
 ## [0.4.2] - 2026-07-12
 
 ### Added
@@ -266,7 +296,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/vantroy/zigoku/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/vantroy/zigoku/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/vantroy/zigoku/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vantroy/zigoku/compare/v0.3.1...v0.4.0
