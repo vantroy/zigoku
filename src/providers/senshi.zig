@@ -23,6 +23,7 @@ const domain = @import("../domain.zig");
 const source = @import("../source.zig");
 const log = @import("../log.zig");
 const http = @import("http.zig");
+const hls = @import("hls.zig");
 
 const API = "https://senshi.live";
 // A current Chrome UA. senshi's Cloudflare edge serves a plain client with this
@@ -260,13 +261,6 @@ pub const Senshi = struct {
 
     pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
-        // senshi hands back a standard adaptive HLS master; mpv picks the rendition
-        // off its bandwidth ladder. Honoring the quality *cap* means fetching and
-        // parsing that master for its variants, then applying the cap policy — which
-        // is exactly the machinery being lifted into the shared hls.zig, so quality
-        // support lands with that extraction rather than duplicating the cap logic
-        // here now (ROD-301 follow-up). Until then the pref is a no-op on senshi.
-        _ = quality;
         try guardShowId(show_id);
         try guardEpLabel(ep.raw);
 
@@ -284,6 +278,14 @@ pub const Senshi = struct {
         // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
         // controls that could smuggle a second mpv option or header).
         if (!domain.isAbsoluteUrl(stream) or !cleanArg(stream)) return error.BadStreamUrl;
+
+        // Honor the quality cap. `.best` is what mpv already picks off the master's
+        // bandwidth ladder, so skip the round-trip there; a cap (worst/rung) means
+        // fetching the master, reading its variants, and applying the cap policy
+        // (shared hls.zig, ROD-302). Best-effort: any failure falls back to the
+        // adaptive master, exactly what senshi handed mpv before this landed.
+        const chosen = if (quality == .best) stream else capVariant(arena, io, stream, quality) orelse stream;
+
         // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv echoes
         // the referer on the whole HLS chain (master/variant/segments) via
         // --http-header-fields. `user_agent`: the same browser UA the resolver used, part of
@@ -292,11 +294,41 @@ pub const Senshi = struct {
         // `cloaked_segments`: senshi serves its `.ts` segments as `.jpg`, so the player must
         // relax ffmpeg's HLS segment-extension gate or nothing plays.
         return .{
-            .url = stream,
+            .url = chosen,
             .referer = STREAM_REFERER,
             .user_agent = UA,
             .cloaked_segments = true,
         };
+    }
+
+    /// Fetch the adaptive master and return the variant URL matching the quality cap,
+    /// or null when the master can't be fetched/parsed, has no variants, or none
+    /// survive the argv-safety gate. Best-effort: resolve() falls back to the master.
+    fn capVariant(arena: Allocator, io: Io, master_url: []const u8, quality: domain.Quality) ?[]const u8 {
+        // The ninstream CDN 403s a refererless GET (same gate as the segment chain), so
+        // send the stream referer + browser UA here, not request()'s JSON/API headers.
+        const body = http.request(arena, io, .{
+            .method = .GET,
+            .url = master_url,
+            .user_agent = UA,
+            .extra_headers = &.{.{ .name = "Referer", .value = STREAM_REFERER }},
+            .tag = "senshi",
+            .accept = .ok_only,
+        }) catch return null;
+        const variants = hls.parseMasterPlaylist(arena, body) catch return null;
+        if (variants.len == 0) return null; // already a media playlist: let mpv take the master
+
+        // Build cap-policy candidates: join relative variant URIs against the master
+        // and drop any that fail argv safety before they could reach mpv's command line.
+        var links: std.ArrayList(domain.StreamLink) = .empty;
+        for (variants) |v| {
+            const vu = hls.joinUrl(arena, master_url, v.url) catch continue;
+            if (!cleanArg(vu)) continue;
+            links.append(arena, .{ .url = vu, .resolution = v.resolution }) catch return null;
+        }
+        const pick = hls.selectVariant(links.items, quality) orelse return null;
+        log.debug("senshi resolve: quality={s} picked {?d}p from {d} variant(s)", .{ @tagName(quality), pick.resolution, links.items.len });
+        return pick.url;
     }
 
     /// Choose the embed URL best matching the requested track. For dub we want the
