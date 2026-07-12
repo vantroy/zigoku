@@ -641,6 +641,19 @@ fn toastFallbackHop(self: *App, next_p: SourceProvider, failed_name: ?[]const u8
     self.pushToast(.warn, msg, false);
 }
 
+/// ROD-357: a MANUAL 'v' flip whose walk found no provider that stocks the show.
+/// Name the provider that missed and note the pin persists (the keep-pin decision,
+/// ROD-347) instead of the generic dead-end line, then return true so the caller
+/// skips its own toast. `manual` must be captured before `advanceFallback` deinits
+/// the walk. Returns false for an automatic walk, leaving the generic toast to stand.
+pub fn toastFlipExhaust(self: *App, registry: Registry, manual: bool) bool {
+    if (!manual) return false;
+    var buf: [96]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "no match on {s}, pin kept", .{self.owningProvider(registry).displayName()}) catch "no match, pin kept";
+    self.pushToast(.warn, msg, false);
+    return true;
+}
+
 /// Every History-origin episode-grid open routes through here (ONE gate) so the
 /// ROD-329 unbound sentinel renders "no source available" instead of firing a provider
 /// fetch. Must key on `rec.source`: `fireEpisodesForId` only gets a bare `source_id`,
