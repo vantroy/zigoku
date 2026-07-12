@@ -318,6 +318,15 @@ pub const Senshi = struct {
         };
     }
 
+    /// The ninstream sidecar CDN intermittently answers 200 with an empty/garbage
+    /// body, and 403s inside a Cloudflare rate-scoring window (the ROD-309 pattern a
+    /// burst of replays triggers). A one-shot would coinflip subs off; the video
+    /// survives the same window via mpv's own retry, so the sidecar gets a bounded
+    /// one too. Escalating backoff before each re-try (the first try is immediate):
+    /// a short window clears on the 300ms retry, a longer one gets ~2s total to pass
+    /// before we give up and play raw. Bounded so a dead sidecar can't stall resolve.
+    const SUB_RETRY_BACKOFFS_MS = [_]i64{ 300, 700, 1200 };
+
     /// Follow the picked embed's `serverFM` sidecar to a soft-sub `.vtt` for mpv, or
     /// null to play raw. The sidecar url is host-controlled → it's the same SSRF +
     /// redirect-refuse gate megaplay's probe uses (ROD-266/377) before we fetch it;
@@ -329,17 +338,29 @@ pub const Senshi = struct {
         // info_url is our fetch target (host-controlled): vet its shape, then SSRF-guard.
         if (!domain.isAbsoluteUrl(info_url) or !cleanArg(info_url)) return null;
         fetchguard.guardFetchUrl(info_url) catch return null;
-        const body = http.request(arena, io, .{
-            .method = .GET,
-            .url = info_url,
-            .user_agent = UA,
-            .extra_headers = &.{.{ .name = "Referer", .value = STREAM_REFERER }},
-            .redirect_behavior = .not_allowed,
-            .tag = "senshi-sub",
-            .accept = .ok_only,
-        }) catch return null;
-        const tracks = std.json.parseFromSlice([]SubTrack, arena, body, .{ .ignore_unknown_fields = true }) catch return null;
-        const src = pickSubTrack(tracks.value) orelse return null;
+
+        // Retry the fetch+parse: an empty-body 200 fails the parse and is retried; a
+        // valid but empty `[]` parses fine and drops through to pickSubTrack (no track
+        // → raw), never wasting a retry on a genuine no-subs answer (ROD-381).
+        const tracks = for (0..SUB_RETRY_BACKOFFS_MS.len + 1) |attempt| {
+            if (attempt > 0) std.Io.sleep(io, .fromMilliseconds(SUB_RETRY_BACKOFFS_MS[attempt - 1]), .awake) catch {};
+            const body = http.request(arena, io, .{
+                .method = .GET,
+                .url = info_url,
+                .user_agent = UA,
+                .extra_headers = &.{.{ .name = "Referer", .value = STREAM_REFERER }},
+                .redirect_behavior = .not_allowed,
+                .tag = "senshi-sub",
+                .accept = .ok_only,
+            }) catch continue;
+            const parsed = std.json.parseFromSlice([]SubTrack, arena, body, .{ .ignore_unknown_fields = true }) catch continue;
+            break parsed.value;
+        } else {
+            log.warn("senshi: subtitle sidecar unavailable after {d} tries; playing raw", .{SUB_RETRY_BACKOFFS_MS.len + 1});
+            return null;
+        };
+
+        const src = pickSubTrack(tracks) orelse return null;
         // The .vtt goes to mpv argv: absolute http(s) carrying only clean bytes.
         if (!domain.isAbsoluteUrl(src) or !cleanArg(src)) return null;
         return src;
