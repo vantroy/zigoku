@@ -737,50 +737,6 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.country == null) a.country = dupeOptText(gpa, rec.country) catch a.country;
 }
 
-/// Background task: enrich one page of search results from AniList. `results` and
-/// `query` are GPA-owned by this task and transferred to the `.search_enriched`
-/// event on success (freed here on failure). Fills each row via `applyMetadata`.
-pub fn enrichTask(
-    loop: *Loop,
-    gpa: Allocator,
-    io: std.Io,
-    results: []Anime,
-    query: []const u8,
-    offset: usize,
-) void {
-    var posted = false;
-    defer if (!posted) {
-        for (results) |a| freeOwnedAnime(gpa, a);
-        gpa.free(results);
-        gpa.free(query);
-    };
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-
-    // ROD-278: page-level answered signal — the handler stamps the freshness clock
-    // only if EVERY row got an answer (a match or a confirmed no-match). If any row's
-    // enrich hit a transport failure (error.NoAnswer / OOM), leave the whole page
-    // un-stamped so those rows retry on next view instead of burning the clock on a
-    // failed fetch. Conservative: a partial-failure page also re-enriches its answered
-    // rows next view (harmless waste), but never stamps a row AniList never reached.
-    var all_answered = true;
-    for (results) |*a| {
-        if (anilist.enrich(arena.allocator(), io, a.*)) |maybe_meta| {
-            if (maybe_meta) |meta| applyMetadata(gpa, a, meta);
-        } else |err| {
-            all_answered = false;
-            log.debug("search enrich got no answer: {s}", .{@errorName(err)});
-        }
-    }
-
-    loop.postEvent(.{ .search_enriched = .{ .results = results, .for_query = query, .offset = offset, .answered = all_answered } }) catch |pe| {
-        log.debug("postEvent failed: {s}", .{@errorName(pe)});
-        return; // `posted` stays false → the defer frees results/query
-    };
-    posted = true;
-}
-
 /// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read stale, so
 /// re-pull AniList metadata and post it for the UI thread to persist + reload. `stub` is a
 /// gpa-owned identity record (id/name/english_name/anilist_id) blank beyond identity, so
