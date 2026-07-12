@@ -39,6 +39,10 @@ pub const Request = struct {
     /// Provider name for the always-on diagnostics.
     tag: []const u8,
     accept: Accept = .any_2xx,
+    /// Untrusted-destination fetches set `.not_allowed` so a 3xx can't bounce a
+    /// request past its caller's SSRF guard (ROD-266). Null keeps std's default
+    /// (follow), correct for our own trusted endpoints.
+    redirect_behavior: ?std.http.Client.Request.RedirectBehavior = null,
 };
 
 /// One request. Returns the response body (lives in `arena`). Failures split into the
@@ -58,6 +62,7 @@ pub fn request(arena: Allocator, io: Io, req: Request) ![]u8 {
         .response_writer = &w,
         .headers = .{ .user_agent = .{ .override = req.user_agent } },
         .extra_headers = req.extra_headers,
+        .redirect_behavior = req.redirect_behavior,
     }) catch |e| {
         // Log the raw error name here, at the single call site, so mapTransportError
         // stays a pure mapper (its unit test would otherwise spew warn lines).
