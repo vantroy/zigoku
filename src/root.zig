@@ -131,6 +131,7 @@ test {
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests
     _ = @import("providers/http.zig"); // ROD-349: run the shared transport taxonomy tests
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
+    _ = @import("util/fetchguard.zig"); // ROD-266: run the lifted SSRF-guard tests
     _ = @import("util/semver.zig"); // ROD-370: run the version-compare tests
     _ = updatecheck; // ROD-370: run the cache/parse tests
     _ = update; // ROD-371: run the install-detection decision tests
