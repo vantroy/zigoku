@@ -371,9 +371,13 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// confident match wins and the posted event carries the winner's name). `providers` is
 /// gpa-owned by this task and freed here, so a preference change mid-flight can't touch
 /// a walk already underway.
-/// Per provider: search its OWN catalog and match: tier B first
-/// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
-/// in its results; the retired anipub's MALID backfill shape, kept for future
+/// Per provider, in tier order: tier A first (ROD-366) via `canonicalKey`, so a
+/// provider this same walk retries (the add-widen) still gets its direct catalog
+/// key even though the caller already tried tier A on the FIRST provider only
+/// (browseResolveTarget stops there); a tier-A-only provider like megaplay is
+/// unreachable otherwise. Then, if that misses, search its OWN catalog and match:
+/// tier B (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider
+/// embedded in its results; the retired anipub's MALID backfill shape, kept for future
 /// tier-B providers), then tier C
 /// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
 /// query passes: the canonical (romaji) title, then the English title, since an
@@ -455,13 +459,43 @@ fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const Sourc
 /// The search→match→probe core of `resolveSearchTask`, split from the thread/event
 /// glue so the pass control flow is unit-testable with a stub provider.
 fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) SearchVerdict {
+    var transport_failed = false;
+    // `probed` gates the `.absent` verdict: at least one authoritative pass (a
+    // clean tier-A episode probe or a title search) must have run, or a clean
+    // miss is really "learned nothing" (`.unknown`).
+    var probed = false;
+
+    // Tier A (ROD-366): the provider id-keys its own catalog from the canonical.
+    // Try it BEFORE the title search so a tier-A-only provider (megaplay, whose
+    // `search` is `error.Unsupported`) is reachable at all here. Mirrors the tier
+    // order advanceFallback + prewarmTask already use; the initial resolve only
+    // ever probes the FIRST tier-A provider (browseResolveTarget stops there), so
+    // a later provider's key still needs trying on the widen.
+    if (provider.canonicalKey(arena, canonical) catch null) |key| {
+        // Play skips the probe (its own downstream fetch confirms), same as the
+        // search arm below.
+        if (for_play) return .{ .match = key };
+        if (provider.episodes(arena, io, key, translation, null)) |eps| {
+            if (eps.len > 0) return .{ .match = key };
+            // 200-with-empty on the canonical route is an authoritative "not
+            // stocked" (megaplay's empty-is-authoritative contract, ROD-347). It
+            // still falls through to a title search for a provider that also has
+            // one (senshi): the canonical's mal_id may differ from the id senshi
+            // cataloged the show under, which only a search recovers. That costs a
+            // dual-capability provider one extra sequential request (probe, then
+            // search); still one-at-a-time, so the ROD-309 rate-scoring discipline holds.
+            probed = true;
+        } else |e| {
+            log.debug("resolve tier-A episode probe failed: {s}", .{@errorName(e)});
+            transport_failed = true;
+        }
+    }
+
     const opts: source_mod.SearchOptions = .{
         .translation = translation,
         .limit = source_mod.search_page_size,
         .page = 1,
     };
-    var transport_failed = false;
-    var searched = false;
     const passes = [_]?[]const u8{ canonical.name, canonical.english_name };
     for (passes, 0..) |pass, pi| {
         const query = pass orelse continue;
@@ -469,11 +503,17 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         // Skip a redundant second search when the English title IS the name.
         if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
         const results = provider.search(arena, io, query, opts) catch |e| {
-            log.debug("resolve-search failed: {s}", .{@errorName(e)});
-            transport_failed = true;
+            // A provider with no catalog search (megaplay) reports Unsupported:
+            // that is "nothing to search here", not a transport failure, so it
+            // must not taint an absence a clean tier-A probe already established
+            // (ROD-366/347). Any other error is a real transport failure.
+            if (e != error.Unsupported) {
+                log.debug("resolve-search failed: {s}", .{@errorName(e)});
+                transport_failed = true;
+            }
             continue;
         };
-        searched = true;
+        probed = true;
         const idx = resolver.bestIdMatch(canonical, results) orelse
             resolver.bestProviderMatch(canonical, results) orelse continue;
         const matched_id = results[idx].id;
@@ -493,9 +533,10 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         }
         return .{ .match = matched_id };
     }
-    // A clean miss is definitive only when at least one pass ran AND no transport
-    // failure could have hidden a hit (a CF-diva day must never poison the cache).
-    if (transport_failed or !searched) return .unknown;
+    // A clean miss is definitive only when at least one authoritative pass ran AND
+    // no transport failure could have hidden a hit (a CF-diva day must never poison
+    // the cache).
+    if (transport_failed or !probed) return .unknown;
     return .absent;
 }
 
@@ -1744,6 +1785,11 @@ const StubCatalog = struct {
     /// Transport-failure knobs (ROD-347): fail the search / the episode probe.
     search_fails: bool = false,
     episodes_fail: bool = false,
+    /// Tier-A knobs (ROD-366): the canonical→catalog key this provider derives
+    /// (null = no tier-A, the pre-366 default), and whether `search` reports
+    /// `error.Unsupported` (megaplay's tier-A-only shape).
+    canon_key: ?[]const u8 = null,
+    search_unsupported: bool = false,
 
     fn provider(self: *StubCatalog) SourceProvider {
         return .{ .ptr = self, .vtable = &stub_vtable };
@@ -1763,6 +1809,7 @@ const StubCatalog = struct {
     }
     fn stubSearch(ptr: *anyopaque, arena: Allocator, _: std.Io, query: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        if (self.search_unsupported) return error.Unsupported;
         self.searches += 1;
         if (self.search_fails) return error.NoAnswer;
         const rows: []const Anime = if (std.mem.eql(u8, query, "Romaji Title"))
@@ -1773,8 +1820,9 @@ const StubCatalog = struct {
             &.{};
         return arena.dupe(Anime, rows);
     }
-    fn stubCanonicalKey(_: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
-        return null;
+    fn stubCanonicalKey(ptr: *anyopaque, _: Allocator, _: Anime) anyerror!?[]const u8 {
+        const self: *StubCatalog = @ptrCast(@alignCast(ptr));
+        return self.canon_key;
     }
     fn stubEpisodes(ptr: *anyopaque, arena: Allocator, _: std.Io, show_id: []const u8, _: domain.Translation, _: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *StubCatalog = @ptrCast(@alignCast(ptr));
@@ -1871,6 +1919,66 @@ test "resolveViaSearch three-state: transport failures read unknown, never absen
     var idle = StubCatalog{};
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, idle.provider(), untitled, .sub, true) == .unknown);
     try std.testing.expectEqual(@as(u32, 0), idle.searches);
+}
+
+test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable off the canonical key (ROD-366)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
+
+    // megaplay's shape: canonicalKey derives a catalog id, `search` is Unsupported.
+    // The pre-366 search-only walk saw only the Unsupported search and learned
+    // nothing; tier-A must now bind it on the canonical key + episode probe.
+    var mega = StubCatalog{ .canon_key = "66624", .alive_id = "66624", .search_unsupported = true };
+    const hit = resolveViaSearch(arena_state.allocator(), std.testing.io, mega.provider(), canonical, .sub, false);
+    try std.testing.expectEqualStrings("66624", hit.match);
+    try std.testing.expectEqual(@as(u32, 0), mega.searches); // tier-A hit → search never fired
+
+    // The same provider that does NOT stock the show: the tier-A probe lists empty
+    // (authoritative), and the Unsupported search must not downgrade that to unknown.
+    // It's a cacheable absence (ROD-347).
+    var mega_miss = StubCatalog{ .canon_key = "404", .alive_id = "", .search_unsupported = true };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_miss.provider(), canonical, .sub, false) == .absent);
+
+    // No mal_id → no tier-A key; the Unsupported search then learned nothing, so a
+    // stale absence must NOT be cached (a show that gains a mal_id later isn't
+    // blocked). This is the case the megaplay Unsupported contract protects.
+    const no_mal: Anime = .{ .id = "2", .name = "Romaji Title", .anilist_id = 2 };
+    var mega_nokey = StubCatalog{ .search_unsupported = true };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_nokey.provider(), no_mal, .sub, false) == .unknown);
+
+    // Play skips the episode probe: the tier-A key resolves immediately, the
+    // downstream fetch is the confirmation (parity with the search arm).
+    var mega_play = StubCatalog{ .canon_key = "66624", .alive_id = "", .search_unsupported = true };
+    const played = resolveViaSearch(arena_state.allocator(), std.testing.io, mega_play.provider(), canonical, .sub, true);
+    try std.testing.expectEqualStrings("66624", played.match);
+
+    // A tier-A probe that dies on TRANSPORT (not a clean empty) taints the walk to
+    // unknown even when a subsequent search comes back clean-empty: the error may
+    // have hidden a hit, so the miss is never a cacheable absence (ROD-278/347). Here
+    // the search runs (not Unsupported) and finds nothing, yet the verdict must stay
+    // unknown because of the tier-A transport failure.
+    var mega_flaky = StubCatalog{ .canon_key = "66624", .episodes_fail = true };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_flaky.provider(), canonical, .sub, false) == .unknown);
+    try std.testing.expect(mega_flaky.searches > 0); // tier-A transport fail still fell through to search
+}
+
+test "resolveViaSearch tier-A: an empty tier-A probe still falls through to a title search (ROD-366)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    // senshi's shape: it keys episodes by mal_id (tier-A) AND has a title search.
+    // The canonical's mal_id lists empty on the direct route, but the show is
+    // cataloged under a different id a title search recovers, so the tier-A miss
+    // must not short-circuit that.
+    const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
+    var senshi = StubCatalog{
+        .canon_key = "52991", // direct route: lists empty (alive_id below is the search id)
+        .romaji = &.{.{ .id = "found", .name = "Romaji Title", .mal_id = 52991 }},
+        .alive_id = "found",
+    };
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, senshi.provider(), canonical, .sub, false);
+    try std.testing.expectEqualStrings("found", got.match);
+    try std.testing.expect(senshi.searches > 0); // tier-A empty → search still ran
 }
 
 test "resolveAcrossProviders: walks registry order, first confident match wins (ROD-343)" {

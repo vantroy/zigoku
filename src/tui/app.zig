@@ -2323,6 +2323,38 @@ pub const App = struct {
                 }
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
+                // ROD-368: a 200-with-empty listing is the provider's authoritative
+                // "doesn't stock this show" (senshi's shape; the same signal
+                // resolveAddTask reads as `.absent`), NOT a real 0-episode grid.
+                // Binding it strands the detail on an empty pane and the provider
+                // ladder never walks, since only `episodes_error` walked. Treat it
+                // like that error: cache the absence and hop to a provider that does
+                // carry the show (megaplay) before conceding a dead end. pending_bind
+                // is the aid for a tier-A/resolve open; a plain History open reads it
+                // off the row being served.
+                if (ev.episodes.len == 0) {
+                    self.gpa.free(ev.episodes);
+                    const failed_bind = self.pending_bind;
+                    self.pending_bind = null;
+                    if (self.episodes.for_source) |src| {
+                        const aid: ?i64 = failed_bind orelse blk: {
+                            const st = self.store orelse break :blk null;
+                            var a = std.heap.ArenaAllocator.init(self.gpa);
+                            defer a.deinit();
+                            const rec = (st.getAnime(a.allocator(), src, ev.for_id) catch null) orelse break :blk null;
+                            break :blk rec.anilist_id;
+                        };
+                        if (aid) |id| self.persistProviderAbsences(id, &.{src});
+                    }
+                    if (self.advanceFallback(loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
+                    // The whole ladder came up empty: no provider stocks it, so render
+                    // the unbound state ("no source available") rather than a bare
+                    // 0-episode grid. In-memory only; a plain browse peek must not mint
+                    // a persisted unbound row (that is the Add path's call, ROD-329).
+                    self.demoteResumeLanding();
+                    self.episodes.unbound = true;
+                    return;
+                }
                 // ROD-229: the resume grid loaded — the auto-open succeeded, so
                 // there is nothing left to demote from.
                 self.resume_landing_pending = false;
