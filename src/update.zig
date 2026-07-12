@@ -184,13 +184,17 @@ fn selfExePath(arena: Allocator, io: Io) ![]const u8 {
     }
 }
 
-const darwin = if (builtin.os.tag == .macos) @cImport(@cInclude("mach-o/dyld.h")) else void;
+// Declared extern, NOT via `@cImport("mach-o/dyld.h")`: that header pulls in mach
+// message descriptor types whose translate-c size-asserts fail to compile on macOS.
+// The one symbol we need lives in libSystem (linked via libc). `[*c]u8` so the first
+// call can pass null to learn the length.
+extern "c" fn _NSGetExecutablePath(buf: [*c]u8, bufsize: *u32) c_int;
 
 fn selfExePathDarwin(arena: Allocator) ![]const u8 {
     var size: u32 = 0;
-    _ = darwin._NSGetExecutablePath(null, &size); // first call: learn the required length
+    _ = _NSGetExecutablePath(null, &size); // first call: learn the required length
     const buf = try arena.alloc(u8, size);
-    if (darwin._NSGetExecutablePath(buf.ptr, &size) != 0) return error.NameTooLong;
+    if (_NSGetExecutablePath(buf.ptr, &size) != 0) return error.NameTooLong;
     return std.mem.sliceTo(buf, 0); // dyld null-terminates; the path may be non-canonical (fine for dirname/access)
 }
 
