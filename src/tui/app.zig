@@ -1363,6 +1363,17 @@ pub const App = struct {
         return selection.cellPx(self);
     }
 
+    /// Discover grid geometry for the current terminal (ROD-276). The single home
+    /// for the visible-rows gate + cover-pixel feed: every Discover fill/scroll site
+    /// routes through here rather than recompute, or the sites drift out of sync.
+    /// `visible` clamps to 0 below a usable size, so geometry returns an empty grid.
+    pub fn discoverGeometry(self: *const App) discover_view.Geometry {
+        const w = self.term_cols;
+        const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
+        const cp = self.cellPx();
+        return discover_view.geometry(w, visible, cp[0], cp[1]);
+    }
+
     pub fn topBarSeasonChip(self: *App) []const u8 {
         return selection.topBarSeasonChip(self);
     }
@@ -2697,10 +2708,7 @@ pub const App = struct {
     pub fn pumpDiscoverCovers(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         if (self.active_view != .discover) return;
 
-        const w = self.term_cols;
-        const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
-        const cp = self.cellPx();
-        const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
+        const geo = self.discoverGeometry();
         if (geo.cols == 0 or geo.rows_visible == 0) return;
 
         const items = self.discover.activeSlot().results.items;
@@ -3973,10 +3981,7 @@ pub const App = struct {
         const slot = self.discover.activeSlot();
         if (!discoverFillEligible(slot.loading, slot.exhausted, slot.failed, slot.page)) return;
 
-        const w = self.term_cols;
-        const visible: u16 = if (self.term_rows >= 4 and w >= 16) self.term_rows - 3 else 0;
-        const cp = self.cellPx();
-        const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
+        const geo = self.discoverGeometry();
         if (discoverNeedsFill(slot.results.items.len, geo)) {
             self.fireDiscoverFeed(loop, io, self.discover.axis, slot.page + 1);
         }
@@ -4390,8 +4395,7 @@ pub const App = struct {
             // Discover: keep the cursor's card-row inside the grid viewport. scroll
             // is a card-row offset; geometry resolves cols + the visible row budget.
             .discover => {
-                const cp = self.cellPx();
-                const geo = discover_view.geometry(w, visible, cp[0], cp[1]);
+                const geo = self.discoverGeometry();
                 if (geo.rows_visible == 0 or geo.cols == 0) {
                     self.discover.scroll = 0;
                 } else {
