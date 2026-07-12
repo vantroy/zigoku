@@ -75,10 +75,19 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     y += 1;
 
     // AniList Sync (ROD-286) — a read-only account status (like Catalog), then the
-    // interactive connect action + sync master-switch toggle (rows 11..end).
+    // interactive connect action + sync master-switch toggle (rows 11..13).
     y = drawSettingsHeader(self, win, y, w, "AniList Sync");
     drawInertRow(self, win, y, w, "account", accountStatus(self));
     y += 1;
+    while (i < 13) : (i += 1) {
+        const r = settings_rows[i];
+        drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);
+        y += 1;
+    }
+    y += 1;
+
+    // Updates (ROD-370): the startup update-check opt-out (rows 13..end).
+    y = drawSettingsHeader(self, win, y, w, "Updates");
     while (i < settings_rows.len) : (i += 1) {
         const r = settings_rows[i];
         drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);

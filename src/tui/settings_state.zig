@@ -47,6 +47,8 @@ pub const SettingId = enum {
     // ── AniList Sync section (ROD-286) ──
     connect,
     anilist_sync,
+    // ── Updates section (ROD-370) ──
+    check_for_updates,
 };
 
 /// `action` (ROD-286): a focusable row whose Enter fires a side effect rather than
@@ -83,6 +85,9 @@ pub const settings_rows = [_]SettingRow{
     // separately (like Catalog) and is not focusable, so it isn't in this table.
     .{ .id = .connect, .label = "connect", .kind = .action, .hint = "enter to connect" },
     .{ .id = .anilist_sync, .label = "sync", .kind = .toggle, .hint = "space to toggle" },
+    // Updates (ROD-370): the startup update-check opt-out. Its own section since it's
+    // app behavior, not display or an AniList concern.
+    .{ .id = .check_for_updates, .label = "check for updates", .kind = .toggle, .hint = "space to toggle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not
@@ -91,15 +96,17 @@ pub const settings_row_count = settings_rows.len;
 
 comptime {
     // `drawSettings` splits this table 0..5 = Player, 5 = Catalog's provider row,
-    // 6..11 = Interface, 11..end = AniList Sync. Pin the boundaries so
-    // inserting/removing a row can't silently misattribute it to the wrong group
+    // 6..11 = Interface, 11..13 = AniList Sync, 13..end = Updates. Pin the boundaries
+    // so inserting/removing a row can't silently misattribute it to the wrong group
     // header: this breaks the build instead.
-    std.debug.assert(settings_rows.len == 13);
+    std.debug.assert(settings_rows.len == 14);
     std.debug.assert(settings_rows[4].id == .skip_mode); // last Player row
     std.debug.assert(settings_rows[5].id == .provider); // the Catalog row (ROD-344)
     std.debug.assert(settings_rows[6].id == .cover_art); // first Interface row
     std.debug.assert(settings_rows[10].id == .title_language); // last Interface row (ROD-205)
     std.debug.assert(settings_rows[11].id == .connect); // first AniList Sync row
+    std.debug.assert(settings_rows[12].id == .anilist_sync); // last AniList Sync row
+    std.debug.assert(settings_rows[13].id == .check_for_updates); // the Updates row (ROD-370)
 }
 
 const quality_presets = [_][]const u8{ "worst", "480", "720", "1080", "best" };
@@ -190,6 +197,7 @@ fn toggle(config: *Config, id: SettingId) void {
         .cover_art => config.cover_art = !config.cover_art,
         .kanji_chips => config.kanji_chips = !config.kanji_chips,
         .anilist_sync => config.anilist_sync_enabled = !config.anilist_sync_enabled, // ROD-286 master switch
+        .check_for_updates => config.check_for_updates = !config.check_for_updates, // ROD-370
         else => {},
     }
 }
@@ -395,6 +403,7 @@ pub const SettingsState = struct {
             .landing => config.landing,
             .title_language => config.title_language,
             .anilist_sync => if (config.anilist_sync_enabled) "on" else "off",
+            .check_for_updates => if (config.check_for_updates) "on" else "off",
             .connect => "", // an action row has no stored value; its hint carries the affordance
         };
     }
