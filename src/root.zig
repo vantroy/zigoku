@@ -130,6 +130,7 @@ test {
     _ = @import("providers/allanime.zig");
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests
     _ = @import("providers/http.zig"); // ROD-349: run the shared transport taxonomy tests
+    _ = @import("providers/hls.zig"); // ROD-302: run the lifted HLS parse/select tests
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
     _ = @import("util/fetchguard.zig"); // ROD-266: run the lifted SSRF-guard tests
     _ = @import("util/semver.zig"); // ROD-370: run the version-compare tests
