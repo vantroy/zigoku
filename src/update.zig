@@ -84,7 +84,7 @@ pub fn run(
         try out.print("couldn't reach GitHub to check the latest release; continuing anyway.\n\n", .{});
     }
 
-    const method = detectMethod(io, exe);
+    const method = detectMethod(arena, io, exe);
     switch (decide(method, bindir, dirWritable(io, bindir))) {
         .package_directions => |m| try printPackageDirections(out, m),
         .refuse_unwritable => try printRefusal(out, bindir),
@@ -197,24 +197,25 @@ fn selfExePathDarwin(arena: Allocator) ![]const u8 {
 /// Which package manager, if any, owns the running binary. Exit-code-only probes:
 /// a missing tool (pacman on non-Arch, brew on non-mac) fails to spawn and reads as
 /// "not that manager", falling through to standalone.
-fn detectMethod(io: Io, exe: []const u8) InstallMethod {
+fn detectMethod(arena: Allocator, io: Io, exe: []const u8) InstallMethod {
     switch (builtin.os.tag) {
         .linux => if (commandSucceeds(io, &.{ "pacman", "-Qo", exe })) return .pacman,
-        // `brew list zigoku` only proves a zigoku formula is installed SOMEWHERE, not
-        // that THIS binary is it, so also require the running path to sit under a brew
-        // prefix. Without the second clause a standalone binary running next to a brew
-        // install would be misrouted to "use brew" instead of self-updating.
-        .macos => if (commandSucceeds(io, &.{ "brew", "list", "zigoku" }) and underBrewPrefix(exe)) return .brew,
+        .macos => {
+            // `brew list zigoku` only proves a zigoku formula exists SOMEWHERE, not that
+            // THIS binary is it. Confirm by comparing the running path against brew's real
+            // prefix (`brew --prefix`, so a custom HOMEBREW_PREFIX is handled, which two
+            // hardcoded roots would miss). If the prefix won't resolve, prefer .brew:
+            // telling a user to `brew upgrade` when they needn't is harmless, but
+            // self-updating a brew-managed binary out of band corrupts brew's bookkeeping.
+            if (commandSucceeds(io, &.{ "brew", "list", "zigoku" })) {
+                if (commandOutput(arena, io, &.{ "brew", "--prefix" })) |prefix|
+                    return if (hasPrefixDir(exe, prefix)) .brew else .standalone;
+                return .brew;
+            }
+        },
         else => {},
     }
     return .standalone;
-}
-
-/// Whether `exe` lives under a Homebrew prefix. Covers the two standard roots; a
-/// custom `HOMEBREW_PREFIX` install that also has a stray standalone binary is a rare
-/// edge that degrades to the pre-fix behavior (a wrong "use brew"), never worse.
-fn underBrewPrefix(exe: []const u8) bool {
-    return hasPrefixDir(exe, "/opt/homebrew") or hasPrefixDir(exe, "/usr/local");
 }
 
 /// True if `path` equals `prefix` or sits under it as a directory (so `/usr/local`
@@ -239,6 +240,38 @@ fn commandSucceeds(io: Io, argv: []const []const u8) bool {
         .exited => |code| code == 0,
         else => false,
     };
+}
+
+/// Run `argv` and return its trimmed stdout, or null on spawn failure / nonzero exit /
+/// empty output. Reads the pipe to EOF before `wait()` (the callers' commands emit one
+/// short line, far under any pipe buffer, so this can't deadlock). Output lives in `arena`.
+fn commandOutput(arena: Allocator, io: Io, argv: []const []const u8) ?[]const u8 {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return null;
+    var pipe = child.stdout orelse {
+        _ = child.wait(io) catch {};
+        return null;
+    };
+    // Don't close `pipe` ourselves: child.wait's cleanup closes the child's stdio
+    // handles, and a manual close first makes that a double-close (BADF panic).
+    var rbuf: [512]u8 = undefined;
+    var reader = pipe.reader(io, &rbuf);
+    const data = reader.interface.allocRemaining(arena, Io.Limit.limited(4096)) catch {
+        _ = child.wait(io) catch {};
+        return null;
+    };
+    const term = child.wait(io) catch return null;
+    const ok = switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+    if (!ok) return null;
+    const trimmed = std.mem.trim(u8, data, " \t\r\n");
+    return if (trimmed.len == 0) null else trimmed;
 }
 
 /// Whether we can write into `dir` (so an in-place swap is possible). A relative
@@ -356,4 +389,17 @@ test "sanitizeTag: strips control bytes, leaves a clean tag intact" {
     // A forged tag with an escape sequence keeps only the printable bytes.
     try std.testing.expectEqualStrings("v1.0[2J", sanitizeTag(&buf, "v1.0\x1b[2J"));
     try std.testing.expectEqualStrings("", sanitizeTag(&buf, "\x00\x07\x1b"));
+}
+
+test "commandOutput: captures + trims stdout, null on failure (the brew --prefix mechanism)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    // `echo` stands in for `brew --prefix`: the trailing newline must be trimmed.
+    try std.testing.expectEqualStrings("/opt/homebrew", commandOutput(a, io, &.{ "echo", "/opt/homebrew" }).?);
+    // Nonzero exit → null.
+    try std.testing.expectEqual(@as(?[]const u8, null), commandOutput(a, io, &.{"false"}));
+    // Absent binary (spawn failure) → null.
+    try std.testing.expectEqual(@as(?[]const u8, null), commandOutput(a, io, &.{"zzz-no-such-command-zzz"}));
 }
