@@ -220,6 +220,12 @@ pub fn play(
         // (spike-verified: lostproject.club 200s under the megaplay referer).
         // Same untrusted-bytes contract as `url`: cleanArg-vetted upstream.
         try argv.append(arena, try std.fmt.allocPrint(arena, "--sub-file={s}", .{s}));
+        // Style the softsub for anime backgrounds (ROD-382): lift it off the very
+        // bottom edge (sub-pos < 100 raises it) and render bold so thin glyphs hold
+        // up over bright frames. Constant literals, no untrusted data. External subs
+        // only (this block); burned-in hardsubs are pixels and untouchable.
+        try argv.append(arena, "--sub-pos=90");
+        try argv.append(arena, "--sub-bold=yes");
     }
     if (link.cloaked_segments) {
         // The stream's HLS segments use a disguised extension (senshi serves `.ts` as `.jpg`;
