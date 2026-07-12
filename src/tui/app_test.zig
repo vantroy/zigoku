@@ -3,6 +3,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("app.zig");
+const resolve = @import("resolve.zig");
 const event_mod = @import("event.zig");
 const workers = @import("workers.zig");
 const store_mod = @import("../store.zig");
@@ -3592,7 +3593,7 @@ test "browseResolveTarget: a provider-keyed row is .direct (ROD-328)" {
     defer arena_inst.deinit();
     // id != stringified anilist_id → not an unresolved AniList hit, fetch as-is.
     const sel: Anime = .{ .id = "52991", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), "", sel, null, arena_inst.allocator())) {
+    switch (resolve.browseResolveTarget(dummyRegistry(), "", sel, null, arena_inst.allocator())) {
         .direct => |id| try testing.expectEqualStrings("52991", id),
         else => return error.TestExpectationFailed,
     }
@@ -3606,7 +3607,7 @@ test "browseResolveTarget: an AniList hit with a mal_id is .tier_a (ROD-328)" {
     // id == stringified anilist_id (an unresolved hit), mal_id present, no binding yet →
     // the provider's canonicalKey derives its id.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
+    switch (resolve.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
         .tier_a => |t| {
             try testing.expectEqualStrings("52991", t.id);
             try testing.expectEqual(@as(i64, 154587), t.anilist_id);
@@ -3622,7 +3623,7 @@ test "browseResolveTarget: an AniList hit with no mal_id is .needs_search (ROD-3
     defer st.close();
     // No mal_id → canonicalKey returns null → tier-C title search.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 };
-    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
+    switch (resolve.browseResolveTarget(dummyRegistry(), "", sel, &st, arena_inst.allocator())) {
         .needs_search => |aid| try testing.expectEqual(@as(i64, 154587), aid),
         else => return error.TestExpectationFailed,
     }
@@ -3647,7 +3648,7 @@ test "browseResolveTarget: an existing binding is tier 0 and wins over tier A (R
 
     // An AniList hit that is ALSO tier-A eligible (carries a mal_id): tier 0 must still win.
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(dummyRegistry(), "", sel, &st, arena)) {
+    switch (resolve.browseResolveTarget(dummyRegistry(), "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("99999", b.id); // the stored binding, not tier-A's 52991
             try testing.expectEqual(@as(i64, 154587), b.anilist_id);
@@ -3678,7 +3679,7 @@ test "browseResolveTarget: tier 0 on a later provider beats tier A on the first 
     const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
     const registry: source_mod.Registry = .{ .providers = &slots };
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(registry, "", sel, &st, arena)) {
+    switch (resolve.browseResolveTarget(registry, "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("beta", b.provider.name());
             try testing.expectEqualStrings("99999", b.id);
@@ -3707,7 +3708,7 @@ test "browseResolveTarget: bindings on both providers tie to registry order (ROD
     const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
     const registry: source_mod.Registry = .{ .providers = &slots };
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(registry, "", sel, &st, arena)) {
+    switch (resolve.browseResolveTarget(registry, "", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("allanime", b.provider.name());
             try testing.expectEqualStrings("11111", b.id);
@@ -3738,7 +3739,7 @@ test "browseResolveTarget: the provider preference breaks a tier-0 tie (ROD-344)
     const slots = [_]SourceProvider{ dummyProvider(), beta.provider() };
     const registry: source_mod.Registry = .{ .providers = &slots };
     const sel: Anime = .{ .id = "154587", .name = "Frieren", .anilist_id = 154587, .mal_id = 52991 };
-    switch (App.browseResolveTarget(registry, "beta", sel, &st, arena)) {
+    switch (resolve.browseResolveTarget(registry, "beta", sel, &st, arena)) {
         .bound => |b| {
             try testing.expectEqualStrings("beta", b.provider.name());
             try testing.expectEqualStrings("99999", b.id);
@@ -3746,7 +3747,7 @@ test "browseResolveTarget: the provider preference breaks a tier-0 tie (ROD-344)
         else => return error.TestExpectationFailed,
     }
     // An unregistered preference degrades to construction order, not a panic.
-    switch (App.browseResolveTarget(registry, "gone", sel, &st, arena)) {
+    switch (resolve.browseResolveTarget(registry, "gone", sel, &st, arena)) {
         .bound => |b| try testing.expectEqualStrings("allanime", b.provider.name()),
         else => return error.TestExpectationFailed,
     }
@@ -6236,7 +6237,7 @@ test "ROD-346: a failed episode fetch hops to the next provider's tier-A probe" 
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     // The failed fetch's identity: alpha's binding, as fireEpisodesForId set it.
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
@@ -6287,7 +6288,7 @@ test "ROD-346: a fallback hop reuses an existing sibling binding (tier 0) before
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -6333,7 +6334,7 @@ test "ROD-347: the walk skips a fresh-absent provider; a stale verdict re-probes
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -6390,7 +6391,7 @@ test "ROD-347: a tier-0 sibling binding outranks even a fresh negative" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -6431,13 +6432,13 @@ test "ROD-351: prewarmCandidates keeps only unchecked providers (bound and fresh
 
     // alpha is bound (tier 0 already routes there), beta has a fresh negative:
     // only gamma is worth a probe.
-    const c1 = try App.prewarmCandidates(&st, registry, 154587, arena);
+    const c1 = try resolve.prewarmCandidates(&st, registry, 154587, arena);
     try testing.expectEqual(@as(usize, 1), c1.len);
     try testing.expectEqualStrings("gamma", c1[0].name());
 
     // An aged-out verdict reads unchecked again: beta rejoins the walk.
     try st.markProviderAbsent(154587, "beta", store_mod.Store.nowSecs() - store_mod.Store.ABSENCE_TTL_SECONDS - 1);
-    const c2 = try App.prewarmCandidates(&st, registry, 154587, arena);
+    const c2 = try resolve.prewarmCandidates(&st, registry, 154587, arena);
     try testing.expectEqual(@as(usize, 2), c2.len);
     try testing.expectEqualStrings("beta", c2[0].name());
     try testing.expectEqualStrings("gamma", c2[1].name());
@@ -6566,7 +6567,7 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     const snap = try workers.dupeOwnedAnime(app.gpa, canonical);
     const provs = try app.gpa.alloc(SourceProvider, 0);
     app.fallback = .{ .canonical = snap, .anilist_id = 999, .providers = provs, .tried = 0 };
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     try st.upsertCanonicalOnly(.{ .id = "999", .name = "Other", .anilist_id = 999, .mal_id = 111 }, true, 5000, arena);
     app.add_resolving = true;
     const sid3 = try std.testing.allocator.dupe(u8, "111");
@@ -6576,7 +6577,7 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     // Spacing floor: with the walk gone, a fire inside the 30s window since the
     // last walk START stays silent AND unmarked (so the show retries later);
     // past the window it runs.
-    app.clearFallback();
+    resolve.clearFallback(&app);
     app.now_ms = app.prewarm_last_start_ms.? + 1_000;
     app.add_resolving = true;
     const sid4 = try std.testing.allocator.dupe(u8, "111");
@@ -6620,7 +6621,7 @@ test "ROD-346: an exhausted walk falls through to the dead-end toast and frees i
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -6664,7 +6665,7 @@ test "ROD-346: a landed fallback grid mints under the hop provider and clears th
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -6717,7 +6718,7 @@ test "ROD-346: a virgin tier-A probe failure walks on via pending_bind (no bindi
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     app.pending_bind = 154587; // the resolving Browse fire armed it
@@ -6761,7 +6762,7 @@ test "ROD-368: an empty listing walks the ladder instead of binding an empty gri
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     app.pending_bind = 154587; // the resolving Browse fire armed it
@@ -6808,7 +6809,7 @@ test "ROD-368: an empty listing with no other provider concedes the unbound stat
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     app.pending_bind = 154587;
@@ -6971,12 +6972,12 @@ test "ROD-351: prewarmTask posts per-provider verdicts and honors the cancel fla
 test "ROD-346: mapEpisodeIndex prefers the raw label, falls back to ordinal, else null" {
     const eps = [_]domain.EpisodeNumber{ .{ .raw = "0" }, .{ .raw = "1" }, .{ .raw = "2" } };
     // Label match wins even when it disagrees with the ordinal position.
-    try testing.expectEqual(@as(?usize, 1), App.mapEpisodeIndex(&eps, "1", 3));
+    try testing.expectEqual(@as(?usize, 1), resolve.mapEpisodeIndex(&eps, "1", 3));
     // No label match: 1-based ordinal maps positionally.
-    try testing.expectEqual(@as(?usize, 2), App.mapEpisodeIndex(&eps, "SP3", 3));
+    try testing.expectEqual(@as(?usize, 2), resolve.mapEpisodeIndex(&eps, "SP3", 3));
     // Neither fits: the hop provider's grid is too short.
-    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "SP9", 9));
-    try testing.expectEqual(@as(?usize, null), App.mapEpisodeIndex(&eps, "9", 0));
+    try testing.expectEqual(@as(?usize, null), resolve.mapEpisodeIndex(&eps, "SP9", 9));
+    try testing.expectEqual(@as(?usize, null), resolve.mapEpisodeIndex(&eps, "9", 0));
 }
 
 test "ROD-346: a never-played stream failure relaunches on the hop provider, bounded by one shot each" {
@@ -7005,7 +7006,7 @@ test "ROD-346: a never-played stream failure relaunches on the hop provider, bou
     // The relaunch spawns a REAL playTask; `true` stands in for mpv (exits 0
     // instantly, so no production error log trips the runner's guard).
     app.config.mpv_path = "true";
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     // The play that is about to fail: alpha's grid is loaded and the session
     // carries the fire-time identity, episode "1" (ordinal 1).
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
@@ -7106,7 +7107,7 @@ test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stal
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -7239,7 +7240,7 @@ test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demot
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
     defer app.episodes.freeResults(app.gpa);
@@ -7339,7 +7340,7 @@ test "ROD-345: v cycles unpinned -> alpha -> beta (tier-0 re-route) -> unpinned"
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.active_view = .detail; // the zoom: a detail surface, v applies
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
@@ -7421,7 +7422,7 @@ test "ROD-355: a v flip landing keeps the cursor on the in-progress episode" {
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.active_view = .detail;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
@@ -7523,7 +7524,7 @@ test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint ar
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.active_view = .detail;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
@@ -7573,7 +7574,7 @@ test "ROD-345: a History open redirects to the pinned provider's sibling binding
     app.active_view = .history;
     app.active_pane = .list;
     app.term_cols = 100; // two-pane: l focuses the detail pane + fires the fetch
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     // The visible History row is still alpha's (most-recently-watched sibling);
     // the redirect must open beta's binding anyway.
@@ -7624,7 +7625,7 @@ test "ROD-345: the pin leads the automatic fallback walk's order (effectivePrefe
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
@@ -7668,7 +7669,7 @@ test "ROD-345: v with a retired (unregistered) pin name wraps to unpinned, no re
     app.gpa = std.testing.allocator;
     app.store = &st;
     app.active_view = .detail;
-    defer app.clearFallback();
+    defer resolve.clearFallback(&app);
     defer if (app.show_pin) |p| app.gpa.free(p);
     app.episodes.for_id = try app.gpa.dupe(u8, "a1");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
