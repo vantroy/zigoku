@@ -163,6 +163,16 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ROD-371: `zigoku update` resolves how the binary was installed and either
+    // updates it in place, points a packaged user at their package manager, or
+    // refuses a root-owned install. A subcommand like login/sync, intercepted
+    // before the positional is read as a search query.
+    if (isUpdateCommand(args)) {
+        try zigoku.update.run(arena, io, out, zigoku.version);
+        try out.flush();
+        return;
+    }
+
     var stdin_buf: [256]u8 = undefined;
     var stdin_fr: Io.File.Reader = Io.File.stdin().reader(io, &stdin_buf);
     const in = &stdin_fr.interface;
@@ -713,6 +723,12 @@ fn isSyncCommand(args: []const [:0]const u8) bool {
     return isSubcommand(args, "sync");
 }
 
+/// ROD-371: `zigoku update` updates the binary in place (or points a packaged user
+/// at their package manager).
+fn isUpdateCommand(args: []const [:0]const u8) bool {
+    return isSubcommand(args, "update");
+}
+
 /// ROD-221: the `--version`/`-V` fast-path, factored out of `main` so the
 /// flag-dispatch *and* the line emission can be unit-tested without standing up
 /// `main`'s full IO. Returns true when a version flag was present (and the
@@ -752,6 +768,15 @@ test "isSyncCommand accepts sync behind flags, rejects it as a query word (ROD-2
     try std.testing.expect(!isSyncCommand(&[_][:0]const u8{ "zigoku", "frieren" }));
     try std.testing.expect(!isSyncCommand(&[_][:0]const u8{ "zigoku", "frieren", "sync" }));
     try std.testing.expect(!isSyncCommand(&[_][:0]const u8{"zigoku"}));
+}
+
+test "isUpdateCommand accepts update behind flags, rejects it as a query word (ROD-371)" {
+    try std.testing.expect(isUpdateCommand(&[_][:0]const u8{ "zigoku", "update" }));
+    try std.testing.expect(isUpdateCommand(&[_][:0]const u8{ "zigoku", "--debug", "update" }));
+    // A real search, and `update` sitting after a query, must NOT be the subcommand.
+    try std.testing.expect(!isUpdateCommand(&[_][:0]const u8{ "zigoku", "frieren" }));
+    try std.testing.expect(!isUpdateCommand(&[_][:0]const u8{ "zigoku", "frieren", "update" }));
+    try std.testing.expect(!isUpdateCommand(&[_][:0]const u8{"zigoku"}));
 }
 
 fn renderSummary(s: zigoku.sync.Summary, buf: *std.Io.Writer.Allocating) ![]const u8 {

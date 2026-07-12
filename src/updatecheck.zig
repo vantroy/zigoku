@@ -45,6 +45,16 @@ pub fn check(arena: Allocator, io: Io, current_version: []const u8, now: i64) ?[
     return if (semver.isNewer(latest, current_version)) latest else null;
 }
 
+/// Fetch the latest tag fresh, bypassing the 6h cache and refreshing it as a side
+/// effect. For the explicit `zigoku update` command (ROD-371), which shouldn't act
+/// on a possibly-stale cached answer the way the ambient boot check happily does.
+/// null on any failure.
+pub fn latestFresh(arena: Allocator, io: Io, now: i64) ?[]const u8 {
+    const tag = fetchLatest(arena, io) catch return null;
+    writeCache(arena, io, now, tag);
+    return tag;
+}
+
 /// The latest tag, from cache if the last check is still fresh, else from the
 /// network (writing the cache on success). null on any failure or missing dir.
 fn resolveLatest(arena: Allocator, io: Io, now: i64) ?[]const u8 {
