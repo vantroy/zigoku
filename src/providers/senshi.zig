@@ -325,7 +325,7 @@ pub const Senshi = struct {
     /// one too. Escalating backoff before each re-try (the first try is immediate):
     /// a short window clears on the 300ms retry, a longer one gets ~2s total to pass
     /// before we give up and play raw. Bounded so a dead sidecar can't stall resolve.
-    const sub_retry_backoffs_ms = [_]i64{ 300, 700, 1200 };
+    const SUB_RETRY_BACKOFFS_MS = [_]i64{ 300, 700, 1200 };
 
     /// Follow the picked embed's `serverFM` sidecar to a soft-sub `.vtt` for mpv, or
     /// null to play raw. The sidecar url is host-controlled → it's the same SSRF +
@@ -342,8 +342,8 @@ pub const Senshi = struct {
         // Retry the fetch+parse: an empty-body 200 fails the parse and is retried; a
         // valid but empty `[]` parses fine and drops through to pickSubTrack (no track
         // → raw), never wasting a retry on a genuine no-subs answer (ROD-381).
-        const tracks = for (0..sub_retry_backoffs_ms.len + 1) |attempt| {
-            if (attempt > 0) std.Io.sleep(io, .fromMilliseconds(sub_retry_backoffs_ms[attempt - 1]), .awake) catch {};
+        const tracks = for (0..SUB_RETRY_BACKOFFS_MS.len + 1) |attempt| {
+            if (attempt > 0) std.Io.sleep(io, .fromMilliseconds(SUB_RETRY_BACKOFFS_MS[attempt - 1]), .awake) catch {};
             const body = http.request(arena, io, .{
                 .method = .GET,
                 .url = info_url,
@@ -356,7 +356,7 @@ pub const Senshi = struct {
             const parsed = std.json.parseFromSlice([]SubTrack, arena, body, .{ .ignore_unknown_fields = true }) catch continue;
             break parsed.value;
         } else {
-            log.warn("senshi: subtitle sidecar unavailable after {d} tries; playing raw", .{sub_retry_backoffs_ms.len + 1});
+            log.warn("senshi: subtitle sidecar unavailable after {d} tries; playing raw", .{SUB_RETRY_BACKOFFS_MS.len + 1});
             return null;
         };
 
