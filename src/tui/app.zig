@@ -122,6 +122,7 @@ pub fn run(
     registry: Registry,
     config: Config,
     config_path: ?[]const u8,
+    app_version: []const u8,
 ) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -168,6 +169,7 @@ pub fn run(
     app.store = store;
     app.config = config;
     app.config_path = config_path;
+    app.app_version = std.fmt.bufPrint(&app.version_buf, "v{s}", .{app_version}) catch app_version;
     // Seed the cell-pixel cache from the initial resize (the .winsize event was
     // drained above, so read vaxis's settled screen) — Discover's cover-fill height
     // needs it on the first frame (ROD-247).
@@ -331,6 +333,16 @@ pub fn run(
     // action flush's one-flush gate, so a very early mutation just re-arms behind it
     // (fireSyncFlush sees inflight and waits).
     app.fireLaunchPull(&loop, io);
+
+    // ROD-370: best-effort boot update check on its own thread; compares our build
+    // against GitHub's latest release and whispers `.update_available` if we're behind.
+    // Gated by config (the hard opt-out) and skipped under test. The worker keeps all
+    // its state thread-local (posts a payloadless event), so a plain spawn/join suffices.
+    const update_thread: ?std.Thread = if (config.check_for_updates and !builtin.is_test)
+        std.Thread.spawn(.{}, workers.updateCheckTask, .{ &loop, gpa, io, app_version }) catch null
+    else
+        null;
+    defer if (update_thread) |t| t.join();
 
     // First paint, then the event loop.
     {
@@ -920,6 +932,11 @@ pub const App = struct {
     /// run()'s process-lifetime arena. Null when no $HOME/$XDG_CONFIG_HOME — in
     /// which case settings still edit live but can't persist.
     config_path: ?[]const u8 = null,
+    /// Built-in version for the Settings "current version" inert row (ROD-370),
+    /// formatted `v{version}` once in run() into `version_buf`. Slice into an
+    /// App-owned buffer, so it outlives every frame.
+    app_version: []const u8 = "",
+    version_buf: [16]u8 = undefined,
     /// Active color palette (ROD-87). Points to one of the Palette presets in
     /// colors.zig; updated live when the user cycles the palette setting.
     palette: *const colors.Palette = &colors.terminal_ghost,
@@ -1992,6 +2009,12 @@ pub const App = struct {
                     const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
                     self.pushToast(.info, msg, false);
                 }
+            },
+            .update_available => {
+                // ROD-370: the boot check found a newer release. A fixed-width whisper
+                // (no version) so it can never clip the actionable command; the version
+                // lives in Settings and in `zigoku update`'s own output.
+                self.pushToast(.info, "update available · run zigoku update", false);
             },
             .connect_result => |outcome| self.onConnectResult(outcome, loop, io),
             .search_done => |ev| {

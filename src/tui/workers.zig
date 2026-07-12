@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const sync = @import("../sync.zig");
 const auth_mod = @import("../auth.zig");
 const login_loopback = @import("../login_loopback.zig");
+const updatecheck = @import("../updatecheck.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -1602,6 +1603,18 @@ pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Boot update check (ROD-370): compare our build against GitHub's latest release
+/// and, if we're behind, post a bare `.update_available` for a low-key toast.
+/// Best-effort: offline / rate-limited / already-current posts nothing. The whole
+/// fetch lives in a task-local arena freed on return, so nothing crosses the
+/// worker→UI seam (the toast names the command, not the version).
+pub fn updateCheckTask(loop: *Loop, gpa: Allocator, io: std.Io, current_version: []const u8) void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    if (updatecheck.check(arena.allocator(), io, current_version, Store.nowSecs()) == null) return;
+    loop.postEvent(.update_available) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
 test "coverCacheStem is a stable hex-16 SHA-256 truncation (ROD-171)" {

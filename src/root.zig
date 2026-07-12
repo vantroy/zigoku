@@ -25,6 +25,9 @@ pub const login_loopback = @import("login_loopback.zig");
 pub const sync = @import("sync.zig");
 pub const provider_migrate = @import("provider_migrate.zig");
 pub const paths = @import("paths.zig");
+pub const semver = @import("util/semver.zig");
+pub const updatecheck = @import("updatecheck.zig");
+pub const update = @import("update.zig");
 pub const log = @import("log.zig");
 // NB: the log handler is installed via `std_options` in `main.zig` (the exe's
 // compilation root). Declaring it here would be dead — when std resolves
@@ -128,4 +131,7 @@ test {
     _ = @import("providers/senshi.zig"); // ROD-301: run the senshi provider tests
     _ = @import("providers/http.zig"); // ROD-349: run the shared transport taxonomy tests
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
+    _ = @import("util/semver.zig"); // ROD-370: run the version-compare tests
+    _ = updatecheck; // ROD-370: run the cache/parse tests
+    _ = update; // ROD-371: run the install-detection decision tests
 }

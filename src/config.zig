@@ -60,6 +60,12 @@ pub const Config = struct {
     /// token gates WHETHER we can.
     anilist_sync_enabled: bool = true,
 
+    /// Whether to check GitHub for a newer release at startup (ROD-370). Off = no
+    /// network hit, no cache write, no toast; the entire update-notify path stays
+    /// inert for offline/privacy/CI users. The check is best-effort and 6h-cached
+    /// regardless; this is the hard opt-out. The Settings "updates" toggle writes it.
+    check_for_updates: bool = true,
+
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
     pub fn translationEnum(self: Config) domain.Translation {
@@ -177,6 +183,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
     try testing.expectEqualStrings(want.preferred_provider, got.preferred_provider);
     try testing.expectEqual(want.anilist_sync_enabled, got.anilist_sync_enabled);
+    try testing.expectEqual(want.check_for_updates, got.check_for_updates);
 }
 
 test "empty struct literal yields all defaults" {
@@ -230,6 +237,7 @@ test "serialized config round-trips back through parse" {
         .discover_cover_concurrency = 8,
         .preferred_provider = "megaplay",
         .anilist_sync_enabled = false,
+        .check_for_updates = false,
     };
 
     var aw = std.Io.Writer.Allocating.init(a);

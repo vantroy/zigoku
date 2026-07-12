@@ -2191,6 +2191,17 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     try testing.expect(quiet.toast_queue[0] == null);
 }
 
+test "update_available: a low-key non-persistent whisper naming the command (ROD-370)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    try testTick(&app, .update_available);
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.info, t.kind);
+    try testing.expect(!t.persistent);
+    try testing.expectEqualStrings("update available · run zigoku update", t.text[0..t.text_len]);
+}
+
 test "sync_flushed: pull whispers ↓, and a two-way flush enqueues ↓ before ↑ (ROD-293)" {
     // The launch pull (and an action flush's pull half) whispers a low-key ↓ when a
     // reconcile lands remote changes — symmetric with the push's ↑, and it flags a
@@ -5417,7 +5428,7 @@ test "settings: the AniList sync toggle flips the master switch (ROD-286)" {
     var app: App = .{};
     app.gpa = testing.allocator;
     app.active_view = .settings;
-    app.settings.cursor = app_mod.settings_row_count - 1; // the `sync` toggle (last row)
+    app.settings.cursor = app_mod.settings_row_count - 2; // the `sync` toggle (now second-to-last, after Updates)
     try testing.expect(app.config.anilist_sync_enabled); // defaults on
 
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
@@ -5426,6 +5437,21 @@ test "settings: the AniList sync toggle flips the master switch (ROD-286)" {
 
     try testTick(&app, keyEv(vaxis.Key.space, .{}));
     try testing.expect(app.config.anilist_sync_enabled);
+}
+
+test "settings: the update-check toggle flips check_for_updates (ROD-370)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.active_view = .settings;
+    app.settings.cursor = app_mod.settings_row_count - 1; // the `check for updates` toggle (last row)
+    try testing.expect(app.config.check_for_updates); // defaults on
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(!app.config.check_for_updates);
+    try testing.expect(app.settings.dirty); // so leaveSettings persists the opt-out
+
+    try testTick(&app, keyEv(vaxis.Key.space, .{}));
+    try testing.expect(app.config.check_for_updates);
 }
 
 test "settings: the connect row is an action — inert to cycle/toggle, opens no modal under test (ROD-286)" {
