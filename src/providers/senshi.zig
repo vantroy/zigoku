@@ -24,6 +24,7 @@ const source = @import("../source.zig");
 const log = @import("../log.zig");
 const http = @import("http.zig");
 const hls = @import("hls.zig");
+const fetchguard = @import("../util/fetchguard.zig");
 
 const API = "https://senshi.live";
 // A current Chrome UA. senshi's Cloudflare edge serves a plain client with this
@@ -255,9 +256,16 @@ pub const Senshi = struct {
     // ── resolve ──────────────────────────────────────────────────────────────────
 
     /// One embed row from /episode-embeds/{mal_id}/{ep}: a direct HLS master `url`
-    /// tagged with a `status` track ("Dub", "HardSub", "SoftSub", "Sub"). The other
-    /// columns (server2/serverFM/download/masked_base_url) are ignored.
-    const Embed = struct { url: ?[]const u8 = null, status: ?[]const u8 = null };
+    /// tagged with a `status` track ("Dub", "HardSub", "SoftSub", "Sub"). `serverFM`
+    /// carries a `sub.info=…json` param pointing at the external subtitle sidecar
+    /// (ROD-378): the `status` label is unreliable. Some shows tag a soft-sub embed
+    /// "HardSub" yet ship no burned-in text, so the subs only render if we follow
+    /// that sidecar. The other columns (server2/download/masked_base_url) are ignored.
+    const Embed = struct { url: ?[]const u8 = null, status: ?[]const u8 = null, serverFM: ?[]const u8 = null };
+
+    /// One track in the sidecar `sub.info` JSON: a `.vtt` `src`, a `label` ("ENG",
+    /// "SDH (JPN)"), and the host's `default` hint (ROD-378).
+    const SubTrack = struct { src: ?[]const u8 = null, label: ?[]const u8 = null, default: bool = false };
 
     pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
@@ -268,12 +276,13 @@ pub const Senshi = struct {
         const raw = try request(arena, io, .GET, url, null);
         const embeds = try std.json.parseFromSlice([]Embed, arena, raw, .{ .ignore_unknown_fields = true });
 
-        const stream = pickEmbed(embeds.value, tt) orelse {
+        const picked = pickEmbed(embeds.value, tt) orelse {
             // Always-on: the show/episode exists but the requested track doesn't —
             // distinct from a network failure, and the receipt says which.
             log.warn("senshi resolve: no {s} stream for show={s} ep={s} ({d} embed(s))", .{ tt.str(), show_id, ep.raw, embeds.value.len });
             return error.NoStreamForTrack;
         };
+        const stream = picked.url orelse return error.NoStreamForTrack; // pickEmbed skips null urls
         // The embed url is senshi-provided data about to enter mpv's argv: require
         // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
         // controls that could smuggle a second mpv option or header).
@@ -285,6 +294,13 @@ pub const Senshi = struct {
         // (shared hls.zig, ROD-302). Best-effort: any failure falls back to the
         // adaptive master, exactly what senshi handed mpv before this landed.
         const chosen = if (quality == .best) stream else capVariant(arena, io, stream, quality) orelse stream;
+
+        // Soft subs ride `link.sub_url` (ROD-354 seam) → mpv `--sub-file`. senshi's
+        // `status` label lies (a "HardSub"-tagged embed can carry no burned-in text),
+        // so we don't gate on it: for any sub resolve, follow the embed's sidecar and
+        // attach the picked .vtt. Best-effort: a null keeps the stream playing raw,
+        // exactly the pre-ROD-378 behavior.
+        const sub_url = if (tt == .sub) fetchSubtitle(arena, io, picked.serverFM) else null;
 
         // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv echoes
         // the referer on the whole HLS chain (master/variant/segments) via
@@ -298,7 +314,94 @@ pub const Senshi = struct {
             .referer = STREAM_REFERER,
             .user_agent = UA,
             .cloaked_segments = true,
+            .sub_url = sub_url,
         };
+    }
+
+    /// Follow the picked embed's `serverFM` sidecar to a soft-sub `.vtt` for mpv, or
+    /// null to play raw. The sidecar url is host-controlled → it's the same SSRF +
+    /// redirect-refuse gate megaplay's probe uses (ROD-266/377) before we fetch it;
+    /// the chosen `.vtt` then enters mpv's argv, so it gets the same absolute-url +
+    /// clean-arg gate as the stream. Any failure (no sidecar, fetch/parse error,
+    /// unsafe url) returns null; the stream still plays.
+    fn fetchSubtitle(arena: Allocator, io: Io, server_fm: ?[]const u8) ?[]const u8 {
+        const info_url = subInfoUrl(arena, server_fm) orelse return null;
+        // info_url is our fetch target (host-controlled): vet its shape, then SSRF-guard.
+        if (!domain.isAbsoluteUrl(info_url) or !cleanArg(info_url)) return null;
+        fetchguard.guardFetchUrl(info_url) catch return null;
+        const body = http.request(arena, io, .{
+            .method = .GET,
+            .url = info_url,
+            .user_agent = UA,
+            .extra_headers = &.{.{ .name = "Referer", .value = STREAM_REFERER }},
+            .redirect_behavior = .not_allowed,
+            .tag = "senshi-sub",
+            .accept = .ok_only,
+        }) catch return null;
+        const tracks = std.json.parseFromSlice([]SubTrack, arena, body, .{ .ignore_unknown_fields = true }) catch return null;
+        const src = pickSubTrack(tracks.value) orelse return null;
+        // The .vtt goes to mpv argv: absolute http(s) carrying only clean bytes.
+        if (!domain.isAbsoluteUrl(src) or !cleanArg(src)) return null;
+        return src;
+    }
+
+    /// Pull the `sub.info` param out of a `serverFM` embed url and percent-decode it
+    /// into the sidecar JSON url. senshi encodes it as e.g.
+    /// `…/e/abc/?sub.info=https%3A%2F%2F…%2Fsub_filemoon.json`. Null when the param is
+    /// absent (a genuinely burned-in HardSub show carries no sidecar).
+    fn subInfoUrl(arena: Allocator, server_fm: ?[]const u8) ?[]const u8 {
+        const fm = server_fm orelse return null;
+        const key = "sub.info=";
+        const at = std.mem.indexOf(u8, fm, key) orelse return null;
+        var val = fm[at + key.len ..];
+        if (std.mem.indexOfScalar(u8, val, '&')) |amp| val = val[0..amp]; // stop at the next param
+        if (val.len == 0) return null;
+        return percentDecode(arena, val) catch null;
+    }
+
+    /// Choose the one subtitle track to hand mpv, mirroring megaplay's preference:
+    /// the host `default` wins, then the first english-labeled track, then the first
+    /// track at all. Language/SDH preference beyond that is out of scope (ROD-377).
+    fn pickSubTrack(tracks: []const SubTrack) ?[]const u8 {
+        var english: ?[]const u8 = null;
+        var first: ?[]const u8 = null;
+        for (tracks) |t| {
+            const src = t.src orelse continue;
+            if (t.default) return src;
+            if (first == null) first = src;
+            const label = t.label orelse continue;
+            if (english == null and std.ascii.startsWithIgnoreCase(label, "eng")) english = src;
+        }
+        return english orelse first;
+    }
+
+    /// Percent-decode a URL-query value (`%3A`→`:`, `%2F`→`/`). A malformed escape
+    /// (stray `%`, non-hex digit) is kept literal rather than dropped, and a decoded
+    /// control byte is caught downstream by `cleanArg`. `+` stays literal: the value
+    /// is a raw URL, not form data.
+    fn percentDecode(arena: Allocator, s: []const u8) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < s.len) {
+            if (s[i] == '%' and i + 2 < s.len) {
+                const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                    try out.append(arena, s[i]);
+                    i += 1;
+                    continue;
+                };
+                const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                    try out.append(arena, s[i]);
+                    i += 1;
+                    continue;
+                };
+                try out.append(arena, hi * 16 + lo);
+                i += 3;
+            } else {
+                try out.append(arena, s[i]);
+                i += 1;
+            }
+        }
+        return out.items;
     }
 
     /// Fetch the adaptive master and return the variant URL matching the quality cap,
@@ -331,18 +434,19 @@ pub const Senshi = struct {
         return pick.url;
     }
 
-    /// Choose the embed URL best matching the requested track. For dub we want the
-    /// Dub embed; for sub we prefer a selectable SoftSub, then burned-in HardSub,
-    /// then any other subbed variant. Null when the track isn't offered at all.
-    fn pickEmbed(embeds: []const Embed, tt: domain.Translation) ?[]const u8 {
-        var best: ?[]const u8 = null;
+    /// Choose the embed best matching the requested track. For dub we want the Dub
+    /// embed; for sub we prefer a selectable SoftSub, then burned-in HardSub, then any
+    /// other subbed variant. Returns the whole embed so the caller can also follow its
+    /// `serverFM` sidecar (ROD-378). Null when the track isn't offered at all.
+    fn pickEmbed(embeds: []const Embed, tt: domain.Translation) ?Embed {
+        var best: ?Embed = null;
         var best_score: u8 = 0;
         for (embeds) |e| {
-            const u = e.url orelse continue;
+            if (e.url == null) continue;
             const sc = matchScore(e.status, tt);
             if (sc > best_score) {
                 best_score = sc;
-                best = u;
+                best = e;
             }
         }
         return best;
@@ -628,13 +732,13 @@ test "pickEmbed picks the right track and prefers soft subs (ROD-301)" {
         .{ .url = "https://cdn/soft.m3u8", .status = "SoftSub" },
     };
     // sub → SoftSub wins over HardSub; dub → the Dub embed.
-    try testing.expectEqualStrings("https://cdn/soft.m3u8", Senshi.pickEmbed(&embeds, .sub).?);
-    try testing.expectEqualStrings("https://cdn/dub.m3u8", Senshi.pickEmbed(&embeds, .dub).?);
+    try testing.expectEqualStrings("https://cdn/soft.m3u8", Senshi.pickEmbed(&embeds, .sub).?.url.?);
+    try testing.expectEqualStrings("https://cdn/dub.m3u8", Senshi.pickEmbed(&embeds, .dub).?.url.?);
 
     // A sub-only show offers no dub → null (resolve turns this into a clear error).
     const sub_only = [_]Senshi.Embed{.{ .url = "https://cdn/hard.m3u8", .status = "HardSub" }};
     try testing.expect(Senshi.pickEmbed(&sub_only, .dub) == null);
-    try testing.expectEqualStrings("https://cdn/hard.m3u8", Senshi.pickEmbed(&sub_only, .sub).?);
+    try testing.expectEqualStrings("https://cdn/hard.m3u8", Senshi.pickEmbed(&sub_only, .sub).?.url.?);
 
     // An embed with no url is skipped, not chosen.
     const no_url = [_]Senshi.Embed{.{ .url = null, .status = "SoftSub" }};
@@ -647,6 +751,77 @@ test "matchScore never crosses sub and dub" {
     try testing.expectEqual(@as(u8, 0), Senshi.matchScore("Raw", .sub));
     try testing.expectEqual(@as(u8, 0), Senshi.matchScore(null, .sub));
     try testing.expect(Senshi.matchScore("SoftSub", .sub) > Senshi.matchScore("HardSub", .sub));
+}
+
+test "subInfoUrl decodes the sidecar url, null when absent (ROD-378)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The live serverFM shape: a filemoon embed url carrying an encoded sub.info.
+    const fm = "https://host.example/e/abc123/?sub.info=https%3A%2F%2Fninstream.com%2Fx%2Fsub_filemoon.json";
+    try testing.expectEqualStrings("https://ninstream.com/x/sub_filemoon.json", Senshi.subInfoUrl(a, fm).?);
+
+    // A trailing param after sub.info is trimmed at the &.
+    const fm2 = "https://host.example/e/abc/?sub.info=https%3A%2F%2Fc%2Fs.json&t=9";
+    try testing.expectEqualStrings("https://c/s.json", Senshi.subInfoUrl(a, fm2).?);
+
+    // A genuinely burned-in HardSub embed has no sub.info → no sidecar.
+    try testing.expect(Senshi.subInfoUrl(a, "https://host.example/d/xyz") == null);
+    try testing.expect(Senshi.subInfoUrl(a, null) == null);
+}
+
+test "pickSubTrack: default wins, english next, first as fallback (ROD-378)" {
+    const eng: Senshi.SubTrack = .{ .src = "https://c/eng.vtt", .label = "ENG", .default = true };
+    const jpn: Senshi.SubTrack = .{ .src = "https://c/jpn.vtt", .label = "SDH (JPN)" };
+    // The live Yani shape: ENG default over the SDH (JPN) track.
+    try testing.expectEqualStrings("https://c/eng.vtt", Senshi.pickSubTrack(&.{ eng, jpn }).?);
+
+    // No default: english label wins over an earlier non-english track.
+    const spa: Senshi.SubTrack = .{ .src = "https://c/spa.vtt", .label = "Spanish" };
+    const eng2: Senshi.SubTrack = .{ .src = "https://c/eng2.vtt", .label = "English" };
+    try testing.expectEqualStrings("https://c/eng2.vtt", Senshi.pickSubTrack(&.{ spa, eng2 }).?);
+
+    // No default, no english: the first track with a src.
+    const bare: Senshi.SubTrack = .{ .src = "https://c/bare.vtt" };
+    try testing.expectEqualStrings("https://c/spa.vtt", Senshi.pickSubTrack(&.{ spa, bare }).?);
+
+    // A src-less track is skipped; an empty list yields null.
+    try testing.expectEqualStrings("https://c/bare.vtt", Senshi.pickSubTrack(&.{ .{ .label = "ENG" }, bare }).?);
+    try testing.expect(Senshi.pickSubTrack(&.{}) == null);
+}
+
+test "percentDecode: escapes decode, malformed stays literal (ROD-378)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    try testing.expectEqualStrings("://", try Senshi.percentDecode(a, "%3A%2F%2F"));
+    try testing.expectEqualStrings("a b", try Senshi.percentDecode(a, "a%20b"));
+    try testing.expectEqualStrings("plain", try Senshi.percentDecode(a, "plain"));
+    // A stray or truncated % is preserved, not silently eaten.
+    try testing.expectEqualStrings("100%", try Senshi.percentDecode(a, "100%"));
+    try testing.expectEqualStrings("%zz", try Senshi.percentDecode(a, "%zz"));
+    // A literal + is not treated as a space (this is a URL, not form data).
+    try testing.expectEqualStrings("a+b", try Senshi.percentDecode(a, "a+b"));
+}
+
+test "sidecar url is guarded on both layers after percent-decode (ROD-378)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A CRLF-injection payload smuggled through the sub.info percent-encoding
+    // decodes to raw control bytes, which cleanArg (printable ASCII only) rejects
+    // before the url could reach our fetch or mpv's argv.
+    const crlf = try Senshi.percentDecode(a, "https://h/x%0d%0aHost:%20evil");
+    try testing.expect(!Senshi.cleanArg(crlf));
+
+    // A percent-encoded private-IP host decodes to bytes cleanArg PASSES (digits and
+    // dots are printable), so cleanArg alone can't stop SSRF. fetchguard is the layer
+    // that does: fetchSubtitle runs both, in that order, before the fetch.
+    const priv = try Senshi.percentDecode(a, "http://127%2e0%2e0%2e1/latest");
+    try testing.expect(Senshi.cleanArg(priv));
+    try testing.expectError(error.BlockedHost, fetchguard.guardFetchUrl(priv));
 }
 
 test "guardEpLabel accepts numeric/decimal labels, rejects path tricks" {
