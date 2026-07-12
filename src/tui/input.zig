@@ -458,6 +458,10 @@ pub fn onProviderPinKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, reg
     const fid = self.episodes.for_id orelse return true;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
+    // Invariant this rests on: for_source/for_id name the currently-focused show,
+    // never a different one, because episode fetches fire synchronously at nav time
+    // (the grid can't out-run the detail selection). Both identity legs below trust
+    // it: getAnime keys on for_source/for_id, the fallback on currentDetailAnime.
     const aid: i64 = id_blk: {
         // The current provider's persisted row is the direct identity (normal path).
         if (st.getAnime(arena.allocator(), src, fid) catch null) |rec| {

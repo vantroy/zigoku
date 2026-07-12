@@ -642,14 +642,16 @@ fn toastFallbackHop(self: *App, next_p: SourceProvider, failed_name: ?[]const u8
 }
 
 /// ROD-357: a MANUAL 'v' flip whose walk found no provider that stocks the show.
-/// Name the provider that missed and note the pin persists (the keep-pin decision,
-/// ROD-347) instead of the generic dead-end line, then return true so the caller
-/// skips its own toast. `manual` must be captured before `advanceFallback` deinits
-/// the walk. Returns false for an automatic walk, leaving the generic toast to stand.
-pub fn toastFlipExhaust(self: *App, registry: Registry, manual: bool) bool {
-    if (!manual) return false;
+/// `failed_name` is the flipped-to provider's display name, or null for an automatic
+/// walk (leaves the caller's generic toast to stand). It must come from the walk
+/// itself, captured before `advanceFallback` deinits it: at the tier-C search-miss
+/// site `episodes.for_source` still points at the PREVIOUS provider (spawnFallbackSearch
+/// never updates it), so deriving the name from owningProvider there would misname the
+/// miss. Names the provider and notes the pin persists (the keep-pin decision, ROD-347).
+pub fn toastFlipExhaust(self: *App, failed_name: ?[]const u8) bool {
+    const name = failed_name orelse return false;
     var buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "no match on {s}, pin kept", .{self.owningProvider(registry).displayName()}) catch "no match, pin kept";
+    const msg = std.fmt.bufPrint(&buf, "no match on {s}, pin kept", .{name}) catch "no match, pin kept";
     self.pushToast(.warn, msg, false);
     return true;
 }
