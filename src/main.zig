@@ -597,10 +597,8 @@ test "live registry leads with megaplay as the default provider (ROD-380)" {
 }
 
 test "live registry registers allanime as the tier-B backstop, last (ROD-365)" {
-    // AllAnime is re-registered behind the two tier-A-capable providers: an unset
-    // preference degrades to construction order, so it is tried only after megaplay
-    // and senshi. It carries no canonicalKey (tier B), so its resolve comes through
-    // the search + bestIdMatch path on the anilist id embedded in its thumbnails.
+    // Pins allanime LAST: reachable only after both tier-A-capable providers miss.
+    // An accidental reorder or prepend would silently make it tier-A-eligible first.
     var live = LiveProviders.init();
     const reg = live.registry();
     try std.testing.expectEqual(@as(usize, 3), reg.providers.len);
