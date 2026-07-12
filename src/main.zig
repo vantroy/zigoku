@@ -168,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
     // refuses a root-owned install. A subcommand like login/sync, intercepted
     // before the positional is read as a search query.
     if (isUpdateCommand(args)) {
-        try zigoku.update.run(arena, io, out, zigoku.version);
+        try zigoku.update.run(arena, io, out, zigoku.version, init.environ_map);
         try out.flush();
         return;
     }

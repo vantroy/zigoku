@@ -46,8 +46,16 @@ pub fn decide(method: InstallMethod, bindir: []const u8, dir_writable: bool) Act
 
 /// `zigoku update` entry point. Best-effort and chatty: it prints what it finds and
 /// what it decides, then acts. Never returns an error for an expected condition
-/// (offline, packaged, root-owned); those are outcomes, not failures.
-pub fn run(arena: Allocator, io: Io, out: *Io.Writer, current_version: []const u8) !void {
+/// (offline, packaged, root-owned); those are outcomes, not failures. `environ`
+/// is the process environment, forwarded (with BINDIR/ZIGOKU_VERSION added) to the
+/// installer the self-update path spawns.
+pub fn run(
+    arena: Allocator,
+    io: Io,
+    out: *Io.Writer,
+    current_version: []const u8,
+    environ: *std.process.Environ.Map,
+) !void {
     const exe = selfExePath(arena, io) catch {
         try out.print(
             \\couldn't locate the running zigoku binary.
@@ -60,12 +68,15 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer, current_version: []const u
 
     // Explicit command → a fresh check, not the ambient 6h cache. Distinguish
     // "already current" (stop) from "couldn't reach GitHub" (press on: the user
-    // asked to update, and we can still route them by install method).
+    // asked to update, and we can still route them by install method). Keep the
+    // tag to pin the installer's download to exactly the release we compared against.
+    var latest_tag: ?[]const u8 = null;
     if (updatecheck.latestFresh(arena, io, nowSecs(io))) |latest| {
         if (!semver.isNewer(latest, current_version)) {
             try out.print("zigoku v{s} is already the latest release.\n", .{current_version});
             return;
         }
+        latest_tag = latest;
         try out.print("update available: v{s} -> {s}\n\n", .{ current_version, latest });
     } else {
         try out.print("couldn't reach GitHub to confirm the latest release; continuing anyway.\n\n", .{});
@@ -75,11 +86,56 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer, current_version: []const u
     switch (decide(method, bindir, dirWritable(io, bindir))) {
         .package_directions => |m| try printPackageDirections(out, m),
         .refuse_unwritable => try printRefusal(out, bindir),
-        .self_update => |dir| {
-            // ROD-372 owns the download + checksum + atomic swap. Until it lands, name
-            // the intent so the command reads coherently end to end.
-            try out.print("standalone install at {s} -> in-place update lands in ROD-372.\n", .{dir});
-        },
+        .self_update => |dir| try performUpdate(io, out, environ, dir, latest_tag),
+    }
+}
+
+/// Drive install.sh to replace the binary in place: point BINDIR at our own dir and
+/// pin ZIGOKU_VERSION to the tag we resolved, then run the installer and stream its
+/// progress. The installer stages + renames (see install.sh), so a running binary is
+/// replaced atomically and a mid-run failure leaves the current one intact. The
+/// installer already verifies the download's checksum, which is why we drive it
+/// rather than reimplement the fetch here (ROD-372).
+fn performUpdate(
+    io: Io,
+    out: *Io.Writer,
+    environ: *std.process.Environ.Map,
+    bindir: []const u8,
+    latest_tag: ?[]const u8,
+) !void {
+    try environ.put("BINDIR", bindir);
+    if (latest_tag) |t| try environ.put("ZIGOKU_VERSION", t);
+
+    try out.print("updating in place at {s} ...\n\n", .{bindir});
+    try out.flush(); // the installer inherits stdout; flush ours first so lines don't interleave
+
+    // Fetch install.sh with whichever downloader is present (mirrors install.sh's own
+    // curl-or-wget probe), then pipe it to sh. BINDIR/ZIGOKU_VERSION reach the piped
+    // shell through the inherited environment.
+    const cmd = "if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/" ++ REPO ++
+        "/master/install.sh; else wget -qO- https://raw.githubusercontent.com/" ++ REPO ++
+        "/master/install.sh; fi | sh";
+
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "sh", "-c", cmd },
+        .environ_map = environ,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    }) catch |e| {
+        try out.print("couldn't launch the installer: {s}\n", .{@errorName(e)});
+        return;
+    };
+    const term = child.wait(io) catch |e| {
+        try out.print("installer did not complete: {s}\n", .{@errorName(e)});
+        return;
+    };
+    switch (term) {
+        .exited => |code| if (code == 0)
+            try out.print("\nupdated. restart zigoku to run the new version.\n", .{})
+        else
+            try out.print("\ninstaller exited with status {d}; your existing binary is untouched.\n", .{code}),
+        else => try out.print("\ninstaller was interrupted; your existing binary is untouched.\n", .{}),
     }
 }
 

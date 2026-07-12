@@ -102,7 +102,8 @@ say "  into     ${bindir}"
 
 # ── Download tarball + checksums into a scratch dir we always clean up ─────────
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zigoku-install.XXXXXX") || err "could not create a temp dir"
-trap 'rm -rf "$tmp"' EXIT INT TERM
+staged=  # a partially-written binary in $bindir, cleaned up if we die before the rename
+trap 'rm -rf "$tmp"; [ -n "$staged" ] && rm -f "$staged"' EXIT INT TERM
 
 say "downloading ${tarball} ..."
 dl "${base}/${tarball}" "$tmp/$tarball" \
@@ -128,9 +129,21 @@ srcbin="$tmp/${BIN}-v${ver}-${target}/${BIN}"
 [ -f "$srcbin" ] || err "extracted archive is missing the ${BIN} binary"
 
 mkdir -p "$bindir" || err "could not create ${bindir}"
-install -m 0755 "$srcbin" "$bindir/${BIN}" 2>/dev/null \
-  || { cp "$srcbin" "$bindir/${BIN}" && chmod 0755 "$bindir/${BIN}"; } \
-  || err "could not write ${bindir}/${BIN} (permission? set BINDIR to a writable dir)"
+
+# Stage into a temp file in the SAME dir, then rename over the target. Two reasons:
+#   1. rename() is atomic, so a reader never sees a half-written binary, and a death
+#      mid-write leaves the old binary intact (the trap drops the staged file).
+#   2. You cannot write over a RUNNING executable on Linux (ETXTBSY), but you can
+#      rename onto it: the running process keeps its open inode. This is what lets
+#      `zigoku update` replace the very binary it's running from (ROD-372).
+# Same-dir is required: a rename across filesystems isn't atomic (it falls back to
+# copy+unlink), which would reintroduce both hazards.
+staged="$bindir/.${BIN}.new.$$"
+install -m 0755 "$srcbin" "$staged" 2>/dev/null \
+  || { cp "$srcbin" "$staged" && chmod 0755 "$staged"; } \
+  || err "could not stage the binary in ${bindir} (permission? set BINDIR to a writable dir)"
+mv -f "$staged" "$bindir/${BIN}" || err "could not place ${bindir}/${BIN}"
+staged=  # placed; the trap must not remove the installed binary
 
 say ""
 say "installed ${BIN} v${ver} to ${bindir}/${BIN}"
