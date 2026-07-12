@@ -13,6 +13,7 @@ const aniskip = @import("../aniskip.zig");
 const paths = @import("../paths.zig");
 const lru_mod = @import("../util/lru.zig");
 const deadline = @import("../util/deadline.zig");
+const fetchguard = @import("../util/fetchguard.zig");
 const event_mod = @import("event.zig");
 const log = @import("../log.zig");
 const sync = @import("../sync.zig");
@@ -1378,6 +1379,15 @@ const cover_fetch_deadline_s = 20;
 /// gpa-owned slice (caller frees). Fetch and non-200 failures return `error.CoverFetchFailed`;
 /// `loadCoverPixels` collapses that, OOM, and the deadline's `error.Timeout` to a cover miss.
 fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u8 {
+    // SSRF guard (ROD-266): cover refs are untrusted third-party strings (AllAnime
+    // thumbnails, AniList coverImage). Refuse private/loopback/link-local targets so a
+    // hostile ref can't aim the worker at an internal service or the metadata endpoint.
+    // Paired with redirect_behavior=.not_allowed below so a 3xx can't bounce past it.
+    fetchguard.guardFetchUrl(req.url) catch |e| {
+        log.debug("cover fetch blocked by SSRF guard: {s}", .{@errorName(e)});
+        return error.CoverFetchFailed;
+    };
+
     var client: std.http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
 
@@ -1398,6 +1408,7 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u
     const res = client.fetch(.{
         .location = .{ .url = req.url },
         .method = .GET,
+        .redirect_behavior = .not_allowed,
         .response_writer = &resp_writer,
         .headers = if (req.user_agent) |ua| .{ .user_agent = .{ .override = ua } } else .{},
         .extra_headers = extra[0..extra_len],
