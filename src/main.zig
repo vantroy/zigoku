@@ -586,6 +586,8 @@ test "live registry leads with megaplay as the default provider (ROD-380)" {
     const reg = live.registry();
     try std.testing.expectEqualStrings("megaplay", reg.primary().name());
     try std.testing.expectEqualStrings("megaplay", reg.preferred("").name());
+    var it = reg.ordered("");
+    try std.testing.expectEqualStrings("megaplay", it.next().?.name());
     try std.testing.expect(reg.byName("senshi") != null);
 }
 
