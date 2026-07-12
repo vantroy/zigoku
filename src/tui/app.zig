@@ -2111,6 +2111,10 @@ pub const App = struct {
                     // ROD-346: a walk hop's search missed; advance to the next provider.
                     // Guarded on the walk's anilist_id so a late miss for a superseded
                     // search can never advance a newer show's walk.
+                    // ROD-357: capture the flipped-to provider name before advanceFallback
+                    // deinits the walk. for_source is stale here (a tier-C search never
+                    // updates it), so the name must come from the walk itself.
+                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.anilist_id == ev.anilist_id and w.providers.len > 0) w.providers[0].displayName() else null) else null;
                     if (self.fallback != null and self.fallback.?.anilist_id == ev.anilist_id) {
                         if (resolve.advanceFallback(self, loop, io, registry, null, null)) return;
                     }
@@ -2118,6 +2122,8 @@ pub const App = struct {
                     // and exhausted HERE (tier-C was the last hop) must demote just like
                     // the episodes_error dead end, or the user strands on a blank pane.
                     self.demoteResumeLanding();
+                    // ROD-357: a manual flip that exhausted names the miss + keeps the pin.
+                    if (resolve.toastFlipExhaust(self, flip_miss)) return;
                     // No confident provider match (unmatched, ROD-329): same dead-end as a
                     // failed episode fetch.
                     self.pushToast(.@"error", "couldn't load episodes", false);
@@ -2288,12 +2294,16 @@ pub const App = struct {
                         };
                         if (aid) |id| resolve.persistProviderAbsences(self, id, &.{src});
                     }
+                    // ROD-357: capture the flipped-to provider name (a manual walk is
+                    // single-provider) before advanceFallback deinits the walk.
+                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
                     if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
                     // The whole ladder came up empty: no provider stocks it, so render
                     // the unbound state ("no source available") rather than a bare
                     // 0-episode grid. In-memory only; a plain browse peek must not mint
                     // a persisted unbound row (that is the Add path's call, ROD-329).
                     self.demoteResumeLanding();
+                    _ = resolve.toastFlipExhaust(self, flip_miss);
                     self.episodes.unbound = true;
                     return;
                 }
@@ -2378,6 +2388,9 @@ pub const App = struct {
                 // virgin probe's aid is the walk's only handle on the canonical.
                 const failed_bind = self.pending_bind;
                 self.pending_bind = null;
+                // ROD-357: capture the flipped-to provider name (a manual walk is
+                // single-provider) before advanceFallback deinits the walk.
+                const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
                 // ROD-346: walk the remaining providers before declaring the dead end.
                 // A fired hop suppresses the demote + toast below; exhaustion (or a
                 // show that can't fall back) falls through to them.
@@ -2388,6 +2401,9 @@ pub const App = struct {
                 // below still explains the failure. A user-driven open is never
                 // pending here (cleared at fire time), so it stays put.
                 self.demoteResumeLanding();
+                // ROD-357: a manual flip that exhausted names the miss + keeps the pin;
+                // otherwise the generic failure line stands.
+                if (resolve.toastFlipExhaust(self, flip_miss)) return;
                 // §4.10: an empty grid with no explanation is indistinguishable
                 // from a show that genuinely has no episodes — surface the fetch
                 // failure so the blank pane isn't a silent dead end. ROD-173 names

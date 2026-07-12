@@ -458,16 +458,34 @@ pub fn onProviderPinKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, reg
     const fid = self.episodes.for_id orelse return true;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
-    const rec = (st.getAnime(arena.allocator(), src, fid) catch null) orelse {
-        // A tier-A probe's row mints only on episodes_done; a flip inside
-        // that window has no persisted identity yet. Say so rather than
-        // eating the key.
-        self.pushToast(.info, "still resolving, try again shortly", false);
-        return true;
-    };
-    const aid = rec.anilist_id orelse {
-        self.pushToast(.info, "no canonical identity: can't pin a provider", false);
-        return true;
+    // Invariant this rests on: for_source/for_id name the currently-focused show,
+    // never a different one, because episode fetches fire synchronously at nav time
+    // (the grid can't out-run the detail selection). Both identity legs below trust
+    // it: getAnime keys on for_source/for_id, the fallback on currentDetailAnime.
+    const aid: i64 = id_blk: {
+        // The current provider's persisted row is the direct identity (normal path).
+        if (st.getAnime(arena.allocator(), src, fid) catch null) |rec| {
+            break :id_blk rec.anilist_id orelse {
+                self.pushToast(.info, "no canonical identity: can't pin a provider", false);
+                return true;
+            };
+        }
+        // ROD-357: no row for the current provider means it's an unbound failed flip
+        // (megaplay for a senshi-only show) whose binding never minted. Recover the id
+        // from the focused detail show, whose identity survives a failed flip, so the
+        // cycle can still walk back off the missing provider instead of dead-ending on
+        // "still resolving" forever.
+        const sel = self.currentDetailAnime() orelse {
+            self.pushToast(.info, "still resolving, try again shortly", false);
+            return true;
+        };
+        break :id_blk std.math.cast(i64, sel.anilist_id orelse {
+            self.pushToast(.info, "no canonical identity: can't pin a provider", false);
+            return true;
+        }) orelse {
+            self.pushToast(.info, "no canonical identity: can't pin a provider", false);
+            return true;
+        };
     };
 
     // Next stop in the cycle: construction order, one past the current pin.

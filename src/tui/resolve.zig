@@ -641,6 +641,21 @@ fn toastFallbackHop(self: *App, next_p: SourceProvider, failed_name: ?[]const u8
     self.pushToast(.warn, msg, false);
 }
 
+/// ROD-357: a MANUAL 'v' flip whose walk found no provider that stocks the show.
+/// `failed_name` is the flipped-to provider's display name, or null for an automatic
+/// walk (leaves the caller's generic toast to stand). It must come from the walk
+/// itself, captured before `advanceFallback` deinits it: at the tier-C search-miss
+/// site `episodes.for_source` still points at the PREVIOUS provider (spawnFallbackSearch
+/// never updates it), so deriving the name from owningProvider there would misname the
+/// miss. Names the provider and notes the pin persists (the keep-pin decision, ROD-347).
+pub fn toastFlipExhaust(self: *App, failed_name: ?[]const u8) bool {
+    const name = failed_name orelse return false;
+    var buf: [96]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "no match on {s}, pin kept", .{name}) catch "no match, pin kept";
+    self.pushToast(.warn, msg, false);
+    return true;
+}
+
 /// Every History-origin episode-grid open routes through here (ONE gate) so the
 /// ROD-329 unbound sentinel renders "no source available" instead of firing a provider
 /// fetch. Must key on `rec.source`: `fireEpisodesForId` only gets a bare `source_id`,
