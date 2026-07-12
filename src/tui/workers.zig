@@ -660,8 +660,9 @@ pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.D
 /// Fill an Anime's blank fields from AniList metadata — AllAnime is the source of
 /// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
 /// before the arena `meta` came from is torn down; a failed copy keeps the prior
-/// (blank) value rather than aliasing the soon-dead arena. Shared by the
-/// search-page enrich and the ROD-182 refresh-on-view.
+/// (blank) value rather than aliasing the soon-dead arena. Called by the ROD-182
+/// refresh-on-view (refreshEnrichTask); the search-page enrich that shared it was
+/// excised in ROD-330.
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
     // ROD-312: stash true romaji alongside the provider `name` (never overwritten

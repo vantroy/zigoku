@@ -248,7 +248,7 @@ pub fn run(
     // join returns at once, the discarded result is never read. (The episode-prefetch
     // half of ROD-179 detaches a superseded fetch instead; see `episode_drain`.)
     //
-    // Declared before the search/enrich joins and episode drain, so by LIFO it runs
+    // Declared before the search join and episode drain, so by LIFO it runs
     // AFTER them: every other worker is already reaped when interrupt fires, so it can
     // only hit loadHistory's statement, never one another worker started.
     defer if (hist_thread) |t| {
@@ -275,7 +275,7 @@ pub fn run(
     defer if (app.search_thread) |t| t.join();
     // ROD-291: join an in-flight AniList flush on the error-unwind / test teardown path
     // so it can't touch a torn-down loop/store/gpa or the freed token arena. Like the
-    // search/enrich/cover joins above, this defer is SKIPPED on the ordinary quit path
+    // search/cover joins above, this defer is SKIPPED on the ordinary quit path
     // (q/Ctrl-C fall through to the ROD-232 fast-exit `_exit(0)`). Safe for this writer:
     // the DB is WAL crash-safe and SaveMediaListEntry is idempotent, so a push abandoned
     // before its markSynced leaves the row dirty and re-flushes next session.
@@ -2866,7 +2866,9 @@ pub const App = struct {
     /// STALE show UNLESS a competing enrich path already covers it:
     ///   * `discover_inflight`:    a Discover feed fetch is running (its rows arrive
     ///                             fully enriched and persist fresh, ROD-336),
-    ///   * `search_enrich_active`: a live Browse search-page enrich is running,
+    ///   * `search_enrich_active`: a live Browse search-page enrich is running (fed a
+    ///                             constant false since ROD-330 excised that path; kept
+    ///                             as the guard seam for a future search-side enrich),
     ///   * `refresh_inflight`:     another refresh-on-view is already in flight.
     ///
     /// Only tracked rows refresh here: a hidden Browse/Discover cache row has its OWN

@@ -191,8 +191,8 @@ const MediaResp = struct {
 
 // NOTE: the show ← Metadata fill-if-null mapping lives in `workers.applyMetadata`,
 // not here. It has to: each filled field is deep-copied into GPA as it goes, so
-// nothing aliases the parse arena that `Metadata`'s slices borrow from. Done in
-// anilist.zig it would hand back a struct pointing into that soon-dead arena, a UAF
+// nothing aliases the parse arena that `Metadata`'s slices borrow from. Doing it in
+// anilist.zig would hand back a struct pointing into that soon-dead arena, a UAF
 // trap, so the mapping stays where the GPA-owning copy happens.
 
 /// The three-state enrich contract (ROD-278). Callers that stamp an enrichment freshness
