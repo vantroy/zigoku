@@ -14,6 +14,16 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-12
+
+### Added
+
+- **Install with one command**: zigoku can now be installed with a single piped shell command, which downloads and verifies the right prebuilt binary for your platform (Linux or macOS, x86_64 or arm64) straight from the GitHub release. It sits alongside the existing Homebrew tap and AUR package, with environment variables available if you want to customize the install location.
+
+### Fixed
+
+- **Shows only a backup source carries now resolve**: some shows couldn't be found on the primary streaming source but were available elsewhere. These used to show up with an empty episode list and refuse to play; zigoku now checks every available source before giving up, so they load and play like any other show.
+
 ## [0.4.0] - 2026-07-11
 
 ### Added
@@ -248,7 +258,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/vantroy/zigoku/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vantroy/zigoku/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/vantroy/zigoku/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vantroy/zigoku/compare/v0.2.3...v0.3.0
