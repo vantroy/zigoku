@@ -214,9 +214,20 @@ pub const MegaPlay = struct {
 
         const src_url = try std.fmt.allocPrint(arena, HOST ++ "/stream/getSources?id={s}", .{data_id});
         const raw = try request(arena, io, src_url, .xhr);
-        const stream = try mapSources(arena, raw, tt);
-        // Softsub pick rides link.sub_url (ROD-354); intro/outro skip stamps
-        // still ride `stream` unused, parked until a player seam exists (ROD-340).
+        var stream = try mapSources(arena, raw, tt);
+        // Softsub pick rides link.sub_url (ROD-354). mapSources' metadata pick trusts
+        // the host `default` flag, which marks a signs-only track over the real
+        // dialogue on some shows (ROD-377); when the host ships several English
+        // tracks, upgrade to a content-decided pick. On any failure keep the
+        // metadata pick rather than dropping subs.
+        if (tt == .sub) {
+            const cands = try englishCaptions(arena, stream.tracks);
+            if (cands.len >= 2) {
+                if (refineSubtitleByCues(arena, io, cands)) |best| stream.link.sub_url = best;
+            }
+        }
+        // intro/outro skip stamps still ride `stream` unused, parked until a
+        // player seam exists (ROD-340).
         return stream.link;
     }
 
@@ -299,6 +310,42 @@ pub const MegaPlay = struct {
             if (first == null) first = t.file;
         }
         return english orelse first;
+    }
+
+    /// The English-labeled caption tracks, in host order (already argv-vetted by
+    /// mapSources). Feeds the content-decided pick when a host ships more than one:
+    /// a signs-only track and the real dialogue track are both just labeled
+    /// "English", so only their content tells them apart (ROD-377).
+    fn englishCaptions(arena: Allocator, tracks: []const Track) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        for (tracks) |t| {
+            if (t.kind) |k| if (!std.mem.eql(u8, k, "captions")) continue;
+            const label = t.label orelse continue;
+            if (!std.ascii.startsWithIgnoreCase(label, "english")) continue;
+            try out.append(arena, t.file);
+        }
+        return out.items;
+    }
+
+    /// Among several English caption urls, pick the one with the most cues. The
+    /// host's `default` can flag a 9-cue signs/songs track over a 500-cue dialogue
+    /// track (live: Dungeon Meshi ep21), and metadata can't tell them apart, so we
+    /// fetch and count the `-->` cue markers. Same Referer+UA-gated http as the
+    /// video. Null when every fetch fails, so resolve falls back to the metadata
+    /// pick instead of dropping subs. The most-cues rule can prefer an SDH track;
+    /// modeling a language/SDH preference is out of scope (ROD-377).
+    fn refineSubtitleByCues(arena: Allocator, io: Io, candidates: []const []const u8) ?[]const u8 {
+        var best: ?[]const u8 = null;
+        var best_cues: usize = 0;
+        for (candidates) |url| {
+            const body = request(arena, io, url, .embed) catch continue;
+            const cues = std.mem.count(u8, body, " --> ");
+            if (best == null or cues > best_cues) {
+                best = url;
+                best_cues = cues;
+            }
+        }
+        return best;
     }
 
     /// Normalize a raw skip stamp: both ends present, finite, and a positive-width
@@ -537,6 +584,33 @@ test "pickSubtitle: default wins, english next, first as fallback, thumbnails ne
     const alien: Track = .{ .file = "https://c/alien.vtt", .kind = "chapters", .default = true };
     try testing.expect(MegaPlay.pickSubtitle(&.{alien}) == null);
     try testing.expectEqualStrings("https://c/spa.vtt", MegaPlay.pickSubtitle(&.{ alien, spanish }).?);
+}
+
+test "englishCaptions: only english-labeled caption tracks, host order (ROD-377)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const eng_signs: Track = .{ .file = "https://c/eng-3.vtt", .label = "English", .kind = "captions", .default = true };
+    const eng_2: Track = .{ .file = "https://c/eng-4.vtt", .label = "English 2", .kind = "captions" };
+    const spanish: Track = .{ .file = "https://c/spa.vtt", .label = "Spanish", .kind = "captions" };
+    const thumbs: Track = .{ .file = "https://c/thumbs.vtt", .label = "English", .kind = "thumbnails" };
+    const unlabeled: Track = .{ .file = "https://c/bare.vtt", .kind = "captions" };
+
+    // The multi-english case the fix disambiguates: both english captions, in order,
+    // regardless of the host's `default`. Spanish, the sprite sheet, and the
+    // label-less track are excluded.
+    const got = try MegaPlay.englishCaptions(a, &.{ eng_signs, spanish, eng_2, thumbs, unlabeled });
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expectEqualStrings("https://c/eng-3.vtt", got[0]);
+    try testing.expectEqualStrings("https://c/eng-4.vtt", got[1]);
+
+    // A lone english track: the caller skips the probe and keeps the metadata pick.
+    const one = try MegaPlay.englishCaptions(a, &.{ eng_2, spanish });
+    try testing.expectEqual(@as(usize, 1), one.len);
+    // No english at all: empty, so the metadata pick stands.
+    const none = try MegaPlay.englishCaptions(a, &.{ spanish, thumbs });
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "mapSources: missing or unsafe stream url is a clean error" {
