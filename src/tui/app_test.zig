@@ -5991,13 +5991,17 @@ const RecordingProvider = struct {
     /// When true, canonicalKey derives stringify(mal_id) like a mal-keyed catalog;
     /// when false the provider can only be reached by tier-C search.
     tier_a: bool = false,
+    /// Per-instance display name so a toast-naming test can tell providers apart
+    /// (defaults to "Rec", the historical constant, so existing tests are unaffected).
+    display: []const u8 = "Rec",
 
     fn nameFn(ptr: *anyopaque) []const u8 {
         const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
         return self.id;
     }
-    fn displayNameFn(_: *anyopaque) []const u8 {
-        return "Rec";
+    fn displayNameFn(ptr: *anyopaque) []const u8 {
+        const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
+        return self.display;
     }
     fn searchFn(ptr: *anyopaque, _: Allocator, _: std.Io, _: []const u8, _: source_mod.SearchOptions) anyerror![]Anime {
         const self: *RecordingProvider = @ptrCast(@alignCast(ptr));
@@ -7606,6 +7610,99 @@ test "ROD-357: v off an unbound failed-flip provider recovers via the focused sh
     try testing.expectEqualStrings("sen", app.episodes.for_source.?);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-357: v off an unbound MIDDLE provider advances to the next carrier (3-provider cycle)" {
+    // With a 3rd provider, flipping onto a MIDDLE provider that can't carry the show
+    // must advance to the next one, not wrap or dead-end. Registry [a, mid, c]: bound
+    // on a and c, not mid. Parked unbound on mid (a prior flip that came up empty), a
+    // 'v' advances mid -> c (index 1 -> 2) via c's sibling binding.
+    var a = RecordingProvider{ .id = "a" };
+    var mid = RecordingProvider{ .id = "mid" };
+    var c = RecordingProvider{ .id = "c" };
+    const slots = [_]SourceProvider{ a.provider(), mid.provider(), c.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+    try testing.expect(try st.bindCanonical("a", "a1", 154587, true, 5000, arena));
+    try testing.expect(try st.bindCanonical("c", "c1", 154587, false, 5001, arena));
+    try st.setProviderPin(154587, "mid"); // a prior v landed on mid, which came up empty
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.active_view = .browse;
+    app.active_pane = .detail;
+    app.list_cursor = 0;
+    try app.search.results.append(app.gpa, .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 });
+    defer app.search.results.deinit(app.gpa);
+    defer resolve.clearFallback(&app);
+    defer if (app.show_pin) |p| app.gpa.free(p);
+    app.episodes.for_id = try app.gpa.dupe(u8, "mid-key");
+    app.episodes.for_source = try app.gpa.dupe(u8, "mid");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    try testing.expect((st.getAnime(arena, "mid", "mid-key") catch null) == null);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('v', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // Advanced mid -> c (the next carrier), not wrapped to unpinned, not dead-ended.
+    try testing.expectEqualStrings("c", (try st.getProviderPin(arena, 154587)).?);
+    try testing.expect(c.hit.load(.acquire));
+    try testing.expect(!a.hit.load(.acquire)); // did not jump back to the first provider
+    try testing.expectEqualStrings("c", app.episodes.for_source.?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-357: a manual flip's tier-C miss toast names the flipped-to provider, not stale for_source" {
+    // The tier-C search-miss dead end (resolve_play_target, ok=false) must name the
+    // provider the manual walk was searching, NOT episodes.for_source: a tier-C search
+    // never updates for_source, so it still points at the previous provider. The name
+    // has to come from the walk itself (providers[0]).
+    var target = RecordingProvider{ .id = "target", .display = "Target" };
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    // for_source is the PREVIOUS provider, stale relative to the tier-C walk on target.
+    app.episodes.for_source = try app.gpa.dupe(u8, "prev");
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    // A manual single-provider walk mid tier-C search on `target`, `next` already past
+    // it so the miss below exhausts the walk (advanceFallback deinits canonical+providers).
+    const canonical = try workers.dupeOwnedAnime(app.gpa, .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 });
+    const provs = try app.gpa.alloc(SourceProvider, 1);
+    provs[0] = target.provider();
+    app.fallback = .{ .canonical = canonical, .anilist_id = 154587, .providers = provs, .next = 1, .manual = true };
+    defer resolve.clearFallback(&app);
+    app.play_resolve_aid = 154587; // the show this search is FOR (staleness gate)
+
+    try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = "" } });
+
+    // The toast names the flipped-to provider (Target), never the stale for_source.
+    var named_target = false;
+    for (app.toast_queue) |slot| {
+        if (slot) |t| {
+            const txt = t.text[0..t.text_len];
+            if (std.mem.indexOf(u8, txt, "Target") != null) named_target = true;
+        }
+    }
+    try testing.expect(named_target);
 }
 
 test "ROD-345: a History open redirects to the pinned provider's sibling binding" {
