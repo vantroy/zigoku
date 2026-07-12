@@ -371,9 +371,13 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
 /// confident match wins and the posted event carries the winner's name). `providers` is
 /// gpa-owned by this task and freed here, so a preference change mid-flight can't touch
 /// a walk already underway.
-/// Per provider: search its OWN catalog and match: tier B first
-/// (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider embedded
-/// in its results; the retired anipub's MALID backfill shape, kept for future
+/// Per provider, in tier order: tier A first (ROD-366) via `canonicalKey`, so a
+/// provider this same walk retries (the add-widen) still gets its direct catalog
+/// key even though the caller already tried tier A on the FIRST provider only
+/// (browseResolveTarget stops there); a tier-A-only provider like megaplay is
+/// unreachable otherwise. Then, if that misses, search its OWN catalog and match:
+/// tier B (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider
+/// embedded in its results; the retired anipub's MALID backfill shape, kept for future
 /// tier-B providers), then tier C
 /// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
 /// query passes: the canonical (romaji) title, then the English title, since an
@@ -477,7 +481,9 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
             // stocked" (megaplay's empty-is-authoritative contract, ROD-347). It
             // still falls through to a title search for a provider that also has
             // one (senshi): the canonical's mal_id may differ from the id senshi
-            // cataloged the show under, which only a search recovers.
+            // cataloged the show under, which only a search recovers. That costs a
+            // dual-capability provider one extra sequential request (probe, then
+            // search); still one-at-a-time, so the ROD-309 rate-scoring discipline holds.
             probed = true;
         } else |e| {
             log.debug("resolve tier-A episode probe failed: {s}", .{@errorName(e)});
@@ -1946,6 +1952,15 @@ test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable o
     var mega_play = StubCatalog{ .canon_key = "66624", .alive_id = "", .search_unsupported = true };
     const played = resolveViaSearch(arena_state.allocator(), std.testing.io, mega_play.provider(), canonical, .sub, true);
     try std.testing.expectEqualStrings("66624", played.match);
+
+    // A tier-A probe that dies on TRANSPORT (not a clean empty) taints the walk to
+    // unknown even when a subsequent search comes back clean-empty: the error may
+    // have hidden a hit, so the miss is never a cacheable absence (ROD-278/347). Here
+    // the search runs (not Unsupported) and finds nothing, yet the verdict must stay
+    // unknown because of the tier-A transport failure.
+    var mega_flaky = StubCatalog{ .canon_key = "66624", .episodes_fail = true };
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_flaky.provider(), canonical, .sub, false) == .unknown);
+    try std.testing.expect(mega_flaky.searches > 0); // tier-A transport fail still fell through to search
 }
 
 test "resolveViaSearch tier-A: an empty tier-A probe still falls through to a title search (ROD-366)" {
