@@ -13,6 +13,7 @@ const std = @import("std");
 const vaxis = @import("vaxis");
 
 const app_mod = @import("app.zig");
+const resolve = @import("resolve.zig");
 const App = app_mod.App;
 
 const selection = @import("selection.zig");
@@ -199,7 +200,7 @@ pub fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, regist
             self.detail_origin = .discover;
             self.active_view = .detail;
             self.active_pane = .detail;
-            self.fireEpisodesCanonical(loop, io, registry, a);
+            resolve.fireEpisodesCanonical(self, loop, io, registry, a);
         }
         return;
     }
@@ -207,7 +208,7 @@ pub fn onDiscoverKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, regist
     // routing as Browse-P (ROD-336): a direct addToWatchlist would persist a
     // bogus (provider, anilist_id) row.
     if (key.matches('P', .{ .shift = true }) or key.matches('P', .{})) {
-        if (selection.selectedDiscoverAnime(self)) |a| self.addSelectedCanonical(loop, io, registry, a);
+        if (selection.selectedDiscoverAnime(self)) |a| resolve.addSelectedCanonical(self, loop, io, registry, a);
         return;
     }
     // / → jump to Browse and open its search prompt (the discovery→search seam).
@@ -278,17 +279,17 @@ pub fn onDrillKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry:
                     // event; fireEpisodesBrowse's in-flight guard avoids
                     // respawning a fetch already running for this same show.
                     self.active_pane = .detail;
-                    self.fireEpisodesBrowse(loop, io, registry);
+                    resolve.fireEpisodesBrowse(self, loop, io, registry);
                 } else if (key.matches(vaxis.Key.enter, .{})) {
                     // Single-column (< 60): no pane — Enter opens the zoom
                     // (mirrors History; ROD-194 regression fix). `l`/right
                     // are no-ops here, nothing to focus rightward.
-                    self.openBrowseZoom(loop, io, registry);
+                    resolve.openBrowseZoom(self, loop, io, registry);
                 }
             } else if (self.active_pane == .detail) {
                 // Enter on episode in detail pane: play
                 if (key.matches(vaxis.Key.enter, .{})) {
-                    self.firePlay(loop, io, registry);
+                    resolve.firePlay(self, loop, io, registry);
                 }
                 // l in detail: no-op (already rightmost)
             }
@@ -304,21 +305,21 @@ pub fn onDrillKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry:
                     if (self.term_cols >= App.pane_split_min) {
                         // Two-pane: focus the detail pane + fetch its grid.
                         self.active_pane = .detail;
-                        self.fireEpisodesForHistoryRecord(loop, io, registry, rec);
+                        resolve.fireEpisodesForHistoryRecord(self, loop, io, registry, rec);
                     } else if (key.matches(vaxis.Key.enter, .{})) {
                         // Single-column (< 60): no pane — Enter opens the zoom.
-                        self.openHistoryZoom(loop, io, registry, rec);
+                        resolve.openHistoryZoom(self, loop, io, registry, rec);
                     }
                 }
             } else if (key.matches(vaxis.Key.enter, .{})) {
                 // Detail pane focused: the in-pane grid is present at every
                 // two-pane width now (ROD-259) → play the focused episode.
                 // Space still promotes to the full-screen zoom for a roomier grid.
-                self.firePlay(loop, io, registry);
+                resolve.firePlay(self, loop, io, registry);
             }
         },
         .detail => {
-            if (key.matches(vaxis.Key.enter, .{})) self.firePlay(loop, io, registry);
+            if (key.matches(vaxis.Key.enter, .{})) resolve.firePlay(self, loop, io, registry);
         },
         .settings => {},
         // Discover routes its own drill (Enter→zoom) through onDiscoverKey,
@@ -411,13 +412,13 @@ pub fn onZoomKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: 
         self.term_cols < App.pane_split_min)
     {
         // Single-column History: no pane to toggle — Space opens the zoom.
-        if (self.selectedHistoryRecord()) |rec| self.openHistoryZoom(loop, io, registry, rec);
+        if (self.selectedHistoryRecord()) |rec| resolve.openHistoryZoom(self, loop, io, registry, rec);
     } else if (self.active_view == .browse and self.active_pane == .list and
         self.term_cols < App.pane_split_min)
     {
         // Single-column Browse: no pane to toggle — Space opens the zoom
         // (mirrors History; ROD-194 regression fix).
-        self.openBrowseZoom(loop, io, registry);
+        resolve.openBrowseZoom(self, loop, io, registry);
     }
     return true;
 }
@@ -529,9 +530,9 @@ pub fn onProviderPinKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, reg
         return true;
     };
     providers[0] = target;
-    self.clearFallback();
+    resolve.clearFallback(self);
     self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0, .manual = true };
-    if (!self.advanceFallback(loop, io, registry, null, null)) {
+    if (!resolve.advanceFallback(self, loop, io, registry, null, null)) {
         var buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "couldn't reach {s}", .{target.displayName()}) catch "couldn't switch provider";
         self.pushToast(.warn, msg, false);
@@ -569,7 +570,7 @@ pub fn onEpisodeGridKey(self: *App, key: vaxis.Key) bool {
 pub fn onBrowseAddKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Registry) bool {
     if (!(self.active_view == .browse and self.active_pane == .list and
         (key.matches('P', .{ .shift = true }) or key.matches('P', .{})))) return false;
-    if (selection.selectedAnime(self)) |anime| self.addSelectedCanonical(loop, io, registry, anime);
+    if (selection.selectedAnime(self)) |anime| resolve.addSelectedCanonical(self, loop, io, registry, anime);
     return true; // P is consumed in Browse-list focus whether or not a row is selected
 }
 
