@@ -31,18 +31,23 @@ pub const std_options: std.Options = .{
 const LiveProviders = struct {
     senshi: zigoku.Senshi,
     megaplay: zigoku.MegaPlay,
-    slots: [2]zigoku.SourceProvider,
+    allanime: zigoku.AllAnime,
+    slots: [3]zigoku.SourceProvider,
 
     fn init() LiveProviders {
         return .{
             .senshi = zigoku.Senshi.init(),
             .megaplay = zigoku.MegaPlay.init(),
+            .allanime = zigoku.AllAnime.init(),
             .slots = undefined,
         };
     }
 
     fn registry(self: *LiveProviders) zigoku.Registry {
-        self.slots = .{ self.megaplay.provider(), self.senshi.provider() };
+        // Order IS the default fallback/preference order. megaplay leads (ROD-380);
+        // allanime trails as the tier-B backstop (canonicalKey null → resolved by
+        // its thumbnail-embedded anilist id via bestIdMatch, ROD-365).
+        self.slots = .{ self.megaplay.provider(), self.senshi.provider(), self.allanime.provider() };
         return .{ .providers = &self.slots };
     }
 };
@@ -589,6 +594,20 @@ test "live registry leads with megaplay as the default provider (ROD-380)" {
     var it = reg.ordered("");
     try std.testing.expectEqualStrings("megaplay", it.next().?.name());
     try std.testing.expect(reg.byName("senshi") != null);
+}
+
+test "live registry registers allanime as the tier-B backstop, last (ROD-365)" {
+    // Pins allanime LAST: reachable only after both tier-A-capable providers miss.
+    // An accidental reorder or prepend would silently make it tier-A-eligible first.
+    var live = LiveProviders.init();
+    const reg = live.registry();
+    try std.testing.expectEqual(@as(usize, 3), reg.providers.len);
+    try std.testing.expect(reg.byName("allanime") != null);
+    var it = reg.ordered("");
+    try std.testing.expectEqualStrings("megaplay", it.next().?.name());
+    try std.testing.expectEqualStrings("senshi", it.next().?.name());
+    try std.testing.expectEqualStrings("allanime", it.next().?.name());
+    try std.testing.expect(it.next() == null);
 }
 
 test "observedPlaybackWasMeaningful requires positive observed position" {
