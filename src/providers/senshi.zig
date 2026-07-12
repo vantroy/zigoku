@@ -805,6 +805,25 @@ test "percentDecode: escapes decode, malformed stays literal (ROD-378)" {
     try testing.expectEqualStrings("a+b", try Senshi.percentDecode(a, "a+b"));
 }
 
+test "sidecar url is guarded on both layers after percent-decode (ROD-378)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A CRLF-injection payload smuggled through the sub.info percent-encoding
+    // decodes to raw control bytes, which cleanArg (printable ASCII only) rejects
+    // before the url could reach our fetch or mpv's argv.
+    const crlf = try Senshi.percentDecode(a, "https://h/x%0d%0aHost:%20evil");
+    try testing.expect(!Senshi.cleanArg(crlf));
+
+    // A percent-encoded private-IP host decodes to bytes cleanArg PASSES (digits and
+    // dots are printable), so cleanArg alone can't stop SSRF. fetchguard is the layer
+    // that does: fetchSubtitle runs both, in that order, before the fetch.
+    const priv = try Senshi.percentDecode(a, "http://127%2e0%2e0%2e1/latest");
+    try testing.expect(Senshi.cleanArg(priv));
+    try testing.expectError(error.BlockedHost, fetchguard.guardFetchUrl(priv));
+}
+
 test "guardEpLabel accepts numeric/decimal labels, rejects path tricks" {
     try Senshi.guardEpLabel("1");
     try Senshi.guardEpLabel("13.5");
