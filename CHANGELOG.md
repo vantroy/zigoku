@@ -14,6 +14,24 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-07-13
+
+### Added
+
+- **Another source rejoins the fallback lineup**: a streaming source that had
+  been retired is back, sitting behind the two already in rotation as a
+  backstop. When a show comes up empty everywhere else, zigoku now has one
+  more place to check before giving up, so more shows resolve and play.
+
+### Known Issues
+
+- **A resume marker can land one episode behind after switching sources**: on
+  a show where two sources number episodes differently, switching a show to a
+  different source can leave the "continue watching" marker parked one
+  episode behind where you actually left off. The watched count stays
+  correct; only the resume cursor is off. Selecting the right episode fixes
+  it on the spot, and a proper fix is planned.
+
 ## [0.4.4] - 2026-07-12
 
 ### Fixed
@@ -306,7 +324,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/vantroy/zigoku/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/vantroy/zigoku/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/vantroy/zigoku/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/vantroy/zigoku/compare/v0.4.1...v0.4.2
