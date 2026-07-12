@@ -14,6 +14,14 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-07-12
+
+### Added
+
+- **A heads-up when a new version is out**: zigoku checks GitHub for a newer release on startup (no more than once every six hours) and shows a low-key, dismissable toast pointing you at `zigoku update` when one's available. A new "Updates" section in Settings turns the check off if you'd rather not be told, and Settings now also shows the version you're running.
+
+- **`zigoku update`**: run it and zigoku updates itself, the right way for however you installed it. Through Homebrew or the AUR, it prints the matching upgrade command instead of touching your install. Installed standalone somewhere writable, it downloads the new binary, verifies it, and swaps it in atomically, with progress as it streams. Somewhere that needs elevated permissions to write, it refuses and explains why rather than leaving a half-updated binary behind.
+
 ## [0.4.1] - 2026-07-12
 
 ### Added
@@ -258,7 +266,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/vantroy/zigoku/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/vantroy/zigoku/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/vantroy/zigoku/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/vantroy/zigoku/compare/v0.3.0...v0.3.1
