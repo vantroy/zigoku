@@ -1606,13 +1606,15 @@ pub fn nowMs(io: std.Io) i64 {
 }
 
 /// Boot update check (ROD-370): compare our build against GitHub's latest release
-/// and, if we're behind, post the newer tag for a low-key toast. Best-effort: a
-/// null result (offline, rate-limited, already current) posts nothing at all.
-/// `gpa` must outlive the event drain: the posted tag borrows it, and the UI copies
-/// it into a toast synchronously in tick(); run() owns that allocator's lifetime.
+/// and, if we're behind, post a bare `.update_available` for a low-key toast.
+/// Best-effort: offline / rate-limited / already-current posts nothing. The whole
+/// fetch lives in a task-local arena freed on return, so nothing crosses the
+/// worker→UI seam (the toast names the command, not the version).
 pub fn updateCheckTask(loop: *Loop, gpa: Allocator, io: std.Io, current_version: []const u8) void {
-    const latest = updatecheck.check(gpa, io, current_version, Store.nowSecs()) orelse return;
-    loop.postEvent(.{ .update_available = latest }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    if (updatecheck.check(arena.allocator(), io, current_version, Store.nowSecs()) == null) return;
+    loop.postEvent(.update_available) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
 test "coverCacheStem is a stable hex-16 SHA-256 truncation (ROD-171)" {

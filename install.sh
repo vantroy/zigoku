@@ -138,11 +138,14 @@ mkdir -p "$bindir" || err "could not create ${bindir}"
 #      `zigoku update` replace the very binary it's running from (ROD-372).
 # Same-dir is required: a rename across filesystems isn't atomic (it falls back to
 # copy+unlink), which would reintroduce both hazards.
-staged="$bindir/.${BIN}.new.$$"
+# mktemp creates the staged file atomically (O_EXCL) with an unguessable name, so a
+# co-tenant on a shared bindir can't pre-plant a symlink at the path for the fallback
+# `cp` to follow and write through.
+staged=$(mktemp "$bindir/.${BIN}.new.XXXXXX") || err "could not stage into ${bindir} (permission? set BINDIR to a writable dir)"
 install -m 0755 "$srcbin" "$staged" 2>/dev/null \
   || { cp "$srcbin" "$staged" && chmod 0755 "$staged"; } \
-  || err "could not stage the binary in ${bindir} (permission? set BINDIR to a writable dir)"
-mv -f "$staged" "$bindir/${BIN}" || err "could not place ${bindir}/${BIN}"
+  || err "could not write the staged binary in ${bindir} (permission? set BINDIR to a writable dir)"
+mv -f "$staged" "$bindir/${BIN}" || err "could not move the staged binary into ${bindir}/${BIN}"
 staged=  # placed; the trap must not remove the installed binary
 
 say ""

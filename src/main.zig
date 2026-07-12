@@ -166,7 +166,7 @@ pub fn main(init: std.process.Init) !void {
     // ROD-371: `zigoku update` resolves how the binary was installed and either
     // updates it in place, points a packaged user at their package manager, or
     // refuses a root-owned install. A subcommand like login/sync, intercepted
-    // before the positional is read as a search query.
+    // before the positional arg is read as a search query.
     if (isUpdateCommand(args)) {
         try zigoku.update.run(arena, io, out, zigoku.version, init.environ_map);
         try out.flush();

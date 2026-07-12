@@ -73,7 +73,6 @@ pub const Version = struct {
 
     fn orderPrerelease(self_pre: bool, other_pre: bool) std.math.Order {
         if (self_pre == other_pre) return .eq;
-        // A prerelease is LESS than a release with the same core.
         return if (self_pre) .lt else .gt;
     }
 };

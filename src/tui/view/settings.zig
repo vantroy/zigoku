@@ -86,8 +86,11 @@ pub fn drawSettings(self: *App, win: vaxis.Window, top: u16, visible: u16, w: u1
     }
     y += 1;
 
-    // Updates (ROD-370): the startup update-check opt-out (rows 13..end).
+    // Updates (ROD-370): a read-only current-version row (status-above-control, like
+    // Catalog/AniList Sync), then the startup update-check opt-out (rows 13..end).
     y = drawSettingsHeader(self, win, y, w, "Updates");
+    drawInertRow(self, win, y, w, "current version", self.app_version);
+    y += 1;
     while (i < settings_rows.len) : (i += 1) {
         const r = settings_rows[i];
         drawSettingRow(self, win, y, w, r, self.settings.value(&self.config, r.id), i == self.settings.cursor);

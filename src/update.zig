@@ -26,11 +26,9 @@ pub const InstallMethod = enum { pacman, brew, standalone };
 /// binary's dir is writable. Pure product of `decide`, so the policy is tested
 /// without spawning a process or touching the filesystem.
 pub const Action = union(enum) {
-    /// Packaged: tell the user to update through their package manager.
     package_directions: InstallMethod,
-    /// Standalone but the binary's dir isn't writable by us: refuse.
     refuse_unwritable,
-    /// Standalone and writable: proceed with the self-update into this dir.
+    /// Standalone and writable: the payload is the bindir to update into.
     self_update: []const u8,
 };
 
@@ -70,16 +68,20 @@ pub fn run(
     // "already current" (stop) from "couldn't reach GitHub" (press on: the user
     // asked to update, and we can still route them by install method). Keep the
     // tag to pin the installer's download to exactly the release we compared against.
+    var tag_buf: [64]u8 = undefined;
     var latest_tag: ?[]const u8 = null;
     if (updatecheck.latestFresh(arena, io, nowSecs(io))) |latest| {
-        if (!semver.isNewer(latest, current_version)) {
+        // Sanitize before it touches the terminal: a forged tag_name (compromised
+        // release / broken-TLS MITM) with control bytes must not emit raw escapes.
+        const clean = sanitizeTag(&tag_buf, latest);
+        if (!semver.isNewer(clean, current_version)) {
             try out.print("zigoku v{s} is already the latest release.\n", .{current_version});
             return;
         }
-        latest_tag = latest;
-        try out.print("update available: v{s} -> {s}\n\n", .{ current_version, latest });
+        latest_tag = clean;
+        try out.print("update available: v{s} -> {s}\n\n", .{ current_version, clean });
     } else {
-        try out.print("couldn't reach GitHub to confirm the latest release; continuing anyway.\n\n", .{});
+        try out.print("couldn't reach GitHub to check the latest release; continuing anyway.\n\n", .{});
     }
 
     const method = detectMethod(io, exe);
@@ -91,11 +93,11 @@ pub fn run(
 }
 
 /// Drive install.sh to replace the binary in place: point BINDIR at our own dir and
-/// pin ZIGOKU_VERSION to the tag we resolved, then run the installer and stream its
-/// progress. The installer stages + renames (see install.sh), so a running binary is
-/// replaced atomically and a mid-run failure leaves the current one intact. The
-/// installer already verifies the download's checksum, which is why we drive it
-/// rather than reimplement the fetch here (ROD-372).
+/// pin ZIGOKU_VERSION to the resolved tag, then download the installer to a temp file
+/// and run it, streaming its progress. The installer stages + renames (see install.sh),
+/// so a running binary is replaced atomically and a mid-run failure leaves the current
+/// one intact. We drive install.sh rather than reimplement the fetch because it already
+/// verifies the download's checksum (ROD-372).
 fn performUpdate(
     io: Io,
     out: *Io.Writer,
@@ -106,15 +108,32 @@ fn performUpdate(
     try environ.put("BINDIR", bindir);
     if (latest_tag) |t| try environ.put("ZIGOKU_VERSION", t);
 
+    // Pin the installer SCRIPT to the release tag, not just the tarball: fetching
+    // install.sh from `master` would let a compromised master script ignore the
+    // version pin entirely. Fall back to `master` only with no usable tag (offline
+    // path) or a tag that isn't a safe git ref. Built here and passed by env, never
+    // interpolated into the shell string, so a forged tag can't inject.
+    const ref = if (latest_tag) |t| (if (safeRef(t)) t else "master") else "master";
+    var url_buf: [256]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "https://raw.githubusercontent.com/" ++ REPO ++ "/{s}/install.sh", .{ref}) catch {
+        try out.print("couldn't build the installer URL\n", .{});
+        return;
+    };
+    try environ.put("INSTALL_URL", url);
+
     try out.print("updating in place at {s} ...\n\n", .{bindir});
     try out.flush(); // the installer inherits stdout; flush ours first so lines don't interleave
 
-    // Fetch install.sh with whichever downloader is present (mirrors install.sh's own
-    // curl-or-wget probe), then pipe it to sh. BINDIR/ZIGOKU_VERSION reach the piped
-    // shell through the inherited environment.
-    const cmd = "if command -v curl >/dev/null 2>&1; then curl -fsSL https://raw.githubusercontent.com/" ++ REPO ++
-        "/master/install.sh; else wget -qO- https://raw.githubusercontent.com/" ++ REPO ++
-        "/master/install.sh; fi | sh";
+    // Download to a temp file and RUN it, NOT `curl | sh`: a pipe reports the pipeline's
+    // exit as `sh`'s (0 on empty stdin), so a failed download would read as a successful
+    // update. `set -e` aborts with the fetch's real status, which we surface below.
+    const cmd =
+        \\set -e
+        \\f=$(mktemp)
+        \\trap 'rm -f "$f"' EXIT
+        \\if command -v curl >/dev/null 2>&1; then curl -fsSL "$INSTALL_URL" -o "$f"; else wget -qO "$f" "$INSTALL_URL"; fi
+        \\sh "$f"
+    ;
 
     var child = std.process.spawn(io, .{
         .argv = &.{ "sh", "-c", cmd },
@@ -134,9 +153,21 @@ fn performUpdate(
         .exited => |code| if (code == 0)
             try out.print("\nupdated. restart zigoku to run the new version.\n", .{})
         else
-            try out.print("\ninstaller exited with status {d}; your existing binary is untouched.\n", .{code}),
-        else => try out.print("\ninstaller was interrupted; your existing binary is untouched.\n", .{}),
+            try out.print("\nupdate failed (installer exited {d}); your existing binary is untouched.\n", .{code}),
+        else => try out.print("\nupdate interrupted; your existing binary is untouched.\n", .{}),
     }
+}
+
+/// A tag safe to splice into a raw.githubusercontent URL path as a git ref: version
+/// charset only, no slash (no path traversal), no shell metacharacters. Guards the
+/// installer-URL construction against a forged `tag_name`.
+fn safeRef(tag: []const u8) bool {
+    if (tag.len == 0 or tag.len > 64) return false;
+    for (tag) |ch| switch (ch) {
+        'A'...'Z', 'a'...'z', '0'...'9', '.', '+', '_', '-' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// Absolute path of the running binary. Linux reads `/proc/self/exe`; macOS asks
@@ -169,10 +200,29 @@ fn selfExePathDarwin(arena: Allocator) ![]const u8 {
 fn detectMethod(io: Io, exe: []const u8) InstallMethod {
     switch (builtin.os.tag) {
         .linux => if (commandSucceeds(io, &.{ "pacman", "-Qo", exe })) return .pacman,
-        .macos => if (commandSucceeds(io, &.{ "brew", "list", "zigoku" })) return .brew,
+        // `brew list zigoku` only proves a zigoku formula is installed SOMEWHERE, not
+        // that THIS binary is it, so also require the running path to sit under a brew
+        // prefix. Without the second clause a standalone binary running next to a brew
+        // install would be misrouted to "use brew" instead of self-updating.
+        .macos => if (commandSucceeds(io, &.{ "brew", "list", "zigoku" }) and underBrewPrefix(exe)) return .brew,
         else => {},
     }
     return .standalone;
+}
+
+/// Whether `exe` lives under a Homebrew prefix. Covers the two standard roots; a
+/// custom `HOMEBREW_PREFIX` install that also has a stray standalone binary is a rare
+/// edge that degrades to the pre-fix behavior (a wrong "use brew"), never worse.
+fn underBrewPrefix(exe: []const u8) bool {
+    return hasPrefixDir(exe, "/opt/homebrew") or hasPrefixDir(exe, "/usr/local");
+}
+
+/// True if `path` equals `prefix` or sits under it as a directory (so `/usr/local`
+/// matches `/usr/local/bin/zigoku` but not `/usr/local-other/...`). Pure, tested.
+fn hasPrefixDir(path: []const u8, prefix: []const u8) bool {
+    const p = std.mem.trimEnd(u8, prefix, "/");
+    if (p.len == 0 or !std.mem.startsWith(u8, path, p)) return false;
+    return path.len == p.len or path[p.len] == '/';
 }
 
 /// True iff `argv` spawns and exits 0. A spawn failure (tool absent) or any nonzero
@@ -203,13 +253,13 @@ fn dirWritable(io: Io, dir: []const u8) bool {
 fn printPackageDirections(out: *Io.Writer, method: InstallMethod) !void {
     switch (method) {
         .pacman => try out.print(
-            \\zigoku was installed from the AUR. Update it with your AUR helper:
+            \\zigoku was installed via the AUR. Update it with your AUR helper:
             \\  yay -S zigoku
             \\  # or: paru -S zigoku
             \\
         , .{}),
         .brew => try out.print(
-            \\zigoku was installed with Homebrew. Update it with:
+            \\zigoku was installed via Homebrew. Update it with:
             \\  brew upgrade zigoku
             \\
         , .{}),
@@ -233,6 +283,21 @@ fn printRefusal(out: *Io.Writer, bindir: []const u8) !void {
 fn nowSecs(io: Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Copy `tag` into `buf` keeping only printable ASCII, so a forged `tag_name` can't
+/// smuggle terminal escapes through the CLI's raw stdout (the TUI toast drops control
+/// bytes on its own; this closes the CLI path). A legit version tag is unchanged.
+fn sanitizeTag(buf: []u8, tag: []const u8) []const u8 {
+    var n: usize = 0;
+    for (tag) |ch| {
+        if (n == buf.len) break;
+        if (ch >= 0x20 and ch < 0x7f) {
+            buf[n] = ch;
+            n += 1;
+        }
+    }
+    return buf[0..n];
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
@@ -265,4 +330,30 @@ test "dirWritable: true for a writable temp dir, false for a missing or relative
     try std.testing.expect(dirWritable(io, abs));
     try std.testing.expect(!dirWritable(io, "/definitely/not/a/real/dir/zzz"));
     try std.testing.expect(!dirWritable(io, "relative/path")); // unresolvable → conservative false
+}
+
+test "hasPrefixDir: matches on a path boundary, not a bare string prefix" {
+    try std.testing.expect(hasPrefixDir("/usr/local/bin/zigoku", "/usr/local"));
+    try std.testing.expect(hasPrefixDir("/opt/homebrew/bin/zigoku", "/opt/homebrew"));
+    try std.testing.expect(hasPrefixDir("/usr/local", "/usr/local")); // exact
+    try std.testing.expect(hasPrefixDir("/usr/local/bin/zigoku", "/usr/local/")); // trailing slash tolerated
+    try std.testing.expect(!hasPrefixDir("/usr/local-other/bin/zigoku", "/usr/local")); // no false prefix match
+    try std.testing.expect(!hasPrefixDir("/home/u/.local/bin/zigoku", "/usr/local"));
+}
+
+test "safeRef: accepts version tags, rejects anything that could break out of a URL path" {
+    try std.testing.expect(safeRef("v0.4.1"));
+    try std.testing.expect(safeRef("0.10.0-rc1"));
+    try std.testing.expect(!safeRef("")); // empty
+    try std.testing.expect(!safeRef("v1/../../etc")); // slash → traversal
+    try std.testing.expect(!safeRef("v1.0;rm -rf ~")); // shell metachars
+    try std.testing.expect(!safeRef("v1.0 x")); // space
+}
+
+test "sanitizeTag: strips control bytes, leaves a clean tag intact" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("v0.5.0", sanitizeTag(&buf, "v0.5.0"));
+    // A forged tag with an escape sequence keeps only the printable bytes.
+    try std.testing.expectEqualStrings("v1.0[2J", sanitizeTag(&buf, "v1.0\x1b[2J"));
+    try std.testing.expectEqualStrings("", sanitizeTag(&buf, "\x00\x07\x1b"));
 }

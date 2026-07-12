@@ -61,12 +61,10 @@ pub const Event = union(enum) {
     /// `↑ N to AniList` when a push landed (both `.info`, either or both per flush). Soft
     /// failures stay silent (rows stay dirty, retry next flush).
     sync_flushed: SyncFlushOutcome,
-    /// The boot update check found a newer release (ROD-370). Payload is the latest
-    /// version tag, borrowed from the update worker's arena; the handler copies it
-    /// into a toast synchronously, so it must not outlive the tick that drains it (the
-    /// worker's arena is torn down only after the event loop exits). The check posts
-    /// this ONLY when strictly behind, so the handler always has something to nag about.
-    update_available: []const u8,
+    /// The boot update check found a newer release (ROD-370). Payloadless: the toast
+    /// names only the command to run, not the version, so the worker keeps its fetched
+    /// tag entirely thread-local and posts a bare signal. Fired only when strictly behind.
+    update_available,
     /// The in-TUI AniList connect flow settled (ROD-286). Posted once by `connectTask`
     /// when the loopback worker resolves to a real outcome (a state-valid callback or a
     /// hard listener error) — NEVER on `.canceled` (esc tears the modal down directly,

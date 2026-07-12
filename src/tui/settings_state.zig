@@ -87,7 +87,7 @@ pub const settings_rows = [_]SettingRow{
     .{ .id = .anilist_sync, .label = "sync", .kind = .toggle, .hint = "space to toggle" },
     // Updates (ROD-370): the startup update-check opt-out. Its own section since it's
     // app behavior, not display or an AniList concern.
-    .{ .id = .check_for_updates, .label = "check for updates", .kind = .toggle, .hint = "space to toggle" },
+    .{ .id = .check_for_updates, .label = "check", .kind = .toggle, .hint = "space to toggle" },
 };
 
 /// Number of interactive (focusable) settings rows — the Catalog rows are not

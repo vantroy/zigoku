@@ -2191,6 +2191,17 @@ test "sync_flushed: whisper on push, reload on reconcile, disconnect on expiry (
     try testing.expect(quiet.toast_queue[0] == null);
 }
 
+test "update_available: a low-key non-persistent whisper naming the command (ROD-370)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+
+    try testTick(&app, .update_available);
+    const t = app.toast_queue[0] orelse return error.TestExpectationFailed;
+    try testing.expectEqual(Toast.Kind.info, t.kind);
+    try testing.expect(!t.persistent);
+    try testing.expectEqualStrings("update available · run zigoku update", t.text[0..t.text_len]);
+}
+
 test "sync_flushed: pull whispers ↓, and a two-way flush enqueues ↓ before ↑ (ROD-293)" {
     // The launch pull (and an action flush's pull half) whispers a low-key ↓ when a
     // reconcile lands remote changes — symmetric with the push's ↑, and it flags a

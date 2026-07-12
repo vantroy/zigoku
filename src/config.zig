@@ -183,6 +183,7 @@ fn expectConfigEqual(want: Config, got: Config) !void {
     try testing.expectEqual(want.discover_cover_concurrency, got.discover_cover_concurrency);
     try testing.expectEqualStrings(want.preferred_provider, got.preferred_provider);
     try testing.expectEqual(want.anilist_sync_enabled, got.anilist_sync_enabled);
+    try testing.expectEqual(want.check_for_updates, got.check_for_updates);
 }
 
 test "empty struct literal yields all defaults" {
@@ -236,6 +237,7 @@ test "serialized config round-trips back through parse" {
         .discover_cover_concurrency = 8,
         .preferred_provider = "megaplay",
         .anilist_sync_enabled = false,
+        .check_for_updates = false,
     };
 
     var aw = std.Io.Writer.Allocating.init(a);

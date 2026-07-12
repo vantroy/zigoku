@@ -17,6 +17,7 @@ const Allocator = std.mem.Allocator;
 const http = @import("providers/http.zig");
 const paths = @import("paths.zig");
 const semver = @import("util/semver.zig");
+const deadline = @import("util/deadline.zig");
 
 const log = std.log.scoped(.update_check);
 
@@ -28,9 +29,14 @@ pub const CHECK_TTL_SECS: i64 = 6 * 60 * 60;
 /// GitHub rejects API requests without a User-Agent (403). Identify ourselves.
 const USER_AGENT = "zigoku-update-check";
 
+/// Wall-clock ceiling for the check's one GET. Without it a reachable-but-silent
+/// host (captive portal, tarpit) hangs the fetch forever, and the boot worker's
+/// join would then stall a clean quit. Short: this is an ambient nicety, not
+/// something worth waiting on.
+const FETCH_DEADLINE_S = 3;
+
 const LATEST_URL = "https://api.github.com/repos/vantroy/zigoku/releases/latest";
 
-/// What the 6h cache holds: when we last asked, and the tag we got back.
 pub const CacheEntry = struct {
     checked_at: i64,
     latest_version: []const u8,
@@ -132,16 +138,18 @@ fn writeCache(arena: Allocator, io: Io, now: i64, latest: []const u8) void {
 /// transport; GitHub's `/releases/latest` skips prereleases and drafts, so the
 /// tag we read is the newest stable cut.
 fn fetchLatest(arena: Allocator, io: Io) ![]const u8 {
-    const body = try http.request(arena, io, .{
-        .method = .GET,
-        .url = LATEST_URL,
-        .user_agent = USER_AGENT,
-        .tag = "update_check",
+    const body = try deadline.withDeadline(io, .fromSeconds(FETCH_DEADLINE_S), http.request, .{
+        arena, io,
+        http.Request{
+            .method = .GET,
+            .url = LATEST_URL,
+            .user_agent = USER_AGENT,
+            .tag = "update_check",
+        },
     });
     return parseLatestTag(arena, body);
 }
 
-/// The one field we want out of the release JSON. Everything else is ignored.
 const LatestRelease = struct { tag_name: []const u8 };
 
 /// Extract `tag_name` from a `/releases/latest` body. Split out so the JSON
