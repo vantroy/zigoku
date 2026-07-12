@@ -6763,6 +6763,97 @@ test "ROD-346: a virgin tier-A probe failure walks on via pending_bind (no bindi
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
 
+test "ROD-368: an empty listing walks the ladder instead of binding an empty grid" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    var beta = RecordingProvider{ .id = "beta", .tier_a = true };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "52991");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    app.pending_bind = 154587; // the resolving Browse fire armed it
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    // alpha lists empty (a 200-with-[] "not stocked", not an error).
+    const eps = try app.gpa.alloc(domain.EpisodeNumber, 0);
+    const for_id = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .episodes_done = .{ .episodes = eps, .for_id = for_id } }, &loop, io, registry);
+
+    app.episode_drain.drain();
+    // The empty listing did NOT bind alpha; it cached alpha's absence and hopped to
+    // beta, whose probe fired with the re-armed mint.
+    try testing.expect((try st.getAnime(arena, "alpha", "52991")) == null);
+    try testing.expect(try st.providerAbsentFresh(154587, "alpha", store_mod.Store.nowSecs()));
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expectEqualStrings("beta", app.episodes.for_source.?);
+    try testing.expect(app.fallback != null);
+    try testing.expect(!app.episodes.unbound); // the hop is in flight, not a dead end
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
+test "ROD-368: an empty listing with no other provider concedes the unbound state" {
+    var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
+    const slots = [_]SourceProvider{alpha.provider()};
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{
+        .id = "154587",
+        .name = "Frieren",
+        .anilist_id = 154587,
+        .mal_id = 52991,
+    }, true, 5000, arena);
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    defer app.clearFallback();
+    app.episodes.for_id = try app.gpa.dupe(u8, "52991");
+    app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
+    app.pending_bind = 154587;
+    defer app.episodes.freeResults(app.gpa);
+    defer app.episodes.deinit(app.gpa);
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    const eps = try app.gpa.alloc(domain.EpisodeNumber, 0);
+    const for_id = try app.gpa.dupe(u8, "52991");
+    try app.tick(.{ .episodes_done = .{ .episodes = eps, .for_id = for_id } }, &loop, io, registry);
+
+    // The only provider came up empty: nothing bound, alpha's absence cached, and the
+    // pane concedes the unbound "no source available" state rather than a blank grid.
+    try testing.expect((try st.getAnime(arena, "alpha", "52991")) == null);
+    try testing.expect(try st.providerAbsentFresh(154587, "alpha", store_mod.Store.nowSecs()));
+    try testing.expect(app.fallback == null);
+    try testing.expect(app.episodes.unbound);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+}
+
 test "ROD-346: a tier-A add-probe miss widens the search to the remaining providers before unbound" {
     var alpha = RecordingProvider{ .id = "alpha", .tier_a = true };
     var beta = RecordingProvider{ .id = "beta" };
