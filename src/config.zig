@@ -60,6 +60,12 @@ pub const Config = struct {
     /// token gates WHETHER we can.
     anilist_sync_enabled: bool = true,
 
+    /// Whether to check GitHub for a newer release at startup (ROD-370). Off = no
+    /// network hit, no cache write, no toast; the entire update-notify path stays
+    /// inert for offline/privacy/CI users. The check is best-effort and 6h-cached
+    /// regardless; this is the hard opt-out. The Settings "updates" toggle writes it.
+    check_for_updates: bool = true,
+
     /// Map `translation` onto the domain enum, defaulting to `.sub` for anything
     /// unrecognized. Kept here so every consumer agrees on the fallback.
     pub fn translationEnum(self: Config) domain.Translation {

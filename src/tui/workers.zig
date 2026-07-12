@@ -18,6 +18,7 @@ const log = @import("../log.zig");
 const sync = @import("../sync.zig");
 const auth_mod = @import("../auth.zig");
 const login_loopback = @import("../login_loopback.zig");
+const updatecheck = @import("../updatecheck.zig");
 
 const Allocator = std.mem.Allocator;
 const Store = store_mod.Store;
@@ -1602,6 +1603,16 @@ pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
+}
+
+/// Boot update check (ROD-370): compare our build against GitHub's latest release
+/// and, if we're behind, post the newer tag for a low-key toast. Best-effort: a
+/// null result (offline, rate-limited, already current) posts nothing at all.
+/// `gpa` must outlive the event drain: the posted tag borrows it, and the UI copies
+/// it into a toast synchronously in tick(); run() owns that allocator's lifetime.
+pub fn updateCheckTask(loop: *Loop, gpa: Allocator, io: std.Io, current_version: []const u8) void {
+    const latest = updatecheck.check(gpa, io, current_version, Store.nowSecs()) orelse return;
+    loop.postEvent(.{ .update_available = latest }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
 test "coverCacheStem is a stable hex-16 SHA-256 truncation (ROD-171)" {

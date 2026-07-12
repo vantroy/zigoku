@@ -122,6 +122,7 @@ pub fn run(
     registry: Registry,
     config: Config,
     config_path: ?[]const u8,
+    app_version: []const u8,
 ) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.Tty.init(io, &tty_buf);
@@ -331,6 +332,19 @@ pub fn run(
     // action flush's one-flush gate, so a very early mutation just re-arms behind it
     // (fireSyncFlush sees inflight and waits).
     app.fireLaunchPull(&loop, io);
+
+    // ROD-370: best-effort boot update check on its own thread; compares our build
+    // against GitHub's latest release and whispers `.update_available` if we're behind.
+    // Gated by config (the hard opt-out) and skipped under test. The posted tag borrows
+    // `update_arena`, so the arena's deinit is declared BEFORE the join defer: LIFO runs
+    // the join first, then frees the arena, so the worker never outlives its allocator.
+    var update_arena = std.heap.ArenaAllocator.init(gpa);
+    defer update_arena.deinit();
+    const update_thread: ?std.Thread = if (config.check_for_updates and !builtin.is_test)
+        std.Thread.spawn(.{}, workers.updateCheckTask, .{ &loop, update_arena.allocator(), io, app_version }) catch null
+    else
+        null;
+    defer if (update_thread) |t| t.join();
 
     // First paint, then the event loop.
     {
@@ -1992,6 +2006,18 @@ pub const App = struct {
                     const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
                     self.pushToast(.info, msg, false);
                 }
+            },
+            .update_available => |latest| {
+                // ROD-370: the boot check found a newer release. One low-key, dismissable
+                // whisper; the copy is placeholder pending final wording. `latest` borrows the
+                // update worker's arena; pushToast copies into its own inline buffer, so it's
+                // safe to drop after this handler. Tags carry a leading `v` already.
+                // Size the buffer past the toast width so the format always succeeds;
+                // the render layer truncates to `max_copy_cols`. Front-load the version
+                // so it survives the clip.
+                var buf: [96]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "{s} available · run zigoku update", .{latest}) catch "update available · run zigoku update";
+                self.pushToast(.info, msg, false);
             },
             .connect_result => |outcome| self.onConnectResult(outcome, loop, io),
             .search_done => |ev| {
