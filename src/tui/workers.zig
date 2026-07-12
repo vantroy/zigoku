@@ -547,13 +547,18 @@ const prewarm_gap_ms: u64 = 1500;
 
 /// Background task: eager sibling pre-warm (ROD-351). For one canonical entity,
 /// walk `providers` (already filtered by the UI thread: no binding, no fresh
-/// absence) and try to establish where else the show is stocked: tier-A
-/// `canonicalKey` + episode probe where the provider id-keys its catalog, the
-/// tier-C two-pass search otherwise. One `.prewarm_result` per settled provider
-/// (the UI thread mints hidden bindings / caches negatives incrementally, so a
-/// quit mid-walk loses only the tail); `.unknown` verdicts post nothing. Strictly
-/// sequential with a gap between providers (ROD-309), and `.prewarm_done` always
-/// closes the walk (clears the single-flight guard).
+/// absence) and try to establish where else the show is stocked through the SHARED
+/// `resolveViaSearch` ladder (ROD-367): tier-A `canonicalKey` + episode probe first,
+/// then, only if that comes up empty, the tier-C two-pass search. Routing through
+/// the same primitive the resolve-widen uses is the whole point: a dual-capability
+/// provider (senshi keys by mal_id AND has a catalog search) whose tier-A probe
+/// lists empty must fall through to the search, or the warm caches a false absence
+/// that then also spares future search passes and strands a flip (the ROD-366/368
+/// bug class, one hop over). One `.prewarm_result` per settled provider (the UI
+/// thread mints hidden bindings / caches negatives incrementally, so a quit mid-walk
+/// loses only the tail); `.unknown` verdicts post nothing. Strictly sequential with
+/// a gap between providers (ROD-309), and `.prewarm_done` always closes the walk
+/// (clears the single-flight guard).
 ///
 /// `providers` and `canonical` are gpa-owned by this task and freed here. A
 /// matched id is duped into gpa and transferred to the event (UI thread frees).
@@ -571,18 +576,7 @@ pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const S
         if (cancel.load(.acquire)) break;
         if (i > 0) nanosleepMs(prewarm_gap_ms);
         if (cancel.load(.acquire)) break;
-        const verdict: SearchVerdict = blk: {
-            if (p.canonicalKey(arena.allocator(), canonical) catch null) |key| {
-                // Tier A: the probe is the existence check, same bar as Add's
-                // (a 200-empty is an authoritative "not stocked", ROD-346).
-                const eps = p.episodes(arena.allocator(), io, key, translation, null) catch |e| {
-                    log.debug("prewarm probe failed on {s}: {s}", .{ p.name(), @errorName(e) });
-                    break :blk .unknown;
-                };
-                break :blk if (eps.len > 0) .{ .match = key } else .absent;
-            }
-            break :blk resolveViaSearch(arena.allocator(), io, p, canonical, translation, false);
-        };
+        const verdict = resolveViaSearch(arena.allocator(), io, p, canonical, translation, false);
         switch (verdict) {
             .match => |id| {
                 const owned = gpa.dupe(u8, id) catch continue;
@@ -1979,6 +1973,47 @@ test "resolveViaSearch tier-A: an empty tier-A probe still falls through to a ti
     const got = resolveViaSearch(arena_state.allocator(), std.testing.io, senshi.provider(), canonical, .sub, false);
     try std.testing.expectEqualStrings("found", got.match);
     try std.testing.expect(senshi.searches > 0); // tier-A empty → search still ran
+}
+
+test "prewarmTask: a dual-capability empty tier-A falls through to search, no false absence (ROD-367)" {
+    const gpa = std.testing.allocator;
+    // senshi's shape: keys episodes by mal_id (tier-A) AND has a title search. The
+    // canonical's mal_id lists empty on the direct route, but a title search recovers
+    // the show under a different id. Pre-367 prewarm posted `.absent` off the empty
+    // tier-A probe alone (a false negative that also spared future searches and
+    // stranded a flip); routing through resolveViaSearch makes it fall through and
+    // mint the real binding instead.
+    var senshi = StubCatalog{
+        .canon_key = "52991", // direct route lists empty (alive_id is the search id)
+        .romaji = &.{.{ .id = "found", .name = "Romaji Title", .mal_id = 52991 }},
+        .alive_id = "found",
+    };
+    // prewarmTask frees `providers` and `canonical` itself (its own defers).
+    const providers = try gpa.dupe(SourceProvider, &.{senshi.provider()});
+    const canonical = try dupeOwnedAnime(gpa, .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 });
+
+    var loop = Loop{ .io = std.testing.io, .tty = undefined, .vaxis = undefined, .queue = .{ .io = std.testing.io } };
+    var cancel = std.atomic.Value(bool).init(false);
+    var drain = ThreadDrain{};
+    drain.begin(); // the task's `defer drain.finish()` rebalances to zero
+
+    // Single provider: no inter-provider sleep fires (gated on i > 0), so this runs
+    // synchronously and posts straight to the queue.
+    prewarmTask(&loop, gpa, std.testing.io, providers, canonical, 154587, .sub, &cancel, &drain);
+
+    var saw_match = false;
+    while (loop.queue.tryPop() catch null) |ev| {
+        switch (ev) {
+            .prewarm_result => |r| {
+                try std.testing.expect(!r.absent); // NOT a false absence
+                try std.testing.expectEqualStrings("found", r.source_id);
+                saw_match = true;
+                if (r.source_id.len > 0) gpa.free(r.source_id);
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_match);
 }
 
 test "resolveAcrossProviders: walks registry order, first confident match wins (ROD-343)" {
