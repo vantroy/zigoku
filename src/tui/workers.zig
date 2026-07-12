@@ -1,6 +1,7 @@
 //! Zigoku — TUI background workers and shared ownership helpers.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const source_mod = @import("../source.zig");
 const domain = @import("../domain.zig");
 const store_mod = @import("../store.zig");
@@ -447,7 +448,7 @@ const SearchVerdict = union(enum) { match: []const u8, absent, unknown };
 /// to `absent_out` (arena-backed; static vtable names) for the ROD-347 negative cache.
 fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool, absent_out: *std.ArrayListUnmanaged([]const u8)) ?SearchMatch {
     for (providers) |p| {
-        switch (resolveViaSearch(arena, io, p, canonical, translation, for_play)) {
+        switch (resolveViaSearch(arena, io, p, canonical, translation, for_play, null)) {
             .match => |id| return .{ .id = id, .source = p.name() },
             .absent => absent_out.append(arena, p.name()) catch {},
             .unknown => {},
@@ -458,12 +459,16 @@ fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const Sourc
 
 /// The search→match→probe core of `resolveSearchTask`, split from the thread/event
 /// glue so the pass control flow is unit-testable with a stub provider.
-fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool) SearchVerdict {
+fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool, pre_search_gap_ms: ?u64) SearchVerdict {
     var transport_failed = false;
     // `probed` gates the `.absent` verdict: at least one authoritative pass (a
     // clean tier-A episode probe or a title search) must have run, or a clean
     // miss is really "learned nothing" (`.unknown`).
     var probed = false;
+    // Whether a tier-A episode probe actually hit the network this call: gates the
+    // `pre_search_gap_ms` spacing so a no-tier-A provider (its search IS its first
+    // request) never eats a needless gap (ROD-367).
+    var tier_a_probed = false;
 
     // Tier A (ROD-366): the provider id-keys its own catalog from the canonical.
     // Try it BEFORE the title search so a tier-A-only provider (megaplay, whose
@@ -475,20 +480,28 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         // Play skips the probe (its own downstream fetch confirms), same as the
         // search arm below.
         if (for_play) return .{ .match = key };
+        tier_a_probed = true;
         if (provider.episodes(arena, io, key, translation, null)) |eps| {
             if (eps.len > 0) return .{ .match = key };
             // 200-with-empty on the canonical route is an authoritative "not
             // stocked" (megaplay's empty-is-authoritative contract, ROD-347). It
             // still falls through to a title search for a provider that also has
             // one (senshi): the canonical's mal_id may differ from the id senshi
-            // cataloged the show under, which only a search recovers. That costs a
-            // dual-capability provider one extra sequential request (probe, then
-            // search); still one-at-a-time, so the ROD-309 rate-scoring discipline holds.
+            // cataloged the show under, which only a search recovers.
             probed = true;
         } else |e| {
             log.debug("resolve tier-A episode probe failed: {s}", .{@errorName(e)});
             transport_failed = true;
         }
+    }
+
+    // ROD-367: a background caller (the pre-warm) that just fired a tier-A probe
+    // spaces the fallback search off it, so the probe+search never burst a
+    // rate-scoring CDN in one pass (the ROD-309 discipline pure-background work
+    // must keep; the foreground widen passes null and stays fast). is_test-gated
+    // so the suite doesn't sleep, mirroring the spawn gates in app.zig.
+    if (pre_search_gap_ms) |g| {
+        if (tier_a_probed and !builtin.is_test) nanosleepMs(g);
     }
 
     const opts: source_mod.SearchOptions = .{
@@ -576,7 +589,7 @@ pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const S
         if (cancel.load(.acquire)) break;
         if (i > 0) nanosleepMs(prewarm_gap_ms);
         if (cancel.load(.acquire)) break;
-        const verdict = resolveViaSearch(arena.allocator(), io, p, canonical, translation, false);
+        const verdict = resolveViaSearch(arena.allocator(), io, p, canonical, translation, false, prewarm_gap_ms);
         switch (verdict) {
             .match => |id| {
                 const owned = gpa.dupe(u8, id) catch continue;
@@ -1842,7 +1855,7 @@ test "resolveViaSearch: English retry pass binds when the romaji pass misses (RO
     var stub = StubCatalog{
         .english = &.{.{ .id = "2454", .name = "English Title", .mal_id = 52991 }},
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true, null);
     try std.testing.expectEqualStrings("2454", got.match);
 }
 
@@ -1857,13 +1870,13 @@ test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add
         .english = &.{.{ .id = "alive", .name = "English Title", .mal_id = 52991 }},
         .alive_id = "alive",
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("alive", got.match);
 
     // Both passes dead → a definitive absent (never a bind on an unplayable
     // listing): the searches ran clean, so the miss is a catalog fact.
     stub.alive_id = "";
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false) == .absent);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false, null) == .absent);
 }
 
 test "resolveViaSearch: Play skips the probe; identical English title skips pass 2" {
@@ -1875,7 +1888,7 @@ test "resolveViaSearch: Play skips the probe; identical English title skips pass
     var stub = StubCatalog{
         .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true, null);
     try std.testing.expectEqualStrings("dead", got.match);
     try std.testing.expectEqual(@as(u32, 1), stub.searches); // pass-1 hit → pass 2 never fired
 
@@ -1883,7 +1896,7 @@ test "resolveViaSearch: Play skips the probe; identical English title skips pass
     // even when pass 1 misses (one search total, resolve collapses to absent).
     const same_title: Anime = .{ .id = "2", .name = "No Such Show", .english_name = "No Such Show", .anilist_id = 2 };
     var stub2 = StubCatalog{};
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true) == .absent);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true, null) == .absent);
     try std.testing.expectEqual(@as(u32, 1), stub2.searches);
 }
 
@@ -1896,7 +1909,7 @@ test "resolveViaSearch three-state: transport failures read unknown, never absen
     // caching absent here would blind the fallback to a healthy provider for a
     // whole TTL just because the network blinked.
     var down = StubCatalog{ .search_fails = true };
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, down.provider(), canonical, .sub, true) == .unknown);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, down.provider(), canonical, .sub, true, null) == .unknown);
 
     // A matched listing whose Add probe dies on transport taints the whole walk:
     // even though pass 2 misses clean, the hit the error may have hidden forbids
@@ -1905,13 +1918,13 @@ test "resolveViaSearch three-state: transport failures read unknown, never absen
         .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }},
         .episodes_fail = true,
     };
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, flaky.provider(), canonical, .sub, false) == .unknown);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, flaky.provider(), canonical, .sub, false, null) == .unknown);
 
     // No runnable query pass (a canonical with no usable titles) also learned
     // nothing: unknown, not absent.
     const untitled: Anime = .{ .id = "3", .name = "", .anilist_id = 3 };
     var idle = StubCatalog{};
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, idle.provider(), untitled, .sub, true) == .unknown);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, idle.provider(), untitled, .sub, true, null) == .unknown);
     try std.testing.expectEqual(@as(u32, 0), idle.searches);
 }
 
@@ -1924,7 +1937,7 @@ test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable o
     // The pre-366 search-only walk saw only the Unsupported search and learned
     // nothing; tier-A must now bind it on the canonical key + episode probe.
     var mega = StubCatalog{ .canon_key = "66624", .alive_id = "66624", .search_unsupported = true };
-    const hit = resolveViaSearch(arena_state.allocator(), std.testing.io, mega.provider(), canonical, .sub, false);
+    const hit = resolveViaSearch(arena_state.allocator(), std.testing.io, mega.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("66624", hit.match);
     try std.testing.expectEqual(@as(u32, 0), mega.searches); // tier-A hit → search never fired
 
@@ -1932,19 +1945,19 @@ test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable o
     // (authoritative), and the Unsupported search must not downgrade that to unknown.
     // It's a cacheable absence (ROD-347).
     var mega_miss = StubCatalog{ .canon_key = "404", .alive_id = "", .search_unsupported = true };
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_miss.provider(), canonical, .sub, false) == .absent);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_miss.provider(), canonical, .sub, false, null) == .absent);
 
     // No mal_id → no tier-A key; the Unsupported search then learned nothing, so a
     // stale absence must NOT be cached (a show that gains a mal_id later isn't
     // blocked). This is the case the megaplay Unsupported contract protects.
     const no_mal: Anime = .{ .id = "2", .name = "Romaji Title", .anilist_id = 2 };
     var mega_nokey = StubCatalog{ .search_unsupported = true };
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_nokey.provider(), no_mal, .sub, false) == .unknown);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_nokey.provider(), no_mal, .sub, false, null) == .unknown);
 
     // Play skips the episode probe: the tier-A key resolves immediately, the
     // downstream fetch is the confirmation (parity with the search arm).
     var mega_play = StubCatalog{ .canon_key = "66624", .alive_id = "", .search_unsupported = true };
-    const played = resolveViaSearch(arena_state.allocator(), std.testing.io, mega_play.provider(), canonical, .sub, true);
+    const played = resolveViaSearch(arena_state.allocator(), std.testing.io, mega_play.provider(), canonical, .sub, true, null);
     try std.testing.expectEqualStrings("66624", played.match);
 
     // A tier-A probe that dies on TRANSPORT (not a clean empty) taints the walk to
@@ -1953,7 +1966,7 @@ test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable o
     // the search runs (not Unsupported) and finds nothing, yet the verdict must stay
     // unknown because of the tier-A transport failure.
     var mega_flaky = StubCatalog{ .canon_key = "66624", .episodes_fail = true };
-    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_flaky.provider(), canonical, .sub, false) == .unknown);
+    try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_flaky.provider(), canonical, .sub, false, null) == .unknown);
     try std.testing.expect(mega_flaky.searches > 0); // tier-A transport fail still fell through to search
 }
 
@@ -1970,7 +1983,7 @@ test "resolveViaSearch tier-A: an empty tier-A probe still falls through to a ti
         .romaji = &.{.{ .id = "found", .name = "Romaji Title", .mal_id = 52991 }},
         .alive_id = "found",
     };
-    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, senshi.provider(), canonical, .sub, false);
+    const got = resolveViaSearch(arena_state.allocator(), std.testing.io, senshi.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("found", got.match);
     try std.testing.expect(senshi.searches > 0); // tier-A empty → search still ran
 }
