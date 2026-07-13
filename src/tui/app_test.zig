@@ -674,6 +674,52 @@ test "a background reload cancels an armed delete confirm (ROD-220)" {
     try testing.expectEqual(@as(?usize, null), app.confirm_delete);
 }
 
+test "a confirmed delete nullifies a pending undo (ROD-220)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    inline for (.{ "1", "2" }) |id| {
+        try st.upsertAnime(.{ .source = "s", .source_id = id, .title = id, .history_visible = true }, 1000, arena);
+    }
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 0;
+
+    // A real p (paused) mutation captures a single-level undo with GPA-owned keys.
+    try testTick(&app, keyEv('p', .{}));
+    try testing.expect(app.undo != null);
+
+    // Deleting nullifies it (a stale undo may point at a gone row). The test allocator
+    // fails on a leak, so this also proves the nullify frees the entry's keys.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('y', .{}));
+    try testing.expect(app.undo == null);
+}
+
+test "ROD-220 confirm tail width matches chrome.zig tail_cols (drift guard)" {
+    // chrome.zig's drawBottomBar sizes the delete-confirm title budget by reserving a
+    // hardcoded `tail_cols = 48` for the fixed segments rendered after the title. That
+    // constant must equal the display width of those exact segments; if the prompt's
+    // tail wording changes without bumping tail_cols, the title truncation silently
+    // desyncs. Guard the coupling against the same piece literals chrome.zig renders.
+    const gw = vaxis.gwidth.gwidth("\"? episode history gone ", .unicode) +
+        vaxis.gwidth.gwidth("· ", .unicode) +
+        vaxis.gwidth.gwidth("y", .unicode) +
+        vaxis.gwidth.gwidth(" confirm ", .unicode) +
+        vaxis.gwidth.gwidth("· ", .unicode) +
+        vaxis.gwidth.gwidth("esc", .unicode) +
+        vaxis.gwidth.gwidth(" cancel", .unicode);
+    try testing.expectEqual(@as(usize, 48), gw);
+}
+
 test "scrollIntoView keeps the cursor within the viewport" {
     var app: App = .{};
     // 10 rows, viewport of 4.

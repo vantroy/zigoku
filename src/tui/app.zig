@@ -1408,7 +1408,7 @@ pub const App = struct {
         const st = self.store orelse return;
         // Delete through the store BEFORE compacting the slice: rec.source/source_id
         // alias the history arena, which the memmove below overwrites.
-        _ = st.deleteAnime(rec.source, rec.source_id) catch |e| {
+        const removed = st.deleteAnime(rec.source, rec.source_id) catch |e| {
             log.debug("deleteAnime failed: {s}", .{@errorName(e)});
             self.pushToast(.warn, "delete failed", false);
             return;
@@ -1434,7 +1434,16 @@ pub const App = struct {
         const cap = self.filteredHistoryLen();
         if (self.list_cursor >= cap) self.list_cursor = if (cap == 0) 0 else cap - 1;
 
-        self.pushToast(.success, "show deleted", false);
+        // The success toast is the user's only signal the DB write landed, and this
+        // is a no-undo action, so only claim a delete the store actually made. A false
+        // return means the row was already gone (a memory/store desync): the phantom
+        // is dropped from the list above either way, but don't toast a delete that
+        // didn't happen (ROD-220 review).
+        if (removed) {
+            self.pushToast(.success, "show deleted", false);
+        } else {
+            self.pushToast(.warn, "already gone", false);
+        }
     }
 
     pub fn cellPx(self: *const App) [2]u16 {

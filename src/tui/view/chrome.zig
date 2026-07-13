@@ -123,7 +123,10 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
 
             // Title (text.primary + bold) gets the width left after the fixed tail, so
             // the y/esc hints stay on-screen; "…"-truncate when the title overruns.
-            const tail_cols: u16 = 48; // display width of the seg1..cancel tail below.
+            // Display width of the fixed seg1..cancel tail rendered below. A drift
+            // guard test (app_test.zig "confirm tail width matches ...") fails if the
+            // tail wording changes without bumping this.
+            const tail_cols: u16 = 48;
             const budget: u16 = (w -| col) -| tail_cols;
             const shown: []const u8 = if (vaxis.gwidth.gwidth(title, .unicode) <= budget)
                 title
