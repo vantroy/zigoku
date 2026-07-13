@@ -1872,11 +1872,47 @@ pub const App = struct {
     }
 
     pub fn setHistory(self: *App, recs: []AnimeRecord) void {
+        // Anchor the cursor to the focused SHOW, not its ordinal, across a reload.
+        // `list_cursor` is a grouped/filtered ordinal (§5.4); a post-play reload
+        // floats the just-watched show to the top of its group, so a fixed ordinal
+        // would strand the cursor on whatever slid into that slot: the panel would
+        // jump to a different show while the episode grid (bound to for_source/id)
+        // stayed on the one just played. Capture the focused row's key before the
+        // swap, re-find it after, so the cursor follows the show. Key bytes alias the
+        // old (still-live) history arena, so copy them out before overwriting the
+        // slice. Empty on the initial load (no prior selection) → no-op.
+        //
+        // Gate on the history context: `list_cursor` is SHARED with Browse/Discover,
+        // where it means an entirely different row. A background reload (a sync
+        // reconcile) can land in any view, so only re-anchor when the cursor is
+        // actually a history ordinal right now; otherwise leave it alone.
+        const in_history_ctx = self.active_view == .history or
+            (self.active_view == .detail and self.detail_origin == .history);
+        var anchor_src: [64]u8 = undefined;
+        var anchor_id: [128]u8 = undefined;
+        const anchor: ?struct { src: []const u8, id: []const u8 } = blk: {
+            if (!in_history_ctx) break :blk null;
+            const rec = self.selectedHistoryRecord() orelse break :blk null;
+            if (rec.source.len > anchor_src.len or rec.source_id.len > anchor_id.len) break :blk null;
+            @memcpy(anchor_src[0..rec.source.len], rec.source);
+            @memcpy(anchor_id[0..rec.source_id.len], rec.source_id);
+            break :blk .{ .src = anchor_src[0..rec.source.len], .id = anchor_id[0..rec.source_id.len] };
+        };
+
         self.history = recs;
         self.history_loading = false;
         // ROD-234: a successful (re)load clears any prior history-load banner, so a
         // transient failure can never latch History as "unavailable" for the session.
         self.load_error = null;
+
+        // Re-find the anchored show's new ordinal. Falls through to the clamp when the
+        // show is gone (removed remotely) or a filter now hides it.
+        if (anchor) |a| {
+            if (history.ordinalOf(self, a.src, a.id)) |ord| {
+                self.list_cursor = ord;
+                return;
+            }
+        }
         // Clamp against filtered len so an active filter can't leave the cursor
         // pointing past the visible range when history reloads.
         const cap = self.filteredHistoryLen();

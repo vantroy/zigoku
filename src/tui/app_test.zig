@@ -410,6 +410,57 @@ test "setHistory clamps an out-of-range cursor" {
     try testing.expectEqual(@as(usize, 0), app.list_cursor);
 }
 
+test "setHistory follows the focused show across a reorder, not its ordinal" {
+    // The play-then-reload bug: cursor on the 3rd watching show; the post-play
+    // reload floats that show to the top of the group. A raw ordinal would strand
+    // the cursor on whatever slid into slot 2 (the panel jumps to a different show
+    // while the episode grid stays on the one just played). The cursor must track
+    // the show.
+    var before = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "first", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "second", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "chainsmoker", .list_status = .watching },
+    };
+    var app: App = .{};
+    app.active_view = .history;
+    app.setHistory(&before);
+    app.list_cursor = 2; // focused on "chainsmoker"
+    try testing.expectEqualStrings("chainsmoker", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
+
+    // Reload: last_watched DESC floats the just-played show to the top.
+    var after = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "3", .title = "chainsmoker", .list_status = .watching },
+        .{ .source = "s", .source_id = "1", .title = "first", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "second", .list_status = .watching },
+    };
+    app.setHistory(&after);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testing.expectEqualStrings("chainsmoker", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
+}
+
+test "setHistory leaves a shared cursor alone outside the history context" {
+    // `list_cursor` is shared with Browse/Discover. A background reload (sync
+    // reconcile) can land in any view; it must not reinterpret the Browse cursor
+    // as a history ordinal and move it.
+    var before = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "a", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "b", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "c", .list_status = .watching },
+    };
+    var app: App = .{};
+    app.active_view = .browse;
+    app.history = &before;
+    app.list_cursor = 2;
+    var after = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "3", .title = "c", .list_status = .watching },
+        .{ .source = "s", .source_id = "1", .title = "a", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "b", .list_status = .watching },
+    };
+    app.setHistory(&after);
+    // Untouched (still in range): no anchor-follow while browsing.
+    try testing.expectEqual(@as(usize, 2), app.list_cursor);
+}
+
 test "scrollIntoView keeps the cursor within the viewport" {
     var app: App = .{};
     // 10 rows, viewport of 4.
