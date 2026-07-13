@@ -1237,7 +1237,7 @@ metadata stays the compact `28 eps · TV` line):
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
 
-  ▌  hjkl scroll · enter play · v pin · space/esc back                                  [h▌, d help, m+bold keys]
+  ▌  hjkl scroll · enter play · v provider · space/esc back                                  [h▌, d help, m+bold keys]
 ```
 
 Notes:
@@ -1274,7 +1274,7 @@ Notes:
   this mock keeps the two-row ROD-260 baseline for brevity rather than
   redrawing the full rail. The
   `nextAiringEpisode` countdown lands on the chips row (§4.4), not here,
-  shipped separately under the same ROD-261 ticket. `v pin` in the help line cycles
+  shipped separately under the same ROD-261 ticket. `v provider` in the help line cycles
   the provider pin (ROD-345); it's live on this zoom surface, same as the
   in-pane grid.
 
@@ -1710,7 +1710,7 @@ same per-field styling.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit                   [detail pane focused; space promotes to zoom §5.3]
+  ▌  hjkl scroll · h back · enter play · v provider · space zoom · q quit                   [detail pane focused; space promotes to zoom §5.3]
 ```
 
 Notes:
@@ -1743,7 +1743,7 @@ Notes:
   their own dedicated row below this compact line (§5.3a compact-line
   addendum), plus the chips-row airing countdown (§4.4); this mock keeps the
   two-field ROD-260 baseline for brevity rather than
-  redrawing a fully-enriched compact line. `v pin` in the help line is new
+  redrawing a fully-enriched compact line. `v provider` in the help line is new
   (ROD-345, §5.3a); it's live on this in-pane surface, same as the zoom.
 
 ---
@@ -1770,7 +1770,7 @@ focus, the zoom gets the full canvas: `left_w ≈ 60`, `right_w ≈ 96`,
                       [▸1][●2][●3][●4][●5][●6][ 7][ 8][ 9][10][11][12][13][14][15][16][17][18][19]
                       [20][21][22][23][24][25][26][27][28]
 
-  ▌  hjkl scroll · enter play · v pin · space/esc back
+  ▌  hjkl scroll · enter play · v provider · space/esc back
 ```
 
 The two-column internal split (`left_w / right_w`) uses `detail_two_col_min = 100`,
@@ -3275,11 +3275,12 @@ The keybind characters listed in the help line use `color.fg2` + bold (§1.3;
 ROD-220 retired the original underline spec, which never shipped). Surrounding
 text uses `color.fg3`. The `▌` uses `color.hot` + blink as always.
 
-**As shipped:** `drawBottomBar`'s idle-help branch (`chrome.zig`) currently
-renders the whole help string as one `color.fg3` span with no per-key
-emphasis; the bold-per-keybind treatment below is the target for that render
-path, not yet wired in. Bold IS live where keybind emphasis exists today: the
-ROD-220 confirm prompt (§6.5) and the top-bar tab strip (§3.4).
+**As shipped (ROD-387):** `drawBottomBar`'s idle-help branch (`chrome.zig`)
+renders the bold-per-keybind treatment below. Each per-view help line is
+modelled as an array of styled segments: keybind characters render
+`color.fg2` + bold, surrounding words render `color.fg3`. Bold was already
+live elsewhere before this: the ROD-220 confirm prompt (§6.5) and the
+top-bar tab strip (§3.4).
 
 **Character budget:** at 80 cols, the help line has ~74 chars after the `▌`
 and its padding. The strings below are written to fit that budget.
@@ -3295,7 +3296,7 @@ Bold keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
 #### Browse — normal, detail pane focused
 
 ```
-  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v provider · space zoom · q quit
 ```
 
 Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
@@ -3308,8 +3309,8 @@ in-pane grid renders at every two-pane width (narrower at `60 ≤ w < 100`:
 `v` cycles the open show's provider pin (ROD-345, §5.3a). Episodes load on detail
 entry, not on list hover (ROD-202: parity with History — scrolling Browse never
 fires a fetch). At 80 cols the string fits comfortably within the ~74-char
-budget: `hjkl scroll · h back · enter play · v pin · space zoom · q quit` is 63
-characters.
+budget: `hjkl scroll · h back · enter play · v provider · space zoom · q quit` is
+68 characters.
 
 #### History — normal, list pane focused
 
@@ -3332,7 +3333,7 @@ the same destructive-adjacent grouping the status keys already occupy.
 #### History — normal, detail pane focused (w ≥ 100)
 
 ```
-  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v provider · space zoom · q quit
 ```
 
 Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
@@ -3345,7 +3346,7 @@ History's two-pane range.
 #### History — normal, detail pane focused (60 ≤ w < 100)
 
 ```
-  ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
+  ▌  hjkl scroll · h back · enter play · v provider · space zoom · q quit
 ```
 
 Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
@@ -3359,7 +3360,7 @@ longer has a mid-tier variant.
 #### Detail (zoom) — normal
 
 ```
-  ▌  hjkl scroll · enter play · v pin · space/esc back
+  ▌  hjkl scroll · enter play · v provider · space/esc back
 ```
 
 Bold: `h`, `j`, `k`, `l`, `enter`, `v`, `space`, `esc`.
