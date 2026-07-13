@@ -725,9 +725,25 @@ Fully specified in Section 3.5. Component summary:
 | Idle help | default | `▌` blink `state.now` | — | `text.dim` |
 | Search | `/` | `/` static | `state.focus` + bold | `text.primary` + bold |
 | Command | `:` | `:` static | `state.now` + bold | `text.primary` + bold |
+| Confirm (delete) | `X` (History list) | `[!]` static `state.now` (▌ suppressed) | static text `text.muted` | title `text.primary` + bold |
 
 When search or command is active, the `▌` blink is suppressed — the prompt
-character takes its visual position.
+character takes its visual position. The confirm state (ROD-220, §6.5) is a
+fourth in-practice mode with the same suppression rule, driven by
+`confirm_delete` rather than `input_mode`.
+
+**Confirm prompt (80-col):**
+
+```
+[!] delete "Sousou no Frieren"? episode history gone · y confirm · esc cancel
+```
+
+`[!]` is `state.now`; static text (`delete "`, `"? episode history gone`, the
+`y confirm` / `esc cancel` labels) is `text.muted`; the `·` separators are
+`text.dim`; the show title is `text.primary` + bold, `…`-truncated against a
+~48-col fixed tail so the y/esc hints never scroll off. The `y`/`esc`
+keybind characters use the existing hot/fg2 + bold hint treatment, not
+underline (see §6.5 and §8).
 
 ### 4.3 Score Display
 
@@ -1567,7 +1583,7 @@ wide two-pane layout (§5.4a).
       [████████████████]  24 / 24 eps  · completed 2023-11-02
                                                                                      [d bar, d meta]
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit
 ```
 
 Notes:
@@ -1639,7 +1655,7 @@ record is focused.
     ● Fullmetal Alchemist: Brotherhood
       [████████████████]  64 / 64 eps
 
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit                          [list focused; help matches Browse §10.5]
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit                          [list focused; help matches Browse §10.5]
 ```
 
 **History preview — detail stack (authoritative).** The ASCII mocks in this
@@ -2169,6 +2185,7 @@ Notes:
 | `r` | Recompute progress for selected show (History list pane only; no-op elsewhere) |
 | `u` | Undo last status mutation (single-level, History list pane only) |
 | `P` | "Plan it": add highlighted browse result to the watchlist as planning (Browse list pane) / set focused entry's status to planning — the 5th manual transition (History list pane) |
+| `X` | Arm the hard-delete confirm for the cursor-focused show (History list pane only, normal mode; ROD-220, see §6.5) |
 
 Pane focus is indicated by the `·` dot on the right side of the top bar: `state.focus`
 color when the detail pane is active, `text.dim` when the list is active.
@@ -2217,6 +2234,47 @@ not persist history between sessions (can be added later).
   search is async (AniList), show `[~]` in the bottom bar while results are pending.
   The existing visible results remain until new ones arrive — no flash to empty.
 - **Focus changes:** immediate. No cursor animation.
+
+### 6.5 Hard-Delete Confirm (ROD-220)
+
+`X` (shift+x) in the History **list** pane, normal mode, arms a hard-delete
+confirm on the cursor-focused show: a no-op if the list isn't focused or the
+cursor names no entry. Lowercase `x` is untouched (still `.dropped`, §6.1),
+a distinct codepoint, so there is no collision.
+
+Arming replaces the bottom bar with the §4.2 confirm prompt: a third
+bottom-command-line mode alongside idle/search, reusing the Settings
+edit-mode hijack pattern (§5.5). The list pane stays visible but **frozen**.
+Cursor keys, pane switches, and view switches (including `q`) do not reach
+it while armed. The `▌` blink is suppressed for the same reason it is
+suppressed in search: the `[!]` glyph takes its position.
+
+**Key handling while armed:**
+
+| Key | Effect |
+|---|---|
+| `y` / `Y` | Execute the delete |
+| `X` (repeat) | No-op, stays armed. A key-repeat storm can't self-confirm. |
+| `Ctrl-C` | Still hard-quits (emergency exit, unchanged) |
+| `Esc`, `Enter`, anything else | Cancel, return to idle |
+
+`q` does **not** quit while armed. It falls into the "anything else"
+cancel path and is swallowed, matching the "any non-y cancels" reading (§8
+logs this call over the ticket's stray-key ambiguity). Deleting executes a
+cascading `DELETE` (episode history and cache follow via existing FKs),
+drops the row from the in-memory list, and holds the cursor on its ordinal
+(now the next row) unless the deleted row was last, in which case it steps
+back one; deleting the only remaining show falls to the §9.2/§9.5 empty
+state. A stale single-level undo (`u`, §6.1) pointing at the deleted row is
+cleared. Deleting the currently-playing show is refused with a warn toast:
+the TUI never kills mpv out from under itself.
+
+**Frozen list, reload-cancels:** a background history reload (post-play
+float, ROD-386-style reconcile) reorders the underlying slice, so any armed
+confirm is silently cancelled the moment a reload lands. The stored row
+index can no longer be trusted to name the row the prompt is showing. This
+is a correctness guard, not a UX nicety: firing a stale-indexed delete would
+destroy the wrong show's history.
 
 ---
 
@@ -2403,6 +2461,9 @@ revisited without archaeology.
 | Provider field lists providers in fixed registry (construction) order, not `Registry.ordered`'s per-walk preference view (ROD-348) | `ordered` is a resolve-order hint, recomputed per preference and per walk (ROD-344); using it here would make the same show's rail read in a different column order across sessions as the user's global or per-show preference changes, breaking "scan the same column, same order, every show." The rail is a status display of what's out there, not a queue of what to try next, so it wants a stable reference order instead. | If the registry grows past 4-5 providers and scanning a long fixed-order row gets noisy, consider grouping bound-first rather than reordering by preference: preference and "what's out there" are still different questions. |
 | Provider and Pinned surface in the compact form on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356 compact-line fix) | A smoke test found Provider and Pinned invisible on every compact-width detail pane, since a `rail_only` field never blooms below `detail_two_col_min`. A first attempt folded them into the joined line itself, reordering it so they'd survive clipping; rejected on sight, this is a different category of fact (routing/session state) from the AniList enrichment the joined line otherwise carries, and interleaving muddied both. The `MetaField` list, its order, and every `rail_only` flag revert to the original ROD-348/356/345 shape; the fix lives entirely in a new bespoke compact-form row drawn beneath the joined line, `drawProviderLine`, outside the generic field-list iteration either renderer uses. | If a third field ever needs the same "own row" treatment, generalize `drawProviderLine` into a small family of bespoke compact rows rather than routing a third concept through it by special case. |
 | Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356 compact-line fix) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare `megaplay` reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `drawProviderLine` itself, not a generic `MetaField` mechanism, since this row sits outside the field-list iteration; a `prefix` field added to `MetaField` for the rejected joined-line attempt has no consumer once that attempt reverted and is cut. Folding Pinned into Provider's token list instead (a marker on the pinned token) was considered and rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over reviving a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
+| `X` is History's first uppercase key that is destructive with **no undo path** (ROD-220) | Every other History key, including the uppercase `P` ("plan it") and the view switches `B`/`H`/`D`/`S`, is additive or navigational: reversible by another keypress or covered by `u`'s single-level undo (§6.1). Hard-delete cascades the DB row and its episode history; there is nothing for `u` to restore. That is a step change in severity, so it gets its own confirmation layer (§4.2, §6.5) instead of the toast-and-undo pattern the rest of History relies on. Splitting execution onto a separate `y`/`Y` key rather than "press `X` twice" specifically defeats key-repeat: a held or auto-repeating `X` keeps delivering `X` (a no-op once armed, §6.5), never `y`, so a repeat storm cannot self-confirm the delete. | If a second no-undo destructive action is ever added, reuse this pattern (armed state plus distinct confirm key) rather than inventing a fresh one. |
+| Confirm's `y`/`esc` hints use the existing bold hint treatment, not underline (ROD-220, deviates from ticket text) | The ROD-220 brief called for underline on the hint keys. The codebase has zero underline usage anywhere, and `App.s()` (§7.1) has no underline field: inventing one for a single prompt would be a one-off token nothing else uses, and §10.5 already specs underline for the persistent help-line keybinds without ever shipping it, so this is a pre-existing spec/implementation gap, not a new one. Rendered the hints with the established hot/fg2 + bold hint convention instead. | Open: either add a real underline style token (and retrofit §10.5's help line to match), or bless bold as the permanent hint treatment and correct §10.5's wording to what's shipped. Rod to decide. |
+| Any non-`y` key cancels the armed confirm; it does not absorb-and-stay-armed (ROD-220, deviates from ticket text) | The ROD-220 brief was internally inconsistent: the interaction table said stray keys "absorb / stay armed," the DoD said "any other key cancels." Rod chose the forgiving reading: a stray keypress (typo, accidental arrow) drops back to idle rather than trapping the user in a frozen bottom bar they didn't mean to enter, at the cost of a re-press of `X` to retry. `X` itself is the one carve-out (no-op, stays armed, §6.5); that exception exists purely to block key-repeat self-confirm (see the row above), not to generalize into a broader absorb list. | If testing shows accidental cancels are common, reconsider a narrow allowlist of truly inert keys before reopening "absorb" more broadly. |
 
 ---
 
@@ -3241,10 +3302,10 @@ characters.
 #### History — normal, list pane focused
 
 ```
-  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit
+  ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit
 ```
 
-Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `r`, `u`, `q`.
+Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `X`, `r`, `u`, `q`.
 
 Note: the view keys are NOT in this line — the top-bar tab strip (§3.4, ROD-250)
 carries `[B]rowse · [H]istory · [D]iscover · [S]ettings` persistently, so the
@@ -3253,6 +3314,8 @@ bottom bar spends its width on view-specific actions instead.
 pane grammar (ROD-170), and its local filter (ROD-211, distinct from Browse's
 catalogue search) isn't obvious in a watchlist without the hint. Over budget at
 80 cols, so the tail clips; `/ filter` sits near the front to survive it.
+`X delete` (ROD-220, §6.5) was inserted after the `p/x/c/w/P status` cluster,
+the same destructive-adjacent grouping the status keys already occupy.
 
 #### History — normal, detail pane focused (w ≥ 100)
 

@@ -51,6 +51,24 @@ pub fn onKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, registry: Regi
     // doesn't consume falls through to the global chain below.
     if (self.active_view == .settings and onSettingsKey(self, key, loop, io)) return;
 
+    // ROD-220: a hard-delete confirm is armed. Intercept every key ahead of the
+    // global chain so q, the F-key/letter view switches, and list-nav can't leak
+    // through the frozen prompt. Ctrl-C still hard-quits (the emergency exit). y/Y
+    // execute; a re-pressed X is a no-op (never self-confirms); Esc, Enter, and any
+    // other key cancel, the safe default (ROD-220 spec §3, DoD).
+    if (self.confirm_delete != null) {
+        if (key.matches('c', .{ .ctrl = true })) {
+            self.should_quit = true;
+        } else if (key.matches('y', .{}) or key.matches('Y', .{ .shift = true }) or key.matches('Y', .{})) {
+            self.executeDelete();
+        } else if (key.matches('X', .{ .shift = true }) or key.matches('X', .{})) {
+            // no-op: stays armed, so a key-repeat storm can't dismiss-and-refire.
+        } else {
+            self.confirm_delete = null;
+        }
+        return;
+    }
+
     // q quits the app — full stop (§10.6, ROD-210), with no back-nav: unlike
     // Esc, q never peels a layer. The `input_mode == .normal` guard keeps a
     // literal "q" typed into a Browse search or History filter from quitting —
@@ -666,6 +684,13 @@ pub fn onHistoryMutationKey(self: *App, key: vaxis.Key) bool {
         return true;
     } else if (key.matches('x', .{})) {
         self.setSelectedHistoryStatus(.dropped);
+        return true;
+    } else if (key.matches('X', .{ .shift = true }) or key.matches('X', .{})) {
+        // ROD-220: arm the hard-delete confirm. Shift+x is a distinct codepoint from
+        // the lowercase x (.dropped) above, so no collision. The destructive step
+        // waits on a separate y/Y in onKey's confirm interceptor. A mashed X only
+        // re-arms the same row, it can never confirm itself.
+        self.armDelete();
         return true;
     } else if (key.matches('c', .{})) {
         self.setSelectedHistoryStatus(.completed);

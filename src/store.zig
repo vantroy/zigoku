@@ -1043,6 +1043,21 @@ pub const Store = struct {
         return std.fmt.bufPrint(buf, "{d}", .{anilist_id}) catch null;
     }
 
+    /// Hard-delete a show and everything under it (ROD-220). The single DELETE on
+    /// `anime` cascades to `episode_progress` and `episode_cache` via their
+    /// ON DELETE CASCADE FKs (see the schema + the cascade test). Keyed on
+    /// (source, source_id) so it hits exactly the watchlist row the History cursor
+    /// names, never its canonical siblings on other providers. Returns whether a row
+    /// was actually removed so the caller can suppress a success toast on a no-op.
+    pub fn deleteAnime(self: *Store, source: []const u8, source_id: []const u8) Error!bool {
+        const stmt = try self.prepare("DELETE FROM anime WHERE source = ? AND source_id = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, source);
+        try bindText(stmt, 2, source_id);
+        try self.stepDone(stmt);
+        return c.sqlite3_changes(self.db) > 0;
+    }
+
     /// Map a freshly-fetched domain row into the store, set `history_visible`, and
     /// (ONLY when `stamp_fresh`) advance the enrichment freshness clock, then upsert
     /// (ROD-280).
@@ -4386,6 +4401,31 @@ test "foreign key cascade deletes progress and cache with its anime" {
     try s.exec("DELETE FROM anime WHERE source_id = 'x';");
     try testing.expect((try s.getResume(T_SOURCE, "x", .sub, "1")) == null);
     try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "x", .sub, 1001)) == null);
+}
+
+test "deleteAnime cascades episode history and reports whether a row went (ROD-220)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var s = try Store.openMemory();
+    defer s.close();
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "keep", .title = "Keep" }, 1000, arena);
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "gone", .title = "Gone" }, 1000, arena);
+    try s.saveProgress(T_SOURCE, "gone", .sub, "1", 100, 1400, 1001);
+    const eps = [_]domain.EpisodeNumber{.{ .raw = "1" }};
+    try s.putCachedEpisodes(T_SOURCE, "gone", .sub, &eps, "FINISHED", 1000, arena);
+
+    // The public delete keys on (source, source_id): it drops exactly one row and
+    // reports the hit, cascading its progress + cache.
+    try testing.expect(try s.deleteAnime(T_SOURCE, "gone"));
+    try testing.expect((try s.getAnime(arena, T_SOURCE, "gone")) == null);
+    try testing.expect((try s.getResume(T_SOURCE, "gone", .sub, "1")) == null);
+    try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "gone", .sub, 1001)) == null);
+    // The sibling row is untouched...
+    try testing.expect((try s.getAnime(arena, T_SOURCE, "keep")) != null);
+    // ...and a second delete of the now-gone row reports no change (no-op guard).
+    try testing.expect(!(try s.deleteAnime(T_SOURCE, "gone")));
 }
 
 test "recordPlay on an unknown show is a silent no-op" {

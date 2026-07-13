@@ -105,6 +105,55 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     const w = win.width;
     const row = h - 1;
 
+    // ROD-220 hard-delete confirm: a third bottom-bar mode alongside normal/search.
+    // Replace the whole bar with the danger prompt; the ▌ is suppressed (input is
+    // frozen behind the confirm). `input_mode` stays .normal while armed, so the
+    // search branches below never fire concurrently.
+    if (self.confirm_delete) |idx| {
+        if (idx < self.history.len) {
+            const title = self.history[idx].title;
+            var col: u16 = 1;
+
+            // "[!] " danger glyph in state.now, replacing the ▌ (the toast [!] glyph).
+            putClipped(win, row, col, w -| col, "[!] ", self.s(self.palette.hot, .{ .bold = true }));
+            col += 4;
+            const pre = "delete \"";
+            putClipped(win, row, col, w -| col, pre, self.s(self.palette.fg2, .{}));
+            col += @intCast(pre.len);
+
+            // Title (text.primary + bold) gets the width left after the fixed tail, so
+            // the y/esc hints stay on-screen; "…"-truncate when the title overruns.
+            const tail_cols: u16 = 48; // display width of the seg1..cancel tail below.
+            const budget: u16 = (w -| col) -| tail_cols;
+            const shown: []const u8 = if (vaxis.gwidth.gwidth(title, .unicode) <= budget)
+                title
+            else
+                render.truncateToWidth(&self.confirm_scratch, title, budget);
+            putClipped(win, row, col, w -| col, shown, self.s(self.palette.fg, .{ .bold = true }));
+            col += @intCast(vaxis.gwidth.gwidth(shown, .unicode));
+
+            // Tail in pieces: the y/esc keybind hints take the app's hint treatment
+            // (hot/fg2 + bold; there is no underline style token, and the ROD-220
+            // "underline" wording is deferred to the DESIGN doc). `·` is 2 bytes /
+            // 1 display column, so advance col by 1 for it, not by .len.
+            const seg1 = "\"? episode history gone ";
+            putClipped(win, row, col, w -| col, seg1, self.s(self.palette.fg2, .{}));
+            col += @intCast(seg1.len);
+            putClipped(win, row, col, w -| col, "· ", self.s(self.palette.fg3, .{}));
+            col += 2;
+            putClipped(win, row, col, w -| col, "y", self.s(self.palette.hot, .{ .bold = true }));
+            col += 1;
+            putClipped(win, row, col, w -| col, " confirm ", self.s(self.palette.fg2, .{}));
+            col += 9;
+            putClipped(win, row, col, w -| col, "· ", self.s(self.palette.fg3, .{}));
+            col += 2;
+            putClipped(win, row, col, w -| col, "esc", self.s(self.palette.fg2, .{ .bold = true }));
+            col += 3;
+            putClipped(win, row, col, w -| col, " cancel", self.s(self.palette.fg2, .{}));
+        }
+        return;
+    }
+
     // Search mode in Browse: suppress ▌, show /query_ + count.
     if (self.active_view == .browse and self.input_mode == .search) {
         const q = self.search.querySlice();
@@ -189,7 +238,7 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         .history => if (self.history.len == 0)
             "D discover · B browse · q quit"
         else switch (self.active_pane) {
-            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · r/u reset/undo · q quit",
+            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit",
             .detail => "hjkl scroll · h back · enter play · v pin · space zoom · q quit",
         },
         // The full-screen zoom: Space or Esc demote back to the pane; q quits.
