@@ -120,10 +120,10 @@ const help_browse_list = [_]HelpSeg{ key("hjkl"), txt(" · "), key("/"), txt(" f
 // Shared by Browse detail-focus and History detail-focus: symmetric two-pane
 // grammar (ROD-170), and the in-pane grid renders at every two-pane width
 // (ROD-259), so `enter` plays and `space` promotes to the zoom.
-const help_detail_pane = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("h"), txt(" back · "), key("enter"), txt(" play · "), key("v"), txt(" pin · "), key("space"), txt(" zoom · "), key("q"), txt(" quit") };
+const help_detail_pane = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("h"), txt(" back · "), key("enter"), txt(" play · "), key("v"), txt(" provider · "), key("space"), txt(" zoom · "), key("q"), txt(" quit") };
 const help_history_empty = [_]HelpSeg{ key("D"), txt(" discover · "), key("B"), txt(" browse · "), key("q"), txt(" quit") };
 const help_history_list = [_]HelpSeg{ key("jk"), txt(" move · "), key("/"), txt(" filter · "), key("l"), txt("/"), key("enter"), txt(" detail · "), key("p"), txt("/"), key("x"), txt("/"), key("c"), txt("/"), key("w"), txt("/"), key("P"), txt(" status · "), key("X"), txt(" delete · "), key("r"), txt("/"), key("u"), txt(" reset/undo · "), key("q"), txt(" quit") };
-const help_zoom = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("enter"), txt(" play · "), key("v"), txt(" pin · "), key("space"), txt("/"), key("esc"), txt(" back · "), key("q"), txt(" quit") };
+const help_zoom = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("enter"), txt(" play · "), key("v"), txt(" provider · "), key("space"), txt("/"), key("esc"), txt(" back · "), key("q"), txt(" quit") };
 const help_discover = [_]HelpSeg{ key("hjkl"), txt(" move · "), key("enter"), txt(" open · "), key("P"), txt(" save · "), key("["), txt(" "), key("]"), txt(" axis · "), key("/"), txt(" search · "), key("q"), txt(" quit") };
 const help_settings_edit = [_]HelpSeg{ txt("type to edit · "), key("enter"), txt(" confirm · "), key("esc"), txt(" cancel") };
 const help_settings = [_]HelpSeg{ key("hjkl"), txt(" navigate · "), key("space"), txt(" toggle · "), key("enter"), txt(" edit · "), key("q"), txt(" save+quit") };
@@ -352,10 +352,10 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
 test "help segment arrays reproduce their §10.5 flat strings (ROD-387)" {
     const cases = .{
         .{ &help_browse_list, "hjkl · / find anime · P save · q quit" },
-        .{ &help_detail_pane, "hjkl scroll · h back · enter play · v pin · space zoom · q quit" },
+        .{ &help_detail_pane, "hjkl scroll · h back · enter play · v provider · space zoom · q quit" },
         .{ &help_history_empty, "D discover · B browse · q quit" },
         .{ &help_history_list, "jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit" },
-        .{ &help_zoom, "hjkl scroll · enter play · v pin · space/esc back · q quit" },
+        .{ &help_zoom, "hjkl scroll · enter play · v provider · space/esc back · q quit" },
         .{ &help_discover, "hjkl move · enter open · P save · [ ] axis · / search · q quit" },
         .{ &help_settings_edit, "type to edit · enter confirm · esc cancel" },
         .{ &help_settings, "hjkl navigate · space toggle · enter edit · q save+quit" },
