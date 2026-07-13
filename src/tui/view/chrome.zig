@@ -101,13 +101,11 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
 }
 
-// §10.5 idle help line: a run of text with the keybind characters promoted.
-// `bold` runs render fg2 + bold (the keybind chars); the rest render fg3. Splitting
-// the line into explicit runs (rather than parsing keys out of the string) is what
-// lets multi-char keys (`enter`/`space`/`esc`) and key letters buried in words
-// (`find`, `back`) land on the right emphasis. Concatenating each array's `t` fields
-// reproduces the flat string, so width and wording are unchanged from the pre-split
-// render, so only the per-key styling is new.
+// §10.5 idle help line, split into styled runs: keybind chars render fg2 + bold,
+// surrounding words fg3. Explicit runs (not key-parsing) because multi-char keys
+// (enter/space/esc) and key letters inside words (find, back) can't be lifted out
+// of a flat string. INVARIANT: concatenating an array's `t` fields reproduces its
+// flat help string, so wording and column budget stay put (the test below pins it).
 const HelpSeg = struct { t: []const u8, bold: bool };
 fn key(t: []const u8) HelpSeg {
     return .{ .t = t, .bold = true };
