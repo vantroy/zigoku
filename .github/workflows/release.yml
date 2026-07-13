@@ -19,8 +19,8 @@ on:
 
 jobs:
   # ── Fail fast before burning build minutes ─────────────────────────────────
-  # The version-sync test only catches root.zig↔zon drift, not tag drift or a
-  # missing changelog. These two guards close both gaps (push events only; the
+  # build.zig.zon is the single version source, so these guards cover what the
+  # build cannot: tag drift and a missing changelog (push events only; the
   # rehearsal path skips them so it can run against an unpromoted CHANGELOG).
   guard:
     runs-on: ubuntu-latest
@@ -42,7 +42,7 @@ jobs:
         run: |
           expected="v${{ steps.version.outputs.version }}"
           if [ "$GITHUB_REF_NAME" != "$expected" ]; then
-            echo "::error::tag '$GITHUB_REF_NAME' != in-repo version '$expected' — bump build.zig.zon + src/root.zig, or fix the tag"
+            echo "::error::tag '$GITHUB_REF_NAME' != in-repo version '$expected': bump build.zig.zon, or fix the tag"
             exit 1
           fi
           echo "tag $GITHUB_REF_NAME matches in-repo version"

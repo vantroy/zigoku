@@ -60,8 +60,7 @@ pub const StreamLink = domain.StreamLink;
 pub const Translation = domain.Translation;
 pub const Quality = domain.Quality;
 
-/// Zigoku version. Keep in sync with `build.zig.zon`.
-pub const version = "0.4.5";
+pub const version = @import("build_options").version;
 
 const banner =
     \\  ╋ zigoku · 地獄
@@ -89,13 +88,6 @@ test "writeVersion prints a clean line carrying the version" {
     try writeVersion(&aw.writer);
     const out = aw.writer.buffered();
     try std.testing.expectEqualStrings("zigoku v" ++ version ++ "\n", out);
-}
-
-test "version matches build.zig.zon" {
-    // Pin the literal so a bump here without the matching `.version` edit in
-    // build.zig.zon (or vice versa) trips CI — the "keep in sync" comment above
-    // otherwise has no teeth.
-    try std.testing.expectEqualStrings("0.4.5", version);
 }
 
 // Pull in the unit tests from every module so `zig build test` covers them all.

@@ -53,6 +53,10 @@ pub fn build(b: *std.Build) void {
         // that include this module inherit the linkage.
         .link_libc = true,
     });
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    mod.addImport("build_options", build_options.createModule());
+
     mod.addIncludePath(b.path("src/c"));
     // STBI_MAX_DIMENSIONS is injected from src/decode_limits.zig so the stb and
     // libwebp decode-bomb backstops share one value (see cover.zig).
