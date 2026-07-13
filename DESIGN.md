@@ -107,7 +107,11 @@ native field — rather than generalizing it to "any non-primary row" — is wha
 keeps the default `romaji` preference rendering byte-for-byte identical to
 today, since today's English alt row is already plain `fg2`, never italic.
 
-**Underline is for navigation hints only** — keybind characters in the help line.
+**Underline is unused.** Keybind characters in help lines and confirm prompts use
+bold instead (the same "promotion" treatment as H1/H2 above). Underline was the
+original spec for this role; it never shipped (`App.s()`, §7.1, carries no
+underline field), so ROD-220 retires it and formalizes bold as the permanent
+keybind-hint treatment.
 
 **Blink is used exactly once** — the `▌` status cursor. Nowhere else.
 
@@ -412,7 +416,8 @@ Single row. Full terminal width. This row does triple duty:
 ```
 - `▌` in `state.now`, blinking ~1hz.
 - Text in `text.dim`.
-- Keybind characters (h, j, k, l, /, :, q) in `text.muted` + underline.
+- Keybind characters (h, j, k, l, /, :, q) in `text.muted` + bold (§1.3; ROD-220
+  retired the original underline spec, see §10.5 for the as-shipped caveat).
 
 **State 2 — Search active (triggered by `/`):**
 ```
@@ -742,8 +747,8 @@ fourth in-practice mode with the same suppression rule, driven by
 `y confirm` / `esc cancel` labels) is `text.muted`; the `·` separators are
 `text.dim`; the show title is `text.primary` + bold, `…`-truncated against a
 ~48-col fixed tail so the y/esc hints never scroll off. The `y`/`esc`
-keybind characters use the existing hot/fg2 + bold hint treatment, not
-underline (see §6.5 and §8).
+keybind characters use the standard hot/fg2 + bold keybind-hint treatment
+(§1.3, §8).
 
 ### 4.3 Score Display
 
@@ -1159,7 +1164,7 @@ Terminal width: 120 cols. List col: 44 cols. Detail col: 74 cols.
                                                        continent without purpose, until
                                                        she meets a young girl…
                                                                                          [spacer]
-  ▌  hjkl · / search · : command · q quit                                               [h▌ blink, d text, m+underline keys]
+  ▌  hjkl · / search · : command · q quit                                               [h▌ blink, d text, m+bold keys]
 ```
 
 > **Score tokens in the Browse wireframes (§5.1, §5.2) are drawn in the long
@@ -1232,7 +1237,7 @@ metadata stays the compact `28 eps · TV` line):
                             [13][14][15][16][17][18][19][20][21][22][23][24]
                             [25][26][27][28]
 
-  ▌  hjkl scroll · enter play · v pin · space/esc back                                  [h▌, d help, m+underline keys]
+  ▌  hjkl scroll · enter play · v pin · space/esc back                                  [h▌, d help, m+bold keys]
 ```
 
 Notes:
@@ -2462,7 +2467,7 @@ revisited without archaeology.
 | Provider and Pinned surface in the compact form on their own dedicated row, not as segments of the joined `·` meta line (ROD-348/356 compact-line fix) | A smoke test found Provider and Pinned invisible on every compact-width detail pane, since a `rail_only` field never blooms below `detail_two_col_min`. A first attempt folded them into the joined line itself, reordering it so they'd survive clipping; rejected on sight, this is a different category of fact (routing/session state) from the AniList enrichment the joined line otherwise carries, and interleaving muddied both. The `MetaField` list, its order, and every `rail_only` flag revert to the original ROD-348/356/345 shape; the fix lives entirely in a new bespoke compact-form row drawn beneath the joined line, `drawProviderLine`, outside the generic field-list iteration either renderer uses. | If a third field ever needs the same "own row" treatment, generalize `drawProviderLine` into a small family of bespoke compact rows rather than routing a third concept through it by special case. |
 | Pinned's dedicated-row segment gets a `pin ` prefix; Provider's does not (ROD-348/356 compact-line fix) | Pinned's value is a bare raw provider name, ambiguous once it sits next to Provider's own token list on the same unlabeled row (a trailing bare `megaplay` reads as an unmarked provider token, not the pin). Provider's value already carries its own marker glyphs (`▸ + - ?`), which self-disambiguate without a label. The `pin ` marker is a literal composed inside `drawProviderLine` itself, not a generic `MetaField` mechanism, since this row sits outside the field-list iteration; a `prefix` field added to `MetaField` for the rejected joined-line attempt has no consumer once that attempt reverted and is cut. Folding Pinned into Provider's token list instead (a marker on the pinned token) was considered and rejected: a pin can target a provider independent of its bound/absent/unchecked state, so a folded marker would need to represent combinations the tri-state grammar was not designed for, for a marginal width saving, and it would lose Pinned's independent omit-when-unset behavior. | If a similar disambiguation need comes up for a future bespoke row, prefer a literal composed in that row's own renderer over reviving a generic `MetaField.prefix`, unless a third bespoke row needs the exact same decoration. |
 | `X` is History's first uppercase key that is destructive with **no undo path** (ROD-220) | Every other History key, including the uppercase `P` ("plan it") and the view switches `B`/`H`/`D`/`S`, is additive or navigational: reversible by another keypress or covered by `u`'s single-level undo (§6.1). Hard-delete cascades the DB row and its episode history; there is nothing for `u` to restore. That is a step change in severity, so it gets its own confirmation layer (§4.2, §6.5) instead of the toast-and-undo pattern the rest of History relies on. Splitting execution onto a separate `y`/`Y` key rather than "press `X` twice" specifically defeats key-repeat: a held or auto-repeating `X` keeps delivering `X` (a no-op once armed, §6.5), never `y`, so a repeat storm cannot self-confirm the delete. | If a second no-undo destructive action is ever added, reuse this pattern (armed state plus distinct confirm key) rather than inventing a fresh one. |
-| Confirm's `y`/`esc` hints use the existing bold hint treatment, not underline (ROD-220, deviates from ticket text) | The ROD-220 brief called for underline on the hint keys. The codebase has zero underline usage anywhere, and `App.s()` (§7.1) has no underline field: inventing one for a single prompt would be a one-off token nothing else uses, and §10.5 already specs underline for the persistent help-line keybinds without ever shipping it, so this is a pre-existing spec/implementation gap, not a new one. Rendered the hints with the established hot/fg2 + bold hint convention instead. | Open: either add a real underline style token (and retrofit §10.5's help line to match), or bless bold as the permanent hint treatment and correct §10.5's wording to what's shipped. Rod to decide. |
+| Confirm's `y`/`esc` hints use the existing bold hint treatment, not underline (ROD-220, deviates from ticket text) | The ROD-220 brief called for underline on the hint keys. The codebase has zero underline usage anywhere, and `App.s()` (§7.1) has no underline field: inventing one for a single prompt would be a one-off token nothing else uses, and §10.5 already specs underline for the persistent help-line keybinds without ever shipping it, so this is a pre-existing spec/implementation gap, not a new one. Rendered the hints with the established hot/fg2 + bold hint convention instead. | **Resolved:** Rod blessed bold as the permanent keybind-hint treatment across the doc. Underline is retired from the spec (§1.3, §3.5, §10.5 updated to match); it never shipped anywhere, so nothing is lost. |
 | Any non-`y` key cancels the armed confirm; it does not absorb-and-stay-armed (ROD-220, deviates from ticket text) | The ROD-220 brief was internally inconsistent: the interaction table said stray keys "absorb / stay armed," the DoD said "any other key cancels." Rod chose the forgiving reading: a stray keypress (typo, accidental arrow) drops back to idle rather than trapping the user in a frozen bottom bar they didn't mean to enter, at the cost of a re-press of `X` to retry. `X` itself is the one carve-out (no-op, stays armed, §6.5); that exception exists purely to block key-repeat self-confirm (see the row above), not to generalize into a broader absorb list. | If testing shows accidental cancels are common, reconsider a narrow allowlist of truly inert keys before reopening "absorb" more broadly. |
 
 ---
@@ -2712,8 +2717,9 @@ Rendering rules:
   users who already know the title. ROD-254: an empty watchlist is a user who
   doesn't yet know what to watch, so the first action is the zero-input Discover
   feed (ROD-247), not Browse's blank `/` prompt — this supersedes ROD-211's Browse
-  pointer (written before Discover shipped). Do not underline — the help line
-  already owns the underline treatment for keybinds.
+  pointer (written before Discover shipped). Bold alone marks the keybind here;
+  it is the same treatment the help line uses (§1.3), so nothing further is
+  layered on top.
 - Bottom bar: idle help line as normal (§3.5 State 1), including the `▌` blink.
   The empty state does not suppress navigation.
 - The message block is treated as a unit for centering: headline at `mid -2`, the
@@ -3265,9 +3271,15 @@ The help line is the idle state of the bottom bar (§3.5 State 1). It updates pe
 view. The `▌` blink and rendering rules from §3.5 are unchanged; only the text
 content varies.
 
-The keybind characters listed in the help line use `color.fg2` + underline
-(§1.3: "Underline is for navigation hints only"). Surrounding text uses
-`color.fg3`. The `▌` uses `color.hot` + blink as always.
+The keybind characters listed in the help line use `color.fg2` + bold (§1.3;
+ROD-220 retired the original underline spec, which never shipped). Surrounding
+text uses `color.fg3`. The `▌` uses `color.hot` + blink as always.
+
+**As shipped:** `drawBottomBar`'s idle-help branch (`chrome.zig`) currently
+renders the whole help string as one `color.fg3` span with no per-key
+emphasis; the bold-per-keybind treatment below is the target for that render
+path, not yet wired in. Bold IS live where keybind emphasis exists today: the
+ROD-220 confirm prompt (§6.5) and the top-bar tab strip (§3.4).
 
 **Character budget:** at 80 cols, the help line has ~74 chars after the `▌`
 and its padding. The strings below are written to fit that budget.
@@ -3278,7 +3290,7 @@ and its padding. The strings below are written to fit that budget.
   ▌  hjkl · / find anime · P save · q quit
 ```
 
-Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
+Bold keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
 
 #### Browse — normal, detail pane focused
 
@@ -3286,7 +3298,7 @@ Underlined keybinds: `h`, `j`, `k`, `l`, `/`, `P`, `q`.
   ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
+Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
 Note: `q` quits the app (ROD-210) — `h`/`Esc` return focus to the list. Browse uses this string at all two-pane
 widths (`w ≥ 60`) — `enter play` and `space zoom` are always present. The
@@ -3305,7 +3317,7 @@ characters.
   ▌  jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit
 ```
 
-Underlined: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `X`, `r`, `u`, `q`.
+Bold: `j`, `k`, `/`, `l`, `enter`, `p`, `x`, `c`, `w`, `P`, `X`, `r`, `u`, `q`.
 
 Note: the view keys are NOT in this line — the top-bar tab strip (§3.4, ROD-250)
 carries `[B]rowse · [H]istory · [D]iscover · [S]ettings` persistently, so the
@@ -3323,7 +3335,7 @@ the same destructive-adjacent grouping the status keys already occupy.
   ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
+Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
 Identical to Browse detail pane focused — symmetric two-pane grammar,
 including `v` (ROD-345, §5.3a). Also identical, since ROD-259, to History's
@@ -3336,7 +3348,7 @@ History's two-pane range.
   ▌  hjkl scroll · h back · enter play · v pin · space zoom · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
+Bold: `h`, `j`, `k`, `l`, `h`, `enter`, `v`, `space`, `q`.
 
 The in-pane grid renders at this width too now (ROD-259) — narrower
 (`detail_w ≈ 25` at `w = 60` → ≈ 5 columns) but real. `Enter` plays the focused
@@ -3350,7 +3362,7 @@ longer has a mid-tier variant.
   ▌  hjkl scroll · enter play · v pin · space/esc back
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `enter`, `v`, `space`, `esc`.
+Bold: `h`, `j`, `k`, `l`, `enter`, `v`, `space`, `esc`.
 
 `space/esc back` reinforces that both keys demote from zoom. `v` cycles the
 provider pin (ROD-345, §5.3a); the zoom is a detail surface like the in-pane
@@ -3363,7 +3375,7 @@ budget.
   ▌  D discover · B browse · q quit
 ```
 
-Underlined: `D`, `B`, `q`.
+Bold: `D`, `B`, `q`.
 
 This is the §9.2 empty state. Minimal help — the `/` filter is suppressed (nothing
 to filter), and the screen itself names the state and points first to Discover
@@ -3376,7 +3388,7 @@ to filter), and the screen itself names the state and points first to Discover
   ▌  hjkl navigate · space toggle · enter edit · q save+quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `space`, `enter`, `q`.
+Bold: `h`, `j`, `k`, `l`, `space`, `enter`, `q`.
 
 Settings persists a dirty tab on the way out, so `q` reads `q save+quit`
 (ROD-210; the `+` signals one press does both). `B`/`H`/`D` are surfaced so
@@ -3391,7 +3403,7 @@ cancel lives in the edit-mode line below. This matches the §5.5 mock.
   ▌  type value · enter confirm · esc cancel
 ```
 
-Underlined: `enter`, `esc`.
+Bold: `enter`, `esc`.
 
 The `▌` blink is suppressed in this mode — the field edit cursor takes that
 visual slot. However this help string still displays to confirm what keys are
@@ -3403,7 +3415,7 @@ available. The `▌` reappears when the edit is committed or cancelled.
   ▌  hjkl move · enter open · P save · [ ] axis · / search · q quit
 ```
 
-Underlined: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `q`.
+Bold: `h`, `j`, `k`, `l`, `enter`, `P`, `[`, `]`, `/`, `q`.
 
 `hjkl` navigate the card grid (left/right wrap within a row; up/down move card-rows).
 `enter` opens the detail zoom (`active_view = .detail`, `detail_origin = .discover`).
