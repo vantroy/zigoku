@@ -752,6 +752,13 @@ pub const App = struct {
     /// Topmost visible row index — the viewport offset for scrolling.
     list_top: usize = 0,
 
+    /// Hard-delete confirm, armed by X in History (ROD-220): the self.history index
+    /// of the row awaiting a y/Y. Non-null is a third bottom-bar mode alongside
+    /// normal/search (a nullable index, not an enum arm, because it carries the
+    /// pending row). Confirm is a separate key from the X trigger so a key-repeat
+    /// storm can't arm and fire in one burst.
+    confirm_delete: ?usize = null,
+
     /// Per-frame render scratch (formatted meta/bar/message strings). Grouped
     /// off application state so the list passes can take `*const App` (ROD-155);
     /// see RenderScratch for the vaxis by-reference lifetime contract.
@@ -988,6 +995,10 @@ pub const App = struct {
     /// the longest tag + a multi-digit count ("·" is 2 UTF-8 bytes; the full
     /// " · " separator is 4 — [16] fell one byte short for "[catalogue · NN]").
     cnt_scratch: [32]u8 = undefined,
+    /// Stable storage for the ROD-220 delete-confirm title when it needs a
+    /// "…" truncation (the arena title slice is used verbatim when it fits). App-
+    /// owned so vaxis holds a valid slice after drawBottomBar returns (ROD-141).
+    confirm_scratch: [128]u8 = undefined,
     /// Stable storage for the top-bar season/year chip text (e.g. "冬 2024",
     /// ROD-186). App-owned so vaxis holds a valid slice after drawTopBar returns
     /// (the ROD-141 cell-slice lifetime trap).
@@ -1358,6 +1369,81 @@ pub const App = struct {
     /// ordering definition (ROD-139).
     pub fn selectedHistoryRecord(self: *const App) ?AnimeRecord {
         return history.recordAtCursor(self);
+    }
+
+    /// Arm the ROD-220 hard-delete confirm on the cursor-focused row. No-op (no
+    /// feedback, nothing to delete) when the list pane isn't focused or the cursor
+    /// names no entry. Stores the raw `self.history` index; a background reload
+    /// clears it (see `setHistory`), so the index the confirm prompt renders can't
+    /// go stale under a swap. The destructive step is `executeDelete`, gated behind
+    /// a separate y/Y so a mashed X never confirms itself.
+    pub fn armDelete(self: *App) void {
+        if (self.active_pane != .list) return;
+        const idx = history.indexAtCursor(self) orelse return;
+        self.confirm_delete = idx;
+    }
+
+    /// Execute the armed hard-delete (ROD-220 §4): DELETE the show (cascading its
+    /// episode history), drop it from the in-memory list, reposition the cursor, and
+    /// toast. Blocks with a warn toast when the target show is the one currently
+    /// playing; we never kill mpv from the TUI. A no-op if nothing is armed or the
+    /// armed index no longer resolves.
+    pub fn executeDelete(self: *App) void {
+        const idx = self.confirm_delete orelse return;
+        self.confirm_delete = null;
+        if (idx >= self.history.len) return;
+        const rec = &self.history[idx];
+
+        // Currently-playing guard: this show's mpv session is live, so refuse and
+        // leave the row. The comparison keys on (source, source_id): the session's
+        // `anime_id` is the show's source_id (see PlaybackSession.begin).
+        if (self.playing and
+            std.mem.eql(u8, self.session.source, rec.source) and
+            std.mem.eql(u8, self.session.anime_id, rec.source_id))
+        {
+            self.pushToast(.warn, "can't delete, currently playing", false);
+            return;
+        }
+
+        const st = self.store orelse return;
+        // Delete through the store BEFORE compacting the slice: rec.source/source_id
+        // alias the history arena, which the memmove below overwrites.
+        const removed = st.deleteAnime(rec.source, rec.source_id) catch |e| {
+            log.debug("deleteAnime failed: {s}", .{@errorName(e)});
+            self.pushToast(.warn, "delete failed", false);
+            return;
+        };
+
+        // Drop the row from the live slice. Arena-backed value structs, so a plain
+        // compaction is enough: the freed row's strings die with the next reload's
+        // arena swap, never individually.
+        std.mem.copyForwards(AnimeRecord, self.history[idx..], self.history[idx + 1 ..]);
+        self.history = self.history[0 .. self.history.len - 1];
+
+        // A stale single-level undo may point at the now-gone row (matches r/recompute).
+        if (self.undo) |u| {
+            u.free(self.gpa);
+            self.undo = null;
+        }
+        // Defensive: the X trigger only arms in the list pane, but never execute a
+        // delete with the detail pane focused on a row that just vanished.
+        self.active_pane = .list;
+
+        // Same clamp as a reload: the cursor stays on the ordinal (now the next row)
+        // unless the deleted row was last, then it steps back one; empty → 0 (§9.2).
+        const cap = self.filteredHistoryLen();
+        if (self.list_cursor >= cap) self.list_cursor = if (cap == 0) 0 else cap - 1;
+
+        // The success toast is the user's only signal the DB write landed, and this
+        // is a no-undo action, so only claim a delete the store actually made. A false
+        // return means the row was already gone (a memory/store desync): the phantom
+        // is dropped from the list above either way, but don't toast a delete that
+        // didn't happen (ROD-220 review).
+        if (removed) {
+            self.pushToast(.success, "show deleted", false);
+        } else {
+            self.pushToast(.warn, "already gone", false);
+        }
     }
 
     pub fn cellPx(self: *const App) [2]u16 {
@@ -1899,6 +1985,10 @@ pub const App = struct {
 
         self.history = recs;
         self.history_loading = false;
+        // A reload (post-play float, sync reconcile) reorders the slice, so any armed
+        // ROD-220 delete index is now meaningless: cancel it rather than risk firing
+        // on a different row than the prompt named.
+        self.confirm_delete = null;
         // ROD-234: a successful (re)load clears any prior history-load banner, so a
         // transient failure can never latch History as "unavailable" for the session.
         self.load_error = null;

@@ -516,6 +516,210 @@ test "setHistory leaves a shared cursor alone outside the history context" {
     try testing.expectEqual(@as(usize, 2), app.list_cursor);
 }
 
+fn hasToastKind(app: *const App, kind: Toast.Kind) bool {
+    for (app.toast_queue) |slot| {
+        if (slot) |t| if (t.kind == kind) return true;
+    }
+    return false;
+}
+
+test "X + y hard-deletes the focused show, cascades, and holds the cursor (ROD-220)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    // Seed the store so the SQL delete actually hits a row (and cascades).
+    inline for (.{ "1", "2", "3" }) |id| {
+        try st.upsertAnime(.{ .source = "s", .source_id = id, .title = id, .history_visible = true }, 1000, arena);
+    }
+    try st.saveProgress("s", "2", .sub, "1", 100, 1400, 1001);
+
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "charlie", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 1; // focused on "bravo"
+
+    // X arms the confirm on the focused row; the list is untouched until y.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testing.expectEqual(@as(?usize, 1), app.confirm_delete);
+    try testing.expectEqual(@as(usize, 3), app.history.len);
+
+    // y fires it: bravo is gone from the list AND the store (cascade), the siblings
+    // survive in order, and the cursor holds ordinal 1 (now "charlie").
+    try testTick(&app, keyEv('y', .{}));
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete);
+    try testing.expectEqual(@as(usize, 2), app.history.len);
+    try testing.expectEqualStrings("alpha", app.history[0].title);
+    try testing.expectEqualStrings("charlie", app.history[1].title);
+    try testing.expectEqual(@as(usize, 1), app.list_cursor);
+    try testing.expect((try st.getAnime(arena, "s", "2")) == null);
+    try testing.expect((try st.getResume("s", "2", .sub, "1")) == null);
+    try testing.expect(hasToastKind(&app, .success));
+}
+
+test "delete confirm: q is absorbed, X re-arms, Esc/any-other cancels, only y fires (ROD-220)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 0;
+
+    // Esc cancels an armed confirm without deleting.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testing.expectEqual(@as(?usize, 0), app.confirm_delete);
+    try testTick(&app, .{ .key_press = .{ .codepoint = vaxis.Key.escape, .mods = .{} } });
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete);
+    try testing.expectEqual(@as(usize, 2), app.history.len);
+
+    // q is swallowed while armed: it must NOT quit (the key safety property). Under
+    // the chosen "any non-y cancels" semantics it also dismisses the confirm.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('q', .{}));
+    try testing.expect(!app.should_quit);
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete);
+
+    // A re-pressed X keeps it armed (never self-confirms); a stray key cancels.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testing.expectEqual(@as(?usize, 0), app.confirm_delete); // still armed
+    try testTick(&app, keyEv('z', .{}));
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete); // stray key canceled
+    try testing.expectEqual(@as(usize, 2), app.history.len);
+
+    // Ctrl-C still hard-quits even with a confirm armed (emergency exit).
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('c', .{ .ctrl = true }));
+    try testing.expect(app.should_quit);
+}
+
+test "X blocks deleting the currently-playing show (ROD-220)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 0;
+
+    // mpv is live on this exact show (session.anime_id is its source_id).
+    app.playing = true;
+    app.session.source = "s";
+    app.session.anime_id = "1";
+
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('y', .{}));
+    // Refused: the row stays, the confirm clears, and a warn toast fires.
+    try testing.expectEqual(@as(usize, 1), app.history.len);
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete);
+    try testing.expect(hasToastKind(&app, .warn));
+}
+
+test "deleting the only show empties history into the first-run state (ROD-220)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 0;
+
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('y', .{}));
+    try testing.expectEqual(@as(usize, 0), app.history.len);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+}
+
+test "a background reload cancels an armed delete confirm (ROD-220)" {
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 1;
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testing.expectEqual(@as(?usize, 1), app.confirm_delete);
+
+    // A reorder reload (post-play float, sync reconcile) invalidates the armed
+    // index, so setHistory clears it rather than risk firing on a moved row.
+    var reordered = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+    };
+    app.setHistory(&reordered);
+    try testing.expectEqual(@as(?usize, null), app.confirm_delete);
+}
+
+test "a confirmed delete nullifies a pending undo (ROD-220)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    app.store = &st;
+    inline for (.{ "1", "2" }) |id| {
+        try st.upsertAnime(.{ .source = "s", .source_id = id, .title = id, .history_visible = true }, 1000, arena);
+    }
+    var recs = [_]AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "alpha", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "bravo", .list_status = .watching },
+    };
+    app.setHistory(&recs);
+    app.list_cursor = 0;
+
+    // A real p (paused) mutation captures a single-level undo with GPA-owned keys.
+    try testTick(&app, keyEv('p', .{}));
+    try testing.expect(app.undo != null);
+
+    // Deleting nullifies it (a stale undo may point at a gone row). The test allocator
+    // fails on a leak, so this also proves the nullify frees the entry's keys.
+    try testTick(&app, keyEv('X', .{ .shift = true }));
+    try testTick(&app, keyEv('y', .{}));
+    try testing.expect(app.undo == null);
+}
+
+test "ROD-220 confirm tail width matches chrome.zig tail_cols (drift guard)" {
+    // chrome.zig's drawBottomBar sizes the delete-confirm title budget by reserving a
+    // hardcoded `tail_cols = 48` for the fixed segments rendered after the title. That
+    // constant must equal the display width of those exact segments; if the prompt's
+    // tail wording changes without bumping tail_cols, the title truncation silently
+    // desyncs. Guard the coupling against the same piece literals chrome.zig renders.
+    const gw = vaxis.gwidth.gwidth("\"? episode history gone ", .unicode) +
+        vaxis.gwidth.gwidth("· ", .unicode) +
+        vaxis.gwidth.gwidth("y", .unicode) +
+        vaxis.gwidth.gwidth(" confirm ", .unicode) +
+        vaxis.gwidth.gwidth("· ", .unicode) +
+        vaxis.gwidth.gwidth("esc", .unicode) +
+        vaxis.gwidth.gwidth(" cancel", .unicode);
+    try testing.expectEqual(@as(usize, 48), gw);
+}
+
 test "scrollIntoView keeps the cursor within the viewport" {
     var app: App = .{};
     // 10 rows, viewport of 4.
