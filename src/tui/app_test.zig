@@ -438,6 +438,61 @@ test "setHistory follows the focused show across a reorder, not its ordinal" {
     try testing.expectEqualStrings("chainsmoker", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
 }
 
+test "setHistory anchors to the FILTERED ordinal, not a raw history index" {
+    // Filter active: the anchor must re-find the show's ordinal in the same
+    // grouped/filtered space `list_cursor` lives in, or a reorder would land the
+    // cursor on the wrong (or a hidden) row. "ap" matches apple + apricot; banana
+    // is filtered out, so its presence must not shift the surviving ordinals.
+    var before = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "apple", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "apricot", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "banana", .list_status = .watching },
+    };
+    var app: App = .{};
+    app.active_view = .history;
+    @memcpy(app.history_filter[0..2], "ap");
+    app.history_filter_len = 2;
+    app.setHistory(&before);
+    app.list_cursor = 1; // filtered ordinal 1 == "apricot"
+    try testing.expectEqualStrings("apricot", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
+
+    // Reload floats apricot to the top of the raw slice; banana (hidden) sits
+    // between the two visible rows to prove the ordinal is filtered, not raw.
+    var after = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "2", .title = "apricot", .list_status = .watching },
+        .{ .source = "s", .source_id = "3", .title = "banana", .list_status = .watching },
+        .{ .source = "s", .source_id = "1", .title = "apple", .list_status = .watching },
+    };
+    app.setHistory(&after);
+    // Filtered order is apricot(0), apple(1); banana is skipped. A raw-index anchor
+    // would have set cursor 0 too here by luck, so pin the harder case next.
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testing.expectEqualStrings("apricot", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
+}
+
+test "setHistory falls through to the clamp when the anchored show is filtered out" {
+    // The anchor's re-find misses (show gone from the reloaded slice): the cursor
+    // must fall through to the length clamp, never strand on a stale ordinal.
+    var before = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "apple", .list_status = .watching },
+        .{ .source = "s", .source_id = "2", .title = "apricot", .list_status = .watching },
+    };
+    var app: App = .{};
+    app.active_view = .history;
+    @memcpy(app.history_filter[0..2], "ap");
+    app.history_filter_len = 2;
+    app.setHistory(&before);
+    app.list_cursor = 1; // "apricot"
+
+    // Reload drops apricot entirely; only apple survives the filter.
+    var after = [_]store_mod.AnimeRecord{
+        .{ .source = "s", .source_id = "1", .title = "apple", .list_status = .watching },
+    };
+    app.setHistory(&after);
+    try testing.expectEqual(@as(usize, 0), app.list_cursor);
+    try testing.expectEqualStrings("apple", (app.selectedHistoryRecord() orelse return error.TestUnexpectedNull).title);
+}
+
 test "setHistory leaves a shared cursor alone outside the history context" {
     // `list_cursor` is shared with Browse/Discover. A background reload (sync
     // reconcile) can land in any view; it must not reinterpret the Browse cursor

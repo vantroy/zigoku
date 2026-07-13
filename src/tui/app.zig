@@ -1872,20 +1872,18 @@ pub const App = struct {
     }
 
     pub fn setHistory(self: *App, recs: []AnimeRecord) void {
-        // Anchor the cursor to the focused SHOW, not its ordinal, across a reload.
-        // `list_cursor` is a grouped/filtered ordinal (§5.4); a post-play reload
-        // floats the just-watched show to the top of its group, so a fixed ordinal
-        // would strand the cursor on whatever slid into that slot: the panel would
-        // jump to a different show while the episode grid (bound to for_source/id)
-        // stayed on the one just played. Capture the focused row's key before the
-        // swap, re-find it after, so the cursor follows the show. Key bytes alias the
-        // old (still-live) history arena, so copy them out before overwriting the
-        // slice. Empty on the initial load (no prior selection) → no-op.
+        // Anchor the cursor to the focused SHOW, not its grouped ordinal, across a
+        // reload (ROD-386): a reorder (post-play float-to-top) must not leave the
+        // cursor on a different row than the episode grid, which stays bound to
+        // for_source/id. `list_cursor` is a grouped/filtered ordinal (§5.4), not a
+        // stable handle: capture the focused key before the swap, re-find it after.
+        // Copy the key out of the old (still-live) history arena rather than aliasing
+        // it across the swap (the ROD-141 lifetime trap).
         //
-        // Gate on the history context: `list_cursor` is SHARED with Browse/Discover,
-        // where it means an entirely different row. A background reload (a sync
-        // reconcile) can land in any view, so only re-anchor when the cursor is
-        // actually a history ordinal right now; otherwise leave it alone.
+        // Gate on history context: `list_cursor` is SHARED with Browse/Discover, where
+        // it indexes a different list. A background reload (sync reconcile) can land in
+        // any view, so only re-anchor when the cursor is a history ordinal right now.
+        // Empty prior history (initial load) → anchor null → no-op.
         const in_history_ctx = self.active_view == .history or
             (self.active_view == .detail and self.detail_origin == .history);
         var anchor_src: [64]u8 = undefined;
