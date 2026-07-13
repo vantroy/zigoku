@@ -101,6 +101,33 @@ pub fn drawTopBar(self: *App, win: vaxis.Window, w: u16) void {
     if (w > 2) put(win, 0, w - 2, "·", self.s(dot_color, .{}));
 }
 
+// §10.5 idle help line: a run of text with the keybind characters promoted.
+// `bold` runs render fg2 + bold (the keybind chars); the rest render fg3. Splitting
+// the line into explicit runs (rather than parsing keys out of the string) is what
+// lets multi-char keys (`enter`/`space`/`esc`) and key letters buried in words
+// (`find`, `back`) land on the right emphasis. Concatenating each array's `t` fields
+// reproduces the flat string, so width and wording are unchanged from the pre-split
+// render, so only the per-key styling is new.
+const HelpSeg = struct { t: []const u8, bold: bool };
+fn key(t: []const u8) HelpSeg {
+    return .{ .t = t, .bold = true };
+}
+fn txt(t: []const u8) HelpSeg {
+    return .{ .t = t, .bold = false };
+}
+
+const help_browse_list = [_]HelpSeg{ key("hjkl"), txt(" · "), key("/"), txt(" find anime · "), key("P"), txt(" save · "), key("q"), txt(" quit") };
+// Shared by Browse detail-focus and History detail-focus: symmetric two-pane
+// grammar (ROD-170), and the in-pane grid renders at every two-pane width
+// (ROD-259), so `enter` plays and `space` promotes to the zoom.
+const help_detail_pane = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("h"), txt(" back · "), key("enter"), txt(" play · "), key("v"), txt(" pin · "), key("space"), txt(" zoom · "), key("q"), txt(" quit") };
+const help_history_empty = [_]HelpSeg{ key("D"), txt(" discover · "), key("B"), txt(" browse · "), key("q"), txt(" quit") };
+const help_history_list = [_]HelpSeg{ key("jk"), txt(" move · "), key("/"), txt(" filter · "), key("l"), txt("/"), key("enter"), txt(" detail · "), key("p"), txt("/"), key("x"), txt("/"), key("c"), txt("/"), key("w"), txt("/"), key("P"), txt(" status · "), key("X"), txt(" delete · "), key("r"), txt("/"), key("u"), txt(" reset/undo · "), key("q"), txt(" quit") };
+const help_zoom = [_]HelpSeg{ key("hjkl"), txt(" scroll · "), key("enter"), txt(" play · "), key("v"), txt(" pin · "), key("space"), txt("/"), key("esc"), txt(" back · "), key("q"), txt(" quit") };
+const help_discover = [_]HelpSeg{ key("hjkl"), txt(" move · "), key("enter"), txt(" open · "), key("P"), txt(" save · "), key("["), txt(" "), key("]"), txt(" axis · "), key("/"), txt(" search · "), key("q"), txt(" quit") };
+const help_settings_edit = [_]HelpSeg{ txt("type to edit · "), key("enter"), txt(" confirm · "), key("esc"), txt(" cancel") };
+const help_settings = [_]HelpSeg{ key("hjkl"), txt(" navigate · "), key("space"), txt(" toggle · "), key("enter"), txt(" edit · "), key("q"), txt(" save+quit") };
+
 pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
     const w = win.width;
     const row = h - 1;
@@ -228,31 +255,35 @@ pub fn drawBottomBar(self: *App, win: vaxis.Window, h: u16) void {
         put(win, row, 1, "▌", self.s(self.palette.hot, .{ .blink = true }));
     }
 
-    const help: []const u8 = switch (self.active_view) {
+    const help: []const HelpSeg = switch (self.active_view) {
         .browse => switch (self.active_pane) {
-            .list => "hjkl · / find anime · P save · q quit",
-            // ROD-170: detail pane can promote to the full-screen zoom with Space.
-            .detail => "hjkl scroll · h back · enter play · v pin · space zoom · q quit",
+            .list => &help_browse_list,
+            .detail => &help_detail_pane,
         },
         // ROD-170: History is a two-pane like Browse. List focus keeps the
-        // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors the
-        // Browse detail line — the in-pane grid renders at every two-pane width
-        // now (ROD-259), so enter plays and Space promotes to the roomy zoom.
+        // ROD-139 watch-state transitions (p/x/c/w); detail focus mirrors Browse.
         .history => if (self.history.len == 0)
-            "D discover · B browse · q quit"
+            &help_history_empty
         else switch (self.active_pane) {
-            .list => "jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit",
-            .detail => "hjkl scroll · h back · enter play · v pin · space zoom · q quit",
+            .list => &help_history_list,
+            .detail => &help_detail_pane,
         },
-        // The full-screen zoom: Space or Esc demote back to the pane; q quits.
-        .detail => "hjkl scroll · enter play · v pin · space/esc back · q quit",
-        .discover => "hjkl move · enter open · P save · [ ] axis · / search · q quit",
-        .settings => if (self.settings.editing)
-            "type to edit · enter confirm · esc cancel"
-        else
-            "hjkl navigate · space toggle · enter edit · q save+quit",
+        .detail => &help_zoom,
+        .discover => &help_discover,
+        .settings => if (self.settings.editing) &help_settings_edit else &help_settings,
     };
-    putClipped(win, row, 3, if (w > 3) w - 3 else 0, help, self.s(self.palette.fg3, .{}));
+    // §3.7: 1-cell left padding within the bar → keybind runs start at col 3.
+    // `·` is 2 bytes / 1 display column, so advance by gwidth, not `.len`.
+    var col: u16 = 3;
+    for (help) |seg| {
+        if (col >= w) break;
+        const sty = if (seg.bold)
+            self.s(self.palette.fg2, .{ .bold = true })
+        else
+            self.s(self.palette.fg3, .{});
+        putClipped(win, row, col, w -| col, seg.t, sty);
+        col += @intCast(vaxis.gwidth.gwidth(seg.t, .unicode));
+    }
 }
 
 pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
@@ -311,5 +342,31 @@ pub fn drawToasts(self: *App, win: vaxis.Window, h: u16) void {
         const txt_w: u16 = if (toast_w > pre_w) toast_w - pre_w else 0;
         putClipped(win, row, txt_col, txt_w, t.text[0..t.text_len], self.s(fg_color, .{ .bold = bold, .bg = self.palette.bg_elevated }));
         row -|= 1;
+    }
+}
+
+// ROD-387: the idle help line was split into per-keybind runs so the keys render
+// bold; concatenating a run array's text back together must reproduce the flat
+// string it replaced, so the visible wording and column budget (§10.5) are
+// unchanged. A future edit that drifts a segment's wording or spacing trips this.
+test "help segment arrays reproduce their §10.5 flat strings (ROD-387)" {
+    const cases = .{
+        .{ &help_browse_list, "hjkl · / find anime · P save · q quit" },
+        .{ &help_detail_pane, "hjkl scroll · h back · enter play · v pin · space zoom · q quit" },
+        .{ &help_history_empty, "D discover · B browse · q quit" },
+        .{ &help_history_list, "jk move · / filter · l/enter detail · p/x/c/w/P status · X delete · r/u reset/undo · q quit" },
+        .{ &help_zoom, "hjkl scroll · enter play · v pin · space/esc back · q quit" },
+        .{ &help_discover, "hjkl move · enter open · P save · [ ] axis · / search · q quit" },
+        .{ &help_settings_edit, "type to edit · enter confirm · esc cancel" },
+        .{ &help_settings, "hjkl navigate · space toggle · enter edit · q save+quit" },
+    };
+    inline for (cases) |c| {
+        var buf: [256]u8 = undefined;
+        var len: usize = 0;
+        for (c[0]) |seg| {
+            @memcpy(buf[len .. len + seg.t.len], seg.t);
+            len += seg.t.len;
+        }
+        try std.testing.expectEqualStrings(c[1], buf[0..len]);
     }
 }
