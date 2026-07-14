@@ -1057,6 +1057,79 @@ test "discover_feed lands in its own axis slot; hasNextPage drives exhaustion (R
     try testing.expect(popular.exhausted);
 }
 
+test "overlapping Discover feeds: a multi-axis fan-out balances the drain, interleaved pages file per-axis (ROD-263)" {
+    var app: App = .{};
+    app.gpa = testing.allocator;
+    defer app.discover.deinit(testing.allocator);
+    app.active_view = .discover;
+    app.now_ms = 1_000_000; // >0 so the this_season fire clears its pre-epoch guard
+
+    // Fan out a fetch on every axis, the same-type overlap discover_feed_cap exists to
+    // bound (ROD-264). A real discoverFeedTask can't run under is_test (it would hit live
+    // AniList), so fireDiscoverFeed begin()s then finish()es behind its gate; what this
+    // pins is that the real fire path pairs them, so the drain returns to balance across
+    // the fan-out. The "N workers genuinely in flight, inflight == N while parked"
+    // accounting is covered at the primitive (workers.zig, ROD-179) and is unreachable
+    // through this gated path.
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    for ([_]anilist.DiscoverAxis{ .trending, .popular, .top_rated, .this_season }) |ax| {
+        app.discover.axis = ax;
+        app.refreshDiscover(&loop, io);
+    }
+    try testing.expectEqual(@as(usize, 0), app.discover_drain.inflight.load(.acquire));
+    // this_season fired last and never lands below, so it stays the active axis with a
+    // live spinner. The interleaved lands must leave that active slot alone.
+
+    // Interleave two axes the way overlapping fetches land: popular p1, a trending page
+    // sandwiched between, then popular p2. Frieren rides both axes; the slot invariant
+    // (discover_state.zig) is four independent owned copies, never a shared/interned row.
+    const pop1 = try testing.allocator.alloc(Anime, 2);
+    pop1[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "182255", .name = "Frieren", .anilist_id = 182255 });
+    pop1[1] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "1535", .name = "Death Note", .anilist_id = 1535 });
+    try testTick(&app, .{ .discover_feed = .{ .results = pop1, .axis = .popular, .page = 1, .has_next = true } });
+
+    const tr1 = try testing.allocator.alloc(Anime, 1);
+    tr1[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "182255", .name = "Frieren", .anilist_id = 182255 });
+    try testTick(&app, .{ .discover_feed = .{ .results = tr1, .axis = .trending, .page = 1, .has_next = true } });
+
+    const pop2 = try testing.allocator.alloc(Anime, 1);
+    pop2[0] = try workers.dupeOwnedAnime(testing.allocator, .{ .id = "5114", .name = "FMA:B", .anilist_id = 5114 });
+    try testTick(&app, .{ .discover_feed = .{ .results = pop2, .axis = .popular, .page = 2, .has_next = false } });
+
+    const popular = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.popular)];
+    const trending = &app.discover.slots[@intFromEnum(anilist.DiscoverAxis.trending)];
+
+    // Popular kept both its pages in order despite trending landing between them; page 2
+    // with has_next=false exhausts it.
+    try testing.expectEqual(@as(usize, 3), popular.results.items.len);
+    try testing.expectEqualStrings("182255", popular.results.items[0].id);
+    try testing.expectEqualStrings("1535", popular.results.items[1].id);
+    try testing.expectEqualStrings("5114", popular.results.items[2].id);
+    try testing.expectEqual(@as(u32, 2), popular.page);
+    try testing.expect(popular.exhausted);
+    try testing.expect(!popular.loading);
+
+    // Trending holds only its own page, untouched by popular's two lands.
+    try testing.expectEqual(@as(usize, 1), trending.results.items.len);
+    try testing.expectEqualStrings("182255", trending.results.items[0].id);
+    try testing.expectEqual(@as(u32, 1), trending.page);
+    try testing.expect(!trending.exhausted);
+    try testing.expect(!trending.loading);
+
+    // Frieren rides both axes as independent owned copies. The landing arm appends
+    // without dedup today, so this is a regression lock: it fails the day someone teaches
+    // the cache to intern or share an Anime across axes (banned by discover_state.zig).
+    try testing.expect(popular.results.items[0].id.ptr != trending.results.items[0].id.ptr);
+    try testing.expect(popular.results.items[0].name.ptr != trending.results.items[0].name.ptr);
+
+    // A land files strictly by ev.axis: the active axis (this_season) and the un-landed
+    // top_rated slot took no rows, and the active slot is still spinning from its fire.
+    try testing.expectEqual(@as(usize, 0), app.discover.activeSlot().results.items.len);
+    try testing.expectEqual(@as(usize, 0), app.discover.slots[@intFromEnum(anilist.DiscoverAxis.top_rated)].results.items.len);
+    try testing.expect(app.discover.activeSlot().loading);
+}
+
 test "feed retention cap flips exhausted even while AniList reports more (ROD-339)" {
     // The load-more chain has no natural bound (prefetch pages while hasNextPage
     // holds), so max_feed_rows is the ceiling: crossing it must exhaust the slot
