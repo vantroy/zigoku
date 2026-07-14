@@ -216,7 +216,7 @@ fn nextWrappedLine(text: []const u8, max_w: u16) WrapLine {
     while (it.next()) |g| {
         const cluster = g.bytes(text);
         if (first_len == 0) first_len = cluster.len;
-        const gw: u16 = @intCast(vaxis.gwidth.gwidth(cluster, .unicode));
+        const gw = vaxis.gwidth.gwidth(cluster, .unicode);
         if (cols + gw > max_w) {
             // Prefer the last word break; else hard-cut at the last cluster that
             // fit; else (not even one fits) take the first cluster so we progress.
