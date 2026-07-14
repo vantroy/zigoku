@@ -1202,7 +1202,13 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 }
 
 const max_cover_encoded_bytes = 8 * 1024 * 1024;
-const max_cover_dimension = 4096;
+// Cover decode-footprint cap (ROD-270). decodeCoverBody transmits the full decoded RGBA to
+// Kitty with no pre-transmit downscale, so this must admit every cover a source legitimately
+// serves, not the on-screen thumbnail size: too low and a real cover degrades to a fallback
+// block. Largest across 703 cached covers is 1635x2247, so 2560 holds ~14% margin while
+// cutting the worst-case transient from 64 MiB (4096^2*4) to 25 MiB, and the
+// discoverCoverConcurrency-amplified ceiling (up to 16 in flight) from ~1 GiB to ~400 MiB.
+const max_cover_dimension = 2560;
 const max_cover_pixels = max_cover_dimension * max_cover_dimension;
 
 fn postCoverError(loop: *Loop, gpa: Allocator, for_id: []const u8) void {
@@ -1326,13 +1332,19 @@ fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8)
     };
 }
 
+/// The decode gate (ROD-270): a probed cover is admitted only when both axes are within
+/// max_cover_dimension and the pixel count is within the derived cap. decodeCoverBody runs
+/// this on the header BEFORE decodeRgba, so an over-cap (or degenerate) cover is refused
+/// without ever allocating the decode buffer.
+fn coverDimsWithinCap(dims: cover_mod.Dimensions) bool {
+    if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) return false;
+    const pixel_count = std.math.mul(u64, dims.w, dims.h) catch return false;
+    return pixel_count <= max_cover_pixels;
+}
+
 fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
     const dims = cover_mod.probeDimensions(body) orelse return error.DecodeFailed;
-    if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) {
-        return error.DecodeFailed;
-    }
-    const pixel_count = std.math.mul(u64, dims.w, dims.h) catch return error.DecodeFailed;
-    if (pixel_count > max_cover_pixels) return error.DecodeFailed;
+    if (!coverDimsWithinCap(dims)) return error.DecodeFailed;
     return cover_mod.decodeRgba(gpa, body);
 }
 
@@ -1601,6 +1613,22 @@ test "coverCachePath nests the stem under covers/ with a .jpg suffix (ROD-171)" 
     defer arena.deinit();
     const path = try coverCachePath(arena.allocator(), "https://example.com/cover.jpg");
     try std.testing.expect(std.mem.endsWith(u8, path, "/covers/f8ebf6e202ed59a9.jpg"));
+}
+
+test "coverDimsWithinCap admits real covers, refuses over-cap on either axis (ROD-270)" {
+    // Covers transmit at full decoded resolution, so the gate must admit every real cover:
+    // undershooting regresses real art to a flat fallback block. Largest across the 703-cover
+    // local cache is 1635x2247 (2247 long-axis); assert it and a second real cover pass.
+    try std.testing.expect(coverDimsWithinCap(.{ .w = 1635, .h = 2247 }));
+    try std.testing.expect(coverDimsWithinCap(.{ .w = 1080, .h = 1490 }));
+    // Boundary is a strict >: exactly the cap on both axes is admitted.
+    try std.testing.expect(coverDimsWithinCap(.{ .w = max_cover_dimension, .h = max_cover_dimension }));
+    // One past the cap on EITHER axis is refused (the old test only exercised width).
+    try std.testing.expect(!coverDimsWithinCap(.{ .w = max_cover_dimension + 1, .h = 1 }));
+    try std.testing.expect(!coverDimsWithinCap(.{ .w = 1, .h = max_cover_dimension + 1 }));
+    // Degenerate zero-axis dimensions are refused before any allocation.
+    try std.testing.expect(!coverDimsWithinCap(.{ .w = 0, .h = 100 }));
+    try std.testing.expect(!coverDimsWithinCap(.{ .w = 100, .h = 0 }));
 }
 
 test "msToTimespec splits milliseconds into whole seconds and remainder nanos (ROD-294)" {
