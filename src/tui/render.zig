@@ -196,27 +196,53 @@ pub fn centerKeyHint(win: vaxis.Window, row: u16, w: u16, key: []const u8, key_s
     putClipped(win, row, start + key_w, w -| (start + key_w), rest, rest_sty);
 }
 
+/// One wrapped line: the space-trimmed slice to paint and how many bytes of
+/// `text` it consumes (the line plus any trailing break space skipped). `advance`
+/// is always ≥ 1 for non-empty input, so a caller loop can never stall.
+const WrapLine = struct { line: []const u8, advance: usize };
+
+/// Greedy word-wrap of the front of `text` into one line ≤ `max_w` display
+/// columns. Breaks at the last space that fits; a run with no fitting space
+/// (CJK synopses have none) hard-breaks on a grapheme-cluster boundary measured
+/// in columns, never at a raw byte offset. A byte cut at `max_w` shears a
+/// multibyte cluster mid-sequence and mojibakes the next line (ROD-252). Callers
+/// pass `max_w > 0` and `text.len > 0`.
+fn nextWrappedLine(text: []const u8, max_w: u16) WrapLine {
+    var cols: u16 = 0;
+    var consumed: usize = 0; // bytes of whole clusters that fit within max_w cols
+    var break_at: usize = 0; // bytes up to and including the last fitting space (0 = none)
+    var first_len: usize = 0; // first cluster's byte length, the forced-progress floor
+    var it = vaxis.unicode.graphemeIterator(text);
+    while (it.next()) |g| {
+        const cluster = g.bytes(text);
+        if (first_len == 0) first_len = cluster.len;
+        const gw: u16 = @intCast(vaxis.gwidth.gwidth(cluster, .unicode));
+        if (cols + gw > max_w) {
+            // Prefer the last word break; else hard-cut at the last cluster that
+            // fit; else (not even one fits) take the first cluster so we progress.
+            const cut = if (break_at > 0) break_at else if (consumed > 0) consumed else first_len;
+            var adv = cut;
+            while (adv < text.len and text[adv] == ' ') : (adv += 1) {}
+            return .{ .line = std.mem.trim(u8, text[0..cut], " "), .advance = adv };
+        }
+        cols += gw;
+        consumed += cluster.len;
+        if (cluster.len == 1 and cluster[0] == ' ') break_at = consumed;
+    }
+    // Whole remainder fits on this line.
+    return .{ .line = std.mem.trim(u8, text, " "), .advance = text.len };
+}
+
 pub fn drawWrappedText(win: vaxis.Window, start_row: u16, start_col: u16, max_w: u16, max_rows: u16, text: []const u8, sty: vaxis.Style) u16 {
     if (max_w == 0 or max_rows == 0 or text.len == 0) return 0;
 
     var row: u16 = 0;
     var i: usize = 0;
     while (i < text.len and row < max_rows) {
-        const remaining = text[i..];
-        if (remaining.len <= max_w) {
-            putClipped(win, start_row + row, start_col, max_w, std.mem.trim(u8, remaining, " "), sty);
-            return row + 1;
-        }
-
-        var cut: usize = max_w;
-        while (cut > 0 and remaining[cut - 1] != ' ') : (cut -= 1) {}
-        if (cut == 0) cut = max_w;
-
-        const line = std.mem.trim(u8, remaining[0..cut], " ");
-        putClipped(win, start_row + row, start_col, max_w, line, sty);
+        const w = nextWrappedLine(text[i..], max_w);
+        putClipped(win, start_row + row, start_col, max_w, w.line, sty);
         row += 1;
-        i += cut;
-        while (i < text.len and text[i] == ' ') : (i += 1) {}
+        i += w.advance;
     }
     return row;
 }
@@ -353,6 +379,67 @@ test "truncateToWidth: a single grapheme wider than the budget yields just … (
     try testing.expectEqualStrings("…", truncateToWidth(&buf, "東", 1));
     // max_cols == 0 is a 0-column budget: empty, not even "…".
     try testing.expectEqualStrings("", truncateToWidth(&buf, "anything", 0));
+}
+
+test "nextWrappedLine: greedy ASCII word-wrap matches the byte-based original (ROD-252)" {
+    // A word that ends exactly at the budget still breaks at the prior space: the
+    // trailing space is what overflows, so "the quick" (9 cols) yields "the" then
+    // re-wraps "quick brown". Pinned so the grapheme rewrite kept the old wrap points.
+    const w = nextWrappedLine("the quick brown", 9);
+    try testing.expectEqualStrings("the", w.line);
+    try testing.expectEqual(@as(usize, 4), w.advance); // consumes "the " incl. the break space
+
+    // A run with no fitting space hard-breaks at the column budget.
+    const hard = nextWrappedLine("abcdefgh", 5);
+    try testing.expectEqualStrings("abcde", hard.line);
+    try testing.expectEqual(@as(usize, 5), hard.advance);
+
+    // Whole remainder fits → one line, consume everything.
+    const whole = nextWrappedLine("hi there", 20);
+    try testing.expectEqualStrings("hi there", whole.line);
+    try testing.expectEqual(@as(usize, 8), whole.advance);
+
+    // Extra spaces at the break are all skipped, not re-emitted as a blank cluster.
+    const spaced = nextWrappedLine("ab  cd", 3);
+    try testing.expectEqualStrings("ab", spaced.line);
+    try testing.expectEqual(@as(usize, 4), spaced.advance); // "ab" + both spaces
+}
+
+test "nextWrappedLine: CJK breaks on a cluster boundary, never mid-codepoint (ROD-252)" {
+    // The bug: byte-cutting at max_w slices a 3-byte cluster mid-sequence. A 5-col
+    // budget fits two 2-col glyphs (4 cols); the third would overflow, so the line
+    // ends at the boundary between 京 and 都: valid UTF-8, within budget.
+    const w = nextWrappedLine("東京都市", 5);
+    try testing.expectEqualStrings("東京", w.line);
+    try testing.expectEqual(@as(usize, 6), w.advance); // two 3-byte clusters
+    try testing.expect(std.unicode.utf8ValidateSlice(w.line));
+    try testing.expect(vaxis.gwidth.gwidth(w.line, .unicode) <= 5);
+
+    // A single glyph wider than the whole budget still advances (no stall) and
+    // stays a valid, un-sheared cluster; putClipped clips the paint to the column.
+    const one = nextWrappedLine("東", 1);
+    try testing.expectEqualStrings("東", one.line);
+    try testing.expectEqual(@as(usize, 3), one.advance);
+    try testing.expect(std.unicode.utf8ValidateSlice(one.line));
+}
+
+test "nextWrappedLine: every wrapped line of a CJK-heavy synopsis is valid and in budget (ROD-252)" {
+    // Walk a mixed ASCII/CJK synopsis end to end the way drawWrappedText does and
+    // assert the invariants the byte-cut violated: each line is valid UTF-8, never
+    // exceeds the column budget, and the loop always makes progress.
+    const synopsis = "勇者パーティを追放された魔法使い the mage sets out 東の国へ alone";
+    const max_w: u16 = 12;
+    var i: usize = 0;
+    var lines: usize = 0;
+    while (i < synopsis.len) {
+        const w = nextWrappedLine(synopsis[i..], max_w);
+        try testing.expect(w.advance >= 1); // progress guaranteed
+        try testing.expect(std.unicode.utf8ValidateSlice(w.line));
+        try testing.expect(vaxis.gwidth.gwidth(w.line, .unicode) <= max_w);
+        i += w.advance;
+        lines += 1;
+        try testing.expect(lines <= synopsis.len); // loop can't run away
+    }
 }
 
 test "barFracColor: text.muted only on the selected, list-focused watching/paused row (ROD-194)" {
