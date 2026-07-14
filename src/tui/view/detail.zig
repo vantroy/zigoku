@@ -6,6 +6,7 @@
 const std = @import("std");
 const vaxis = @import("vaxis");
 const app_mod = @import("../app.zig");
+const workers = @import("../workers.zig");
 const render = @import("../render.zig");
 const cover_render = @import("../cover_render.zig");
 const domain = @import("../../domain.zig");
@@ -792,6 +793,17 @@ pub fn drawHistoryPreview(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, 
     _ = drawSynopsis(self, win, w, h, anime, row);
 }
 
+/// Scratch slot for the grid cell at `ep_idx`, or null when it lands past `cap`
+/// (ROD-396 F1). The draw loop walks `ep_idx` upward from `view_top*cols`, so
+/// consecutive cells claim consecutive slots and no two live cells share one.
+/// A null slot means "past the cap": the caller borrows the episode's owned label
+/// instead of wrapping into an occupied slot. Precondition: `ep_idx >= view_top*cols`
+/// (the loop guarantees it), so the subtraction never underflows.
+fn scratchSlotFor(ep_idx: usize, view_top: usize, cols: u16, cap: usize) ?usize {
+    const slot = ep_idx - view_top * cols;
+    return if (slot < cap) slot else null;
+}
+
 fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
     if (self.episodes.unbound) {
         // ROD-329: no grid to draw and Play is inert. Distinct copy from the zero-episode
@@ -867,18 +879,18 @@ fn drawEpisodeGrid(self: *App, win: vaxis.Window, w: u16, h: u16) void {
             // there and lean on the state.now color alone to mark resume.
             const resume_glyph = is_resume and ep.raw.len < 3;
 
-            // Use ep_scratch to avoid dangling stack buffers. Index relative
-            // to the viewport start so we never alias two live cells.
-            const slot = (ep_idx - view_top * cols) % 512;
-            const cell_buf = &self.ep_scratch[slot];
-            // §4.6: a launching cell shows the current spinner frame in place of
-            // its number, in the same `[ ]` shell so it reads as that cell working.
-            const cell_text = if (launching)
-                std.fmt.bufPrint(cell_buf, "[{s}]", .{self.spinnerChar()}) catch "[?]"
-            else if (resume_glyph)
-                std.fmt.bufPrint(cell_buf, "[▸{s}]", .{ep.raw}) catch "[?]"
-            else
-                std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
+            // Each drawn cell gets a unique scratch slot (see ep_scratch). Past the
+            // cap, borrow the owned `ep.raw` rather than wrap into a live slot and
+            // alias it (ROD-396 F1). §4.6: a launching cell shows the current spinner
+            // frame in its `[ ]` shell so it reads as that cell working.
+            const cell_text = blk: {
+                const slot = scratchSlotFor(ep_idx, view_top, cols, self.ep_scratch.len) orelse
+                    break :blk ep.raw;
+                const cell_buf = &self.ep_scratch[slot];
+                if (launching) break :blk std.fmt.bufPrint(cell_buf, "[{s}]", .{self.spinnerChar()}) catch "[?]";
+                if (resume_glyph) break :blk std.fmt.bufPrint(cell_buf, "[▸{s}]", .{ep.raw}) catch "[?]";
+                break :blk std.fmt.bufPrint(cell_buf, "[{s}]", .{ep.raw}) catch "[?]";
+            };
 
             // §4.6/§5.3 cell styling: watched cells (below the high-water) recede to
             // text.dim; the resume cell lights state.now + bold (the loudest token in the
@@ -1099,6 +1111,76 @@ test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane
     // The synopsis lands at exactly its reserved minimum under the worst-case header.
     const after_header = (coverHeightCap(h) + cover_spacer_rows) + max_header_rows;
     try t.expectEqual(min_synopsis_rows, synopsisCap(h - after_header));
+}
+
+// ── ROD-396 F1: episode-grid scratch aliasing ────────────────────────────────
+
+test "scratchSlotFor: unique consecutive slots, degrades to null past the cap (ROD-396 F1)" {
+    const t = std.testing;
+    const cap: usize = 4; // tiny cap to exercise the boundary
+    const cols: u16 = 2;
+    const view_top: usize = 3; // base = view_top*cols = 6, the first drawn ep_idx
+
+    // First drawn cell (ep_idx == base) is slot 0. No underflow at the boundary.
+    try t.expectEqual(@as(?usize, 0), scratchSlotFor(6, view_top, cols, cap));
+    // Consecutive cells claim consecutive, distinct slots.
+    try t.expectEqual(@as(?usize, 1), scratchSlotFor(7, view_top, cols, cap));
+    try t.expectEqual(@as(?usize, 3), scratchSlotFor(9, view_top, cols, cap));
+    // Exactly at the cap: degrade to null (borrow path), never slot == cap.
+    try t.expectEqual(@as(?usize, null), scratchSlotFor(10, view_top, cols, cap));
+    try t.expectEqual(@as(?usize, null), scratchSlotFor(11, view_top, cols, cap));
+
+    // Across a viewport that crosses the cap, every non-null slot is distinct.
+    // This is the invariant the `% len` bug broke (cell N aliased cell N-len).
+    var seen = [_]bool{false} ** 4;
+    for (6..6 + 20) |ep_idx| {
+        if (scratchSlotFor(ep_idx, view_top, cols, cap)) |slot| {
+            try t.expect(slot < cap);
+            try t.expect(!seen[slot]);
+            seen[slot] = true;
+        }
+    }
+}
+
+test "drawEpisodeGrid: cell 0 and cell 512 never alias past the old 512-slot cap (ROD-396 F1)" {
+    const t = std.testing;
+    // Frame drawing >512 cells (700 eps on a 200x15 grid → 40 cols × 15 rows =
+    // 600 cells) used to wrap slot 512 back onto slot 0, so cell 0 rendered
+    // episode 513's "[513]". Drive the real grid and read the cells back: cell 0
+    // must show its own "1", cell 512 its own "513".
+    var app: App = .{}; // default palette is enough for self.s()
+    app.gpa = t.allocator;
+    app.active_pane = .list; // nothing focused in the grid → the putClipped path
+
+    var raw: [700][4]u8 = undefined;
+    var proto: [700]domain.EpisodeNumber = undefined;
+    for (0..700) |i| proto[i] = .{ .raw = std.fmt.bufPrint(&raw[i], "{d}", .{i + 1}) catch unreachable };
+    app.episodes.results = try workers.dupEpisodesOwned(app.gpa, &proto);
+    defer app.episodes.freeResults(t.allocator);
+
+    var screen = try vaxis.Screen.init(t.allocator, .{ .rows = 15, .cols = 200, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(t.allocator);
+    const win: vaxis.Window = .{
+        .x_off = 0,
+        .y_off = 0,
+        .parent_x_off = 0,
+        .parent_y_off = 0,
+        .width = 200,
+        .height = 15,
+        .screen = &screen,
+    };
+
+    drawEpisodeGrid(&app, win, 200, 15);
+
+    // Cell 0 (ep_idx 0) at (col 0, row 0): "[1]".
+    try t.expectEqualStrings("[", win.readCell(0, 0).?.char.grapheme);
+    try t.expectEqualStrings("1", win.readCell(1, 0).?.char.grapheme);
+    // Cell 512 (ep_idx 512) at grid col 32, row 12 → x=160: "[513]". On the old
+    // `% 512` code this shared slot 0, so cell 0 and this cell both showed "513".
+    try t.expectEqualStrings("[", win.readCell(160, 12).?.char.grapheme);
+    try t.expectEqualStrings("5", win.readCell(161, 12).?.char.grapheme);
+    try t.expectEqualStrings("1", win.readCell(162, 12).?.char.grapheme);
+    try t.expectEqualStrings("3", win.readCell(163, 12).?.char.grapheme);
 }
 
 // ── ROD-231: Watchlist/History detail title-parity ───────────────────────────
