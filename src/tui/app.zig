@@ -949,11 +949,15 @@ pub const App = struct {
     settings: SettingsState = .{},
     /// Scratch for episode grid cell text (avoids dangling stack buffers in draw).
     /// vaxis stores text by reference, so we need stable storage that survives vx.render().
+    /// One slot per visible cell, sized past the longest real show fully on screen
+    /// (One Piece ~1100 eps). Do NOT reintroduce a `% len` index. That aliases cell N
+    /// onto cell N-len before the frame flushes (ROD-396 F1); past the cap a cell
+    /// borrows its owned label instead (see scratchSlotFor).
     /// 16 bytes/slot (ROD-192): the glyph path "[▸XX]" = 1 + 3 (▸ is 3 UTF-8 bytes)
     /// + 2 + 1 = 7 bytes — the ▸ only fires for labels < 3 chars — and a plain
     /// "[1000a]" is 7; [16] leaves headroom. The prior [8] was tight and silently
     /// fell back to "[?]".
-    ep_scratch: [512][16]u8 = undefined,
+    ep_scratch: [2048][16]u8 = undefined,
     /// Stable storage for the detail-pane score line.
     detail_score_buf: [32]u8 = undefined,
     /// Stable storage for the detail meta grammar (ROD-260). `detail_meta_buf`
