@@ -384,7 +384,12 @@ pub const AllAnime = struct {
                 // has nothing to pick from here. Log it so a `--debug` session
                 // explains why `worst`/`480` look inert on a popular show.
                 log.debug("allanime resolve: fast4speed direct 1080p, quality={s} not applicable", .{@tagName(quality)});
-                return .{ .url = url, .resolution = 1080, .referer = STREAM_REFERER };
+                // Same argv-safety gate the long-tail variants pass (consider): `url`
+                // comes from the decrypted blob (public-seed GCM, so a TLS-MITM could
+                // forge it) and goes straight to mpv, so require http(s) + clean argv
+                // bytes first. An unsafe match is skipped, not fatal, like a bad provider.
+                if (consider(url, 1080, STREAM_REFERER)) |sl| return sl;
+                continue;
             }
         }
 
@@ -1014,6 +1019,18 @@ test "consider/safeReferer: reject mpv-argv injection (C1)" {
     // A clean http(s) URL is accepted.
     const ok = AllAnime.consider("https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
     try std.testing.expectEqualStrings("https://cdn.test/v.m3u8", ok.url);
+    try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
+}
+
+test "resolve fast path: fast4speed url takes the same argv gate as the long tail (ROD-396 F3)" {
+    // The fast4speed direct path returns straight to mpv. A TLS-MITM-forged sourceUrl
+    // carrying the trusted substring plus an argv injection (embedded newline, or a
+    // leading `--` mpv reads as an option) must be dropped by consider, exactly as the
+    // long-tail variants are; a clean fast4speed url passes through unchanged.
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider("https://tools.fast4speed.rsvp/v\n--script=evil.lua", 1080, "r"));
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.consider("--tools.fast4speed.rsvp/v.m3u8", 1080, "r"));
+    const ok = AllAnime.consider("https://tools.fast4speed.rsvp/hls/v.m3u8", 1080, "https://allanime.day").?;
+    try std.testing.expectEqualStrings("https://tools.fast4speed.rsvp/hls/v.m3u8", ok.url);
     try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
 }
 
