@@ -175,10 +175,12 @@ pub fn fillRow(win: vaxis.Window, row: u16, w: u16, bg: vaxis.Color) void {
     child.fill(.{ .style = .{ .bg = bg } });
 }
 
-/// Horizontally centre an ASCII string on `row` (byte length == display width
-/// for the ASCII copy this is used with).
+/// Horizontally centre a string on `row` by display width (gwidth), so a
+/// multibyte spinner/ellipsis or a CJK title counts the cells it paints, not its
+/// bytes. Byte length would over-count and shove the text left of centre (ROD-396
+/// F5); for a pure-ASCII copy gwidth == byte length, so those callers are unchanged.
 pub fn centerText(win: vaxis.Window, row: u16, w: u16, text: []const u8, sty: vaxis.Style) void {
-    const tw: u16 = @intCast(text.len);
+    const tw: u16 = @intCast(vaxis.gwidth.gwidth(text, .unicode));
     const col: u16 = if (w > tw) (w - tw) / 2 else 0;
     putClipped(win, row, col, w, text, sty);
 }
@@ -379,6 +381,18 @@ test "truncateToWidth: a single grapheme wider than the budget yields just … (
     try testing.expectEqualStrings("…", truncateToWidth(&buf, "東", 1));
     // max_cols == 0 is a 0-column budget: empty, not even "…".
     try testing.expectEqualStrings("", truncateToWidth(&buf, "anything", 0));
+}
+
+test "centerText: centres by display width, not byte length (ROD-396 F5)" {
+    var screen = try vaxis.Screen.init(testing.allocator, .{ .rows = 1, .cols = 10, .x_pixel = 0, .y_pixel = 0 });
+    defer screen.deinit(testing.allocator);
+    const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 10, .height = 1, .screen = &screen };
+
+    // "評" is one cluster: 2 display columns but 3 bytes. In a width-10 row it must
+    // centre at (10-2)/2 = 4. The byte-based math would use (10-3)/2 = 3 and shove
+    // it a column left, so the primary cell landing at 4 is what discriminates the fix.
+    centerText(win, 0, 10, "評", .{});
+    try testing.expectEqualStrings("評", win.readCell(4, 0).?.char.grapheme);
 }
 
 test "nextWrappedLine: greedy ASCII word-wrap matches the byte-based original (ROD-252)" {
