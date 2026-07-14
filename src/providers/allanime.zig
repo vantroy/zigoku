@@ -346,6 +346,22 @@ pub const AllAnime = struct {
         return false;
     }
 
+    /// Scan the decrypted sources for the direct fast4speed url and gate it through
+    /// `consider` before it can reach mpv. Null when no allowed fast4speed source is
+    /// present, or the one found fails the argv gate (the caller then falls to the
+    /// long tail). The url rides the public-seed-GCM blob, so a TLS-MITM could forge
+    /// one carrying the trusted substring plus an argv injection; `consider` is what
+    /// stops it, the same gate the long-tail variants pass (ROD-396 F3).
+    fn fast4speedPick(sources: []const Src) ?domain.StreamLink {
+        for (sources) |s| {
+            if (!sourceAllowed(s.sourceName)) continue;
+            const url = s.sourceUrl orelse continue;
+            if (std.mem.indexOf(u8, url, "tools.fast4speed.rsvp") == null) continue;
+            if (consider(url, 1080, STREAM_REFERER)) |sl| return sl;
+        }
+        return null;
+    }
+
     pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
         // Same two-level escaping as episodes(): `videoInner` escapes show_id and
@@ -374,18 +390,16 @@ pub const AllAnime = struct {
 
         const sources = decoded.value.episode.sourceUrls;
 
-        // Fast path: the direct fast4speed CDN URL (no manifest) — the common case
-        // for popular shows (it comes from the "Default" source). Return at once.
-        for (sources) |s| {
-            if (!sourceAllowed(s.sourceName)) continue;
-            const url = s.sourceUrl orelse continue;
-            if (std.mem.indexOf(u8, url, "tools.fast4speed.rsvp") != null) {
-                // The direct path is single-variant 1080p; the quality preference
-                // has nothing to pick from here. Log it so a `--debug` session
-                // explains why `worst`/`480` look inert on a popular show.
-                log.debug("allanime resolve: fast4speed direct 1080p, quality={s} not applicable", .{@tagName(quality)});
-                return .{ .url = url, .resolution = 1080, .referer = STREAM_REFERER };
-            }
+        // Fast path: the direct fast4speed CDN url (no manifest), the common case
+        // for popular shows (the "Default" source). fast4speedPick gates it through
+        // the same argv-safety check the long tail uses; a forged/unsafe match is
+        // skipped and we fall through to the long tail below (ROD-396 F3).
+        if (fast4speedPick(sources)) |sl| {
+            // Single-variant 1080p: the quality preference has nothing to pick from
+            // here. Log it so a `--debug` session explains why `worst`/`480` look
+            // inert on a popular show.
+            log.debug("allanime resolve: fast4speed direct 1080p, quality={s} not applicable", .{@tagName(quality)});
+            return sl;
         }
 
         // Long-tail (ROD-92): less-popular shows only expose `--<hex>` providers.
@@ -1015,6 +1029,30 @@ test "consider/safeReferer: reject mpv-argv injection (C1)" {
     const ok = AllAnime.consider("https://cdn.test/v.m3u8", 1080, "https://allanime.day").?;
     try std.testing.expectEqualStrings("https://cdn.test/v.m3u8", ok.url);
     try std.testing.expectEqual(@as(?u32, 1080), ok.resolution);
+}
+
+test "fast4speedPick: gates the direct fast4speed url through consider (ROD-396 F3)" {
+    const S = AllAnime.Src;
+    // A clean fast4speed url from an allowed source resolves to a 1080p link.
+    const clean = [_]S{.{ .sourceName = "Default", .sourceUrl = "https://tools.fast4speed.rsvp/hls/v.m3u8" }};
+    const got = AllAnime.fast4speedPick(&clean).?;
+    try std.testing.expectEqualStrings("https://tools.fast4speed.rsvp/hls/v.m3u8", got.url);
+    try std.testing.expectEqual(@as(?u32, 1080), got.resolution);
+
+    // A TLS-MITM-forged url carrying the trusted substring plus an argv injection
+    // (embedded newline) is dropped, so resolve() falls to the long tail, not mpv.
+    // This is the assertion the gate exists for: it fails if the consider() call is
+    // dropped and the url is returned raw.
+    const nl = [_]S{.{ .sourceName = "Default", .sourceUrl = "https://tools.fast4speed.rsvp/v\n--script=evil.lua" }};
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.fast4speedPick(&nl));
+
+    // A leading `--` (mpv would read it as an option), trusted substring or not.
+    const dashed = [_]S{.{ .sourceName = "Default", .sourceUrl = "--tools.fast4speed.rsvp/v.m3u8" }};
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.fast4speedPick(&dashed));
+
+    // An untrusted source is skipped even when it carries a fast4speed url.
+    const spoofed = [_]S{.{ .sourceName = "spoofed", .sourceUrl = "https://tools.fast4speed.rsvp/x.m3u8" }};
+    try std.testing.expectEqual(@as(?domain.StreamLink, null), AllAnime.fast4speedPick(&spoofed));
 }
 
 test "clockJson: inserts .json after the clock segment" {

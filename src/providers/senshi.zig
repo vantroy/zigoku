@@ -429,6 +429,11 @@ pub const Senshi = struct {
     /// or null when the master can't be fetched/parsed, has no variants, or none
     /// survive the argv-safety gate. Best-effort: resolve() falls back to the master.
     fn capVariant(arena: Allocator, io: Io, master_url: []const u8, quality: domain.Quality) ?[]const u8 {
+        // master_url is the host-supplied embed stream (already argv-vetted by resolve).
+        // This is an in-process fetch of it, so it takes the same SSRF gate the sidecar
+        // (fetchSubtitle) and megaplay's probe use: block private/link-local hosts before
+        // the request, and refuse redirects so it can't be bounced onto an arbitrary one.
+        fetchguard.guardFetchUrl(master_url) catch return null;
         // The ninstream CDN 403s a refererless GET (same gate as the segment chain), so
         // send the stream referer + browser UA here, not request()'s JSON/API headers.
         const body = http.request(arena, io, .{
@@ -436,6 +441,7 @@ pub const Senshi = struct {
             .url = master_url,
             .user_agent = UA,
             .extra_headers = &.{.{ .name = "Referer", .value = STREAM_REFERER }},
+            .redirect_behavior = .not_allowed,
             .tag = "senshi",
             .accept = .ok_only,
         }) catch return null;
