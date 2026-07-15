@@ -29,10 +29,6 @@ const Loop = event_mod.Loop;
 const episodesTask = workers.episodesTask;
 const playTask = workers.playTask;
 
-/// Min gap between speculative pre-warm spawns (burst of grid opens must not
-/// fan one worker per open).
-const prewarm_spacing_ms: i64 = 30_000;
-
 /// Pin-or-global preference for NEW canonical resolution only.
 /// Unknown-owner paths (`owningProvider`, play spawn, `.direct` adds) stay on
 /// `primary()`: re-routing those by preference would persist under the wrong provider.
@@ -285,18 +281,15 @@ pub fn prewarmCandidates(st: *Store, registry: Registry, anilist_id: i64, arena:
 /// Silent (no toast/spinner). Yields to fallback and user-facing resolve.
 /// Once per canonical per session; empty candidates mark nothing, so a later-gained canonical id or aged-out absence still gets its warm. Spawn skipped under `is_test` (teardown race).
 pub fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64) void {
-    if (self.prewarm_active or self.add_resolving or self.play_resolving) return;
-    if (self.fallback != null) return;
+    if (self.prewarm.blocked(anilist_id, self.now_ms, self.add_resolving, self.play_resolving, self.fallback != null)) return;
     const st = self.store orelse return;
-    for (self.prewarm_attempted) |a| if (a != null and a.? == anilist_id) return;
-    if (self.prewarm_last_start_ms) |t| if (self.now_ms - t < prewarm_spacing_ms) return;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     const candidates = prewarmCandidates(st, registry, anilist_id, arena.allocator()) catch return;
     if (candidates.len == 0) return;
     const canon_rec = (st.getCanonicalByAnilistId(arena.allocator(), anilist_id) catch null) orelse return;
     if (builtin.is_test) {
-        markPrewarmAttempted(self, anilist_id);
+        self.prewarm.markAttempted(anilist_id, self.now_ms);
         return;
     }
     const gpa = self.gpa;
@@ -305,26 +298,10 @@ pub fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anil
         workers.freeOwnedAnime(gpa, canonical);
         return;
     };
-    self.prewarm_cancel.store(false, .release);
-    self.prewarm_active = true;
-    self.prewarm_drain.begin();
-    const t = std.Thread.spawn(.{}, workers.prewarmTask, .{
-        loop, gpa, io, providers, canonical, anilist_id, self.translation, &self.prewarm_cancel, &self.prewarm_drain,
-    }) catch {
-        self.prewarm_drain.finish();
-        self.prewarm_active = false;
-        gpa.free(providers);
-        workers.freeOwnedAnime(gpa, canonical);
-        return;
-    };
-    t.detach();
-    markPrewarmAttempted(self, anilist_id); // only a walk that actually ran
-}
-
-fn markPrewarmAttempted(self: *App, anilist_id: i64) void {
-    self.prewarm_attempted[self.prewarm_attempted_next] = anilist_id;
-    self.prewarm_attempted_next = (self.prewarm_attempted_next + 1) % self.prewarm_attempted.len;
-    self.prewarm_last_start_ms = self.now_ms;
+    // Only a walk that actually ran gets marked attempted (ring stays honest on spawn failure).
+    if (self.prewarm.fire(gpa, loop, io, providers, canonical, anilist_id, self.translation)) {
+        self.prewarm.markAttempted(anilist_id, self.now_ms);
+    }
 }
 
 pub fn clearFallback(self: *App) void {
@@ -370,7 +347,7 @@ fn beginFallback(self: *App, registry: Registry, pending_aid: ?i64) bool {
 /// Single-flight by construction: one hop per failure event, riding the existing episode-fetch/play_resolving guards.
 pub fn advanceFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, pending_aid: ?i64, failed_name: ?[]const u8) bool {
     // Rescue owns the CDN budget: cancel any background warm.
-    self.prewarm_cancel.store(true, .release);
+    self.prewarm.cancelWalk();
     if (self.fallback == null and !beginFallback(self, registry, pending_aid)) return false;
     var walk = self.fallback.?;
     // Take the walk: hop re-enters fireEpisodesForId, which would clear the field.

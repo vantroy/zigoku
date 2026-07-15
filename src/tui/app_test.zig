@@ -6847,7 +6847,7 @@ test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done c
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.prewarm_active = true;
+    app.prewarm.active = true;
 
     // A stocked verdict mints the sibling binding HIDDEN: the store row exists
     // for tier-0 routing, but History gains nothing until a play reveals it.
@@ -6864,9 +6864,9 @@ test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done c
     try testing.expect(try st.providerAbsentFresh(154587, "gamma", store_mod.Store.nowSecs()));
 
     // The walk's close clears the single-flight guard.
-    try testing.expect(app.prewarm_active);
+    try testing.expect(app.prewarm.active);
     try testTick(&app, .prewarm_done);
-    try testing.expect(!app.prewarm_active);
+    try testing.expect(!app.prewarm.active);
 }
 
 test "ROD-348: a prewarm write refreshes the open show's rail snapshot in place" {
@@ -6937,14 +6937,14 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     // stays an unbound candidate worth warming.
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 154587), app.prewarm_attempted[0]);
+    try testing.expectEqual(@as(?i64, 154587), app.prewarm.attempted[0]);
 
     // Session dedup: a second add/play of the same show doesn't re-mark (the
     // ring would show a duplicate).
     app.add_resolving = true;
     const sid2 = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid2, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
 
     // An armed fallback walk suppresses the warm outright: mid-rescue the
     // providers are exactly what's failing. now_ms sits past the spacing floor
@@ -6959,32 +6959,32 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     app.add_resolving = true;
     const sid3 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid3, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
 
     // Spacing floor: with the walk gone, a fire inside the 30s window since the
     // last walk START stays silent AND unmarked (so the show retries later);
     // past the window it runs.
     resolve.clearFallback(&app);
-    app.now_ms = app.prewarm_last_start_ms.? + 1_000;
+    app.now_ms = app.prewarm.last_start_ms.? + 1_000;
     app.add_resolving = true;
     const sid4 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid4, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
-    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
+    app.now_ms = app.prewarm.last_start_ms.? + 60_000;
     app.add_resolving = true;
     const sid5 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid5, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 999), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, 999), app.prewarm.attempted[1]);
 
     // anilist_id 0 is a real value, not the ring's empty state: an
     // i64-with-0-sentinel ring would read aid 0 as always-attempted and
     // silently never warm it.
     try st.upsertCanonicalOnly(.{ .id = "0", .name = "Zero", .anilist_id = 0, .mal_id = 222 }, true, 5000, arena);
-    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
+    app.now_ms = app.prewarm.last_start_ms.? + 60_000;
     app.add_resolving = true;
     const sid6 = try std.testing.allocator.dupe(u8, "222");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 0, .source_id = sid6, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 0), app.prewarm_attempted[2]);
+    try testing.expectEqual(@as(?i64, 0), app.prewarm.attempted[2]);
 }
 
 test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {

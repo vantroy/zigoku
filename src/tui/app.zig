@@ -73,6 +73,7 @@ pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 pub const SearchController = @import("search_state.zig").SearchController;
 pub const DiscoverState = @import("discover_state.zig").DiscoverState;
 pub const DiscoverCovers = @import("discover_covers.zig").DiscoverCovers;
+pub const PrewarmState = @import("prewarm_state.zig").PrewarmState;
 
 /// Run the TUI to completion. `store` is optional: a DB hiccup means no history, not a refused launch.
 pub fn run(
@@ -200,7 +201,7 @@ pub fn run(
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view
     defer app.add_resolve_drain.drain(); // ROD-327 tier-A add-resolve
     defer app.play_resolve_drain.drain(); // ROD-328 tier-C Play resolve
-    defer app.prewarm_drain.drain(); // ROD-351 pre-warm walk
+    defer app.prewarm.drain.drain(); // ROD-351 pre-warm walk
     defer app.cover.joinThread();
     // Error-unwind/test; quit `_exit` abandons (Kitty clear drops images). Blocks until cover workers finish (ROD-240).
     defer app.discover_cover_drain.drain();
@@ -533,19 +534,8 @@ pub const App = struct {
     play_resolving: bool = false,
     /// Aid the in-flight Play search was fired for; late result dropped if nav moved (ROD-346).
     play_resolve_aid: ?i64 = null,
-    /// Eager pre-warm walk (ROD-351).
-    prewarm_drain: workers.ThreadDrain = .{},
-    /// One walk app-wide; must not block user-facing resolve or vice versa.
-    prewarm_active: bool = false,
-    /// Session ring of pre-warmed aids. Soft dedup (eviction harmless). `?i64` not a 0
-    /// sentinel: nothing enforces anilist_id > 0.
-    prewarm_attempted: [32]?i64 = @splat(null),
-    prewarm_attempted_next: usize = 0,
-    /// Floors walk spacing app-wide; ring alone can burst after eviction (ROD-309/351).
-    /// A floored fire is not marked attempted, so the show retries later.
-    prewarm_last_start_ms: ?i64 = null,
-    /// Cooperative cancel between provider hops; set when a user fallback walk advances.
-    prewarm_cancel: std.atomic.Value(bool) = .init(false),
+    /// Eager pre-warm walk (ROD-351/401).
+    prewarm: PrewarmState = .{},
     /// Episode list/cursor/cache; transport on App (ROD-180).
     episodes: EpisodeState = .{},
     cover: CoverState = .{},
@@ -1535,7 +1525,7 @@ pub const App = struct {
                 self.noteAvailabilityWrite(ev.anilist_id);
             },
 
-            .prewarm_done => self.prewarm_active = false,
+            .prewarm_done => self.prewarm.active = false,
 
             .discover_feed => |ev| {
                 // Land into ev.axis slot, never the active axis mid-switch. No stale drop.

@@ -481,7 +481,7 @@ const prewarm_gap_ms: u64 = 1500;
 /// `.prewarm_done` always closes the single-flight guard.
 ///
 /// `providers`/`canonical` gpa-owned here. Match id dups into gpa and transfers on post.
-/// `cancel` (App.prewarm_cancel) polled between hops so an advancing fallback can yield
+/// `cancel` (App.prewarm.cancel) polled between hops so an advancing fallback can yield
 /// CDN budget; `.prewarm_done` still posts.
 pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, cancel: *const std.atomic.Value(bool), drain: *ThreadDrain) void {
     defer drain.finish();
