@@ -1,38 +1,25 @@
-//! Zigoku — core domain types.
-//!
-//! These are the vocabulary the whole app speaks: a show in the catalog, an episode, a
-//! resolved stream. They are deliberately SOURCE-AGNOSTIC: nothing here knows which provider
-//! exists. A provider (see `source.zig`) fills these in; the rest of the app depends only on
-//! these shapes, never on where they came from. That indirection is the whole defensive play:
-//! when a stream site rots and dies (2026 is a graveyard for them), we swap one provider file,
-//! not this.
+//! Core domain types. Source-agnostic vocabulary (show, episode, stream):
+//! providers fill these; the rest of the app never depends on provider identity.
 
 const std = @import("std");
 
-/// True if `s` is an absolute http(s) URL (carries a scheme), as opposed to a
-/// provider-relative path a source must still resolve. The one axis the cover
-/// pipeline needs — a fetchable absolute URL vs a bare relative ref (ROD-267).
-/// Source-agnostic on purpose: no site knowledge, just the scheme.
+/// Absolute http(s) URL vs provider-relative ref (ROD-267). Scheme only, no site knowledge.
 pub fn isAbsoluteUrl(s: []const u8) bool {
     return std.mem.startsWith(u8, s, "https://") or std.mem.startsWith(u8, s, "http://");
 }
 
-/// Which track we want from the source. AllAnime keys sub/dub at every layer
-/// (search counts, episode lists, stream resolution), so it rides along
-/// everywhere.
+/// Sub/dub track. Rides search, episode lists, and resolve.
 pub const Translation = enum {
     sub,
     dub,
 
-    /// The literal AllAnime expects in its GraphQL `translationType`.
     pub fn str(self: Translation) []const u8 {
         return @tagName(self);
     }
 };
 
-/// Watchlist state for a tracked show (ROD-139, §2.4). Persisted as the lowercase
-/// `@tagName` in `anime.list_status` (TEXT NOT NULL DEFAULT 'planning'). This enum
-/// is the single source of valid states — the column carries no CHECK; it trusts us.
+/// Watchlist state (ROD-139 §2.4). Persisted as lowercase @tagName in anime.list_status
+/// (no SQL CHECK; column trusts the enum).
 pub const ListStatus = enum {
     planning,
     watching,
@@ -40,48 +27,31 @@ pub const ListStatus = enum {
     completed,
     dropped,
 
-    /// Persisted form — the literal stored in `anime.list_status`. `@tagName` keeps
-    /// the column value and the tag in lockstep: add a state, its string comes free.
+    /// Column form: @tagName keeps string and tag in lockstep.
     pub fn str(self: ListStatus) []const u8 {
         return @tagName(self);
     }
 
-    /// Parse the stored column value. Unknown/empty → `planning` (the column
-    /// default): an absent or corrupt status is "not started", never a wrong
-    /// active state. Exact-match against tag names — we only ever write tag names.
+    /// Unknown/empty → planning (never invent an active state). Tag names only.
     pub fn fromString(s: []const u8) ListStatus {
         return std.meta.stringToEnum(ListStatus, s) orelse .planning;
     }
 
-    /// The status produced by a play/progress event (ROD-139 §1, auto-transitions
-    /// only). `progress` is the post-play high-water mark; `total` is the show's
-    /// episode count (null = unknown/ongoing). `still_airing` is true when the
-    /// show isn't known-finished (see `isStillAiring`) — its `total` may then be
-    /// the *aired-so-far* count, not the real finale, so catching up must not
-    /// complete it. Pure + exhaustive so the state machine is unit-testable with no
-    /// DB. Manual states (pause/drop/force) go through `Store.setListStatus`, not here.
+    /// Auto-status after a play (ROD-139 §1). still_airing: total may be aired-so-far,
+    /// so catch-up must not complete (ROD-296). Manual pause/drop/force via setListStatus.
     pub fn afterPlay(current: ListStatus, progress: i64, total: ?i64, still_airing: bool) ListStatus {
-        // A finished show stays finished — a rewatch must not demote it.
+        // Completed stays completed (rewatch must not demote).
         if (current == .completed) return .completed;
-        // A still-airing show never auto-completes, even at its latest aired
-        // episode (ROD-296): `total` is the aired-so-far count mid-broadcast, so
-        // `progress >= total` just means "caught up", not "season over". It stays
-        // `watching` until the season finishes airing. Manual force-complete
-        // (`setListStatus`) is still honoured for the user who wants it done.
+        // Still airing: never auto-complete at latest aired ep (ROD-296).
         if (still_airing) return .watching;
-        // Reaching the known finale completes it.
         if (total) |t| {
             if (t > 0 and progress >= t) return .completed;
         }
-        // Any play of an unfinished show (planning/watching/paused/dropped) means
-        // it's being watched now.
         return .watching;
     }
 
-    /// History grouping order (ROD-139 §3 / §5.4); lower sorts higher in the list.
-    /// Deliberately `planning` before `paused` — Rod's call, overriding the
-    /// active-intent ordering (which put paused first). Not an accident. This is
-    /// the single source of the order; `group_order` is its materialised inverse.
+    /// History group order (ROD-139 §3/§5.4); lower = higher in list.
+    /// planning before paused by design. group_order is the materialised inverse.
     pub fn groupRank(self: ListStatus) u8 {
         return switch (self) {
             .watching => 0,
@@ -94,9 +64,7 @@ pub const ListStatus = enum {
 
     const count = @typeInfo(ListStatus).@"enum".fields.len;
 
-    /// The §5.4 group display order — `groupRank`'s inverse, materialised at
-    /// comptime so the History renderer can iterate groups top-to-bottom with no
-    /// runtime cost and no second copy of the order to drift out of sync.
+    /// §5.4 top-to-bottom group order: groupRank inverse, comptime (no drift).
     pub const group_order: [count]ListStatus = blk: {
         var arr: [count]ListStatus = undefined;
         for (std.enums.values(ListStatus)) |s| arr[s.groupRank()] = s;
@@ -104,21 +72,12 @@ pub const ListStatus = enum {
     };
 };
 
-/// Whether a show's episode count is still provisional, i.e. `total_episodes` may be the
-/// aired-so-far count, not the real finale, so it's unsafe to auto-complete against
-/// (ROD-296). `ListStatus.afterPlay` gates auto-completion on this: a mid-broadcast show
-/// isn't marked done the moment you catch up.
+/// True when total_episodes may be aired-so-far, not the finale (ROD-296). afterPlay
+/// gates auto-complete on this.
 ///
-/// Deliberately a DENYLIST: only `FINISHED`/`CANCELLED` are settled (a finished season's
-/// total IS its finale; a cancelled show's last-aired count is all there'll ever be).
-/// EVERYTHING else is "still airing" for completion:
-///   - `RELEASING` / AllAnime `ongoing`: the obvious weekly case.
-///   - `HIATUS`: split-cour break; the show WILL resume, `total` is only cour-1.
-///   - `NOT_YET_RELEASED`: no episodes yet (progress 0 anyway; harmless).
-///   - null / empty / unknown: never trust a total we can't classify.
-/// Vocab matches `detail.statusChipFor` (case-insensitive). `status` self-heals via the
-/// non-null COALESCE on enrich (`FINISHED` overwrites `RELEASING`), which is why we gate on
-/// it and not the `next_airing_episode` proxy, which that same upsert can never null back out.
+/// DENYLIST: only FINISHED/CANCELLED are settled. Everything else (RELEASING, HIATUS,
+/// NOT_YET_RELEASED, null/unknown) is still airing for completion. Gate on status (COALESCE
+/// heals RELEASING→FINISHED), not next_airing_episode (upsert cannot null it back out).
 pub fn isStillAiring(status: ?[]const u8) bool {
     const s = status orelse return true;
     if (std.ascii.eqlIgnoreCase(s, "FINISHED")) return false;
@@ -126,41 +85,24 @@ pub fn isStillAiring(status: ?[]const u8) bool {
     return true;
 }
 
-/// Ceiling on a derived episode-grid count (ROD-359). `total_episodes` /
-/// `next_airing_episode` ride in from AniList, a crowd-editable database, and feed
-/// a listing-less provider's `arena.alloc(n)` for the label grid; a vandalized or
-/// corrupt count (up to u32 max) would otherwise size a multi-gigabyte allocation
-/// off one bad wiki edit (the ROD-92 unbounded-off-untrusted-data class). No real
-/// streamable MAL entry approaches this, so clipping here can't hide a legitimate
-/// episode.
+/// Cap for listing-less grid allocs from untrusted AniList counts (ROD-359 / ROD-92).
 pub const max_episode_hint: u32 = 10_000;
 
-/// The episode count a play grid should offer for a show, derived from canonical
-/// (AniList) data (ROD-359). This is the `count_hint` a provider with no listing
-/// endpoint of its own (megaplay: per-episode MAL-keyed routes only) turns into
-/// positional labels; providers with real listings ignore it.
-///
-/// While airing, `next_airing_episode - 1` is the aired-so-far count, a floor:
-/// stale enrichment can lag the broadcast (refresh-on-view catches it up, ROD-182).
-/// Without that signal the planned total stands even mid-broadcast: over-listing
-/// degrades to a clean per-episode resolve miss, under-listing would hide aired
-/// episodes with no recovery. Null = nothing aired / nothing known. Clamped to
-/// `max_episode_hint` against a hostile count.
+/// Episode-grid count from canonical data (ROD-359). count_hint for no-listing
+/// providers (megaplay); real listings ignore it. While airing: next_airing-1 floor
+/// (over-list ok; under-list hides eps). Clamped to max_episode_hint.
 pub fn expectedEpisodeCount(a: Anime) ?u32 {
     const raw: ?u32 = if (isStillAiring(a.status)) blk: {
         const next = a.next_airing_episode orelse break :blk a.total_episodes;
-        if (next <= 1) return null; // next to air is ep 1: nothing aired yet
+        if (next <= 1) return null; // next is ep 1: nothing aired
         const aired = next - 1;
         break :blk if (a.total_episodes) |total| @min(aired, total) else aired;
     } else a.total_episodes;
     return if (raw) |n| @min(n, max_episode_hint) else null;
 }
 
-/// The user's stream-quality preference (ROD-152). `best`/`worst` are the
-/// open-ended sentinels; the rungs name a vertical-pixel ceiling. The provider
-/// applies a *cap* policy against whatever variants a source actually exposes —
-/// see `allanime.selectVariant`. Sources with no variants (the fast4speed direct
-/// URL) ignore this entirely; it's a no-op there, not a dead toggle.
+/// Stream quality pref (ROD-152). best/worst = extremum; rungs = pixel cap.
+/// Providers with no variants ignore this.
 pub const Quality = enum {
     best,
     p1080,
@@ -168,10 +110,7 @@ pub const Quality = enum {
     p480,
     worst,
 
-    /// Parse a config string into a preference, degrading anything unrecognized
-    /// to `.best` — the safe default, and the same "degrade at the call site"
-    /// contract `Config.translationEnum` keeps. The settings cycle stores bare
-    /// strings ("1080", "best"…), so this is the one place they become typed.
+    /// Config string → Quality; unknown → best (safe default).
     pub fn fromString(s: []const u8) Quality {
         if (std.mem.eql(u8, s, "worst")) return .worst;
         if (std.mem.eql(u8, s, "480")) return .p480;
@@ -180,8 +119,7 @@ pub const Quality = enum {
         return .best;
     }
 
-    /// The vertical-pixel ceiling for a rung, or null for the `best`/`worst`
-    /// sentinels (which select by extremum, not by cap).
+    /// Pixel ceiling, or null for best/worst.
     pub fn cap(self: Quality) ?u32 {
         return switch (self) {
             .p1080 => 1080,
@@ -192,19 +130,14 @@ pub const Quality = enum {
     }
 };
 
-/// Broadcast season (the cours a show debuts in). AniList serves these
-/// uppercase (`WINTER`…), AllAnime capitalized (`Winter`…); both fold to one
-/// canonical value here so the render layer maps a single set to kanji 春/夏/秋/冬
-/// (ROD-141) instead of re-parsing two source spellings.
+/// Broadcast cour. AniList/AllAnime spellings fold here; render maps to kanji (ROD-141).
 pub const Season = enum {
     winter,
     spring,
     summer,
     fall,
 
-    /// Parse AniList's `season` or AllAnime's `season.quarter`, case-insensitive;
-    /// `autumn` aliases `fall`. Unknown/empty → null (an absent season, never a
-    /// wrong one).
+    /// Case-insensitive; autumn → fall. Unknown → null.
     pub fn fromString(s: []const u8) ?Season {
         if (std.ascii.eqlIgnoreCase(s, "winter")) return .winter;
         if (std.ascii.eqlIgnoreCase(s, "spring")) return .spring;
@@ -213,8 +146,7 @@ pub const Season = enum {
         return null;
     }
 
-    /// DESIGN.md §2.3: kanji label for the season chip.
-    /// 春 spring / 夏 summer / 秋 autumn / 冬 winter (ROD-141).
+    /// DESIGN §2.3 season chip: 春/夏/秋/冬 (ROD-141).
     pub fn kanji(self: Season) []const u8 {
         return switch (self) {
             .winter => "冬",
@@ -224,13 +156,8 @@ pub const Season = enum {
         };
     }
 
-    /// The cour a calendar month (1–12) falls in, using AniList's own season
-    /// boundaries so the top-bar "current season" fallback (ROD-186) agrees with
-    /// the show chips it sits beside: 冬 Dec–Feb, 春 Mar–May, 夏 Jun–Aug, 秋 Sep–Nov.
-    /// Note December belongs to the *next* year's Winter cour on AniList — that
-    /// year roll is the caller's concern (see currentCour); this is month→season
-    /// only. Out-of-range months can't occur (std clock yields 1–12) but default to
-    /// winter rather than trap.
+    /// Month 1–12 → AniList cour (ROD-186). Dec is next-year Winter: year roll is
+    /// caller's (currentCour). Out-of-range → winter.
     pub fn fromMonth(month: u4) Season {
         return switch (month) {
             3, 4, 5 => .spring,
@@ -241,14 +168,11 @@ pub const Season = enum {
     }
 };
 
-/// A broadcast cour: a season anchored to its year.
+/// Season + year.
 pub const Cour = struct { season: Season, year: u32 };
 
-/// The broadcast cour for an epoch-ms instant, with December rolled into next
-/// year's Winter cour per AniList's boundaries. The single cour computation: the
-/// top-bar chip, the Discover NEW badge, and the This Season feed axis (ROD-334)
-/// all read it, so they can never disagree on which cour "now" is. Total: a
-/// pre-epoch instant clamps to 1970 rather than trapping.
+/// Cour for epoch-ms; December → next year's Winter (AniList). Shared by chip,
+/// Discover NEW, This Season (ROD-334). Pre-epoch clamps to 1970.
 pub fn currentCour(now_ms: i64) Cour {
     const secs: u64 = @intCast(@max(0, @divFloor(now_ms, std.time.ms_per_s)));
     const yd = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
@@ -257,85 +181,58 @@ pub fn currentCour(now_ms: i64) Cour {
     return .{ .season = Season.fromMonth(month), .year = year };
 }
 
-/// A calendar date at whatever precision the source offered. `year` is always
-/// present when the date exists; `month`/`day` fill in when known (AllAnime
-/// gives year+month from `airedStart`, AniList year+month+day from `startDate`).
-/// A pure value type — no heap, so it copies and frees for free.
+/// Calendar date at available precision. year always set when present; no heap.
 pub const Date = struct {
     year: u32,
     month: ?u32 = null,
     day: ?u32 = null,
 };
 
-/// One show in the catalog.
-///
-/// Only `id` and `name` are guaranteed. `id` is the PROVIDER's opaque show handle, the
-/// single thing `episodes()` and `resolve()` need, so it must round-trip untouched.
-/// Everything else is best-effort metadata: the provider fills the episode counts; the
-/// richer fields (description, genres, cover, score, MAL/AniList ids) stay empty until
-/// AniList enrichment lands. An optional being `null` means "this source didn't tell us,"
-/// not "doesn't exist."
+/// Catalog show. Only id + name guaranteed. id is the provider opaque handle
+/// (episodes/resolve round-trip). Optionals null = source didn't provide.
 pub const Anime = struct {
-    /// Provider-opaque show id. Downstream calls depend on this being verbatim.
+    /// Provider show id; must stay verbatim for episodes/resolve.
     id: []const u8,
     name: []const u8,
     english_name: ?[]const u8 = null,
-    /// True AniList romaji title (ROD-312), distinct from `name` (which stays the
-    /// provider display seed). Filled by enrichment; carried to the canonical write
-    /// so `canonical.title` heals to romaji while the anime-local title stays the
-    /// unmatched-row fallback. Write-only on this path — read-back surfaces via
-    /// `canonical.title` through the COALESCE join, so it never needs to hydrate.
+    /// AniList romaji (ROD-312), not provider display seed (`name`). Write-only here;
+    /// read-back via canonical.title COALESCE.
     title_romaji: ?[]const u8 = null,
-    /// Native (usually Japanese) title. Populated from the provider search where
-    /// available; render-side use lands with the kanji chips (ROD-141).
     native_name: ?[]const u8 = null,
-    /// MyAnimeList id — AniSkip needs it (M5). Filled by AniList enrichment.
+    /// MAL id (AniSkip). Enrichment.
     mal_id: ?u64 = null,
-    /// AniList id — the future ID-join key into the metadata layer. Enrichment.
+    /// AniList id. Enrichment.
     anilist_id: ?u64 = null,
     thumb: ?[]const u8 = null,
     banner: ?[]const u8 = null,
     eps_sub: u32 = 0,
     eps_dub: u32 = 0,
-    /// Total episode count from enrichment when the provider-side per-track count
-    /// is missing or partial.
     total_episodes: ?u32 = null,
-    /// Per-episode runtime in minutes, from AniList enrichment (ROD-261). Renders
-    /// as "N min" on the detail metadata rail between Format and Studios.
+    /// Runtime minutes (ROD-261).
     duration: ?u32 = null,
     year: ?u32 = null,
-    /// Broadcast season (the cours of `year`). Sourced AllAnime-first from
-    /// `season.quarter`, backfilled by AniList enrichment. Pairs with `year` for
-    /// the season+year detail chip (ROD-141).
+    /// Broadcast cour (ROD-141).
     season: ?Season = null,
-    /// Full debut date when a source offers more than the year. AllAnime's
-    /// `airedStart` gives year+month; AniList's `startDate` adds the day.
     start_date: ?Date = null,
     status: ?[]const u8 = null,
     description: ?[]const u8 = null,
     genres: []const []const u8 = &.{},
     score: ?u32 = null,
     studios: []const []const u8 = &.{},
-    /// AniList adaptation source (MANGA/LIGHT_NOVEL/ORIGINAL…), stored raw and
-    /// prettified at render (ROD-261). Named `source_material` — NOT `source` —
-    /// because `source` is already the provider key elsewhere (AnimeRecord's PK).
+    /// AniList adaptation source raw (ROD-261). Not provider `source`.
     source_material: ?[]const u8 = null,
-    /// The single ranking picked by AniList `selectRank` (ROD-261): position,
-    /// type ("RATED"/"POPULAR"), and year (null = all-time). Rail-only render.
+    /// selectRank pick (ROD-261).
     rank: ?u32 = null,
     rank_type: ?[]const u8 = null,
     rank_year: ?u32 = null,
-    /// Next-episode airing (ROD-261): absolute `airingAt` unix timestamp + episode
-    /// number, from AniList. The chips row recomputes a live countdown from these
-    /// against `state.now` — see DESIGN §4.4. Present only for airing shows.
+    /// Absolute next air (ROD-261, DESIGN §4.4).
     next_airing_at: ?i64 = null,
     next_airing_episode: ?u32 = null,
-    /// AniList `countryOfOrigin` (JP/CN/KR…), surfaced only when not JP (ROD-261).
+    /// countryOfOrigin; UI surfaces non-JP (ROD-261).
     country: ?[]const u8 = null,
-    /// Show kind ("TV", "Movie", "OVA"…). `type` is too close to a keyword to
-    /// read well, so: `kind`.
+    /// TV/Movie/OVA… (`kind`, not `type`).
     kind: ?[]const u8 = null,
-    /// Does this show offer the requested track at all?
+
     pub fn has(self: Anime, tt: Translation) bool {
         return self.episodeCount(tt) > 0;
     }
@@ -347,39 +244,23 @@ pub const Anime = struct {
         };
     }
 
-    /// The primary label under the user's `title_language` preference (ROD-205),
-    /// with a never-blank fallback chain. A thin shim over `preferredTitle` for
-    /// the live-catalog shape; the stored `AnimeRecord` calls `preferredTitle`
-    /// directly with its own columns. Returns a borrow of one of `self`'s fields
-    /// — never allocates, so it inherits the caller's slice lifetime.
+    /// Primary label under title_language (ROD-205). Borrow; never allocates.
     pub fn displayTitle(self: Anime, pref: TitleLanguage) []const u8 {
         return preferredTitle(self.name, self.english_name, self.native_name, pref);
     }
 };
 
-/// Which title form the UI shows as the primary label (ROD-205). Every value is
-/// "preferred-with-fallback": there is deliberately no separate "Auto" — `english`
-/// already resolves as English-first-then-fallback. `config.titleLanguageEnum`
-/// maps the config string onto this, degrading unknown values to `.romaji`.
+/// Primary title form (ROD-205). No separate Auto: english already falls back.
 pub const TitleLanguage = enum { romaji, english, native };
 
-/// `s` if it is present and non-empty, else null — an empty string is treated as
-/// absent so a blank `english_name`/`native_name` falls through the chain rather
-/// than rendering an empty primary label.
+/// Non-empty present, else null (blank does not win the chain).
 fn present(s: ?[]const u8) ?[]const u8 {
     if (s) |v| if (v.len > 0) return v;
     return null;
 }
 
-/// Resolve the primary title under `pref` with a never-blank fallback chain
-/// (ROD-205, DESIGN §9.1a). `romaji` is the only form every source guarantees, so
-/// it is the universal backstop at the end of all three chains:
-///   romaji  → romaji → english → native
-///   english → english → romaji → native
-///   native  → native → romaji → english
-/// Returns a borrow of one of the inputs; the final `orelse romaji` never
-/// allocates and yields romaji even if empty (the render sites' own `"—"`
-/// placeholder, e.g. `detailRenderInfo`, backstops that pathological case).
+/// Primary title under pref; romaji is universal backstop (ROD-205, DESIGN §9.1a).
+/// Borrow of an input. Empty romaji still returned; render may show a placeholder.
 pub fn preferredTitle(
     romaji: []const u8,
     english: ?[]const u8,
@@ -394,17 +275,11 @@ pub fn preferredTitle(
     };
 }
 
-/// One rendered title row: the string plus whether it is the native/Japanese-
-/// script form (which alone renders italic per §1.3).
+/// Alt row: native form alone is italic (§1.3).
 pub const TitleRow = struct { text: []const u8, native: bool };
 
-/// The alt-title rows to render beneath `primary`, in `romaji → english → native` order,
-/// each skipped when empty, byte-equal to `primary`, OR byte-equal to an alt already emitted
-/// (ROD-205, §9.1a). This generalizes ROD-231's partial de-dupe (English vs romaji only)
-/// into a symmetric rule against whichever form resolved as primary, so a fallback (e.g.
-/// `english` with a null `english_name` resolving to romaji) never duplicates its target
-/// into an alt row. The `n >= out.len` guard bounds the write by construction, so even a
-/// `primary` matching none of the three forms can never overrun `out`.
+/// Alts under primary in romaji→english→native order (ROD-205 §9.1a). Skip empty,
+/// equal to primary, or already emitted. out is max 2; never overrun.
 pub fn altTitles(
     romaji: []const u8,
     english: ?[]const u8,
@@ -419,11 +294,9 @@ pub fn altTitles(
     };
     var n: usize = 0;
     for (forms) |f| {
-        if (n >= out.len) break; // bound by construction — never write past out[1]
+        if (n >= out.len) break;
         if (f.text.len == 0) continue;
         if (std.mem.eql(u8, f.text, primary)) continue;
-        // Skip a form byte-equal to one already emitted (e.g. english == native,
-        // neither being the primary) — no duplicate alt rows.
         var dup = false;
         for (out[0..n]) |prev| {
             if (std.mem.eql(u8, prev.text, f.text)) {
@@ -438,16 +311,11 @@ pub fn altTitles(
     return out[0..n];
 }
 
-/// An episode "number" — a *string*, because anime episode labels aren't
-/// integers: "1", "1.5" (a recap wedged between episodes), "13.5", "SP1" (a
-/// special). We keep the source's raw label for display, and derive a numeric
-/// key on demand for sorting.
+/// Episode label as string ("1", "1.5", "SP1"). Sort via sortKey.
 pub const EpisodeNumber = struct {
     raw: []const u8,
 
-    /// Numeric sort key from the leading run of digits/'.': "1.5" → 1.5.
-    /// Anything without a leading digit ("SP1", "OVA") sorts to the very end via
-    /// +inf, which keeps specials below the numbered run instead of scrambling it.
+    /// Leading digits/'.' as f64; non-numeric → +inf (specials after numbered run).
     pub fn sortKey(self: EpisodeNumber) f64 {
         var end: usize = 0;
         while (end < self.raw.len) : (end += 1) {
@@ -458,36 +326,21 @@ pub const EpisodeNumber = struct {
         return std.fmt.parseFloat(f64, self.raw[0..end]) catch std.math.inf(f64);
     }
 
-    /// `std.mem.sort` comparator: ascending by numeric value.
     pub fn lessThan(_: void, a: EpisodeNumber, b: EpisodeNumber) bool {
         return a.sortKey() < b.sortKey();
     }
 };
 
-/// A resolved, playable stream — everything mpv needs to start the bytes flowing.
+/// Playable stream for mpv.
 pub const StreamLink = struct {
     url: []const u8,
-    /// Vertical resolution if known (1080, 720…), else null. The fast4speed CDN
-    /// hands back one direct URL with no manifest, so this is a known 1080 there;
-    /// real per-variant detection arrives with m3u8 parsing (ROD-92).
     resolution: ?u32 = null,
-    /// HTTP Referer mpv must echo to the CDN, or null if the CDN doesn't gate on it.
     referer: ?[]const u8 = null,
-    /// User-Agent mpv must send, or null to leave ffmpeg's default `Lavf/*`. Set so the
-    /// media fetch presents the same browser-shaped client the resolver used, part of
-    /// looking less like a scraper to the CDN's bot/rate scoring (ROD-309).
+    /// Browser-shaped UA for CDN bot scoring (ROD-309); null = ffmpeg default.
     user_agent: ?[]const u8 = null,
-    /// The HLS segments are served under a disguised extension — senshi cloaks its
-    /// `.ts` segments as `.jpg` to slip content filters (ROD-301). ffmpeg's HLS
-    /// demuxer refuses non-standard segment extensions by default, so the player
-    /// must relax that gate for such a stream. False for sources whose segments
-    /// carry their true extension (AllAnime), keeping the default strict.
+    /// HLS segments cloaked as .jpg (senshi, ROD-301); player must relax demuxer gate.
     cloaked_segments: bool = false,
-    /// Sidecar subtitle URL (WebVTT) to load alongside the stream, or null when
-    /// the video carries its subs itself (senshi hardsubs) or has none. megaplay
-    /// 'sub' streams are softsub (clean video + external vtts), so without this
-    /// the sub track never reaches mpv (ROD-354). Same untrusted-bytes contract
-    /// as `url`: the provider vets the bytes before they touch argv.
+    /// External WebVTT (megaplay softsub, ROD-354); null if hardsub/none. Untrusted like url.
     sub_url: ?[]const u8 = null,
 };
 
@@ -552,7 +405,7 @@ test "EpisodeNumber.lessThan: specials after numbered run" {
 }
 
 test "Season.fromString folds AniList and AllAnime spellings" {
-    // AniList uppercase, AllAnime capitalized — both fold to one value.
+    // AniList uppercase, AllAnime capitalized, both fold to one value.
     try std.testing.expectEqual(Season.winter, Season.fromString("WINTER").?);
     try std.testing.expectEqual(Season.fall, Season.fromString("Fall").?);
     // `autumn` aliases `fall`; case is irrelevant.
@@ -585,8 +438,8 @@ test "preferredTitle falls through the chain, never blank (ROD-205)" {
     try std.testing.expectEqualStrings(rom, preferredTitle(rom, "Bleach EN", null, .native));
     // An empty string is treated as absent (falls through), not rendered blank.
     try std.testing.expectEqualStrings(rom, preferredTitle(rom, "", "", .english));
-    // Even with romaji itself empty the result is never a crash — degrades to romaji
-    // ("" here), which the render sites' own "—" placeholder backstops.
+    // Even with romaji itself empty the result is never a crash, degrades to romaji
+    // ("" here), which the render sites' own ", " placeholder backstops.
     try std.testing.expectEqualStrings("only", preferredTitle("", "only", null, .romaji));
 }
 
@@ -623,7 +476,7 @@ test "altTitles de-dupes against the resolved primary, native-marked (ROD-205)" 
     try std.testing.expectEqualStrings(nat, alts[0].text);
 
     // Two alt forms byte-equal to each other (english == native, neither primary)
-    // collapse to a single alt row — no duplicate line.
+    // collapse to a single alt row, no duplicate line.
     alts = altTitles(rom, "同じ", "同じ", rom, &buf);
     try std.testing.expectEqual(@as(usize, 1), alts.len);
     try std.testing.expectEqualStrings("同じ", alts[0].text);
@@ -679,77 +532,57 @@ test "ListStatus.fromString parses tags and falls back to planning" {
 
 test "ListStatus.afterPlay drives the auto-transition table (ROD-139 §1)" {
     const S = ListStatus;
-    const done = false; // not airing — the finished-show path
-    // planning → watching on first play (no finale reached).
+    const done = false; // finished-show path
     try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 1, 12, done));
-    // watching stays watching mid-run.
     try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 5, 12, done));
-    // watching → completed when progress reaches the known finale.
     try std.testing.expectEqual(S.completed, S.afterPlay(.watching, 12, 12, done));
     try std.testing.expectEqual(S.completed, S.afterPlay(.watching, 13, 12, done)); // overshoot still completes
-    // paused / dropped resume to watching on a play.
     try std.testing.expectEqual(S.watching, S.afterPlay(.paused, 3, 12, done));
     try std.testing.expectEqual(S.watching, S.afterPlay(.dropped, 3, 12, done));
-    // A finished show stays finished across rewatches — no demotion.
     try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 1, 12, done));
     try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 12, 12, done));
-    // Unknown total (ongoing): never auto-completes, just marks watching.
     try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 99, null, done));
-    // total <= 0 is treated as unknown (guards the AllAnime "0 episodes" quirk).
-    try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 5, 0, done));
+    try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 5, 0, done)); // total<=0 as unknown
 
-    // ROD-296: a still-airing show never auto-completes, even when caught up to
-    // the latest aired episode (progress == aired count). It stays watching until
-    // the season finishes airing. Covers every non-completed entry state, since the
-    // gate fires before any switch on `current`.
+    // ROD-296: still airing never auto-completes at catch-up; completed still wins.
     try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 12, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.watching, 13, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.planning, 1, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.paused, 12, 12, true));
     try std.testing.expectEqual(S.watching, S.afterPlay(.dropped, 12, 12, true));
-    // But a manual/prior completion still wins over the airing gate — no demotion.
     try std.testing.expectEqual(S.completed, S.afterPlay(.completed, 12, 12, true));
 }
 
 test "isStillAiring settles only on FINISHED/CANCELLED, else keeps airing (ROD-296)" {
-    // Settled: total_episodes is a trustworthy finale → not airing → completable.
     try std.testing.expect(!isStillAiring("FINISHED"));
     try std.testing.expect(!isStillAiring("finished"));
     try std.testing.expect(!isStillAiring("CANCELLED"));
-    // Not settled: total may be aired-so-far → still airing → never auto-complete.
     try std.testing.expect(isStillAiring("RELEASING"));
     try std.testing.expect(isStillAiring("releasing"));
     try std.testing.expect(isStillAiring("ongoing")); // AllAnime vocab
     try std.testing.expect(isStillAiring("Ongoing"));
-    try std.testing.expect(isStillAiring("HIATUS")); // split-cour break — will resume
+    try std.testing.expect(isStillAiring("HIATUS"));
     try std.testing.expect(isStillAiring("NOT_YET_RELEASED"));
-    // Unknown / unclassifiable / absent → default to safe (don't complete).
     try std.testing.expect(isStillAiring("SOME_FUTURE_STATUS"));
     try std.testing.expect(isStillAiring(""));
     try std.testing.expect(isStillAiring(null));
 }
 
 test "expectedEpisodeCount: aired floor while airing, total when settled (ROD-359)" {
-    // Finished show: the total is the finale.
     try std.testing.expectEqual(@as(?u32, 28), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "FINISHED", .total_episodes = 28 }));
-    // Airing with a next-episode signal: aired-so-far, not the planned total.
     try std.testing.expectEqual(@as(?u32, 13), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 24, .next_airing_episode = 14 }));
-    // Airing, no next-episode signal: the planned total stands (over-list, clean miss).
     try std.testing.expectEqual(@as(?u32, 24), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 24 }));
-    // Corrupt/duplicate data: the aired floor never exceeds a known total.
     try std.testing.expectEqual(@as(?u32, 12), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .total_episodes = 12, .next_airing_episode = 99 }));
-    // Nothing aired yet (next to air is ep 1), and the fully-unknown case.
     try std.testing.expectEqual(@as(?u32, null), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "NOT_YET_RELEASED", .next_airing_episode = 1 }));
     try std.testing.expectEqual(@as(?u32, null), expectedEpisodeCount(.{ .id = "x", .name = "x" }));
-    // Null status reads as airing (the isStillAiring denylist), so the floor applies.
     try std.testing.expectEqual(@as(?u32, 5), expectedEpisodeCount(.{ .id = "x", .name = "x", .next_airing_episode = 6 }));
-    // A hostile/corrupt count (crowd-edited AniList) is clamped, not passed to an alloc.
+    // Hostile count clamped (ROD-359), not passed to alloc.
     try std.testing.expectEqual(@as(?u32, max_episode_hint), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "FINISHED", .total_episodes = 4_294_967_295 }));
     try std.testing.expectEqual(@as(?u32, max_episode_hint), expectedEpisodeCount(.{ .id = "x", .name = "x", .status = "RELEASING", .next_airing_episode = 4_000_000_000 }));
 }
 
 test "ListStatus.groupRank orders watching → planning → paused → completed → dropped" {
-    // Rod's ordering (planning before paused), overriding the active-intent spec.
+    // planning before paused by design.
     try std.testing.expect(ListStatus.watching.groupRank() < ListStatus.planning.groupRank());
     try std.testing.expect(ListStatus.planning.groupRank() < ListStatus.paused.groupRank());
     try std.testing.expect(ListStatus.paused.groupRank() < ListStatus.completed.groupRank());
