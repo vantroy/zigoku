@@ -74,6 +74,7 @@ pub const SearchController = @import("search_state.zig").SearchController;
 pub const DiscoverState = @import("discover_state.zig").DiscoverState;
 pub const DiscoverCovers = @import("discover_covers.zig").DiscoverCovers;
 pub const PrewarmState = @import("prewarm_state.zig").PrewarmState;
+pub const ResolveTransport = @import("resolve_state.zig").ResolveTransport;
 
 /// Run the TUI to completion. `store` is optional: a DB hiccup means no history, not a refused launch.
 pub fn run(
@@ -199,8 +200,8 @@ pub fn run(
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view
-    defer app.add_resolve_drain.drain(); // ROD-327 tier-A add-resolve
-    defer app.play_resolve_drain.drain(); // ROD-328 tier-C Play resolve
+    defer app.resolve.add_drain.drain(); // ROD-327 tier-A add-resolve
+    defer app.resolve.play_drain.drain(); // ROD-328 tier-C Play resolve
     defer app.prewarm.drain.drain(); // ROD-351 pre-warm walk
     defer app.cover.joinThread();
     // Error-unwind/test; quit `_exit` abandons (Kitty clear drops images). Blocks until cover workers finish (ROD-240).
@@ -459,15 +460,6 @@ pub const App = struct {
     /// Auto-opened resume grid in flight; on failure demote to History, not a blank detail (ROD-229).
     resume_landing_pending: bool = false,
 
-    /// Canonical id to bind once the current Browse episode probe succeeds (ROD-327).
-    /// fireEpisodesForId nulls at entry so History/Discover cannot inherit a stale bind.
-    pending_bind: ?i64 = null,
-
-    /// Provider-fallback walk, or null (ROD-346). Built at first fetch failure, never at
-    /// fire time: (for_source, for_id) is the keep-check key, live nav is not. Walk hops
-    /// take it out before re-entering fireEpisodesForId (which clears it) and put it back.
-    fallback: ?Fallback = null,
-
     /// Open show's pin, cached at grid-open so render never reads the DB (ROD-345). Null = unpinned.
     show_pin: ?[]u8 = null,
 
@@ -524,16 +516,8 @@ pub const App = struct {
     episode_drain: workers.ThreadDrain = .{},
     /// Refresh-on-view enrich workers (ROD-182).
     enrich_refresh_drain: workers.ThreadDrain = .{},
-    /// Tier-A add-to-watchlist resolve probes (ROD-327).
-    add_resolve_drain: workers.ThreadDrain = .{},
-    /// One Add probe at a time: mashed P must not fan CDN requests (ROD-309/327).
-    add_resolving: bool = false,
-    /// Tier-C Play resolve searches; separate from Add so both may be outstanding (ROD-328).
-    play_resolve_drain: workers.ThreadDrain = .{},
-    /// One Play tier-C search at a time (ROD-309/328).
-    play_resolving: bool = false,
-    /// Aid the in-flight Play search was fired for; late result dropped if nav moved (ROD-346).
-    play_resolve_aid: ?i64 = null,
+    /// Tier-A/tier-C in-flight resolve state + provider-fallback walk (ROD-327/328/346/401).
+    resolve: ResolveTransport = .{},
     /// Eager pre-warm walk (ROD-351/401).
     prewarm: PrewarmState = .{},
     /// Episode list/cursor/cache; transport on App (ROD-180).
@@ -1426,7 +1410,7 @@ pub const App = struct {
                 // Before any early return: widen filters via providerAbsentFresh (ROD-347).
                 resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
                 self.async_start_ms = 0;
-                self.add_resolving = false;
+                self.resolve.add_resolving = false;
                 if (!ev.ok) {
                     // Tier-A miss: widen over remaining providers once (empty source = search walk).
                     if (ev.source.len > 0 and resolve.fireResolveAddWiden(self, loop, io, registry, ev.anilist_id, ev.source)) return;
@@ -1478,15 +1462,15 @@ pub const App = struct {
                 // Catalog facts even when the staleness gate drops the result (ROD-347).
                 resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
                 self.async_start_ms = 0;
-                self.play_resolving = false;
+                self.resolve.play_resolving = false;
                 // Superseded fire: do not hijack the current grid (ROD-346).
-                const wanted = self.play_resolve_aid != null and self.play_resolve_aid.? == ev.anilist_id;
-                self.play_resolve_aid = null;
+                const wanted = self.resolve.play_resolve_aid != null and self.resolve.play_resolve_aid.? == ev.anilist_id;
+                self.resolve.play_resolve_aid = null;
                 if (!wanted) return;
                 if (!ev.ok) {
                     // Capture flip name before advance deinits the walk (ROD-357); for_source is stale.
-                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.anilist_id == ev.anilist_id and w.providers.len > 0) w.providers[0].displayName() else null) else null;
-                    if (self.fallback != null and self.fallback.?.anilist_id == ev.anilist_id) {
+                    const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.anilist_id == ev.anilist_id and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+                    if (self.resolve.fallback != null and self.resolve.fallback.?.anilist_id == ev.anilist_id) {
                         if (resolve.advanceFallback(self, loop, io, registry, null, null)) return;
                     }
                     // Resume walk exhausted on last tier-C hop: demote, not blank pane (ROD-229).
@@ -1495,18 +1479,18 @@ pub const App = struct {
                     self.pushToast(.@"error", "couldn't load episodes", false);
                     return;
                 }
-                std.debug.assert(self.fallback == null or self.fallback.?.anilist_id == ev.anilist_id);
+                std.debug.assert(self.resolve.fallback == null or self.resolve.fallback.?.anilist_id == ev.anilist_id);
                 // fireEpisodesForId nulls pending_bind; arm after. Park walk across the fire.
-                const walk = self.fallback;
-                self.fallback = null;
+                const walk = self.resolve.fallback;
+                self.resolve.fallback = null;
                 resolve.fireEpisodesForId(self, loop, io, registry, ev.source_id, ev.source, if (walk) |w| domain.expectedEpisodeCount(w.canonical) else null);
                 if (self.episodes.loading) {
-                    self.fallback = walk;
+                    self.resolve.fallback = walk;
                 } else if (walk) |w| {
                     var done = w;
                     done.deinit(self.gpa);
                 }
-                self.pending_bind = ev.anilist_id;
+                self.resolve.pending_bind = ev.anilist_id;
             },
 
             .prewarm_result => |ev| {
@@ -1602,8 +1586,8 @@ pub const App = struct {
                 // episodes_error; only that path used to hop. pending_bind is tier-A aid.
                 if (ev.episodes.len == 0) {
                     self.gpa.free(ev.episodes);
-                    const failed_bind = self.pending_bind;
-                    self.pending_bind = null;
+                    const failed_bind = self.resolve.pending_bind;
+                    self.resolve.pending_bind = null;
                     if (self.episodes.for_source) |src| {
                         const aid: ?i64 = failed_bind orelse blk: {
                             const st = self.store orelse break :blk null;
@@ -1614,7 +1598,7 @@ pub const App = struct {
                         };
                         if (aid) |id| resolve.persistProviderAbsences(self, id, &.{src});
                     }
-                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+                    const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
                     if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
                     // Ladder empty: in-memory unbound only (browse must not mint ROD-329).
                     self.demoteResumeLanding();
@@ -1645,8 +1629,8 @@ pub const App = struct {
                 const source = self.episodes.for_source orelse selection.currentDetailSourceName(self, registry);
                 const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
                 // Bind BEFORE cache: episode_cache FKs anime (ROD-327). Hidden until play.
-                if (self.pending_bind) |aid| {
-                    self.pending_bind = null;
+                if (self.resolve.pending_bind) |aid| {
+                    self.resolve.pending_bind = null;
                     if (self.store) |st| {
                         var arena = std.heap.ArenaAllocator.init(self.gpa);
                         defer arena.deinit();
@@ -1668,9 +1652,9 @@ pub const App = struct {
                 self.episodes.loading = false;
                 self.async_start_ms = 0;
                 // Capture before clear: virgin probe's only handle on the canonical (ROD-327).
-                const failed_bind = self.pending_bind;
-                self.pending_bind = null;
-                const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+                const failed_bind = self.resolve.pending_bind;
+                self.resolve.pending_bind = null;
+                const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
                 if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
                 // Resume auto-open failed: demote to History, not blank detail (ROD-229).
                 self.demoteResumeLanding();

@@ -57,9 +57,9 @@ pub fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry
     self.resume_landing_pending = false;
     // Clear stale bind / walk / play-search want. Walk hops stash the walk
     // across this call and reinstall after.
-    self.pending_bind = null;
+    self.resolve.pending_bind = null;
     clearFallback(self);
-    self.play_resolve_aid = null;
+    self.resolve.play_resolve_aid = null;
     // Populated grid must never show the unbound sentinel.
     self.episodes.unbound = false;
 
@@ -158,7 +158,7 @@ pub fn browseResolveTarget(registry: Registry, preferred: []const u8, sel: Anime
 pub fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Registry, sel: Anime) void {
     // `.needs_search` never enters fireEpisodesForId; kill stale walk / play-search want here.
     clearFallback(self);
-    self.play_resolve_aid = null;
+    self.resolve.play_resolve_aid = null;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     const hint = domain.expectedEpisodeCount(sel);
@@ -185,19 +185,19 @@ fn fireEpisodesResolved(self: *App, loop: *Loop, io: std.Io, registry: Registry,
     if (in_flight) {
         // Same id already fetching: skip respawn, but refresh pending_bind
         // (two AniList entries can share a mal_id; bind THIS entry).
-        self.pending_bind = bind;
+        self.resolve.pending_bind = bind;
         return;
     }
     fireEpisodesForId(self, loop, io, registry, id, origin, count_hint);
     // fireEpisodesForId nulled pending_bind; re-arm so only this fire's episodes_done consumes it.
     // Sync cache hit posts no episodes_done: unconsumed bind is fine (binding already exists).
-    self.pending_bind = bind;
+    self.resolve.pending_bind = bind;
 }
 
 /// Tier-C Play resolve: title-search providers for a hit that could not tier-A.
 /// One in-flight search (`play_resolving`); drain-accounted for teardown.
 fn fireResolvePlaySearch(self: *App, loop: *Loop, io: std.Io, registry: Registry, canonical: Anime, anilist_id: i64) void {
-    if (self.play_resolving) return;
+    if (self.resolve.play_resolving) return;
     const gpa = self.gpa;
     const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
     // Snapshot order at fire time; preference can change mid-flight.
@@ -209,19 +209,19 @@ fn fireResolvePlaySearch(self: *App, loop: *Loop, io: std.Io, registry: Registry
         return;
     };
     self.async_start_ms = self.now_ms;
-    self.play_resolving = true;
-    self.play_resolve_drain.begin();
+    self.resolve.play_resolving = true;
+    self.resolve.play_drain.begin();
     const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-        loop, gpa, io, providers, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
+        loop, gpa, io, providers, snap, anilist_id, self.translation, true, &self.resolve.play_drain,
     }) catch {
-        self.play_resolve_drain.finish();
-        self.play_resolving = false;
+        self.resolve.play_drain.finish();
+        self.resolve.play_resolving = false;
         gpa.free(providers);
         workers.freeOwnedAnime(gpa, snap);
         return;
     };
     t.detach();
-    self.play_resolve_aid = anilist_id; // staleness gate for the result
+    self.resolve.play_resolve_aid = anilist_id; // staleness gate for the result
 }
 
 /// Map a failed episode onto a hop provider's grid: exact raw label, else 1-based ordinal.
@@ -281,7 +281,7 @@ pub fn prewarmCandidates(st: *Store, registry: Registry, anilist_id: i64, arena:
 /// Silent (no toast/spinner). Yields to fallback and user-facing resolve.
 /// Once per canonical per session; empty candidates mark nothing, so a later-gained canonical id or aged-out absence still gets its warm. Spawn skipped under `is_test` (teardown race).
 pub fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64) void {
-    if (self.prewarm.blocked(anilist_id, self.now_ms, self.add_resolving, self.play_resolving, self.fallback != null)) return;
+    if (self.prewarm.blocked(anilist_id, self.now_ms, self.resolve.add_resolving, self.resolve.play_resolving, self.resolve.fallback != null)) return;
     const st = self.store orelse return;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
@@ -305,8 +305,8 @@ pub fn firePrewarm(self: *App, loop: *Loop, io: std.Io, registry: Registry, anil
 }
 
 pub fn clearFallback(self: *App) void {
-    if (self.fallback) |*w| w.deinit(self.gpa);
-    self.fallback = null;
+    if (self.resolve.fallback) |*w| w.deinit(self.gpa);
+    self.resolve.fallback = null;
 }
 
 /// Build a walk from the failed fetch. False when the show cannot fall back
@@ -338,7 +338,7 @@ fn beginFallback(self: *App, registry: Registry, pending_aid: ?i64) bool {
     for (providers, 0..) |p, i| {
         if (std.mem.eql(u8, p.name(), src)) tried |= @as(u16, 1) << @intCast(i);
     }
-    self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = tried };
+    self.resolve.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = tried };
     return true;
 }
 
@@ -348,10 +348,10 @@ fn beginFallback(self: *App, registry: Registry, pending_aid: ?i64) bool {
 pub fn advanceFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, pending_aid: ?i64, failed_name: ?[]const u8) bool {
     // Rescue owns the CDN budget: cancel any background warm.
     self.prewarm.cancelWalk();
-    if (self.fallback == null and !beginFallback(self, registry, pending_aid)) return false;
-    var walk = self.fallback.?;
+    if (self.resolve.fallback == null and !beginFallback(self, registry, pending_aid)) return false;
+    var walk = self.resolve.fallback.?;
     // Take the walk: hop re-enters fireEpisodesForId, which would clear the field.
-    self.fallback = null;
+    self.resolve.fallback = null;
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     const scratch = arena.allocator();
@@ -381,7 +381,7 @@ pub fn advanceFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, 
         }
         // Tier C single-provider search; miss advances again via resolve_play_target.
         if (spawnFallbackSearch(self, loop, io, p, walk.canonical, walk.anilist_id, failed_name)) {
-            self.fallback = walk;
+            self.resolve.fallback = walk;
             return true;
         }
     }
@@ -396,7 +396,7 @@ fn fireFallbackFetch(self: *App, loop: *Loop, io: std.Io, registry: Registry, wa
     const landing = self.resume_landing_pending;
     fireEpisodesResolved(self, loop, io, registry, p.name(), id, bind, domain.expectedEpisodeCount(walk.canonical));
     self.resume_landing_pending = landing and self.episodes.loading;
-    self.fallback = walk;
+    self.resolve.fallback = walk;
     // Sync cache hit: no episodes_done will complete the walk.
     if (!self.episodes.loading) completeFallback(self, loop, io, registry);
 }
@@ -405,15 +405,15 @@ fn fireFallbackFetch(self: *App, loop: *Loop, io: std.Io, registry: Registry, wa
 /// failed episode and relaunches with the walk STILL ARMED (one shot per provider
 /// per walk: no ping-pong of fresh walks between two broken providers).
 pub fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
-    var walk = self.fallback orelse return;
+    var walk = self.resolve.fallback orelse return;
     // Progress already raised on every landing path; nothing to raise here.
     const cont = walk.play orelse {
-        self.fallback = null;
+        self.resolve.fallback = null;
         walk.deinit(self.gpa);
         return;
     };
     const eps = self.episodes.results orelse {
-        self.fallback = null;
+        self.resolve.fallback = null;
         walk.deinit(self.gpa);
         return;
     };
@@ -421,7 +421,7 @@ pub fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry)
         var buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "episode {s} not found on {s}", .{ cont.episode_raw, self.owningProvider(registry).displayName() }) catch "episode not found on this provider";
         self.pushToast(.warn, msg, false);
-        self.fallback = null;
+        self.resolve.fallback = null;
         walk.deinit(self.gpa);
         return;
     };
@@ -432,7 +432,7 @@ pub fn completeFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry)
 /// Stream never opened: hop the walk. Takes ownership of `episode_raw` on every path.
 /// true = hop in flight (suppress failure toast).
 pub fn advancePlayFallback(self: *App, loop: *Loop, io: std.Io, registry: Registry, episode_raw: []const u8, ordinal: u32) bool {
-    if (self.fallback) |*w| {
+    if (self.resolve.fallback) |*w| {
         if (w.play != null) {
             // Same episode, standing walk: free the fresh dupe.
             // firePlay's `playing` guard prevents a different episode mid-relaunch.
@@ -446,13 +446,13 @@ pub fn advancePlayFallback(self: *App, loop: *Loop, io: std.Io, registry: Regist
         self.gpa.free(episode_raw);
         return false;
     }
-    self.fallback.?.play = .{ .episode_raw = episode_raw, .ordinal = ordinal };
+    self.resolve.fallback.?.play = .{ .episode_raw = episode_raw, .ordinal = ordinal };
     return advanceFallback(self, loop, io, registry, null, self.owningProvider(registry).displayName());
 }
 
 /// Walk hop tier-C search over ONE provider (initial resolve walks the whole order).
 fn spawnFallbackSearch(self: *App, loop: *Loop, io: std.Io, p: SourceProvider, canonical: Anime, anilist_id: i64, failed_name: ?[]const u8) bool {
-    if (self.play_resolving) return false;
+    if (self.resolve.play_resolving) return false;
     const gpa = self.gpa;
     const snap = workers.dupeOwnedAnime(gpa, canonical) catch return false;
     const one = gpa.alloc(SourceProvider, 1) catch {
@@ -461,19 +461,19 @@ fn spawnFallbackSearch(self: *App, loop: *Loop, io: std.Io, p: SourceProvider, c
     };
     one[0] = p;
     self.async_start_ms = self.now_ms;
-    self.play_resolving = true;
-    self.play_resolve_drain.begin();
+    self.resolve.play_resolving = true;
+    self.resolve.play_drain.begin();
     const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-        loop, gpa, io, one, snap, anilist_id, self.translation, true, &self.play_resolve_drain,
+        loop, gpa, io, one, snap, anilist_id, self.translation, true, &self.resolve.play_drain,
     }) catch {
-        self.play_resolve_drain.finish();
-        self.play_resolving = false;
+        self.resolve.play_drain.finish();
+        self.resolve.play_resolving = false;
         gpa.free(one);
         workers.freeOwnedAnime(gpa, snap);
         return false;
     };
     t.detach();
-    self.play_resolve_aid = anilist_id;
+    self.resolve.play_resolve_aid = anilist_id;
     toastFallbackHop(self, p, failed_name);
     return true;
 }
@@ -506,7 +506,7 @@ pub fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, registr
     if (std.mem.eql(u8, rec.source, store_mod.SOURCE_UNBOUND)) {
         self.episodes.freeResults(self.gpa);
         self.episodes.cursor = 0;
-        self.pending_bind = null;
+        self.resolve.pending_bind = null;
         clearFallback(self);
         self.resume_landing_pending = false;
         self.async_start_ms = 0;
@@ -679,7 +679,7 @@ fn revealBoundFromBrowse(self: *App, loop: *Loop, io: std.Io, registry: Registry
 
 /// Tier-C Add resolve. Shares add_resolving / add_resolve_drain (`for_play = false`).
 fn fireResolveAddSearch(self: *App, loop: *Loop, io: std.Io, registry: Registry, canonical: Anime, anilist_id: i64) void {
-    if (self.add_resolving) return;
+    if (self.resolve.add_resolving) return;
     const gpa = self.gpa;
     const snap = workers.dupeOwnedAnime(gpa, canonical) catch return;
     var pref_arena = std.heap.ArenaAllocator.init(gpa);
@@ -689,13 +689,13 @@ fn fireResolveAddSearch(self: *App, loop: *Loop, io: std.Io, registry: Registry,
         return;
     };
     self.async_start_ms = self.now_ms;
-    self.add_resolving = true;
-    self.add_resolve_drain.begin();
+    self.resolve.add_resolving = true;
+    self.resolve.add_drain.begin();
     const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-        loop, gpa, io, providers, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
+        loop, gpa, io, providers, snap, anilist_id, self.translation, false, &self.resolve.add_drain,
     }) catch {
-        self.add_resolve_drain.finish();
-        self.add_resolving = false;
+        self.resolve.add_drain.finish();
+        self.resolve.add_resolving = false;
         gpa.free(providers);
         workers.freeOwnedAnime(gpa, snap);
         return;
@@ -706,7 +706,7 @@ fn fireResolveAddSearch(self: *App, loop: *Loop, io: std.Io, registry: Registry,
 /// Add twin of fallback: tier-A probe missed, search remaining providers once.
 /// Drops the failed source (same id would miss again). false → unbound arm stands.
 pub fn fireResolveAddWiden(self: *App, loop: *Loop, io: std.Io, registry: Registry, anilist_id: i64, failed_source: []const u8) bool {
-    if (self.add_resolving) return false;
+    if (self.resolve.add_resolving) return false;
     const st = self.store orelse return false;
     const gpa = self.gpa;
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -737,13 +737,13 @@ pub fn fireResolveAddWiden(self: *App, loop: *Loop, io: std.Io, registry: Regist
         return false;
     };
     self.async_start_ms = self.now_ms;
-    self.add_resolving = true;
-    self.add_resolve_drain.begin();
+    self.resolve.add_resolving = true;
+    self.resolve.add_drain.begin();
     const t = std.Thread.spawn(.{}, workers.resolveSearchTask, .{
-        loop, gpa, io, remaining, snap, anilist_id, self.translation, false, &self.add_resolve_drain,
+        loop, gpa, io, remaining, snap, anilist_id, self.translation, false, &self.resolve.add_drain,
     }) catch {
-        self.add_resolve_drain.finish();
-        self.add_resolving = false;
+        self.resolve.add_drain.finish();
+        self.resolve.add_resolving = false;
         gpa.free(remaining);
         workers.freeOwnedAnime(gpa, snap);
         return false;
@@ -754,17 +754,17 @@ pub fn fireResolveAddWiden(self: *App, loop: *Loop, io: std.Io, registry: Regist
 
 /// Tier-A add probe. One at a time (`add_resolving`): mashed P must not fan CDN probes.
 fn fireResolveAdd(self: *App, loop: *Loop, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64) void {
-    if (self.add_resolving) return;
+    if (self.resolve.add_resolving) return;
     const gpa = self.gpa;
     const id = gpa.dupe(u8, candidate_id) catch return;
     self.async_start_ms = self.now_ms;
-    self.add_resolving = true;
-    self.add_resolve_drain.begin();
+    self.resolve.add_resolving = true;
+    self.resolve.add_drain.begin();
     const t = std.Thread.spawn(.{}, workers.resolveAddTask, .{
-        loop, gpa, io, provider, id, anilist_id, self.translation, &self.add_resolve_drain,
+        loop, gpa, io, provider, id, anilist_id, self.translation, &self.resolve.add_drain,
     }) catch {
-        self.add_resolve_drain.finish();
-        self.add_resolving = false;
+        self.resolve.add_drain.finish();
+        self.resolve.add_resolving = false;
         gpa.free(id);
         return;
     };
