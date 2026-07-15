@@ -1,20 +1,16 @@
-//! senshi.live — a `SourceProvider` that replaces the captcha-walled AllAnime (ROD-301;
-//! AllAnime bolted a Cloudflare Turnstile gate onto source resolution that a headless CLI
-//! can't pass, ROD-300).
+//! senshi.live `SourceProvider` (ROD-301; replaces captcha-walled AllAnime, ROD-300).
 //!
-//! senshi is far simpler than AllAnime: plain REST JSON on one origin, no persisted-query
-//! hashes, no AES-GCM blob, no provider deciphering, and (verified live) no captcha or
-//! `cf_clearance` cookie from a raw HTTP client. Everything is keyed by the show's
-//! MyAnimeList id, which doubles as our AniSkip key for free.
+//! Plain REST JSON on one origin, keyed by MAL id (also the AniSkip key). No persisted
+//! query hashes, AES-GCM blob, or captcha from a raw HTTP client.
 //!
-//! The API surface (reversed on ROD-300/301):
-//!   * search / browse → POST /anime/filter  {searchTerm, sortBy, page, limit, …}
+//! API surface (ROD-300/301):
+//!   * search / browse → POST /anime/filter
 //!   * episode list    → GET  /episodes/{mal_id}
 //!   * stream resolve  → GET  /episode-embeds/{mal_id}/{ep}
 //!   * cover art       → /posters/{mal_id}.webp
 //!
-//! Every site-specific fact is quarantined here behind the `source.SourceProvider` vtable.
-//! Lifting the m3u8/quality machinery out of allanime.zig into a shared module is ROD-302.
+//! Site-specific facts stay behind the `source.SourceProvider` vtable.
+//! Shared m3u8/quality machinery is ROD-302.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -27,34 +23,28 @@ const hls = @import("hls.zig");
 const fetchguard = @import("../util/fetchguard.zig");
 
 const API = "https://senshi.live";
-// A current Chrome UA. senshi's Cloudflare edge serves a plain client with this
-// UA without a challenge; keep it recent and unremarkable.
+// Chrome UA: Cloudflare edge serves a plain client with this without a challenge.
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-// The stream CDN (ninstream.com) 403s a refererless GET; it gates on this origin.
-// Kept here for stage 3's resolve() so the referer lives behind the vtable.
+// Stream CDN (ninstream.com) 403s a refererless GET; gate on this origin.
 const STREAM_REFERER = "https://senshi.live/";
 
-// Cap on a cover ref before it's spliced into a fetch URL (mirrors AllAnime's
-// guard). Real refs are a short `/posters/…webp` path or an absolute cover URL.
+// Cap on a cover ref before splicing into a fetch URL (mirrors AllAnime).
 const max_cover_ref_len = 2048;
 
 pub const Senshi = struct {
-    /// Stable identity used by persistence keys `(source_name, show_id)`. NOTE the
-    /// deliberate divergence from AllAnime: senshi keys shows by MAL id, so a user's
-    /// old `("allanime", <opaque id>)` history rows do NOT map here — a fresh start
-    /// until a migration lands (ROD-301 open item).
+    /// Persistence key `(source_name, show_id)`. Senshi keys by MAL id; old
+    /// `("allanime", <opaque id>)` history rows do not map here until migration (ROD-301).
     pub const source_name = "senshi";
 
-    /// Human-facing name for user-visible copy (toasts, banners, CLI).
+    /// User-visible name (toasts, banners, CLI).
     pub const display_name = "Senshi";
 
     pub fn init() Senshi {
         return .{};
     }
 
-    /// Pack this concrete provider into the erased `SourceProvider` the app holds.
-    /// `self` must outlive every call made through the returned value.
+    /// Pack into erased `SourceProvider`. `self` must outlive every call through the return.
     pub fn provider(self: *Senshi) source.SourceProvider {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -69,7 +59,7 @@ pub const Senshi = struct {
         .coverRequest = coverRequestErased,
     };
 
-    // ── vtable trampolines: recover the typed self from the erased ptr ──────────
+    // ── vtable trampolines ─────────────────────────────────────────────────────
     fn nameErased(ptr: *anyopaque) []const u8 {
         _ = ptr;
         return source_name;
@@ -84,15 +74,13 @@ pub const Senshi = struct {
     }
     fn canonicalKeyErased(ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
         _ = ptr;
-        // senshi's show handle IS the stringified MAL id (see mapAnime + the /episodes
-        // /{mal_id} routes), so a canonical with a MAL id resolves for free. No MAL id →
-        // null, and the resolver falls to a title search (tier C, ROD-328).
+        // Show handle is the stringified MAL id. No MAL id → null; resolver falls to title search (ROD-328).
         const mal = canonical.mal_id orelse return null;
         return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
     fn episodesErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber {
         const self: *Senshi = @ptrCast(@alignCast(ptr));
-        _ = count_hint; // real listing endpoint; the canonical count plays no part
+        _ = count_hint; // real listing endpoint; canonical count unused
         return self.episodes(arena, io, show_id, tt);
     }
     fn resolveErased(ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink {
@@ -101,16 +89,13 @@ pub const Senshi = struct {
     }
     fn coverRequestErased(ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source.CoverRequest {
         _ = ptr;
-        // `ref` is untrusted provider data about to be spliced into a URL we fetch.
-        // Reject anything that isn't bounded, non-empty, printable-ASCII URL
-        // material — a CR/LF or space could smuggle a header (mirrors ROD-267).
+        // Untrusted provider data about to be spliced into a fetch URL.
+        // Reject non-printable / CR/LF / space (header smuggle; mirrors ROD-267).
         if (ref.len == 0 or ref.len > max_cover_ref_len or !cleanArg(ref))
             return error.InvalidCoverRef;
-        // Absolute refs (rare — some rows may carry a full CDN url) pass through.
+        // Absolute CDN urls pass through.
         if (domain.isAbsoluteUrl(ref)) return .{ .url = try gpa.dupe(u8, ref) };
-        // A senshi-relative `/posters/…webp`: prepend the site host. The poster
-        // host serves a plain client without a referer (verified), but we send the
-        // site referer + UA anyway — harmless where not gated, correct where it is.
+        // Relative `/posters/…webp`: prepend host. Send site referer + UA.
         const sep = if (std.mem.startsWith(u8, ref, "/")) "" else "/";
         return .{
             .url = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ API, sep, ref }),
@@ -119,12 +104,9 @@ pub const Senshi = struct {
         };
     }
 
-    // ── the catalog JSON shape ─────────────────────────────────────────────────
-    // senshi returns rich, MAL-keyed anime objects from BOTH /anime/filter (as
-    // `{data:[…]}`) and /anime/trending/{window} (as a bare array). We pull every
-    // field with a `domain.Anime` home in one struct; `ignore_unknown_fields`
-    // drops the social/relations/version columns we don't use. `id` is the MAL id
-    // (the show handle episodes()/resolve() key on) and is always present.
+    // ── catalog JSON shape ─────────────────────────────────────────────────────
+    // Both /anime/filter (`{data:[…]}`) and /anime/trending (bare array). `id` is
+    // the MAL id (show handle for episodes/resolve). ignore_unknown_fields drops the rest.
     const SAnime = struct {
         id: u64,
         title: ?[]const u8 = null,
@@ -132,24 +114,21 @@ pub const Senshi = struct {
         anime_picture: ?[]const u8 = null,
         type: ?[]const u8 = null,
         ani_source: ?[]const u8 = null,
-        ani_episodes: ?[]const u8 = null, // sent as a JSON *string* ("16")
+        ani_episodes: ?[]const u8 = null, // JSON string ("16")
         ani_status: ?[]const u8 = null,
         duration: ?[]const u8 = null, // "23 min per ep"
-        score: ?f64 = null, // 0–10
+        score: ?f64 = null, // 0-10
         ani_description: ?[]const u8 = null,
         ani_season: ?[]const u8 = null,
         ani_year: ?u32 = null,
         genres: ?[]const u8 = null, // "Action, Comedy"
-        studios: ?[]const u8 = null, // "Lerche, …"
+        studios: ?[]const u8 = null,
     };
     const FilterResp = struct { data: []SAnime = &.{} };
 
-    /// Map one raw senshi anime object to a `domain.Anime`. String fields borrow
-    /// the parsed-JSON slices (caller owns the arena lifetime).
+    /// Map one raw senshi anime object. String fields borrow parsed-JSON slices (arena-owned).
     fn mapAnime(arena: Allocator, s: SAnime) !domain.Anime {
-        // 0–10 → AniList's 0–100 axis, so a senshi score and an AniList-enriched
-        // score read on the same scale. Guard finiteness (@intFromFloat is UB on
-        // NaN/Inf) and clamp a corrupt over-range value.
+        // 0-10 → AniList 0-100 axis. Guard finiteness (@intFromFloat UB on NaN/Inf).
         const score: ?u32 = if (s.score) |v| blk: {
             if (!std.math.isFinite(v) or v <= 0) break :blk null;
             break :blk @intFromFloat(@min(@round(v * 10.0), 100.0));
@@ -158,22 +137,17 @@ pub const Senshi = struct {
         const total_eps: ?u32 = if (s.ani_episodes) |e| parseLeadingUint(u32, e) else null;
 
         return .{
-            // The MAL id, stringified, IS the provider show handle — it must
-            // round-trip verbatim into episodes()/resolve().
+            // Stringified MAL id is the provider show handle; must round-trip into episodes/resolve.
             .id = try std.fmt.allocPrint(arena, "{d}", .{s.id}),
             .name = s.title orelse "(untitled)",
             .english_name = s.title_english,
-            // senshi's `title` is romaji and it has no separate native field.
-            .native_name = null,
-            .mal_id = s.id, // free AniSkip key — no enrichment round-trip needed.
+            .native_name = null, // senshi has no separate native field
+            .mal_id = s.id, // free AniSkip key
             .thumb = s.anime_picture,
             .kind = s.type,
             .source_material = s.ani_source,
             .score = score,
-            // Catalog data doesn't split sub/dub counts (that's only known at
-            // embed time). Surface the total both as `total_episodes` and as the
-            // sub count (the dominant track) so ranking/`has(.sub)` behave; real
-            // per-track availability lands with resolve (stage 3).
+            // Catalog has no sub/dub split; surface total as eps_sub so ranking/has(.sub) work.
             .eps_sub = total_eps orelse 0,
             .eps_dub = 0,
             .total_episodes = total_eps,
@@ -192,10 +166,8 @@ pub const Senshi = struct {
 
     pub fn search(self: *Senshi, arena: Allocator, io: Io, query: []const u8, opts: source.SearchOptions) ![]domain.Anime {
         _ = self;
-        // senshi's server matches `searchTerm` across title/english/synonyms and
-        // returns already-relevant results ranked by score — so, unlike AllAnime,
-        // we do NOT re-rank on the romaji `name` (the English query would never
-        // match it). Trust the server's order; just trim to the caller's limit.
+        // Server matches title/english/synonyms and ranks by score. Do not re-rank on
+        // romaji `name` (English query would miss it). Trust server order; trim to limit.
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"searchTerm\":\"{s}\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"{s}\"}}",
@@ -213,21 +185,15 @@ pub const Senshi = struct {
 
     // ── episodes ──────────────────────────────────────────────────────────────
 
-    /// One senshi episode row. `ep_id` is the episode NUMBER — the value resolve()
-    /// feeds into /episode-embeds/{mal_id}/{ep}. senshi also carries the title,
-    /// filler/recap flags, and intro/outro skip offsets on this row; the current
-    /// `domain.EpisodeNumber` (just a label) can't hold them — surfacing senshi's
-    /// built-in skip data to replace the AniSkip round-trip is a ROD-301 follow-up.
-    /// Parsed as f64 to tolerate a fractional recap episode (e.g. 13.5).
+    /// One episode row. `ep_id` is the number resolve feeds into /episode-embeds.
+    /// Filler/skip fields exist on the wire but `domain.EpisodeNumber` is label-only
+    /// (ROD-301 follow-up). f64 tolerates fractional recaps (e.g. 13.5).
     const SEp = struct { ep_id: f64 };
 
     pub fn episodes(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation) ![]domain.EpisodeNumber {
         _ = self;
-        // senshi's /episodes list is track-agnostic: it lists every episode once,
-        // and whether an episode has a sub and/or dub is only known at embed time.
-        // So `tt` doesn't filter here — unlike AllAnime, which keyed the list per
-        // track. A dub-only episode still lists; resolve() is where a missing dub
-        // surfaces (stage 3).
+        // List is track-agnostic; sub/dub availability is only known at embed time.
+        // Unlike AllAnime, `tt` does not filter here. Missing track surfaces in resolve.
         _ = tt;
         try guardShowId(show_id);
         const url = try std.fmt.allocPrint(arena, API ++ "/episodes/{s}", .{show_id});
@@ -235,18 +201,15 @@ pub const Senshi = struct {
         return parseEpisodes(arena, raw);
     }
 
-    /// Parse the /episodes array into numerically-sorted episode labels. Pure over
-    /// the response bytes so it's unit-testable without the network.
+    /// Parse /episodes into numerically-sorted labels. Pure over response bytes.
     ///
-    /// Drops a phantom "episode 0": senshi lists a prologue slot at ep_id 0 for some shows,
-    /// but its own /episode-embeds endpoint rejects 0 with 400 "Invalid episode number", so
-    /// it is never playable; offering it only lets a user pick a stream that can't resolve,
-    /// surfacing as a bare "returned an error" toast (ROD-301).
+    /// Drops phantom ep 0: some shows list a prologue, but /episode-embeds rejects 0
+    /// with 400, so offering it only yields an unresolvable pick (ROD-301).
     fn parseEpisodes(arena: Allocator, raw: []const u8) ![]domain.EpisodeNumber {
         const parsed = try std.json.parseFromSlice([]SEp, arena, raw, .{ .ignore_unknown_fields = true });
         var eps: std.ArrayList(domain.EpisodeNumber) = .empty;
         for (parsed.value) |e| {
-            if (e.ep_id == 0) continue; // unplayable prologue slot — see above
+            if (e.ep_id == 0) continue;
             try eps.append(arena, .{ .raw = try epLabel(arena, e.ep_id) });
         }
         std.mem.sort(domain.EpisodeNumber, eps.items, {}, domain.EpisodeNumber.lessThan);
@@ -255,16 +218,12 @@ pub const Senshi = struct {
 
     // ── resolve ──────────────────────────────────────────────────────────────────
 
-    /// One embed row from /episode-embeds/{mal_id}/{ep}: a direct HLS master `url`
-    /// tagged with a `status` track ("Dub", "HardSub", "SoftSub", "Sub"). `serverFM`
-    /// carries a `sub.info=…json` param pointing at the external subtitle sidecar
-    /// (ROD-378): the `status` label is unreliable. Some shows tag a soft-sub embed
-    /// "HardSub" yet ship no burned-in text, so the subs only render if we follow
-    /// that sidecar. The other columns (server2/download/masked_base_url) are ignored.
+    /// One /episode-embeds row: HLS master `url` + `status` track + optional `serverFM`
+    /// carrying `sub.info=…` for soft-sub sidecars (ROD-378). Status labels lie on some
+    /// shows (tagged HardSub with no burn-in); follow the sidecar, do not trust the label.
     const Embed = struct { url: ?[]const u8 = null, status: ?[]const u8 = null, serverFM: ?[]const u8 = null };
 
-    /// One track in the sidecar `sub.info` JSON: a `.vtt` `src`, a `label` ("ENG",
-    /// "SDH (JPN)"), and the host's `default` hint (ROD-378).
+    /// One track in the sidecar `sub.info` JSON (ROD-378).
     const SubTrack = struct { src: ?[]const u8 = null, label: ?[]const u8 = null, default: bool = false };
 
     pub fn resolve(self: *Senshi, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
@@ -277,38 +236,24 @@ pub const Senshi = struct {
         const embeds = try std.json.parseFromSlice([]Embed, arena, raw, .{ .ignore_unknown_fields = true });
 
         const picked = pickEmbed(embeds.value, tt) orelse {
-            // Always-on: the show/episode exists but the requested track doesn't —
-            // distinct from a network failure, and the receipt says which.
+            // Show/episode exists but requested track does not (distinct from network failure).
             log.warn("senshi resolve: no {s} stream for show={s} ep={s} ({d} embed(s))", .{ tt.str(), show_id, ep.raw, embeds.value.len });
             return error.NoStreamForTrack;
         };
-        const stream = picked.url orelse return error.NoStreamForTrack; // pickEmbed skips null urls
-        // The embed url is senshi-provided data about to enter mpv's argv: require
-        // an absolute http(s) url carrying only clean argv bytes (no CRLF/space/
-        // controls that could smuggle a second mpv option or header).
+        const stream = picked.url orelse return error.NoStreamForTrack;
+        // Embed url enters mpv argv: absolute http(s) + cleanArg only (no CRLF/space smuggle).
         if (!domain.isAbsoluteUrl(stream) or !cleanArg(stream)) return error.BadStreamUrl;
 
-        // Honor the quality cap. `.best` is what mpv already picks off the master's
-        // bandwidth ladder, so skip the round-trip there; a cap (worst/rung) means
-        // fetching the master, reading its variants, and applying the cap policy
-        // (shared hls.zig, ROD-302). Best-effort: any failure falls back to the
-        // adaptive master, exactly what senshi handed mpv before this landed.
+        // `.best` leaves mpv on the master ladder; a cap fetches master variants (hls.zig, ROD-302).
+        // Best-effort: failure falls back to the adaptive master.
         const chosen = if (quality == .best) stream else capVariant(arena, io, stream, quality) orelse stream;
 
-        // Soft subs ride `link.sub_url` (ROD-354 seam) → mpv `--sub-file`. senshi's
-        // `status` label lies (a "HardSub"-tagged embed can carry no burned-in text),
-        // so we don't gate on it: for any sub resolve, follow the embed's sidecar and
-        // attach the picked .vtt. Best-effort: a null keeps the stream playing raw,
-        // exactly the pre-ROD-378 behavior.
+        // Soft subs via `link.sub_url` → mpv `--sub-file`. Do not gate on status (ROD-378);
+        // null keeps raw play (pre-ROD-378 behavior).
         const sub_url = if (tt == .sub) fetchSubtitle(arena, io, picked.serverFM) else null;
 
-        // The stream CDN (ninstream, Cloudflare-fronted) 403s a refererless GET; mpv echoes
-        // the referer on the whole HLS chain (master/variant/segments) via
-        // --http-header-fields. `user_agent`: the same browser UA the resolver used, part of
-        // not tripping the CDN's bot/rate scoring that 403s ffmpeg's default requests (the
-        // player also sends keep-alive + drops the Icy-MetaData tell; ROD-309).
-        // `cloaked_segments`: senshi serves its `.ts` segments as `.jpg`, so the player must
-        // relax ffmpeg's HLS segment-extension gate or nothing plays.
+        // ninstream 403s refererless GETs; mpv echoes referer on the HLS chain.
+        // Same browser UA as the resolver (ROD-309). cloaked_segments: .ts served as .jpg.
         return .{
             .url = chosen,
             .referer = STREAM_REFERER,
@@ -318,30 +263,19 @@ pub const Senshi = struct {
         };
     }
 
-    /// The ninstream sidecar CDN intermittently answers 200 with an empty/garbage
-    /// body, and 403s inside a Cloudflare rate-scoring window (the ROD-309 pattern a
-    /// burst of replays triggers). A one-shot would coinflip subs off; the video
-    /// survives the same window via mpv's own retry, so the sidecar gets a bounded
-    /// one too. Escalating backoff before each re-try (the first try is immediate):
-    /// a short window clears on the 300ms retry, a longer one gets ~2s total to pass
-    /// before we give up and play raw. Bounded so a dead sidecar can't stall resolve.
+    /// Sidecar CDN empty/403 windows (ROD-309). Bounded retries with escalating backoff;
+    /// first try immediate. Dead sidecar must not stall resolve.
     const SUB_RETRY_BACKOFFS_MS = [_]i64{ 300, 700, 1200 };
 
-    /// Follow the picked embed's `serverFM` sidecar to a soft-sub `.vtt` for mpv, or
-    /// null to play raw. The sidecar url is host-controlled → it's the same SSRF +
-    /// redirect-refuse gate megaplay's probe uses (ROD-266/377) before we fetch it;
-    /// the chosen `.vtt` then enters mpv's argv, so it gets the same absolute-url +
-    /// clean-arg gate as the stream. Any failure (no sidecar, fetch/parse error,
-    /// unsafe url) returns null; the stream still plays.
+    /// Follow `serverFM` to a soft-sub .vtt, or null to play raw. Host-controlled URL:
+    /// same SSRF + redirect-refuse gate as megaplay (ROD-266/377). Chosen .vtt gets
+    /// absolute-url + cleanArg before mpv argv. Any failure → null; stream still plays.
     fn fetchSubtitle(arena: Allocator, io: Io, server_fm: ?[]const u8) ?[]const u8 {
         const info_url = subInfoUrl(arena, server_fm) orelse return null;
-        // info_url is our fetch target (host-controlled): vet its shape, then SSRF-guard.
         if (!domain.isAbsoluteUrl(info_url) or !cleanArg(info_url)) return null;
         fetchguard.guardFetchUrl(info_url) catch return null;
 
-        // Retry the fetch+parse: an empty-body 200 fails the parse and is retried; a
-        // valid but empty `[]` parses fine and drops through to pickSubTrack (no track
-        // → raw), never wasting a retry on a genuine no-subs answer (ROD-381).
+        // Empty-body 200 fails parse and retries; valid empty `[]` does not (ROD-381).
         const tracks = for (0..SUB_RETRY_BACKOFFS_MS.len + 1) |attempt| {
             if (attempt > 0) std.Io.sleep(io, .fromMilliseconds(SUB_RETRY_BACKOFFS_MS[attempt - 1]), .awake) catch {};
             const body = http.request(arena, io, .{
@@ -361,28 +295,22 @@ pub const Senshi = struct {
         };
 
         const src = pickSubTrack(tracks) orelse return null;
-        // The .vtt goes to mpv argv: absolute http(s) carrying only clean bytes.
         if (!domain.isAbsoluteUrl(src) or !cleanArg(src)) return null;
         return src;
     }
 
-    /// Pull the `sub.info` param out of a `serverFM` embed url and percent-decode it
-    /// into the sidecar JSON url. senshi encodes it as e.g.
-    /// `…/e/abc/?sub.info=https%3A%2F%2F…%2Fsub_filemoon.json`. Null when the param is
-    /// absent (a genuinely burned-in HardSub show carries no sidecar).
+    /// Pull percent-decoded `sub.info` from `serverFM`. Null when absent (true HardSub).
     fn subInfoUrl(arena: Allocator, server_fm: ?[]const u8) ?[]const u8 {
         const fm = server_fm orelse return null;
         const key = "sub.info=";
         const at = std.mem.indexOf(u8, fm, key) orelse return null;
         var val = fm[at + key.len ..];
-        if (std.mem.indexOfScalar(u8, val, '&')) |amp| val = val[0..amp]; // stop at the next param
+        if (std.mem.indexOfScalar(u8, val, '&')) |amp| val = val[0..amp];
         if (val.len == 0) return null;
         return percentDecode(arena, val) catch null;
     }
 
-    /// Choose the one subtitle track to hand mpv, mirroring megaplay's preference:
-    /// the host `default` wins, then the first english-labeled track, then the first
-    /// track at all. Language/SDH preference beyond that is out of scope (ROD-377).
+    /// Prefer host `default`, then english-labeled, then first track (ROD-377).
     fn pickSubTrack(tracks: []const SubTrack) ?[]const u8 {
         var english: ?[]const u8 = null;
         var first: ?[]const u8 = null;
@@ -396,10 +324,8 @@ pub const Senshi = struct {
         return english orelse first;
     }
 
-    /// Percent-decode a URL-query value (`%3A`→`:`, `%2F`→`/`). A malformed escape
-    /// (stray `%`, non-hex digit) is kept literal rather than dropped, and a decoded
-    /// control byte is caught downstream by `cleanArg`. `+` stays literal: the value
-    /// is a raw URL, not form data.
+    /// Percent-decode a query value. Malformed `%` kept literal; controls caught by cleanArg.
+    /// `+` stays literal (raw URL, not form data).
     fn percentDecode(arena: Allocator, s: []const u8) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         var i: usize = 0;
@@ -425,17 +351,12 @@ pub const Senshi = struct {
         return out.items;
     }
 
-    /// Fetch the adaptive master and return the variant URL matching the quality cap,
-    /// or null when the master can't be fetched/parsed, has no variants, or none
-    /// survive the argv-safety gate. Best-effort: resolve() falls back to the master.
+    /// Fetch adaptive master, return variant matching quality cap, or null (resolve falls back).
     fn capVariant(arena: Allocator, io: Io, master_url: []const u8, quality: domain.Quality) ?[]const u8 {
-        // master_url is the host-supplied embed stream (already argv-vetted by resolve).
-        // This is an in-process fetch of it, so it takes the same SSRF gate the sidecar
-        // (fetchSubtitle) and megaplay's probe use: block private/link-local hosts before
-        // the request, and refuse redirects so it can't be bounced onto an arbitrary one.
+        // Host-supplied stream already argv-vetted. In-process fetch still takes SSRF gate
+        // + refuse redirects (same as sidecar / megaplay probe).
         fetchguard.guardFetchUrl(master_url) catch return null;
-        // The ninstream CDN 403s a refererless GET (same gate as the segment chain), so
-        // send the stream referer + browser UA here, not request()'s JSON/API headers.
+        // ninstream 403s refererless GET: send stream referer + browser UA, not API headers.
         const body = http.request(arena, io, .{
             .method = .GET,
             .url = master_url,
@@ -446,10 +367,9 @@ pub const Senshi = struct {
             .accept = .ok_only,
         }) catch return null;
         const variants = hls.parseMasterPlaylist(arena, body) catch return null;
-        if (variants.len == 0) return null; // already a media playlist: let mpv take the master
+        if (variants.len == 0) return null; // media playlist: let mpv take the master
 
-        // Build cap-policy candidates: join relative variant URIs against the master
-        // and drop any that fail argv safety before they could reach mpv's command line.
+        // Join relative URIs; drop any that fail argv safety before mpv's command line.
         var links: std.ArrayList(domain.StreamLink) = .empty;
         for (variants) |v| {
             const vu = hls.joinUrl(arena, master_url, v.url) catch continue;
@@ -461,10 +381,8 @@ pub const Senshi = struct {
         return pick.url;
     }
 
-    /// Choose the embed best matching the requested track. For dub we want the Dub
-    /// embed; for sub we prefer a selectable SoftSub, then burned-in HardSub, then any
-    /// other subbed variant. Returns the whole embed so the caller can also follow its
-    /// `serverFM` sidecar (ROD-378). Null when the track isn't offered at all.
+    /// Best embed for the track. Sub: SoftSub > HardSub > other sub. Returns full embed
+    /// so caller can follow `serverFM` (ROD-378). Null when track not offered.
     fn pickEmbed(embeds: []const Embed, tt: domain.Translation) ?Embed {
         var best: ?Embed = null;
         var best_score: u8 = 0;
@@ -479,9 +397,7 @@ pub const Senshi = struct {
         return best;
     }
 
-    /// Rank an embed's `status` for a track (0 = not this track). Sub prefers
-    /// soft > hard > any-other-sub so a selectable subtitle track wins over a
-    /// burned-in one; a "Dub" is never mistaken for a sub (and vice-versa).
+    /// Rank status for a track (0 = wrong track). Sub never matches Dub and vice-versa.
     fn matchScore(status: ?[]const u8, tt: domain.Translation) u8 {
         const s = status orelse return 0;
         return switch (tt) {
@@ -500,9 +416,7 @@ pub const Senshi = struct {
     }
 
     // ── internals ────────────────────────────────────────────────────────────────
-    /// One request to the senshi API. `body` non-null → POST that JSON; null → GET.
-    /// senshi is REST-shaped (write endpoints answer 201), so any 2xx is success. The
-    /// transport + status error taxonomy lives in the shared http.zig (ROD-349).
+    /// One API request. Non-null body → POST JSON; null → GET. Any 2xx is success (ROD-349).
     fn request(arena: Allocator, io: Io, method: std.http.Method, url: []const u8, body: ?[]const u8) ![]u8 {
         const extra: []const std.http.Header = if (body != null)
             &.{ .{ .name = "Content-Type", .value = "application/json" }, .{ .name = "Accept", .value = "application/json" } }
@@ -518,24 +432,22 @@ pub const Senshi = struct {
         });
     }
 
-    /// senshi's `ani_status` ("Finished Airing"/"Currently Airing"/"Not yet aired")
-    /// folded onto the canonical vocab `domain.isStillAiring` settles on — it only
-    /// treats an exact `FINISHED`/`CANCELLED` as settled, so a raw "Finished Airing"
-    /// would wrongly read as still-airing and never auto-complete (ROD-296).
+    /// Fold senshi prose onto canonical status. isStillAiring only settles exact
+    /// FINISHED/CANCELLED; raw "Finished Airing" would never auto-complete (ROD-296).
     fn mapStatus(s: ?[]const u8) ?[]const u8 {
         const v = s orelse return null;
         if (containsIgnoreCase(v, "finished")) return "FINISHED";
         if (containsIgnoreCase(v, "cancel")) return "CANCELLED";
         if (containsIgnoreCase(v, "not yet")) return "NOT_YET_RELEASED";
         if (containsIgnoreCase(v, "airing") or containsIgnoreCase(v, "current")) return "RELEASING";
-        return v; // unknown → keep raw; isStillAiring defaults it to safe (airing)
+        return v; // unknown → keep raw; isStillAiring defaults to safe (airing)
     }
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
     }
 
-    /// languagePreference the filter expects: JP audio = the sub track, EN = dub.
+    /// Filter languagePreference: JP = sub, EN = dub.
     fn langPref(tt: domain.Translation) []const u8 {
         return switch (tt) {
             .sub => "JP",
@@ -543,8 +455,7 @@ pub const Senshi = struct {
         };
     }
 
-    /// Split senshi's comma-space CSV field ("Action, Comedy") into owned slices.
-    /// Null/empty → an empty list. Borrows nothing beyond the arena.
+    /// Split comma-space CSV into owned slices. Null/empty → empty list.
     fn splitCsv(arena: Allocator, csv: ?[]const u8) ![]const []const u8 {
         const s = csv orelse return &.{};
         if (s.len == 0) return &.{};
@@ -557,8 +468,7 @@ pub const Senshi = struct {
         return out.items;
     }
 
-    /// Parse the leading run of digits of a string into `T` ("23 min per ep" → 23,
-    /// "16" → 16). Null when there's no leading digit.
+    /// Leading digit run only ("23 min per ep" → 23). Null when no leading digit.
     fn parseLeadingUint(comptime T: type, s: []const u8) ?T {
         var end: usize = 0;
         while (end < s.len and std.ascii.isDigit(s[end])) end += 1;
@@ -566,10 +476,7 @@ pub const Senshi = struct {
         return std.fmt.parseInt(T, s[0..end], 10) catch null;
     }
 
-    /// Format an episode number as its label: an integral value drops the decimal
-    /// ("1", "12"), a fractional recap keeps it ("13.5"). The bounded integer path
-    /// keeps `@intFromFloat` in range (it's UB out of range); a non-finite value
-    /// degrades to "0" rather than trap.
+    /// Integral drops decimal ("1"); fractional keeps it ("13.5"). Non-finite → "0".
     fn epLabel(arena: Allocator, n: f64) ![]const u8 {
         if (!std.math.isFinite(n)) return arena.dupe(u8, "0");
         if (n >= 0 and n < 1_000_000 and @floor(n) == n)
@@ -577,19 +484,14 @@ pub const Senshi = struct {
         return std.fmt.allocPrint(arena, "{d}", .{n});
     }
 
-    /// senshi keys shows by numeric MAL id, and our stored `Anime.id` is that id
-    /// stringified — so a well-formed show id is all digits. Enforce that before
-    /// splicing it into a URL path, so a corrupt/hostile id can't smuggle a path
-    /// traversal or a second path segment (e.g. `../…`, `1/x`) onto the wire.
+    /// Show id is digits only (stringified MAL id). Reject before URL path splice
+    /// so `../…` or `1/x` cannot smuggle a second path segment.
     fn guardShowId(show_id: []const u8) !void {
         if (show_id.len == 0) return error.InvalidShowId;
         for (show_id) |c| if (!std.ascii.isDigit(c)) return error.InvalidShowId;
     }
 
-    /// An episode label is our own `epLabel` output — digits with at most one
-    /// decimal point ("1", "13.5"). Enforce that before splicing it into the embed
-    /// URL path, so a corrupt label can't smuggle a second path segment or a
-    /// traversal (`../`, `1/x`) onto the wire.
+    /// Episode label is epLabel shape: digits, at most one `.`. Reject path tricks before URL splice.
     fn guardEpLabel(s: []const u8) !void {
         if (s.len == 0) return error.InvalidEpisode;
         var dots: u8 = 0;
@@ -601,16 +503,13 @@ pub const Senshi = struct {
         }
     }
 
-    /// True if `s` is safe to place in a fetch URL / mpv argv: printable ASCII only
-    /// (0x21–0x7e), rejecting CR/LF, spaces and controls. Mirrors AllAnime's guard.
+    /// Safe for fetch URL / mpv argv: printable ASCII only (0x21-0x7e). Mirrors AllAnime.
     fn cleanArg(s: []const u8) bool {
         for (s) |c| if (c < 0x21 or c > 0x7e) return false;
         return true;
     }
 
-    /// Escape a UTF-8 string for a JSON string literal — the search query, mainly,
-    /// so a stray `"` can't break the hand-rolled request body. Covers the JSON
-    /// mandatory escapes; sub-0x20 controls become `\u00XX`.
+    /// Escape for a JSON string literal (search body). Sub-0x20 → `\u00XX`.
     fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         for (s) |c| switch (c) {
@@ -657,24 +556,22 @@ test "mapAnime maps a filter row into a domain.Anime (ROD-301)" {
     };
     const m = try Senshi.mapAnime(a, row);
 
-    try testing.expectEqualStrings("59708", m.id); // MAL id, stringified → show handle
-    try testing.expectEqual(@as(?u64, 59708), m.mal_id); // free AniSkip key
+    try testing.expectEqualStrings("59708", m.id);
+    try testing.expectEqual(@as(?u64, 59708), m.mal_id);
     try testing.expectEqualStrings("Classroom of the Elite 4th Season", m.english_name.?);
-    try testing.expectEqual(@as(?u32, 79), m.score.?); // 7.88*10 → round 79
+    try testing.expectEqual(@as(?u32, 79), m.score.?); // 7.88*10 → 79
     try testing.expectEqual(@as(?u32, 16), m.total_episodes.?);
     try testing.expectEqual(@as(u32, 16), m.eps_sub);
     try testing.expectEqual(@as(?u32, 23), m.duration.?);
     try testing.expectEqual(domain.Season.spring, m.season.?);
     try testing.expectEqual(@as(u32, 2026), m.start_date.?.year);
-    try testing.expectEqualStrings("FINISHED", m.status.?); // folded from "Finished Airing"
+    try testing.expectEqualStrings("FINISHED", m.status.?);
     try testing.expectEqual(@as(usize, 2), m.genres.len);
     try testing.expectEqualStrings("Drama", m.genres[0]);
     try testing.expectEqualStrings("Suspense", m.genres[1]);
 }
 
 test "mapStatus folds senshi wording onto the canonical airing vocab (ROD-296)" {
-    // The whole point: isStillAiring must settle a finished show, and keep an
-    // airing one airing, off senshi's prose.
     try testing.expectEqualStrings("FINISHED", Senshi.mapStatus("Finished Airing").?);
     try testing.expect(!domain.isStillAiring(Senshi.mapStatus("Finished Airing")));
     try testing.expectEqualStrings("RELEASING", Senshi.mapStatus("Currently Airing").?);
@@ -717,8 +614,7 @@ test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // Out-of-order, with the extra columns senshi sends that we ignore, and a
-    // "10" that must sort after "2" numerically (not lexically).
+    // Phantom ep 0 dropped; "10" sorts after "2" numerically.
     const raw =
         \\[{"ep_id":3,"ep_title":"c","ep_filler":false,"intro_start":null},
         \\ {"ep_id":0,"ep_title":"Gray Phantom"},
@@ -727,11 +623,11 @@ test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {
         \\ {"ep_id":2,"ep_title":"b"}]
     ;
     const eps = try Senshi.parseEpisodes(a, raw);
-    try testing.expectEqual(@as(usize, 4), eps.len); // the phantom ep 0 is dropped
-    try testing.expectEqualStrings("1", eps[0].raw); // first playable episode, not "0"
+    try testing.expectEqual(@as(usize, 4), eps.len);
+    try testing.expectEqualStrings("1", eps[0].raw);
     try testing.expectEqualStrings("2", eps[1].raw);
     try testing.expectEqualStrings("3", eps[2].raw);
-    try testing.expectEqualStrings("10", eps[3].raw); // numeric, not lexical
+    try testing.expectEqualStrings("10", eps[3].raw);
 }
 
 test "epLabel: integral drops the decimal, fractional keeps it" {
@@ -741,7 +637,7 @@ test "epLabel: integral drops the decimal, fractional keeps it" {
     try testing.expectEqualStrings("1", try Senshi.epLabel(a, 1.0));
     try testing.expectEqualStrings("12", try Senshi.epLabel(a, 12.0));
     try testing.expectEqualStrings("13.5", try Senshi.epLabel(a, 13.5));
-    try testing.expectEqualStrings("0", try Senshi.epLabel(a, std.math.inf(f64))); // defensive
+    try testing.expectEqualStrings("0", try Senshi.epLabel(a, std.math.inf(f64)));
 }
 
 test "guardShowId accepts a numeric MAL id, rejects traversal/injection" {
@@ -749,7 +645,7 @@ test "guardShowId accepts a numeric MAL id, rejects traversal/injection" {
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId(""));
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId("../etc"));
     try testing.expectError(error.InvalidShowId, Senshi.guardShowId("59708/x"));
-    try testing.expectError(error.InvalidShowId, Senshi.guardShowId("dsd8y")); // public_id, not our key
+    try testing.expectError(error.InvalidShowId, Senshi.guardShowId("dsd8y"));
 }
 
 test "pickEmbed picks the right track and prefers soft subs (ROD-301)" {
@@ -758,16 +654,13 @@ test "pickEmbed picks the right track and prefers soft subs (ROD-301)" {
         .{ .url = "https://cdn/hard.m3u8", .status = "HardSub" },
         .{ .url = "https://cdn/soft.m3u8", .status = "SoftSub" },
     };
-    // sub → SoftSub wins over HardSub; dub → the Dub embed.
     try testing.expectEqualStrings("https://cdn/soft.m3u8", Senshi.pickEmbed(&embeds, .sub).?.url.?);
     try testing.expectEqualStrings("https://cdn/dub.m3u8", Senshi.pickEmbed(&embeds, .dub).?.url.?);
 
-    // A sub-only show offers no dub → null (resolve turns this into a clear error).
     const sub_only = [_]Senshi.Embed{.{ .url = "https://cdn/hard.m3u8", .status = "HardSub" }};
     try testing.expect(Senshi.pickEmbed(&sub_only, .dub) == null);
     try testing.expectEqualStrings("https://cdn/hard.m3u8", Senshi.pickEmbed(&sub_only, .sub).?.url.?);
 
-    // An embed with no url is skipped, not chosen.
     const no_url = [_]Senshi.Embed{.{ .url = null, .status = "SoftSub" }};
     try testing.expect(Senshi.pickEmbed(&no_url, .sub) == null);
 }
@@ -785,15 +678,12 @@ test "subInfoUrl decodes the sidecar url, null when absent (ROD-378)" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // The live serverFM shape: a filemoon embed url carrying an encoded sub.info.
     const fm = "https://host.example/e/abc123/?sub.info=https%3A%2F%2Fninstream.com%2Fx%2Fsub_filemoon.json";
     try testing.expectEqualStrings("https://ninstream.com/x/sub_filemoon.json", Senshi.subInfoUrl(a, fm).?);
 
-    // A trailing param after sub.info is trimmed at the &.
     const fm2 = "https://host.example/e/abc/?sub.info=https%3A%2F%2Fc%2Fs.json&t=9";
     try testing.expectEqualStrings("https://c/s.json", Senshi.subInfoUrl(a, fm2).?);
 
-    // A genuinely burned-in HardSub embed has no sub.info → no sidecar.
     try testing.expect(Senshi.subInfoUrl(a, "https://host.example/d/xyz") == null);
     try testing.expect(Senshi.subInfoUrl(a, null) == null);
 }
@@ -801,19 +691,15 @@ test "subInfoUrl decodes the sidecar url, null when absent (ROD-378)" {
 test "pickSubTrack: default wins, english next, first as fallback (ROD-378)" {
     const eng: Senshi.SubTrack = .{ .src = "https://c/eng.vtt", .label = "ENG", .default = true };
     const jpn: Senshi.SubTrack = .{ .src = "https://c/jpn.vtt", .label = "SDH (JPN)" };
-    // The live Yani shape: ENG default over the SDH (JPN) track.
     try testing.expectEqualStrings("https://c/eng.vtt", Senshi.pickSubTrack(&.{ eng, jpn }).?);
 
-    // No default: english label wins over an earlier non-english track.
     const spa: Senshi.SubTrack = .{ .src = "https://c/spa.vtt", .label = "Spanish" };
     const eng2: Senshi.SubTrack = .{ .src = "https://c/eng2.vtt", .label = "English" };
     try testing.expectEqualStrings("https://c/eng2.vtt", Senshi.pickSubTrack(&.{ spa, eng2 }).?);
 
-    // No default, no english: the first track with a src.
     const bare: Senshi.SubTrack = .{ .src = "https://c/bare.vtt" };
     try testing.expectEqualStrings("https://c/spa.vtt", Senshi.pickSubTrack(&.{ spa, bare }).?);
 
-    // A src-less track is skipped; an empty list yields null.
     try testing.expectEqualStrings("https://c/bare.vtt", Senshi.pickSubTrack(&.{ .{ .label = "ENG" }, bare }).?);
     try testing.expect(Senshi.pickSubTrack(&.{}) == null);
 }
@@ -825,10 +711,9 @@ test "percentDecode: escapes decode, malformed stays literal (ROD-378)" {
     try testing.expectEqualStrings("://", try Senshi.percentDecode(a, "%3A%2F%2F"));
     try testing.expectEqualStrings("a b", try Senshi.percentDecode(a, "a%20b"));
     try testing.expectEqualStrings("plain", try Senshi.percentDecode(a, "plain"));
-    // A stray or truncated % is preserved, not silently eaten.
     try testing.expectEqualStrings("100%", try Senshi.percentDecode(a, "100%"));
     try testing.expectEqualStrings("%zz", try Senshi.percentDecode(a, "%zz"));
-    // A literal + is not treated as a space (this is a URL, not form data).
+    // `+` is not a space (URL, not form data).
     try testing.expectEqualStrings("a+b", try Senshi.percentDecode(a, "a+b"));
 }
 
@@ -837,15 +722,11 @@ test "sidecar url is guarded on both layers after percent-decode (ROD-378)" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
 
-    // A CRLF-injection payload smuggled through the sub.info percent-encoding
-    // decodes to raw control bytes, which cleanArg (printable ASCII only) rejects
-    // before the url could reach our fetch or mpv's argv.
+    // CRLF smuggled through percent-encoding → cleanArg rejects before fetch/mpv.
     const crlf = try Senshi.percentDecode(a, "https://h/x%0d%0aHost:%20evil");
     try testing.expect(!Senshi.cleanArg(crlf));
 
-    // A percent-encoded private-IP host decodes to bytes cleanArg PASSES (digits and
-    // dots are printable), so cleanArg alone can't stop SSRF. fetchguard is the layer
-    // that does: fetchSubtitle runs both, in that order, before the fetch.
+    // Private IP is printable: cleanArg alone cannot stop SSRF; fetchguard is the second layer.
     const priv = try Senshi.percentDecode(a, "http://127%2e0%2e0%2e1/latest");
     try testing.expect(Senshi.cleanArg(priv));
     try testing.expectError(error.BlockedHost, fetchguard.guardFetchUrl(priv));
