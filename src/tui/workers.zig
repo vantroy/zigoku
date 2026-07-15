@@ -1,4 +1,4 @@
-//! Zigoku — TUI background workers and shared ownership helpers.
+//! TUI background workers and shared ownership helpers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,48 +27,37 @@ const SourceProvider = source_mod.SourceProvider;
 const Anime = domain.Anime;
 const Loop = event_mod.Loop;
 
-/// Fire-and-forget worker accounting (ROD-179): spawn a background worker without
-/// synchronously joining a prior one. The superseded worker is detached and runs to
-/// completion on its own (its stale result is keep-checked and dropped on arrival),
-/// while a teardown barrier still guarantees every outstanding worker finished before
-/// the shared state it borrows (the event loop, the gpa, the io) is torn down.
+/// Fire-and-forget worker accounting (ROD-179). Superseded workers detach and run out;
+/// stale results are keep-checked and dropped. Teardown still waits so nothing touches
+/// loop/gpa/io after free.
 ///
 /// Contract:
-///   - `begin()` on the spawning thread immediately BEFORE each spawn, so the count is
-///     raised before the new thread can start. On spawn failure, pair with `finish()`.
-///   - the worker calls `finish()` as its last action (via `defer`), after its final
-///     `postEvent` returns, so once `drain()` unblocks no worker can still touch the
-///     loop/gpa/io.
-///   - `drain()` once, on teardown: blocks until every begun worker finished.
+///   - `begin()` on the spawning thread immediately BEFORE each spawn. On spawn failure,
+///     pair with `finish()`.
+///   - worker calls `finish()` last (defer), after final `postEvent` returns, so `drain()`
+///     means no further touch of loop/gpa/io.
+///   - `drain()` once on teardown: blocks until every begun worker finished.
 ///
-/// Just an atomic counter: this std's `Thread` is spawn/join/detach/yield only (the
-/// blocking primitives moved to `std.Io`), so `begin`/`finish` are lock-free fetch
-/// add/sub and `drain()` spins with `yield()`. It runs once on teardown, never the hot
-/// path, and is bounded by the in-flight fetch's deadline (ROD-153).
+/// Atomic counter + yield spin (this std's Thread is spawn/join/detach/yield only).
+/// Teardown path only; bounded by in-flight fetch deadline (ROD-153).
 ///
-/// Intentionally uncapped: the episode-prefetch debounce (ROD-156) keeps superseding
-/// fires rare and each fetch is deadline-bounded, so the outstanding set stays small. A
-/// cap would be backpressure policy, not safety, so a caller that wants one (the Discover
-/// fan-out) reads `inflight` against its own soft cap at the spawn site (ROD-264) instead
-/// of this primitive imposing a global limit.
+/// Uncapped on purpose: backpressure is the caller's job (Discover soft-caps via
+/// `inflight` at the spawn site, ROD-264). Episode-prefetch debounce (ROD-156) keeps
+/// supersedes rare.
 ///
-/// `drain()` assumes the event queue keeps draining: a worker's final `postEvent` blocks
-/// if the bounded queue is full, and during teardown the main loop has stopped popping,
-/// so a saturated queue could wedge the drain. A pre-existing low-probability teardown
-/// hazard shared by every worker join in run(); pumping the queue while draining is a
-/// separate follow-up.
+/// `drain()` needs the event queue still draining: final `postEvent` blocks if the queue
+/// is full, and teardown has stopped popping, so a saturated queue can wedge. Shared
+/// teardown hazard; pumping the queue while draining is a follow-up.
 pub const ThreadDrain = struct {
     inflight: std.atomic.Value(usize) = .init(0),
 
-    /// Account for a worker about to be spawned. Call on the spawning thread,
-    /// before the spawn, so `drain()` can never observe a gap.
+    /// Raise the count on the spawning thread before spawn so `drain()` never sees a gap.
     pub fn begin(self: *ThreadDrain) void {
         _ = self.inflight.fetchAdd(1, .acq_rel);
     }
 
-    /// Account for a finished worker. Call as the worker's last action (defer).
-    /// The release here publishes the worker's prior effects (its final
-    /// `postEvent`) to whoever observes the count hit zero in `drain()`.
+    /// Last action of the worker (defer). Release publishes prior effects (final
+    /// `postEvent`) to the observer of count-zero in `drain()`.
     pub fn finish(self: *ThreadDrain) void {
         const prev = self.inflight.fetchSub(1, .acq_rel);
         std.debug.assert(prev > 0);
@@ -94,25 +83,19 @@ pub const DecodedCoverCache = lru_mod.LruCache([]const u8, cover_mod.Pixels, 5, 
 pub const max_cover_raw_cache_bytes = 32 * 1024 * 1024;
 pub const max_cover_decoded_cache_bytes = 48 * 1024 * 1024;
 
-/// Shared, mutex-guarded cover caches (ROD-243). Hoisted out of `CoverState` so the
-/// single-cover path and the Discover grid fetch against the SAME URL-keyed LRUs, so a
-/// cover fetched in Browse is reused by Discover for free.
+/// Shared mutex-guarded cover caches (ROD-243). Single-cover and Discover grid share the
+/// same URL-keyed LRUs so Browse fetches reuse in Discover. `mu` is what makes them safe
+/// under N concurrent cover workers.
 ///
-/// The mutex is what makes these caches safe under N concurrent cover workers; before
-/// ROD-243 safety came only from `cover_state.zig` joining the prior thread before
-/// spawning the next, and the grid breaks that.
-///
-/// Lock discipline (in `loadCoverPixels`): every dupe of a slice that lives in or was
-/// just inserted into a cache happens while `mu` is held; `decodeCoverBody` and the
-/// network fetch run UNLOCKED so a slow decode never stalls another worker. `LruCache.get`
-/// is itself a writer (it promotes the hit), so even a pure lookup must hold the lock.
+/// Lock discipline (`loadCoverPixels`): dupe of cache-resident/inserted slices under `mu`;
+/// `decodeCoverBody` and network fetch UNLOCKED. `LruCache.get` promotes (writer), so pure
+/// lookups hold the lock too.
 pub const CoverCaches = struct {
     mu: std.Io.Mutex = .init,
     raw: RawCoverCache = .{},
     decoded: DecodedCoverCache = .{},
 
-    /// Teardown only — call after every cover worker has joined, so nothing a
-    /// worker still references is freed out from under it.
+    /// Teardown only: call after every cover worker has joined.
     pub fn deinit(self: *CoverCaches, gpa: Allocator) void {
         self.decoded.deinit(gpa);
         self.decoded = .{};
@@ -121,9 +104,8 @@ pub const CoverCaches = struct {
     }
 };
 
-/// One slot of the episode hot-cache: a canonical GPA-owned episode list plus
-/// the Unix-seconds expiry mirroring the DB episode_cache TTL, so the in-memory
-/// mirror never serves data the DB itself would refuse as stale (ROD-130).
+/// Episode hot-cache slot: canonical GPA-owned list + Unix-seconds expiry mirroring the
+/// DB episode_cache TTL, so the mirror never serves data the DB would refuse (ROD-130).
 pub const EpisodeLruEntry = struct {
     episodes: []domain.EpisodeNumber,
     expires_at: i64,
@@ -140,18 +122,14 @@ const EpisodeListOps = struct {
     }
 };
 pub const episode_lru_cap = 8;
-/// Hot in-memory mirror of the DB episode cache (ROD-130), keyed by
-/// "source\x00source_id\x00translation". A synchronous hit bypasses the async
-/// fetch so the detail pane opens instantly on repeat visits. Entries hold
-/// canonical episode copies (each .raw individually owned); a hit dups into the
-/// view, so LRU eviction can never invalidate displayed memory.
+/// In-memory mirror of the DB episode cache (ROD-130), key
+/// "source\x00source_id\x00translation". Entries own canonical episode copies (each
+/// `.raw` owned); hits dupe into the view so LRU eviction cannot invalidate displayed
+/// memory.
 pub const EpisodeLruCache = lru_mod.LruCache([]const u8, EpisodeLruEntry, episode_lru_cap, EpisodeListOps);
 
-/// Duplicate an episode list into a fresh canonical GPA allocation: a new outer
-/// slice plus an individually-owned copy of every `.raw`. Mirrors the exact
-/// ownership shape `episodesTask` produces, so the result is freeable by
-/// `EpisodeState.freeResults` / `EpisodeListOps`. On OOM the partial allocation is
-/// unwound and the error propagates (callers fall back to a network fetch).
+/// Canonical episode-list clone: outer slice + individually-owned `.raw`, matching
+/// `episodesTask` / freeable by `EpisodeState.freeResults` / `EpisodeListOps`.
 pub fn dupEpisodesOwned(alloc: Allocator, eps: []const domain.EpisodeNumber) ![]domain.EpisodeNumber {
     const out = try alloc.alloc(domain.EpisodeNumber, eps.len);
     var filled: usize = 0;
@@ -170,10 +148,8 @@ pub fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
     return if (s) |x| try alloc.dupe(u8, x) else null;
 }
 
-/// Deep-copy a slice of strings (genres, studios) into a fresh owned slice plus
-/// an individually-owned copy of every element — the shape `freeOwnedAnime`
-/// frees. On OOM the partial allocation is unwound and the error propagates.
-/// Returns `&.{}` for an empty input (no allocation, nothing to free).
+/// Deep-copy string list (genres, studios): owned slice + owned elements, freeable by
+/// `freeOwnedAnime`. Empty input returns `&.{}` (no alloc).
 pub fn dupeOwnedStrList(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
     if (items.len == 0) return &.{};
     const out = try alloc.alloc([]const u8, items.len);
@@ -251,39 +227,31 @@ pub fn freeOwnedAnime(alloc: Allocator, a: Anime) void {
     }
 }
 
-/// Whether to replace a card's current cover `cur` with an enriched `inc`: adopt
-/// when there's no cover yet, or when `cur` is only a relative ref and `inc` is a
-/// fetchable absolute url (ROD-267). Never downgrades an absolute url to a relative
-/// one, and never swaps one absolute for another (no churn for equal quality).
+/// Prefer enriched cover `inc` over `cur` (ROD-267): adopt when blank, or relative→absolute.
+/// Never absolute→relative, never absolute→absolute (no equal-quality churn).
 fn preferCover(cur: ?[]const u8, inc: ?[]const u8) bool {
     const incoming = inc orelse return false;
     const current = cur orelse return true;
     return !domain.isAbsoluteUrl(current) and domain.isAbsoluteUrl(incoming);
 }
 
-/// Background task: run a discovery search on AniList (ROD-327) and post the results to
-/// the UI thread. Discovery search is OFF the `SourceProvider` vtable (ROD-324): it
-/// queries AniList directly, so hits are anilist_id-keyed canonical rows, not provider
-/// bindings. Binding a hit to a play provider is the resolver's job (the Play/Add
-/// tier-A path), never this fetch.
+/// AniList discovery search (ROD-327). Off the `SourceProvider` vtable (ROD-324): hits are
+/// anilist_id-keyed canonical rows, not provider bindings. Binding is the resolver's job.
 pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, page: u32) void {
-    // NOTE: `query` ownership is transferred to the `search_done` event's `for_query`
-    // on the success path; the UI thread frees it there. On all error paths we free it
-    // here explicitly before returning. Do NOT add a defer — it would free the string
-    // before the UI thread reads `ev.for_query`, causing a use-after-free.
+    // `query` transfers to `search_done.for_query` on success (UI frees). Error paths free
+    // it here. Do NOT defer free: that UAF's the UI thread reading `ev.for_query`.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
     const raw = anilist.search(arena.allocator(), io, query, page) catch |e| {
         log.debug("search failed: {s}", .{@errorName(e)});
         gpa.free(query);
-        // @errorName is a static string (immortal) — safe to thread into the toast.
+        // @errorName is static/immortal: safe to put in the toast.
         loop.postEvent(.{ .task_error = @errorName(e) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
 
-    // Dupe every owned string we might thread into the UI so arena teardown
-    // cannot leave dangling references in the event payload.
+    // GPA-owned dupes so the event outlives the arena.
     var owned = std.ArrayListUnmanaged(Anime).empty;
     owned.ensureTotalCapacity(gpa, raw.len) catch |e| {
         log.debug("search result alloc failed: {s}", .{@errorName(e)});
@@ -296,11 +264,8 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, pa
         owned.appendAssumeCapacity(duped);
     }
 
-    // `owned.items` is a sub-slice of an over-allocated backing buffer —
-    // `ensureTotalCapacity` grows by more than requested so len < capacity.
-    // `gpa.free(owned.items)` would mismatch the allocation length and panic.
-    // `toOwnedSlice` resizes to exact fit (len == capacity), giving a slice
-    // safe to pass to gpa.free on either path below.
+    // `toOwnedSlice` exact-fits (len == capacity). Freeing `owned.items` raw would
+    // mismatch the over-allocated buffer and panic under gpa.
     const exact = owned.toOwnedSlice(gpa) catch {
         for (owned.items) |r| freeOwnedAnime(gpa, r);
         owned.deinit(gpa);
@@ -313,35 +278,28 @@ pub fn searchTask(loop: *Loop, gpa: Allocator, io: std.Io, query: []const u8, pa
         .for_query = query,
         .page = page,
     } }) catch {
-        // Post failed — we still own everything; free it all.
+        // Post failed: still own everything.
         for (exact) |r| freeOwnedAnime(gpa, r);
-        gpa.free(exact); // exact-fit: len == capacity, free is valid
+        gpa.free(exact); // exact-fit: len == capacity
         gpa.free(query);
     };
-    // On success: `exact` and `query` are now owned by the event.
-    // The UI thread frees them via gpa.free(ev.results) and gpa.free(ev.for_query).
 }
 
-/// Background task: tier-A resolve for add-to-watchlist (ROD-327). A Browse search hit
-/// is anilist_id-keyed; the play provider keys by the stringified mal_id (`candidate_id`).
-/// Probes `provider.episodes(candidate_id)`: a non-empty list means the provider stocks
-/// the show, so the UI thread can mint the binding. A transport failure and an empty list
-/// both collapse to `ok = false` (the UI thread turns that miss into the explicit unbound
-/// marker, ROD-329, add path), but only the authoritative empty rides `absent_sources`
-/// into the ROD-347 negative cache. This worker writes no state itself.
+/// Tier-A resolve for add-to-watchlist (ROD-327). Probes `provider.episodes(candidate_id)`
+/// (play provider keys by stringified mal_id). Non-empty = stocked (UI mints binding).
+/// Transport fail and empty both post `ok = false` (UI → unbound marker, ROD-329), but
+/// only authoritative empty rides `absent_sources` into the ROD-347 negative cache.
+/// This worker writes no state.
 ///
-/// `candidate_id` ownership transfers to the `resolve_add_result` event on a successful
-/// post (the UI thread frees it on either arm); freed here only if the post fails.
-/// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
-/// worker can no longer touch loop/gpa.
+/// `candidate_id` transfers to `resolve_add_result` on successful post (UI frees); free
+/// here only if post fails. `drain.finish()` last so a drained barrier means no loop/gpa touch.
 pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, candidate_id: []const u8, anilist_id: i64, translation: domain.Translation, drain: *ThreadDrain) void {
     defer drain.finish();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    // Three-state (ROD-347): a 200-with-empty listing is an authoritative "not
-    // stocked" (the ROD-346 banking) and earns an absence row; a transport error
-    // proves nothing and must not (ROD-278).
+    // Three-state (ROD-347): 200-with-empty is authoritative "not stocked" (ROD-346) and
+    // earns an absence row; transport error proves nothing (ROD-278).
     const Probe = enum { hit, absent, unknown };
     const probe: Probe = if (provider.episodes(arena.allocator(), io, candidate_id, translation, null)) |eps|
         (if (eps.len > 0) Probe.hit else Probe.absent)
@@ -368,38 +326,19 @@ pub fn resolveAddTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceP
     };
 }
 
-/// Background task: search-then-match binding resolve (ROD-328/342). A Browse search hit
-/// that could not tier-A anywhere is resolved by walking `providers` in effective order
-/// (ROD-343/344: the caller's `Registry.orderedAlloc` snapshot, preference first; first
-/// confident match wins and the posted event carries the winner's name). `providers` is
-/// gpa-owned by this task and freed here, so a preference change mid-flight can't touch
-/// a walk already underway.
-/// Per provider, in tier order: tier A first (ROD-366) via `canonicalKey`, so a
-/// provider this same walk retries (the add-widen) still gets its direct catalog
-/// key even though the caller already tried tier A on the FIRST provider only
-/// (browseResolveTarget stops there); a tier-A-only provider like megaplay is
-/// unreachable otherwise. Then, if that misses, search its OWN catalog and match:
-/// tier B (`resolver.bestIdMatch`: exact canonical-id agreement off ids the provider
-/// embedded in its results; the retired anipub's MALID backfill shape, kept for future
-/// tier-B providers), then tier C
-/// (`resolver.bestProviderMatch`, the STRONG canonical→provider fuzzy direction). Two
-/// query passes: the canonical (romaji) title, then the English title, since an
-/// English-titled catalog misses a romaji query entirely, and a confident
-/// match on the first pass skips the second. A confident match yields the provider's
-/// opaque id; no match or a failed search both collapse to `ok = false` (the add path
-/// then persists the unbound marker, ROD-329; Play just toasts), and each provider's
-/// definitive "not stocked" verdict rides `absent_sources` into the ROD-347 negative
-/// cache. Add (`for_play` false)
-/// then probes `episodes` to confirm the match has playable episodes, the same bar
-/// tier-A Add holds; Play skips that probe because its own downstream episode fetch is
-/// the confirmation.
+/// Search-then-match binding resolve (ROD-328/342). Walks `providers` in effective order
+/// (ROD-343/344: caller's `Registry.orderedAlloc` snapshot; first confident match wins).
+/// `providers` is gpa-owned here so a mid-flight preference change cannot retarget the walk.
 ///
-/// `canonical` is a gpa-owned deep copy (freed here) so it outlives the caller's return
-/// (`fireResolvePlaySearch`/`fireResolveAddSearch`). On a hit the matched id is duped into gpa
-/// and transferred to the posted event (the UI thread frees it); `for_play` selects
-/// `.resolve_play_target` vs `.resolve_add_result`.
-/// `drain.finish()` runs last (mirrors `episodesTask`) so a drained barrier means this
-/// worker can no longer touch loop/gpa.
+/// Per provider (via `resolveViaSearch`): tier A `canonicalKey` first (ROD-366; needed so
+/// tier-A-only providers like megaplay and widen retries past browseResolveTarget's first
+/// provider are reachable), then own-catalog search: tier B `bestIdMatch`, tier C
+/// `bestProviderMatch`. Two title passes (romaji then English). Misses post `ok = false`
+/// (add → unbound ROD-329; Play toasts); definitive absences ride `absent_sources` (ROD-347).
+/// Add probes `episodes` after a match; Play skips (downstream fetch confirms).
+///
+/// `canonical` is a gpa deep copy freed here. Hit id dups into gpa and transfers on post.
+/// `for_play` selects `.resolve_play_target` vs `.resolve_add_result`. `drain.finish()` last.
 pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, for_play: bool, drain: *ThreadDrain) void {
     defer drain.finish();
     defer gpa.free(providers);
@@ -410,7 +349,7 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []c
     var absent_names: std.ArrayListUnmanaged([]const u8) = .empty;
     const match = resolveAcrossProviders(arena.allocator(), io, providers, canonical, translation, for_play, &absent_names);
     const resolved: ?[]const u8 = if (match) |m| gpa.dupe(u8, m.id) catch null else null;
-    // Only the slice is duped: the names are static vtable strings.
+    // Slice only: names are static vtable strings.
     const absent: []const []const u8 = if (absent_names.items.len > 0)
         gpa.dupe([]const u8, absent_names.items) catch &.{}
     else
@@ -430,24 +369,17 @@ pub fn resolveSearchTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []c
     };
 }
 
-/// A settled cross-provider search resolve: the matched catalog id and the name of
-/// the provider that produced it (a static vtable string).
+/// Cross-provider match: catalog id + provider name (static vtable string).
 const SearchMatch = struct { id: []const u8, source: []const u8 };
 
-/// One provider's search-resolve verdict (ROD-347). `.match` carries the catalog id
-/// (borrowing from the search arena). `.absent` is definitive: every runnable query
-/// pass completed and none produced a confident playable match, so the provider does
-/// not stock the show; the UI thread may cache it. `.unknown` means a transport
-/// failure tainted the walk (or no pass could run at all): nothing was learned, and
-/// nothing may be cached (the ROD-278 contract).
+/// One provider's search-resolve verdict (ROD-347). `.match` borrows catalog id from the
+/// search arena. `.absent` is definitive (UI may cache). `.unknown` means transport tainted
+/// the walk or nothing ran: learn nothing, cache nothing (ROD-278).
 const SearchVerdict = union(enum) { match: []const u8, absent, unknown };
 
-/// Walk the effective provider order through `resolveViaSearch`, first confident match
-/// wins (ROD-343/344): each provider gets its full two-pass search before the next is tried,
-/// so a strong first-provider match is never preempted by a weaker later one, and
-/// requests stay sequential (one provider at a time, the ROD-309 discipline).
-/// Providers that returned a definitive `.absent` before the walk settled are appended
-/// to `absent_out` (arena-backed; static vtable names) for the ROD-347 negative cache.
+/// Walk providers through `resolveViaSearch`; first confident match wins (ROD-343/344).
+/// Full two-pass search per provider before the next; sequential (ROD-309). Definitive
+/// `.absent` appends to `absent_out` (arena; static vtable names) for ROD-347.
 fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool, absent_out: *std.ArrayListUnmanaged([]const u8)) ?SearchMatch {
     for (providers) |p| {
         switch (resolveViaSearch(arena, io, p, canonical, translation, for_play, null)) {
@@ -459,37 +391,27 @@ fn resolveAcrossProviders(arena: Allocator, io: std.Io, providers: []const Sourc
     return null;
 }
 
-/// The search→match→probe core of `resolveSearchTask`, split from the thread/event
-/// glue so the pass control flow is unit-testable with a stub provider.
+/// Search→match→probe core of `resolveSearchTask`. Split for unit tests with a stub provider.
 fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, canonical: Anime, translation: domain.Translation, for_play: bool, pre_search_gap_ms: ?u64) SearchVerdict {
     var transport_failed = false;
-    // `probed` gates the `.absent` verdict: at least one authoritative pass (a
-    // clean tier-A episode probe or a title search) must have run, or a clean
-    // miss is really "learned nothing" (`.unknown`).
+    // Gates `.absent`: without at least one clean tier-A probe or title search, a miss
+    // is `.unknown` (learned nothing).
     var probed = false;
-    // Whether a tier-A episode probe actually hit the network this call: gates the
-    // `pre_search_gap_ms` spacing so a no-tier-A provider (its search IS its first
-    // request) never eats a needless gap (ROD-367).
+    // True if tier-A hit the network this call: gates `pre_search_gap_ms` so no-tier-A
+    // providers (search is first request) skip a needless gap (ROD-367).
     var tier_a_probed = false;
 
-    // Tier A (ROD-366): the provider id-keys its own catalog from the canonical.
-    // Try it BEFORE the title search so a tier-A-only provider (megaplay, whose
-    // `search` is `error.Unsupported`) is reachable at all here. Mirrors the tier
-    // order advanceFallback + prewarmTask already use; the initial resolve only
-    // ever probes the FIRST tier-A provider (browseResolveTarget stops there), so
-    // a later provider's key still needs trying on the widen.
+    // Tier A (ROD-366) before title search so tier-A-only providers (megaplay: search is
+    // `error.Unsupported`) are reachable. Also covers widen retries past the first
+    // provider (browseResolveTarget stops there).
     if (provider.canonicalKey(arena, canonical) catch null) |key| {
-        // Play skips the probe (its own downstream fetch confirms), same as the
-        // search arm below.
+        // Play skips probe (downstream fetch confirms).
         if (for_play) return .{ .match = key };
         tier_a_probed = true;
         if (provider.episodes(arena, io, key, translation, null)) |eps| {
             if (eps.len > 0) return .{ .match = key };
-            // 200-with-empty on the canonical route is an authoritative "not
-            // stocked" (megaplay's empty-is-authoritative contract, ROD-347). It
-            // still falls through to a title search for a provider that also has
-            // one (senshi): the canonical's mal_id may differ from the id senshi
-            // cataloged the show under, which only a search recovers.
+            // 200-with-empty is authoritative "not stocked" (ROD-347). Still fall through
+            // to title search when the provider has one: mal_id may not match the catalog id.
             probed = true;
         } else |e| {
             log.debug("resolve tier-A episode probe failed: {s}", .{@errorName(e)});
@@ -497,11 +419,9 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         }
     }
 
-    // ROD-367: a background caller (the pre-warm) that just fired a tier-A probe
-    // spaces the fallback search off it, so the probe+search never burst a
-    // rate-scoring CDN in one pass (the ROD-309 discipline pure-background work
-    // must keep; the foreground widen passes null and stays fast). is_test-gated
-    // so the suite doesn't sleep, mirroring the spawn gates in app.zig.
+    // ROD-367: background pre-warm spaces tier-A → search so pure-background work
+    // does not burst a rate-scoring CDN (ROD-309). Foreground widen passes null.
+    // is_test-gated so the suite does not sleep.
     if (pre_search_gap_ms) |g| {
         if (tier_a_probed and !builtin.is_test) nanosleepMs(g);
     }
@@ -515,13 +435,11 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
     for (passes, 0..) |pass, pi| {
         const query = pass orelse continue;
         if (query.len == 0) continue;
-        // Skip a redundant second search when the English title IS the name.
+        // Skip redundant second search when English title IS the name.
         if (pi == 1 and std.mem.eql(u8, query, canonical.name)) continue;
         const results = provider.search(arena, io, query, opts) catch |e| {
-            // A provider with no catalog search (megaplay) reports Unsupported:
-            // that is "nothing to search here", not a transport failure, so it
-            // must not taint an absence a clean tier-A probe already established
-            // (ROD-366/347). Any other error is a real transport failure.
+            // Unsupported = no catalog search (megaplay), not transport: must not taint
+            // an absence a clean tier-A probe already established (ROD-366/347).
             if (e != error.Unsupported) {
                 log.debug("resolve-search failed: {s}", .{@errorName(e)});
                 transport_failed = true;
@@ -532,12 +450,9 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         const idx = resolver.bestIdMatch(canonical, results) orelse
             resolver.bestProviderMatch(canonical, results) orelse continue;
         const matched_id = results[idx].id;
-        // Add confirms the match actually has playable episodes (parity with tier-A's
-        // resolveAddTask): a catalog listing can be announced-but-empty. Play skips this, since
-        // its own downstream episode fetch is the confirmation. Sequential after the search, so
-        // still one provider request at a time (ROD-309). A failed or empty probe falls
-        // through to the next pass (bounded at 2): a dead listing on one title must not
-        // also deny the other title's legitimate match.
+        // Add probes episodes (parity with resolveAddTask; listing can be empty). Play
+        // skips. Sequential after search (ROD-309). Fail/empty falls through to next title
+        // pass: one dead listing must not deny the other title's match.
         if (!for_play) {
             const eps = provider.episodes(arena, io, matched_id, translation, null) catch |e| {
                 log.debug("resolve-search episode probe failed: {s}", .{@errorName(e)});
@@ -548,38 +463,26 @@ fn resolveViaSearch(arena: Allocator, io: std.Io, provider: SourceProvider, cano
         }
         return .{ .match = matched_id };
     }
-    // A clean miss is definitive only when at least one authoritative pass ran AND
-    // no transport failure could have hidden a hit (a CF-diva day must never poison
-    // the cache).
+    // Clean miss is definitive only if an authoritative pass ran and transport did not
+    // hide a hit (must not poison the negative cache).
     if (transport_failed or !probed) return .unknown;
     return .absent;
 }
 
-/// Polite spacing between a pre-warm's per-provider passes (ROD-351): the walk is
-/// pure background, so unlike the user-blocking resolve walk it can afford to not
-/// even LOOK like a burst to a rate-scoring CDN (ROD-309).
+/// Gap between pre-warm per-provider passes (ROD-351). Pure background, so it can
+/// avoid looking like a CDN burst (ROD-309); foreground resolve does not use this.
 const prewarm_gap_ms: u64 = 1500;
 
-/// Background task: eager sibling pre-warm (ROD-351). For one canonical entity,
-/// walk `providers` (already filtered by the UI thread: no binding, no fresh
-/// absence) and try to establish where else the show is stocked through the SHARED
-/// `resolveViaSearch` ladder (ROD-367): tier-A `canonicalKey` + episode probe first,
-/// then, only if that comes up empty, the tier-C two-pass search. Routing through
-/// the same primitive the resolve-widen uses is the whole point: a dual-capability
-/// provider (senshi keys by mal_id AND has a catalog search) whose tier-A probe
-/// lists empty must fall through to the search, or the warm caches a false absence
-/// that then also spares future search passes and strands a flip (the ROD-366/368
-/// bug class, one hop over). One `.prewarm_result` per settled provider (the UI
-/// thread mints hidden bindings / caches negatives incrementally, so a quit mid-walk
-/// loses only the tail); `.unknown` verdicts post nothing. Strictly sequential with
-/// a gap between providers (ROD-309), and `.prewarm_done` always closes the walk
-/// (clears the single-flight guard).
+/// Eager sibling pre-warm (ROD-351). Walks `providers` (UI-filtered: no binding, no
+/// fresh absence) via shared `resolveViaSearch` (ROD-367) so dual-capability providers
+/// whose tier-A lists empty still fall through to search: a warm-only false absence
+/// would strand flips (ROD-366/368). One `.prewarm_result` per settled provider (UI
+/// mints/caches incrementally); `.unknown` posts nothing. Sequential with gaps (ROD-309).
+/// `.prewarm_done` always closes the single-flight guard.
 ///
-/// `providers` and `canonical` are gpa-owned by this task and freed here. A
-/// matched id is duped into gpa and transferred to the event (UI thread frees).
-/// `cancel` (App.prewarm_cancel) is polled between hops: an advancing fallback
-/// walk winds this walk down early rather than compete for the CDN budget;
-/// `.prewarm_done` still posts so the single-flight guard clears.
+/// `providers`/`canonical` gpa-owned here. Match id dups into gpa and transfers on post.
+/// `cancel` (App.prewarm_cancel) polled between hops so an advancing fallback can yield
+/// CDN budget; `.prewarm_done` still posts.
 pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, cancel: *const std.atomic.Value(bool), drain: *ThreadDrain) void {
     defer drain.finish();
     defer gpa.free(providers);
@@ -607,14 +510,10 @@ pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const S
     loop.postEvent(.prewarm_done) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Background task: fetch one Discover feed page for `axis` from AniList (ROD-336).
-/// Off the vtable like `searchTask` (ROD-324): rows are anilist_id-keyed canonical
-/// entities, fully enriched (full GQL_FIELDS), so no follow-up enrich pass exists.
-/// Mirrors searchTask's ownership shape — dupes every owned string into gpa so the
-/// event payload outlives the worker's arena; the UI thread frees `results` via the
-/// `.discover_feed` arm. `now_ms` anchors the This Season cour. Three-state (ROD-278):
-/// a transport miss (error.NoAnswer) posts `.discover_feed_error`; an empty page is a
-/// confirmed answer and posts normally.
+/// One Discover feed page for `axis` from AniList (ROD-336). Off the vtable (ROD-324):
+/// anilist_id-keyed, fully enriched (no follow-up enrich). GPA-owned results outlive the
+/// arena; UI frees via `.discover_feed`. `now_ms` anchors This Season. Three-state (ROD-278):
+/// transport miss posts `.discover_feed_error`; empty page is a confirmed answer.
 pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.DiscoverAxis, page: u32, now_ms: i64, drain: *ThreadDrain) void {
     defer drain.finish(); // ROD-251: detached; account so teardown can drain us
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -626,8 +525,7 @@ pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.D
         return;
     };
 
-    // Dupe every owned string we thread into the UI so arena teardown cannot leave
-    // dangling references in the event payload (mirrors searchTask).
+    // GPA-owned dupes so the event outlives the arena (mirrors searchTask).
     var owned = std.ArrayListUnmanaged(Anime).empty;
     owned.ensureTotalCapacity(gpa, feed.rows.len) catch |e| {
         log.debug("discover feed alloc failed: {s}", .{@errorName(e)});
@@ -639,8 +537,7 @@ pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.D
         owned.appendAssumeCapacity(duped);
     }
 
-    // toOwnedSlice resizes to exact fit (len == capacity) so gpa.free is valid on
-    // either path below (see searchTask for the over-allocation rationale).
+    // Exact-fit so gpa.free is valid (see searchTask).
     const exact = owned.toOwnedSlice(gpa) catch {
         for (owned.items) |r| freeOwnedAnime(gpa, r);
         owned.deinit(gpa);
@@ -654,25 +551,21 @@ pub fn discoverFeedTask(loop: *Loop, gpa: Allocator, io: std.Io, axis: anilist.D
         .has_next = feed.has_next_page,
     } }) catch {
         for (exact) |r| freeOwnedAnime(gpa, r);
-        gpa.free(exact); // exact-fit: len == capacity, free is valid
+        gpa.free(exact); // exact-fit: len == capacity
     };
 }
 
-/// Fill an Anime's blank fields from AniList metadata — AllAnime is the source of
-/// truth, so only nulls are filled. Each string/slice deep-copies into `gpa`
-/// before the arena `meta` came from is torn down; a failed copy keeps the prior
-/// (blank) value rather than aliasing the soon-dead arena. Called by the ROD-182
-/// refresh-on-view (refreshEnrichTask); the search-page enrich that shared it was
-/// excised in ROD-330.
+/// Fill blank Anime fields from AniList metadata (nulls only). Strings deep-copy into
+/// `gpa` before the arena `meta` dies; failed copy keeps prior blank (no arena alias).
+/// Used by ROD-182 refresh-on-view.
 pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, meta.title_english) catch a.english_name;
-    // ROD-312: stash true romaji alongside the provider `name` (never overwritten
-    // here — see title_romaji's doc), so the canonical write can heal canonical.title.
+    // ROD-312: stash true romaji alongside provider `name` (never overwrite here; see
+    // title_romaji's doc) so the canonical write can heal canonical.title.
     if (a.title_romaji == null) a.title_romaji = dupeOptText(gpa, meta.title_romaji) catch a.title_romaji;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, meta.title_native) catch a.native_name;
-    // Prefer a fetchable absolute cover over a relative source ref (ROD-267): an
-    // AniList/MAL url beats a bare `mcovers/…` that only resolves behind the
-    // provider. Free the old relative ref before adopting; a failed dup keeps it.
+    // Prefer absolute cover over relative provider ref (ROD-267). Free old before adopt;
+    // failed dup keeps it.
     if (preferCover(a.thumb, meta.thumb)) {
         if (dupeOptText(gpa, meta.thumb) catch null) |t| {
             if (a.thumb) |old| gpa.free(old);
@@ -705,12 +598,10 @@ pub fn applyMetadata(gpa: Allocator, a: *Anime, meta: anilist.Metadata) void {
     if (a.country == null) a.country = dupeOptText(gpa, meta.country) catch a.country;
 }
 
-/// Fill the null fields of an in-memory `Anime` from a stored `AnimeRecord`, taking
-/// gpa-owned copies so they ride `freeOwnedAnime`. The record->Anime sibling of
-/// `applyMetadata`: both back-fill only nulls, so a stored value never clobbers a fresher
-/// one already on the row. Pure. Shared by the search-page and Discover-feed hydrates
-/// (ROD-268), so a card whose provider thumb carries no mineable AniList id still
-/// enriches by the id a past match stored.
+/// Fill null Anime fields from a stored `AnimeRecord` (gpa-owned, freeOwnedAnime).
+/// Sibling of `applyMetadata`: nulls only, never clobber fresher in-memory values.
+/// Shared by search/Discover hydrates (ROD-268) so cards without a mineable AniList id
+/// still enrich from a past match's stored id.
 pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRecord) void {
     if (a.english_name == null) a.english_name = dupeOptText(gpa, rec.title_english) catch a.english_name;
     if (a.native_name == null) a.native_name = dupeOptText(gpa, rec.native_name) catch a.native_name;
@@ -724,8 +615,7 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.duration == null) a.duration = if (rec.duration) |x| std.math.cast(u32, x) else null;
     if (a.year == null) a.year = if (rec.year) |x| std.math.cast(u32, x) else null;
     if (a.score == null) a.score = if (rec.score) |x| std.math.cast(u32, x) else null;
-    // Season/start_date are pure values (no heap); genres/studios are deep-copied
-    // into gpa so they outlive the caller's scratch arena and ride freeOwnedAnime.
+    // genres/studios deep-copied into gpa so they outlive caller's scratch arena.
     if (a.season == null) a.season = if (rec.season) |tag| domain.Season.fromString(tag) else null;
     if (a.start_date == null) a.start_date = rec.startDate();
     if (a.genres.len == 0) a.genres = dupeOwnedStrList(gpa, rec.genres) catch a.genres;
@@ -739,19 +629,14 @@ pub fn hydrateAnimeFromRecord(gpa: Allocator, a: *Anime, rec: store_mod.AnimeRec
     if (a.country == null) a.country = dupeOptText(gpa, rec.country) catch a.country;
 }
 
-/// ROD-182 refresh-on-view: a show was opened and its persisted enrichment read stale, so
-/// re-pull AniList metadata and post it for the UI thread to persist + reload. `stub` is a
-/// gpa-owned identity record (id/name/english_name/anilist_id) blank beyond identity, so
-/// `applyMetadata`'s fill-if-null fills every field from `meta` and the upsert COALESCE
-/// overwrites stored content with the fresh values: a content refresh with no in-memory
-/// merge. `stub`/`source` are gpa-owned; ownership transfers to the `enrichment_refreshed`
-/// event, or both are freed here on a post failure.
+/// ROD-182 refresh-on-view: re-pull AniList when persisted enrichment is stale. `stub` is
+/// gpa identity-only (id/name/english_name/anilist_id) so fill-if-null + upsert COALESCE
+/// rewrites stored content with no in-memory merge. `stub`/`source` transfer to
+/// `enrichment_refreshed`, or free here on post failure.
 ///
-/// Miss contract (ROD-278): a CONFIRMED no-match posts `stub` unchanged with
-/// `answered = true`, and the handler stamps it fresh (a negative cache that stops
-/// re-hammering AniList until the TTL lapses). A transport failure (no answer reached)
-/// posts `answered = false`, and the handler skips the stamp so the next view retries
-/// instead of burning the freshness clock.
+/// Miss contract (ROD-278): confirmed no-match posts `stub` with `answered = true` (handler
+/// stamps negative cache until TTL). Transport failure posts `answered = false` (no stamp;
+/// next view retries without burning the freshness clock).
 pub fn refreshEnrichTask(
     loop: *Loop,
     gpa: Allocator,
@@ -764,9 +649,7 @@ pub fn refreshEnrichTask(
     var a = stub;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    // ROD-278: value (a match, or a confirmed no-match `null`) means AniList
-    // answered → stamp. The error arm (transport failure / OOM) means it didn't →
-    // leave the row un-stamped so the next view retries.
+    // ROD-278: Ok(match|null) → AniList answered, stamp. Err → leave un-stamped for retry.
     var answered = true;
     if (anilist.enrich(arena.allocator(), io, a)) |maybe_meta| {
         if (maybe_meta) |meta| applyMetadata(gpa, &a, meta);
@@ -781,37 +664,27 @@ pub fn refreshEnrichTask(
     };
 }
 
-/// Background task: pull history and post it back to the UI thread. Errors are
-/// reported as a toast-able message rather than crashing the worker.
+/// Pull history and post to the UI thread.
 pub fn loadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     const recs = store.loadHistory(arena) catch |err| {
         log.debug("loadHistory failed: {s}", .{@errorName(err)});
-        // ROD-234: post a dedicated history-load failure (not the generic task_error)
-        // so only a real history-load error raises the "history unavailable" banner.
+        // ROD-234: dedicated failure, not generic task_error (banner is history-only).
         loop.postEvent(.{ .history_load_failed = @errorName(err) }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
         return;
     };
     loop.postEvent(.{ .history_loaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Background task: reconcile with AniList then flush local changes up (ROD-291). Armed by
-/// a debounce on a local mutation; .tick spawns it off the render thread when the debounce
-/// elapses. Runs PULL-THEN-PUSH, the same order as the CLI `zigoku sync`: `pullAll`
-/// reconciles first (3-way merge, progress = max) so a value that moved further ahead on
-/// another surface is adopted locally before the push, instead of the push blind-lowering
-/// it (the ROD-285 pull-before-push discipline, now on the action path too). Both engines
-/// are total (every outcome lands in a summary, never an error). The push is skipped only
-/// when the pull already hit a wall the push would too (401 / 429 / store error).
+/// Reconcile with AniList then flush local changes (ROD-291). Debounced off render via
+/// `.tick`. PULL-THEN-PUSH like CLI `zigoku sync` (ROD-285): pull reconciles first so a
+/// farther-ahead remote value is not blind-lowered by push. Both engines are total
+/// (summary, never error). Skip push when pull already hit 401/429/store error.
 ///
-/// `pull_only` (ROD-293) suppresses the push: the launch pull-refresh runs one
-/// `MediaListCollection` round trip to adopt other-device edits but leaves the paced push
-/// to the action and quit flushes. It rides the same `.sync_flushed` event with
-/// `pushed = 0`, so the handler emits no ↑ line, just the ambient `↓ N from AniList`
-/// whisper (and a history reload) when the reconcile changed local rows.
+/// `pull_only` (ROD-293): launch pull-refresh only; same `.sync_flushed` with `pushed = 0`
+/// so the handler shows ↓ reconcile whisper, not ↑.
 ///
-/// `credentials` is by value (slices live in run()'s session auth arena). `inflight` is
-/// cleared in a defer so a failed `postEvent` at quit can't latch the one-flush gate on. A
-/// dropped flush self-heals: unpushed rows stay dirty for the next.
+/// `credentials` by value (slices in run()'s auth arena). `inflight` cleared in defer so a
+/// failed post cannot latch the one-flush gate. Dropped flush self-heals: rows stay dirty.
 pub fn syncFlushTask(
     loop: *Loop,
     gpa: Allocator,
@@ -825,13 +698,10 @@ pub fn syncFlushTask(
     defer inflight.store(false, .release);
 
     const pull = sync.pullAll(gpa, io, store, credentials, now_unix);
-    // `unmatched_ids` is a CLI-only affordance (print ids for manual lookup); the action
-    // path ignores it, so free the gpa-owned slice rather than leak it.
+    // CLI-only `unmatched_ids`; free so the TUI path does not leak.
     if (pull.unmatched_ids.len > 0) gpa.free(pull.unmatched_ids);
 
-    // Skip the push when it's a pull-only launch refresh (ROD-293), or when the pull
-    // already hit a wall the push would hit too — a rejected token or rate limit apply to
-    // both, and an unreadable store fails the same way.
+    // pull_only (ROD-293), or pull already hit a wall push would too (401/429/store).
     const skip_push = pull_only or pull.unauthorized or pull.rate_limited or pull.store_error;
     const push: ?sync.Summary = if (skip_push) null else sync.pushAll(gpa, io, store, credentials, now_unix);
 
@@ -844,30 +714,19 @@ pub fn syncFlushTask(
         log.debug("sync flush postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Poll interval (ms) for `pushOnQuit`'s pool-independent wait — how often it wakes to
-/// check whether the push landed (an early exit). Small enough that a fast push exits
-/// quit near-instantly; the syscall cost of the (≤ deadline/interval) short sleeps is
-/// nothing against a one-time quit. ROD-294.
+/// Poll interval (ms) for `pushOnQuit`'s pool-independent wait (ROD-294).
 const quit_poll_ms: u64 = 5;
 
-/// ROD-294: bounded best-effort push on quit, the mirror of the launch pull at the far end
-/// of the session. Called synchronously from run()'s fast-exit path, AFTER the terminal is
-/// restored and BEFORE `_exit`: if rows are still dirty, land as many as `deadline_ms`
-/// allows so a push that failed mid-session (offline, a dropped 429) doesn't wait for the
-/// next launch. Posts NO event, a pure store+network call that never touches the loop or
-/// tty, so it sidesteps the ROD-179/232 event-queue wedge that retired the graceful drain.
+/// Bounded best-effort push on quit (ROD-294). From run()'s fast-exit AFTER terminal
+/// restore and BEFORE `_exit`. Posts no event (store+network only) so it sidesteps the
+/// ROD-179/232 event-queue wedge. Must not run alongside a pull (ROD-285); caller checks
+/// connected + no sync inflight.
 ///
-/// Runs the push on its OWN thread and bounds the WAIT with a libc-`nanosleep` poll,
-/// deliberately NOT `withDeadline`: withDeadline arms its timer on the same `Io` pool the
-/// push competes for, so under pool starvation it runs the op inline with NO deadline
-/// (deadline.zig), and this sits one line before `_exit`, where an unbounded op on a silent
-/// socket is exactly the quit-hang ROD-232 kills. `nanosleep` is a direct libc syscall,
-/// independent of the pool, so the quit thread ALWAYS returns by the deadline no matter what
-/// the push thread does; a stalled push is abandoned to `_exit` like any ROD-232 worker.
-/// Best-effort: whatever doesn't land stays dirty and re-flushes next launch (`sync.pushAll`
-/// stamps each row as it lands, so a cut-short run leaves a consistent partial). The caller
-/// has already checked we're connected and no sync worker is inflight: the quit push must
-/// never run alongside a pull (ROD-285 ordering).
+/// Push on its own thread; bound the WAIT with libc `nanosleep`, not `withDeadline`
+/// (same Io pool as the push: under starvation that arms no real deadline, and an
+/// unbounded op one line before `_exit` is the quit-hang ROD-232 kills). Stalled push
+/// abandoned to `_exit`. Partial land is fine: `pushAll` stamps rows as it goes; rest
+/// re-flush next launch.
 pub fn pushOnQuit(
     gpa: Allocator,
     io: std.Io,
@@ -876,49 +735,36 @@ pub fn pushOnQuit(
     now_unix: i64,
     deadline_ms: i64,
 ) void {
-    // `done` is heap-allocated and intentionally leaked: `quitPushBody` sets it in a
-    // defer that can run AFTER we return (we abandon a slow push), so it must outlive
-    // this stack frame — a stack `done` would dangle under the abandoned thread. `_exit`
-    // reclaims it moments later, like every other ROD-232 abandoned-worker resource. On
-    // spawn failure we're its only owner and free it; on success the (possibly still
-    // running) thread is its last writer, so we must not.
+    // Heap `done`, intentionally leaked on success: quitPushBody may set it after we
+    // return (abandoned push). Stack would dangle. `_exit` reclaims (ROD-232). Free only
+    // on spawn failure (we are sole owner).
     const done = gpa.create(std.atomic.Value(bool)) catch return;
     done.* = .init(false);
     const t = std.Thread.spawn(.{}, quitPushBody, .{ gpa, io, store, credentials, now_unix, done }) catch {
         gpa.destroy(done);
         return;
     };
-    // Wait for the push to land, up to the deadline, waking every `quit_poll_ms` for an
-    // early exit. Bound on a MONOTONIC WALL CLOCK, not an iteration count: `nanosleep`
-    // returns early on any delivered signal, and this process keeps a live SIGWINCH handler
-    // through quit (vaxis installs it process-wide, never reset), so a fixed poll count
-    // would let a resize storm mid-quit collapse the budget to milliseconds. Re-reading the
-    // clock each pass makes a cut-short sleep harmless (just loop and sleep again), so the
-    // push gets its full window while quit stays capped.
+    // Monotonic wall clock, not iteration count: nanosleep returns early on signals, and
+    // SIGWINCH stays live through quit (vaxis, process-wide), so a fixed poll count would
+    // let a resize storm collapse the budget. Cut-short sleep just loops.
     //
-    // `deadline_ms` is validated, not asserted: a non-positive/oversized value skips the
-    // wait rather than trap or wrap (the assert form was compiled out in Release). The
-    // multiply saturates so an oversized deadline can't overflow to a garbage budget.
+    // Validate `deadline_ms` (assert was stripped in Release). Saturating multiply so an
+    // oversized deadline cannot wrap the budget.
     const ms = std.math.cast(u64, deadline_ms) orelse return;
     const budget_ns: u64 = ms *| std.time.ns_per_ms;
-    // A failed clock read returns 0. If the FIRST read failed we cannot wall-clock-bound,
-    // so skip the wait outright rather than risk an unbounded loop (`0 -% 0 = 0 < budget`
-    // forever) — best-effort degrades to "don't wait," never to "hang." A LATER failure
-    // also returns 0, but `0 -% start` wraps huge and ends the loop on the next compare.
+    // Clock failure returns 0. First-read 0: skip wait (cannot bound; never hang). Later 0:
+    // `0 -% start` wraps huge and ends the loop.
     const start = monotonicNs();
     if (start != 0) {
         while (!done.load(.acquire) and monotonicNs() -% start < budget_ns) nanosleepMs(quit_poll_ms);
     }
-    // Done or timed out: never join — a starved/stalled push must not block quit. `detach`
-    // hands the thread to the runtime; `_exit` reaps it (and the leaked `done`) on our heels.
+    // Never join: stalled push must not block quit. detach; `_exit` reaps thread + leaked done.
     t.detach();
 }
 
-/// The quit push body (ROD-294), run on its own thread so `pushOnQuit` can bound the WAIT
-/// with a pool-independent timer. Sets `done` on every exit path so the caller's poll
-/// loop wakes early on the happy path. The dirty pre-check lives here, INSIDE the bounded
-/// region, so even a wedged storage layer can't stall it past the deadline; it reuses
-/// `pushAll`'s own work-list query so the dirty predicate has one source and can't drift.
+/// Quit push body (ROD-294). Sets `done` on every exit so the poll can wake early. Dirty
+/// pre-check is inside the bounded region (wedged storage cannot stall past deadline) and
+/// reuses `pushAll`'s work-list query so the predicate cannot drift.
 fn quitPushBody(
     gpa: Allocator,
     io: std.Io,
@@ -932,25 +778,21 @@ fn quitPushBody(
     defer arena.deinit();
     const dirty = store.loadDirtyForSync(arena.allocator()) catch return;
     if (dirty.len == 0) return;
-    // Total (returns `Summary`, never errors). Its own inner per-POST deadline may go
-    // unbounded under pool starvation, but the caller's poll loop bounds QUIT regardless,
-    // so a stalled push here is just abandoned. Outcome discarded — the render surface is
-    // gone; unlanded rows stay dirty and re-flush next launch.
+    // Total (Summary, never error). Inner per-POST deadline may unbounded under pool
+    // starvation; caller's poll still bounds quit. Outcome discarded (surface gone);
+    // unlanded rows stay dirty.
     _ = sync.pushAll(gpa, io, store, credentials, now_unix);
 }
 
-/// Pool-independent ~`ms`-millisecond sleep via libc `nanosleep` (the app links libc),
-/// used by `pushOnQuit`'s wait loop so the quit bound can't depend on the `Io` thread
-/// pool the push is competing for. A signal (EINTR) may cut it short — harmless: the
-/// wait loop is bounded by a monotonic clock, not by this sleep completing. ROD-294.
+/// Pool-independent sleep via libc `nanosleep` so quit bound is not on the Io pool the
+/// push competes for. EINTR may cut short: wait loop is clock-bounded, not sleep-complete
+/// (ROD-294).
 fn nanosleepMs(ms: u64) void {
     var req = msToTimespec(ms);
     _ = std.c.nanosleep(&req, null);
 }
 
-/// Split a millisecond count into a `timespec` (whole seconds + remainder nanoseconds).
-/// Pure — factored out of `nanosleepMs` so the arithmetic is unit-testable without a real
-/// sleep. ROD-294.
+/// ms → timespec. Pure, factored for unit tests (ROD-294).
 fn msToTimespec(ms: u64) std.c.timespec {
     return .{
         .sec = @intCast(ms / std.time.ms_per_s),
@@ -958,12 +800,9 @@ fn msToTimespec(ms: u64) std.c.timespec {
     };
 }
 
-/// Monotonic clock in nanoseconds via libc `clock_gettime` — the wall-clock reference for
-/// `pushOnQuit`'s pool-independent wait bound. CLOCK_MONOTONIC is immune to wall-clock/NTP
-/// jumps. Returns 0 as a failure sentinel (near-impossible on a real OS — a vDSO read):
-/// `pushOnQuit` treats a first-read 0 as "skip the wait" and a later 0 as "end the wait,"
-/// so a clock failure can never hang, only shorten. Saturating arithmetic so an absurd
-/// uptime can't overflow to a small value that would truncate the bound. ROD-294.
+/// Monotonic ns via libc `clock_gettime` for `pushOnQuit`'s bound (ROD-294).
+/// CLOCK_MONOTONIC ignores NTP jumps. 0 = failure: first-read → skip wait, later → end
+/// wait (never hang). Saturating arithmetic so absurd uptime cannot wrap the bound.
 fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
@@ -972,13 +811,10 @@ fn monotonicNs() u64 {
     return sec *| std.time.ns_per_s +| nsec;
 }
 
-/// The in-TUI connect worker (ROD-286): run the loopback accept loop off the render
-/// thread and post the settled `ConnectOutcome` back for the UI to adopt. `listener`
-/// and `cancel` are borrowed (owned by `App.ConnectState`'s boxed arena, freed only
-/// after this joins); `arena` is that same connect arena, used for the callback's
-/// verify/persist. On `.canceled` — the UI tore the modal down and is joining us — we
-/// skip the post entirely: there's nothing to report, and posting into a queue no one
-/// is draining (teardown) could wedge the join. Any other outcome is posted best-effort.
+/// In-TUI connect worker (ROD-286): loopback accept off the render thread; post
+/// `ConnectOutcome`. `listener`/`cancel`/`arena` borrowed from `App.ConnectState` (freed
+/// only after this joins). On `.canceled` skip the post: UI is joining us, and posting
+/// into a queue no one drains can wedge that join. Other outcomes post best-effort.
 pub fn connectTask(
     loop: *Loop,
     io: std.Io,
@@ -988,19 +824,17 @@ pub fn connectTask(
 ) void {
     const outcome = login_loopback.awaitConnect(listener, arena, io, cancel);
     switch (outcome) {
-        // Torn down by the UI (esc / teardown) — it's joining us; nothing to report,
-        // and posting into a queue no one is draining could wedge that join.
+        // UI tore the modal down and is joining; post would risk wedging teardown.
         .canceled => {},
         else => loop.postEvent(.{ .connect_result = outcome }) catch |pe|
             log.debug("connect postEvent failed: {s}", .{@errorName(pe)}),
     }
 }
 
-/// Like loadHistoryTask but for the post-playback refresh (ROD-191): posts
-/// dedicated terminal events so run()'s double-buffer reaper always settles —
-/// .history_reloaded on success, .history_reload_failed on error. The generic
-/// .task_error path would never bump the reload's settle signal, latching the
-/// reloader off after one transient failure.
+/// Post-playback history refresh (ROD-191). Dedicated settle events
+/// (`.history_reloaded` / `.history_reload_failed`) so the double-buffer reaper always
+/// settles. Generic `.task_error` would never bump the reload settle signal and would
+/// latch the reloader off after one transient failure.
 pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     const recs = store.loadHistory(arena) catch |err| {
         log.debug("history reload failed: {s}", .{@errorName(err)});
@@ -1010,12 +844,9 @@ pub fn reloadHistoryTask(loop: *Loop, arena: Allocator, store: *Store) void {
     loop.postEvent(.{ .history_reloaded = recs }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
 }
 
-/// Background task: fetch episode list and post to UI.
-/// `id` ownership: transferred to the posted event (`episodes_done.for_id` on
-/// success, `episodes_error.for_id` on failure) so the UI thread can keep-check
-/// it; freed here only if the event can't be posted. `drain.finish()` runs last
-/// (after the final postEvent), so once the barrier drains this worker can no
-/// longer touch loop/gpa (ROD-179).
+/// Fetch episode list and post to UI. `id` transfers to the event (`episodes_done` /
+/// `episodes_error` for_id) for keep-check; free here only if post fails.
+/// `drain.finish()` last so a drained barrier means no loop/gpa touch (ROD-179).
 pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, translation: domain.Translation, count_hint: ?u32, drain: *ThreadDrain) void {
     defer drain.finish();
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -1023,8 +854,7 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
 
     const raw = provider.episodes(arena.allocator(), io, id, translation, count_hint) catch |e| {
         log.debug("episodes fetch failed: {s}", .{@errorName(e)});
-        // Hand `id` to the event so the UI can keep-check a superseded failure
-        // (ROD-179); the handler frees it. Free here only if the post fails.
+        // id on event for keep-check (ROD-179); free only if post fails.
         loop.postEvent(.{ .episodes_error = .{ .cause = e, .for_id = id } }) catch |pe| {
             log.debug("postEvent failed: {s}", .{@errorName(pe)});
             gpa.free(id);
@@ -1048,9 +878,7 @@ pub fn episodesTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourcePro
     const exact = owned.toOwnedSlice(gpa) catch |e| {
         for (owned.items) |ep| gpa.free(ep.raw);
         owned.deinit(gpa);
-        // Mirror the error paths above: post so the UI clears `loading` instead of
-        // stranding the spinner forever; hand `id` to the event and free it here
-        // only if the post fails (ROD-179 review).
+        // Still post so UI clears loading (no stranded spinner); same id ownership.
         loop.postEvent(.{ .episodes_error = .{ .cause = e, .for_id = id } }) catch |pe| {
             log.debug("postEvent failed: {s}", .{@errorName(pe)});
             gpa.free(id);
@@ -1111,37 +939,28 @@ fn persistFinalProgress(
 fn postPositionUpdate(ctx: *anyopaque, update: player_mod.PositionUpdate) void {
     const cb: *PlayTaskCallbackCtx = @ptrCast(@alignCast(ctx));
     cb.progress.record(update);
-    // Heartbeat-frequency event: a failed post means the queue is closing
-    // (shutdown). Not worth a log line on every tick of a teardown.
+    // Heartbeat: failed post = queue closing; skip log spam on teardown.
     cb.loop.postEvent(.{ .position_update = .{
         .time_pos = update.time_pos,
         .duration = update.duration,
     } }) catch {};
 }
 
-/// Total mpv launch attempts per play, including the first (ROD-309). The senshi CDN
-/// intermittently 403s the stream open when this IP is in a short Cloudflare penalty
-/// window (classically: restarting an episode seconds after a quit). Two retries after
-/// the initial try give the window time to clear.
+/// Total mpv launch attempts per play, including the first (ROD-309). Covers short
+/// Cloudflare penalty windows (e.g. restart soon after quit) without hanging a dead stream.
 const MAX_PLAY_ATTEMPTS: usize = 3;
 
-/// Backoff before each retry, indexed by the just-failed attempt (0 → before the 2nd
-/// try, 1 → before the 3rd). The windows observed were seconds-long, so ~2s then ~4s
-/// spans them without stalling a genuinely dead stream too long.
+/// Backoff before each retry, by just-failed attempt index (0 → before 2nd, 1 → before 3rd).
 const RETRY_BACKOFFS_MS = [_]u64{ 2000, 4000 };
 
-/// Whether a failed play attempt is worth a re-resolve + relaunch. Retry only when mpv
-/// failed to OPEN the stream (its code-2 signal — the CDN's transient 403/expiry) AND
-/// nothing ever played (so a mid-episode drop or a normal quit never triggers a restart
-/// storm) AND an attempt budget remains. Pure so the gate is testable without spawning mpv.
+/// Retry only on open failure (`MpvOpenFailed` / CDN 403-class) with no meaningful playback
+/// yet and budget remaining. Mid-episode drop or quit must not restart-storm. Pure for tests.
 fn playAttemptRetryable(cause: anyerror, attempt: usize, played: bool) bool {
     return cause == error.MpvOpenFailed and !played and attempt + 1 < MAX_PLAY_ATTEMPTS;
 }
 
-/// Background task: resolve stream and launch mpv.
-/// All string params are GPA-owned by this task and freed before return.
-/// `mpv_path` and `skip_mode` are borrowed from `App.config` (ROD-85), which
-/// outlives this thread — they must not be freed here.
+/// Resolve stream and launch mpv. String params (except below) are GPA-owned and freed
+/// here. `mpv_path` and `skip_mode` borrow `App.config` (ROD-85); do not free them.
 pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvider, id: []const u8, ep_raw: []const u8, translation: domain.Translation, title: []const u8, start_seconds: u64, mal_id: ?u32, episode_ordinal: u32, mpv_path: []const u8, skip_mode: []const u8, quality: domain.Quality) void {
     defer gpa.free(id);
     defer gpa.free(ep_raw);
@@ -1152,28 +971,24 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 
     const ep: domain.EpisodeNumber = .{ .raw = ep_raw };
 
-    // ROD-83: fetch OP/ED skip data once on this worker thread (never the UI thread);
-    // it doesn't change across the re-resolve retries below, so it's hoisted out.
+    // ROD-83: OP/ED skip once on this worker (never UI); stable across re-resolve retries.
     const skip = aniskip.prepare(arena.allocator(), io, mal_id, title, aniskip.episodeNumber(ep_raw, episode_ordinal), aniskip.SkipMode.fromString(skip_mode));
 
     var progress: PlaybackProgress = .{};
     var callback_ctx: PlayTaskCallbackCtx = .{ .loop = loop, .progress = &progress };
 
-    // ROD-309 retry loop: re-resolve a FRESH signed URL each attempt (the old one's CDN
-    // token is irrelevant once we're in a penalty window; a re-resolve also dodges an
-    // expiry) and relaunch after a short backoff on a pre-playback open failure.
+    // ROD-309: re-resolve a fresh signed URL each attempt (penalty window / expiry), backoff
+    // on pre-playback open failure.
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         const link = provider.resolve(arena.allocator(), io, id, ep, translation, quality) catch |e| {
-            // Always-on top-level receipt (ROD-300): one line per failed play, with
-            // the id/ep to correlate against the provider-level lines below it.
+            // ROD-300: always-on top-level receipt per failed play.
             log.err("resolve failed for id={s} ep={s} tt={s}: {s}", .{ id, ep_raw, translation.str(), @errorName(e) });
             loop.postEvent(.{ .play_error = .{ .final = null, .cause = e } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
             return;
         };
 
-        // Fresh counters per attempt; safe to reset — play() joins its watcher thread
-        // before returning, so nothing else touches `progress` here.
+        // Fresh per attempt; play() joins its watcher before return so nothing races progress.
         progress = .{};
         player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
             .ctx = @ptrCast(&callback_ctx),
@@ -1183,9 +998,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
             if (playAttemptRetryable(e, attempt, played)) {
                 const backoff_ms = RETRY_BACKOFFS_MS[attempt];
                 log.warn("mpv open failed for id={s} ep={s} (attempt {d}/{d}) — re-resolving in {d}ms", .{ id, ep_raw, attempt + 1, MAX_PLAY_ATTEMPTS, backoff_ms });
-                // Surface the wait so the backoff reads as "retrying", not a frozen
-                // launch. `attempt` is 0-based, so attempt+1 is this retry's 1-based
-                // number and MAX_PLAY_ATTEMPTS-1 the total retries (ROD-309).
+                // attempt is 0-based; event surfaces 1-based retry count vs max retries.
                 loop.postEvent(.{ .play_retry = .{ .attempt = @intCast(attempt + 1), .max = @intCast(MAX_PLAY_ATTEMPTS - 1) } }) catch |pe| log.debug("postEvent failed: {s}", .{@errorName(pe)});
                 nanosleepMs(backoff_ms);
                 continue;
@@ -1202,12 +1015,9 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 }
 
 const max_cover_encoded_bytes = 8 * 1024 * 1024;
-// Cover decode-footprint cap (ROD-270). decodeCoverBody transmits the full decoded RGBA to
-// Kitty with no pre-transmit downscale, so this must admit every cover a source legitimately
-// serves, not the on-screen thumbnail size: too low and a real cover degrades to a fallback
-// block. Largest across 703 cached covers is 1635x2247, so 2560 holds ~14% margin while
-// cutting the worst-case transient from 64 MiB (4096^2*4) to 25 MiB, and the
-// discoverCoverConcurrency-amplified ceiling (up to 16 in flight) from ~1 GiB to ~400 MiB.
+// Decode footprint cap (ROD-270). Full RGBA goes to Kitty with no pre-downscale: must
+// admit real source covers (not thumbnail size) or art falls back. 2560 holds margin over
+// largest seen (~1635x2247) and caps concurrent Discover decode RAM.
 const max_cover_dimension = 2560;
 const max_cover_pixels = max_cover_dimension * max_cover_dimension;
 
@@ -1227,49 +1037,34 @@ fn postCoverDoneOwned(loop: *Loop, gpa: Allocator, decoded: cover_mod.Pixels, fo
     };
 }
 
-// ── On-disk raw cover cache (ROD-171) ────────────────────────────────────────
-// A persistence layer one level below `RawCoverCache`: covers fetched in a prior
-// run are served from `<cacheDir>/covers/<hash>.jpg` on a cold start, sparing the
-// network. Every operation is best-effort — any failure degrades to "not
-// persisted" / "cache miss", never to a crash or a stalled cover pipeline.
+// On-disk raw cover cache (ROD-171): cold-start under RawCoverCache. Best-effort only.
 
-/// The on-disk cover-cache subdirectory under `paths.cacheDir`. Single source of
-/// truth: both `coverCachePath` (where covers are read/written) and the Settings
-/// "cover art cache" display row (via `coverCacheDir`) derive from this one name,
-/// so the two can never drift (ROD-225).
+/// Cover cache subdir under `paths.cacheDir`. Shared by `coverCachePath` and Settings
+/// display (`coverCacheDir`) so they cannot drift (ROD-225).
 const cover_subdir = "covers";
 
-/// Absolute path to the cover-cache directory — `<cacheDir>/covers` — allocated
-/// in `alloc`. The Settings view renders this so the displayed path honours
-/// `$XDG_CACHE_HOME` instead of a hardcoded literal (ROD-225). Propagates the
-/// cache-dir resolution error when no cache home can be located.
+/// Absolute cover-cache dir for Settings (honours `$XDG_CACHE_HOME`, ROD-225).
 pub fn coverCacheDir(alloc: Allocator) ![]u8 {
     const dir = try paths.cacheDir(alloc);
     defer alloc.free(dir);
     return std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, cover_subdir });
 }
 
-/// hex-16 SHA-256 of `url`: the on-disk cover filename stem. Truncating the
-/// 32-byte digest to 8 bytes is ample for a content-addressed personal cache —
-/// a (vanishingly unlikely) collision costs a single spurious re-fetch, nothing
-/// worse.
+/// hex-16 of first 8 SHA-256 bytes of `url`: on-disk filename stem. Collision → one re-fetch.
 fn coverCacheStem(url: []const u8) [16]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(url, &digest, .{});
     return std.fmt.bytesToHex(digest[0..8].*, .lower);
 }
 
-/// Absolute on-disk path for `url`'s cover, allocated in `arena`:
-/// `<cacheDir>/covers/<hex-16>.jpg`. Propagates the cache-dir resolution error
-/// when no cache home can be located (no `$XDG_CACHE_HOME`/`$HOME`).
+/// `<cacheDir>/covers/<hex-16>.jpg` for `url`, allocated in `arena`.
 fn coverCachePath(arena: Allocator, url: []const u8) ![]u8 {
     const dir = try paths.cacheDir(arena);
     const stem = coverCacheStem(url);
     return std.fmt.allocPrint(arena, "{s}/{s}/{s}.jpg", .{ dir, cover_subdir, &stem });
 }
 
-/// Read previously-persisted raw cover bytes for `url`, owned by `gpa`, or null
-/// on any miss (no cache dir, file absent, oversized, read error).
+/// GPA-owned raw cover bytes for `url`, or null on any miss.
 fn readCoverDisk(gpa: Allocator, io: std.Io, url: []const u8) ?[]u8 {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1282,18 +1077,11 @@ fn readCoverDisk(gpa: Allocator, io: std.Io, url: []const u8) ?[]u8 {
     return reader.interface.allocRemaining(gpa, std.Io.Limit.limited(max_cover_encoded_bytes)) catch null;
 }
 
-/// Per-write nonce for the disk-cache temp file (ROD-243). With concurrent cover workers,
-/// two threads (or a second app instance) can persist the SAME url at once; a fixed
-/// `<path>.tmp` would let them interleave into one temp file and then rename a torn `.jpg`
-/// into place. A unique suffix per write gives each writer its own temp sibling, so the
-/// atomic rename always promotes a whole file. The thread id keeps it unique across
-/// processes too (Linux tids are system-wide). Worst case is a uniquely-named orphan tmp on
-/// a hard crash; best-effort cleanup deletes it on every non-crash failure path.
+/// Per-write temp-file nonce (ROD-243). Concurrent writers of the same url must not share
+/// a fixed `.tmp` (torn `.jpg` after rename). Thread id + nonce; orphan tmp only on hard crash.
 var disk_tmp_nonce: std.atomic.Value(u64) = .init(0);
 
-/// Persist raw cover `body` for `url` to disk, best-effort. A failure (read-only
-/// dir, full disk, no cache home) is logged at debug and otherwise ignored — the
-/// cover still renders from the in-memory bytes this run.
+/// Persist raw cover to disk, best-effort. Failure still leaves in-memory bytes for this run.
 fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
@@ -1304,10 +1092,7 @@ fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8)
     };
     if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
 
-    // Write to a per-writer temp sibling then atomically rename into place: a
-    // crash, full disk, or concurrent writer racing mid-write can never leave a
-    // torn `.jpg` that a later cold start would read back as a corrupt cover
-    // (ROD-171; per-write nonce added in ROD-243 for the concurrent cover workers).
+    // Per-writer temp then atomic rename: never promote a torn `.jpg` (ROD-171/243).
     const nonce = disk_tmp_nonce.fetchAdd(1, .monotonic);
     const tmp_path = std.fmt.allocPrint(arena, "{s}.{d}.{d}.tmp", .{ path, std.Thread.getCurrentId(), nonce }) catch return;
     var file = std.Io.Dir.createFileAbsolute(io, tmp_path, .{}) catch |e| {
@@ -1332,10 +1117,7 @@ fn writeCoverDisk(gpa: Allocator, io: std.Io, url: []const u8, body: []const u8)
     };
 }
 
-/// The decode gate (ROD-270): a probed cover is admitted only when both axes are within
-/// max_cover_dimension and the pixel count is within the derived cap. decodeCoverBody runs
-/// this on the header BEFORE decodeRgba, so an over-cap (or degenerate) cover is refused
-/// without ever allocating the decode buffer.
+/// Decode gate (ROD-270): probe before decodeRgba so over-cap/degenerate never alloc.
 fn coverDimsWithinCap(dims: cover_mod.Dimensions) bool {
     if (dims.w == 0 or dims.h == 0 or dims.w > max_cover_dimension or dims.h > max_cover_dimension) return false;
     const pixel_count = std.math.mul(u64, dims.w, dims.h) catch return false;
@@ -1348,9 +1130,7 @@ fn decodeCoverBody(gpa: Allocator, body: []const u8) !cover_mod.Pixels {
     return cover_mod.decodeRgba(gpa, body);
 }
 
-/// Insert raw encoded `bytes` into the raw LRU under the lock, taking ownership:
-/// the cache keeps them if accepted, otherwise we free them here. Caller must not
-/// touch `bytes` afterwards (ROD-243).
+/// Insert raw into LRU under lock; takes ownership of `bytes` (ROD-243).
 fn insertRaw(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: []const u8, bytes: []u8) void {
     caches.mu.lockUncancelable(io);
     defer caches.mu.unlock(io);
@@ -1358,43 +1138,28 @@ fn insertRaw(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: []const u8, 
     if (!cached) gpa.free(bytes);
 }
 
-/// Store `decoded` in the decoded LRU and return an INDEPENDENT owned copy for the
-/// caller. The clone is taken under the same lock as the insert: once
-/// `putOwnedBounded` accepts the value, `decoded.rgba` *is* the cache's pointer, so
-/// an unlocked dupe could race a concurrent evict-and-free (ROD-243). If the cache
-/// declines the entry the caller still owns `decoded` and we hand it back directly;
-/// if the clone OOMs after a successful insert the cache owns the pixels (no
-/// double-free) and we surface the error.
+/// Store decoded in LRU; return independent owned copy. Clone under same lock as insert:
+/// after put accepts, `decoded.rgba` is cache-owned; unlocked dupe races evict (ROD-243).
+/// Decline hands `decoded` back; OOM after insert leaves cache owning pixels (no double-free).
 fn storeDecodedAndClone(gpa: Allocator, io: std.Io, caches: *CoverCaches, url: []const u8, decoded: cover_mod.Pixels) !cover_mod.Pixels {
     caches.mu.lockUncancelable(io);
     defer caches.mu.unlock(io);
     const cached = caches.decoded.putOwnedBounded(gpa, url, decoded, max_cover_decoded_cache_bytes) catch false;
-    if (!cached) return decoded; // cache declined — caller keeps the owned pixels
-    const rgba = try gpa.dupe(u8, decoded.rgba); // under lock: `decoded` is now cache-owned
+    if (!cached) return decoded; // declined: caller keeps owned pixels
+    const rgba = try gpa.dupe(u8, decoded.rgba); // under lock: decoded now cache-owned
     return .{ .rgba = rgba, .w = decoded.w, .h = decoded.h };
 }
 
-/// Wall-clock ceiling for one cover fetch — connect, headers, and body, end to
-/// end. Covers are the last app fetch that lacked a deadline (ROD-265): a
-/// reachable-but-silent image host would otherwise hang the cover worker forever,
-/// leaking its `discover_cover_drain` slot so teardown's `drain()` spin-waits on a
-/// counter that never falls (workers.zig `ThreadDrain`). A cover is a GET body of
-/// the same class as the AllAnime long-tail (ROD-153), so it shares that 20 s
-/// ceiling — far above any healthy image fetch, only tripping on a stalled host.
+/// Cover fetch deadline (s): connect+headers+body (ROD-265). Same class as long-tail GET
+/// (ROD-153). Silent host would hang the worker and pin `discover_cover_drain` forever.
 const cover_fetch_deadline_s = 20;
 
-/// The actual cover GET, run as a cancelable unit by `withDeadline` (ROD-265). Takes a
-/// provider-resolved `CoverRequest` (absolute URL + any CDN headers, ROD-267): some cover
-/// CDNs 403 a refererless GET, so Referer/UA ride along when the provider set them. Owns
-/// its `std.http.Client` so a deadline cancel unwinds this frame and frees the connection
-/// instead of leaving a socket blocked in `recv`. Returns the encoded body as an exact
-/// gpa-owned slice (caller frees). Fetch and non-200 failures return `error.CoverFetchFailed`;
-/// `loadCoverPixels` collapses that, OOM, and the deadline's `error.Timeout` to a cover miss.
+/// Cover GET under `withDeadline` (ROD-265). `CoverRequest` carries absolute URL + optional
+/// CDN headers (ROD-267). Owns Client so cancel frees the socket. GPA-owned body; miss →
+/// `CoverFetchFailed` (loadCoverPixels also folds Timeout/OOM to miss).
 fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u8 {
-    // SSRF guard (ROD-266): cover refs are untrusted third-party strings (AllAnime
-    // thumbnails, AniList coverImage). Refuse private/loopback/link-local targets so a
-    // hostile ref can't aim the worker at an internal service or the metadata endpoint.
-    // Paired with redirect_behavior=.not_allowed below so a 3xx can't bounce past it.
+    // SSRF (ROD-266): untrusted cover refs. No private/loopback/link-local.
+    // redirect_behavior=.not_allowed so 3xx cannot bypass.
     fetchguard.guardFetchUrl(req.url) catch |e| {
         log.debug("cover fetch blocked by SSRF guard: {s}", .{@errorName(e)});
         return error.CoverFetchFailed;
@@ -1406,8 +1171,7 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u
     const resp_buf = try gpa.alloc(u8, max_cover_encoded_bytes);
     defer gpa.free(resp_buf);
     var resp_writer: std.Io.Writer = .fixed(resp_buf);
-    // Accept is ours; Referer/UA come from the provider only when its CDN needs
-    // them (AniList/MAL covers need none — the fields stay null).
+    // Accept always; Referer/UA only when provider set them (CDN needs them).
     var extra: [2]std.http.Header = .{
         .{ .name = "Accept", .value = "image/png,image/jpeg,*/*;q=0.1" },
         undefined,
@@ -1425,8 +1189,7 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u
         .headers = if (req.user_agent) |ua| .{ .user_agent = .{ .override = ua } } else .{},
         .extra_headers = extra[0..extra_len],
     }) catch |e| {
-        // Covers the deadline cancel (ReadFailed ← Canceled), oversize body (writer
-        // full), and ordinary network errors.
+        // Deadline cancel, oversize body, network.
         log.debug("cover fetch failed: {s}", .{@errorName(e)});
         return error.CoverFetchFailed;
     };
@@ -1437,19 +1200,14 @@ fn fetchCoverBody(gpa: Allocator, io: std.Io, req: source_mod.CoverRequest) ![]u
     return gpa.dupe(u8, resp_writer.buffered());
 }
 
-/// Shared cover load (ROD-243): resolve `url` to gpa-owned, INDEPENDENT decoded pixels via
-/// cache -> disk -> network, or an error. The returned `rgba` is never a cache-owned
-/// pointer, so it stays valid past any concurrent eviction (the caller owns it). Safe for
-/// concurrent callers: the single-cover worker and the Discover grid share one
-/// `CoverCaches`, under its lock discipline (see `CoverCaches`).
+/// Shared cover load (ROD-243): `url` → gpa-owned independent pixels via cache → disk →
+/// network. Returned rgba is never cache-owned (safe past eviction). Concurrent-safe under
+/// CoverCaches lock discipline.
 ///
-/// `url` is the raw stored cover ref and the cache key at every layer (memory, disk). Only
-/// the network branch resolves it (via `provider.coverRequest`) into the absolute URL
-/// actually fetched, so a CDN-host rotation never invalidates the cache and the host stays
-/// behind the provider seam (ROD-267).
+/// `url` is the cache key at every layer. Only the network branch resolves via
+/// `provider.coverRequest` so CDN host rotation does not bust cache (ROD-267).
 pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url: []const u8, caches: *CoverCaches) !cover_mod.Pixels {
-    // 1) Decoded-cache hit: dupe the pixels out under the lock (get() promotes, so
-    //    it mutates — even this read holds the lock).
+    // 1) Decoded hit: dupe under lock (get promotes = writer).
     {
         caches.mu.lockUncancelable(io);
         defer caches.mu.unlock(io);
@@ -1459,7 +1217,7 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url
         }
     }
 
-    // 2) Raw-cache hit: copy the encoded bytes out under the lock, decode unlocked.
+    // 2) Raw hit: copy under lock, decode unlocked.
     {
         const raw_copy: ?[]u8 = blk: {
             caches.mu.lockUncancelable(io);
@@ -1473,28 +1231,23 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url
         }
     }
 
-    // 3) ROD-171: a raw-LRU miss falls through to disk before the network. A hit
-    //    warms both in-memory caches so the rest of this session is a raw hit.
+    // 3) Disk before network (ROD-171). Hit warms both in-memory caches.
     if (readCoverDisk(gpa, io, url)) |disk_body| {
         if (decodeCoverBody(gpa, disk_body)) |decoded| {
             insertRaw(gpa, io, caches, url, disk_body); // takes ownership of disk_body
             return storeDecodedAndClone(gpa, io, caches, url, decoded);
         } else |e| {
-            // A corrupt/truncated cache file: drop it and refetch from network.
+            // Corrupt/truncated: drop and refetch.
             log.debug("cover disk-cache decode failed: {s}", .{@errorName(e)});
             gpa.free(disk_body);
         }
     }
 
-    // 4) Network fetch (unlocked, deadline-bounded), then warm both caches and
-    //    persist to disk. The provider resolves the (possibly relative) `url` into
-    //    an absolute URL + CDN headers behind the vtable (ROD-267). `withDeadline`
-    //    races the fetch against a timer and cancels a stalled host so a silent CDN
-    //    can't hang this worker forever (ROD-265); the returned body is a gpa-owned
-    //    exact slice we free after decode.
+    // 4) Network (unlocked, deadline-bounded ROD-265), warm caches, persist (ROD-171).
+    // Provider resolves relative url + CDN headers (ROD-267).
     const req = provider.coverRequest(gpa, url) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.CoverFetchFailed, // bad/blocked ref → cover miss
+        else => return error.CoverFetchFailed, // bad/blocked ref → miss
     };
     defer gpa.free(req.url);
     const body = deadline.withDeadline(io, .fromSeconds(cover_fetch_deadline_s), fetchCoverBody, .{ gpa, io, req }) catch |e| {
@@ -1504,18 +1257,15 @@ pub fn loadCoverPixels(gpa: Allocator, io: std.Io, provider: SourceProvider, url
     };
     defer gpa.free(body);
     const decoded = try decodeCoverBody(gpa, body);
-    writeCoverDisk(gpa, io, url, body); // ROD-171: persist for the next cold start
+    writeCoverDisk(gpa, io, url, body); // ROD-171: next cold start
     if (gpa.dupe(u8, body)) |raw_copy| {
         insertRaw(gpa, io, caches, url, raw_copy);
     } else |_| {}
     return storeDecodedAndClone(gpa, io, caches, url, decoded);
 }
 
-/// Background task: load one cover and post it to the UI thread. `url` is task-owned
-/// and freed here; `for_id` transfers to the event on success/error (the UI thread
-/// frees it). The decoded pixels handed to the event are an independent copy (see
-/// `loadCoverPixels`), so a concurrent cache eviction can't invalidate them. One of
-/// N concurrent cover workers sharing `caches` (ROD-243).
+/// Load one cover for UI. `url` freed here; `for_id` transfers on post. Pixels independent
+/// of cache (ROD-243).
 pub fn coverTask(
     loop: *Loop,
     gpa: Allocator,
@@ -1534,16 +1284,9 @@ pub fn coverTask(
     postCoverDoneOwned(loop, gpa, decoded, for_id);
 }
 
-/// Background task: load ONE Discover-grid cover and post it (ROD-240). `url` is gpa-owned
-/// by this task; it transfers to the result event (UI thread frees it) on both done and
-/// error paths, and is freed here only if the post fails. `drain` bounds the fan-out: the
-/// pump caps how many run at once (`config.discoverCoverConcurrency`) by gating spawns on
-/// `drain.inflight`, and `finish()` runs as the worker's LAST action so teardown `drain()`
-/// can never unblock while a worker might still touch `loop`/`gpa` (ROD-179). N of these
-/// plus the single-cover worker may touch `caches` concurrently, safe under its lock. The
-/// per-frame pump replaces the old batch worker: each frame tops the in-flight set back to
-/// the cap against live slot state, so a fetch is never spent on an already-scrolled-past
-/// card.
+/// One Discover-grid cover (ROD-240). `url` transfers on post; free only if post fails.
+/// `drain.finish()` last so teardown cannot unblock while we touch loop/gpa (ROD-179).
+/// Fan-out capped via `drain.inflight` at spawn; per-frame pump avoids scrolled-off cards.
 pub fn discoverCoverTask(
     loop: *Loop,
     gpa: Allocator,
@@ -1570,26 +1313,23 @@ pub fn discoverCoverTask(
     }
 }
 
-/// Heartbeat thread: posts .tick every 100ms until `quit` is set.
+/// Heartbeat: `.tick` every 100ms until `quit`.
 pub fn tickTask(loop: *Loop, io: std.Io, quit: *std.atomic.Value(bool)) void {
     while (!quit.load(.acquire)) {
         std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
-        // Like position_update: a failed post here is just the queue closing.
+        // Failed post = queue closing.
         loop.postEvent(.tick) catch {};
     }
 }
 
-/// Current wall-clock time in milliseconds (ms since Unix epoch).
+/// Wall-clock ms since Unix epoch.
 pub fn nowMs(io: std.Io) i64 {
     const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_ms));
 }
 
-/// Boot update check (ROD-370): compare our build against GitHub's latest release
-/// and, if we're behind, post a bare `.update_available` for a low-key toast.
-/// Best-effort: offline / rate-limited / already-current posts nothing. The whole
-/// fetch lives in a task-local arena freed on return, so nothing crosses the
-/// worker→UI seam (the toast names the command, not the version).
+/// Boot update check (ROD-370): if behind latest release, post `.update_available`.
+/// Best-effort; arena-local so nothing crosses the worker→UI seam.
 pub fn updateCheckTask(loop: *Loop, gpa: Allocator, io: std.Io, current_version: []const u8) void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -1616,31 +1356,25 @@ test "coverCachePath nests the stem under covers/ with a .jpg suffix (ROD-171)" 
 }
 
 test "coverDimsWithinCap admits real covers, refuses over-cap on either axis (ROD-270)" {
-    // Covers transmit at full decoded resolution, so the gate must admit every real cover:
-    // undershooting regresses real art to a flat fallback block. Largest across the 703-cover
-    // local cache is 1635x2247 (2247 long-axis); assert it and a second real cover pass.
+    // Full decoded res to Kitty: undershoot → real art becomes fallback. Largest seen 1635x2247.
     try std.testing.expect(coverDimsWithinCap(.{ .w = 1635, .h = 2247 }));
     try std.testing.expect(coverDimsWithinCap(.{ .w = 1080, .h = 1490 }));
-    // Boundary is a strict >: exactly the cap on both axes is admitted.
     try std.testing.expect(coverDimsWithinCap(.{ .w = max_cover_dimension, .h = max_cover_dimension }));
-    // One past the cap on EITHER axis is refused (the old test only exercised width).
     try std.testing.expect(!coverDimsWithinCap(.{ .w = max_cover_dimension + 1, .h = 1 }));
     try std.testing.expect(!coverDimsWithinCap(.{ .w = 1, .h = max_cover_dimension + 1 }));
-    // Degenerate zero-axis dimensions are refused before any allocation.
     try std.testing.expect(!coverDimsWithinCap(.{ .w = 0, .h = 100 }));
     try std.testing.expect(!coverDimsWithinCap(.{ .w = 100, .h = 0 }));
 }
 
 test "msToTimespec splits milliseconds into whole seconds and remainder nanos (ROD-294)" {
-    // The quit-push wait sleeps in `quit_poll_ms` increments and uses this to build the
-    // libc timespec; a sign/units slip here would mis-scale the poll interval.
-    const a = msToTimespec(5); // the poll interval: sub-second
+    // Units slip here mis-scales quit_poll_ms.
+    const a = msToTimespec(5);
     try std.testing.expectEqual(@as(@TypeOf(a.sec), 0), a.sec);
     try std.testing.expectEqual(@as(@TypeOf(a.nsec), 5_000_000), a.nsec);
-    const b = msToTimespec(2000); // exact seconds, zero remainder
+    const b = msToTimespec(2000);
     try std.testing.expectEqual(@as(@TypeOf(b.sec), 2), b.sec);
     try std.testing.expectEqual(@as(@TypeOf(b.nsec), 0), b.nsec);
-    const c = msToTimespec(2345); // seconds + a nanosecond remainder
+    const c = msToTimespec(2345);
     try std.testing.expectEqual(@as(@TypeOf(c.sec), 2), c.sec);
     try std.testing.expectEqual(@as(@TypeOf(c.nsec), 345_000_000), c.nsec);
 }
@@ -1711,9 +1445,7 @@ test "persistFinalProgress is a no-op without an observed update" {
 
 test "ThreadDrain.drain blocks until every begun worker has finished (ROD-179)" {
     var drain: ThreadDrain = .{};
-    // Gate the workers so they're provably still in flight when we assert the
-    // accounting and then call drain() — a no-op barrier would let the count
-    // race ahead and the test would catch it.
+    // Gate workers in flight so drain is not a no-op race.
     var release: std.atomic.Value(bool) = .init(false);
     var completed: std.atomic.Value(usize) = .init(0);
 
@@ -1729,81 +1461,61 @@ test "ThreadDrain.drain blocks until every begun worker has finished (ROD-179)" 
     for (0..8) |_| {
         drain.begin();
         const t = std.Thread.spawn(.{}, Worker.run, .{ &drain, &release, &completed }) catch {
-            drain.finish(); // spawn failed — rebalance, mirroring the real call site
+            drain.finish(); // spawn failed: rebalance like the real call site
             continue;
         };
-        t.detach(); // never joined; drain() is the only synchronization
+        t.detach(); // drain() is the only sync
         spawned += 1;
     }
 
-    // begin() ran on this thread before each spawn, so the count is exactly the
-    // spawn total and nothing has finished yet — the workers are parked on the gate.
+    // begin before spawn: inflight == spawned, workers still on the gate.
     try std.testing.expectEqual(spawned, drain.inflight.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), completed.load(.acquire));
 
     release.store(true, .release);
     drain.drain();
 
-    // drain() returned ⇒ every worker passed finish() ⇒ every fetchAdd (which
-    // precedes the deferred finish) is visible via finish's release / drain's acquire.
+    // drain returned ⇒ all finish() happened (release/acquire with completed).
     try std.testing.expectEqual(spawned, completed.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), drain.inflight.load(.acquire));
 }
 
 test "preferCover: absolute beats relative, never downgrades or churns (ROD-267)" {
-    // Nothing held yet → adopt whatever's present.
     try std.testing.expect(preferCover(null, "mcovers/x.webp"));
     try std.testing.expect(preferCover(null, "https://s4.anilist.co/x.jpg"));
-    // Relative held + absolute incoming → upgrade.
     try std.testing.expect(preferCover("mcovers/x.webp", "https://s4.anilist.co/x.jpg"));
-    // Absolute held → never downgrade to relative, never swap absolute for absolute.
     try std.testing.expect(!preferCover("https://s4.anilist.co/x.jpg", "mcovers/x.webp"));
     try std.testing.expect(!preferCover("https://a/x.jpg", "https://b/y.jpg"));
-    // Relative held + relative incoming → no change (neither is fetchable as-is).
     try std.testing.expect(!preferCover("mcovers/x.webp", "mcovers/y.png"));
-    // Nothing incoming → nothing to adopt.
     try std.testing.expect(!preferCover("mcovers/x.webp", null));
     try std.testing.expect(!preferCover(null, null));
 }
 
 test "playAttemptRetryable: only an unplayed open-failure with budget left retries (ROD-309)" {
-    // The retry case: mpv couldn't open the stream, nothing played, tries remain.
     try std.testing.expect(playAttemptRetryable(error.MpvOpenFailed, 0, false));
     try std.testing.expect(playAttemptRetryable(error.MpvOpenFailed, 1, false));
-
-    // Budget exhausted — the last allowed attempt does not schedule another.
     try std.testing.expect(!playAttemptRetryable(error.MpvOpenFailed, MAX_PLAY_ATTEMPTS - 1, false));
-
-    // Playback started before it died → not our transient open 403; never hammer-restart.
     try std.testing.expect(!playAttemptRetryable(error.MpvOpenFailed, 0, true));
-
-    // A different failure class (mpv missing, signal, generic exit) is not retryable.
     try std.testing.expect(!playAttemptRetryable(error.MpvFailed, 0, false));
     try std.testing.expect(!playAttemptRetryable(error.MpvNotFound, 0, false));
-
-    // Guard the backoff table covers every retry the gate permits.
     try std.testing.expectEqual(MAX_PLAY_ATTEMPTS - 1, RETRY_BACKOFFS_MS.len);
 }
 
-// ── ROD-342: resolveViaSearch pass control flow, driven by a stub provider ──────
+// ROD-342: resolveViaSearch control flow with stub provider.
 
-/// In-process `SourceProvider` for exercising `resolveViaSearch` without network:
-/// two canned query→results rows and a single show id whose episode probe lists
-/// anything. Everything else errors or lists empty, mirroring a miss.
+/// In-process SourceProvider for resolveViaSearch tests (no network).
 const StubCatalog = struct {
     romaji: []const Anime = &.{},
     english: []const Anime = &.{},
-    /// The one show id whose episode probe succeeds; all others list empty.
+    /// Episode probe succeeds only for this id; others empty.
     alive_id: []const u8 = "",
-    /// Search-call count, for pinning the redundant-pass skip.
+    /// Search-call count (redundant-pass skip).
     searches: u32 = 0,
     catalog_name: []const u8 = "stub",
-    /// Transport-failure knobs (ROD-347): fail the search / the episode probe.
+    /// Transport knobs (ROD-347).
     search_fails: bool = false,
     episodes_fail: bool = false,
-    /// Tier-A knobs (ROD-366): the canonical→catalog key this provider derives
-    /// (null = no tier-A, the pre-366 default), and whether `search` reports
-    /// `error.Unsupported` (megaplay's tier-A-only shape).
+    /// Tier-A knobs (ROD-366): canon key; search_unsupported = megaplay shape.
     canon_key: ?[]const u8 = null,
     search_unsupported: bool = false,
 
@@ -1859,7 +1571,6 @@ const StubCatalog = struct {
 test "resolveViaSearch: English retry pass binds when the romaji pass misses (ROD-342)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // An English-only-searchable catalog embedding mal ids (the retired anipub's shape).
     const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 154587, .mal_id = 52991 };
     var stub = StubCatalog{
         .english = &.{.{ .id = "2454", .name = "English Title", .mal_id = 52991 }},
@@ -1871,8 +1582,7 @@ test "resolveViaSearch: English retry pass binds when the romaji pass misses (RO
 test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add probe" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // Pass 1 id-matches a listing whose episode probe comes up empty; pass 2 must
-    // still get its shot instead of the whole resolve dying with it.
+    // Pass 1 matches empty-probe listing; pass 2 must still run.
     const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
     var stub = StubCatalog{
         .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
@@ -1882,8 +1592,7 @@ test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add
     const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("alive", got.match);
 
-    // Both passes dead → a definitive absent (never a bind on an unplayable
-    // listing): the searches ran clean, so the miss is a catalog fact.
+    // Both dead → clean .absent (catalog fact, not transport).
     stub.alive_id = "";
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, false, null) == .absent);
 }
@@ -1891,18 +1600,16 @@ test "resolveViaSearch: a dead pass-1 listing falls through to pass 2 on the Add
 test "resolveViaSearch: Play skips the probe; identical English title skips pass 2" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // for_play: the downstream episode fetch is the confirmation, so a probe-dead
-    // listing still resolves (and its failure surfaces on that fetch instead).
+    // for_play: probe-dead listing still resolves; confirmation is downstream fetch.
     const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
     var stub = StubCatalog{
         .romaji = &.{.{ .id = "dead", .name = "Romaji Title", .mal_id = 52991 }},
     };
     const got = resolveViaSearch(arena_state.allocator(), std.testing.io, stub.provider(), canonical, .sub, true, null);
     try std.testing.expectEqualStrings("dead", got.match);
-    try std.testing.expectEqual(@as(u32, 1), stub.searches); // pass-1 hit → pass 2 never fired
+    try std.testing.expectEqual(@as(u32, 1), stub.searches); // pass-1 hit → no pass 2
 
-    // english_name == name: the second pass is a redundant query and must not fire
-    // even when pass 1 misses (one search total, resolve collapses to absent).
+    // english_name == name: no redundant second search.
     const same_title: Anime = .{ .id = "2", .name = "No Such Show", .english_name = "No Such Show", .anilist_id = 2 };
     var stub2 = StubCatalog{};
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, stub2.provider(), same_title, .sub, true, null) == .absent);
@@ -1914,23 +1621,18 @@ test "resolveViaSearch three-state: transport failures read unknown, never absen
     defer arena_state.deinit();
     const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
 
-    // A failed search proves nothing about the catalog (the ROD-278 contract):
-    // caching absent here would blind the fallback to a healthy provider for a
-    // whole TTL just because the network blinked.
+    // Failed search proves nothing (ROD-278): must not cache absent for a whole TTL.
     var down = StubCatalog{ .search_fails = true };
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, down.provider(), canonical, .sub, true, null) == .unknown);
 
-    // A matched listing whose Add probe dies on transport taints the whole walk:
-    // even though pass 2 misses clean, the hit the error may have hidden forbids
-    // a definitive verdict.
+    // Matched listing, Add probe transport-fails: taints walk even if later pass clean-misses.
     var flaky = StubCatalog{
         .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }},
         .episodes_fail = true,
     };
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, flaky.provider(), canonical, .sub, false, null) == .unknown);
 
-    // No runnable query pass (a canonical with no usable titles) also learned
-    // nothing: unknown, not absent.
+    // No usable titles → learned nothing: unknown.
     const untitled: Anime = .{ .id = "3", .name = "", .anilist_id = 3 };
     var idle = StubCatalog{};
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, idle.provider(), untitled, .sub, true, null) == .unknown);
@@ -1942,92 +1644,72 @@ test "resolveViaSearch tier-A: a tier-A-only provider (no search) is reachable o
     defer arena_state.deinit();
     const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
 
-    // megaplay's shape: canonicalKey derives a catalog id, `search` is Unsupported.
-    // The pre-366 search-only walk saw only the Unsupported search and learned
-    // nothing; tier-A must now bind it on the canonical key + episode probe.
+    // megaplay shape: canon key + Unsupported search → bind via tier-A.
     var mega = StubCatalog{ .canon_key = "66624", .alive_id = "66624", .search_unsupported = true };
     const hit = resolveViaSearch(arena_state.allocator(), std.testing.io, mega.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("66624", hit.match);
-    try std.testing.expectEqual(@as(u32, 0), mega.searches); // tier-A hit → search never fired
+    try std.testing.expectEqual(@as(u32, 0), mega.searches);
 
-    // The same provider that does NOT stock the show: the tier-A probe lists empty
-    // (authoritative), and the Unsupported search must not downgrade that to unknown.
-    // It's a cacheable absence (ROD-347).
+    // Empty tier-A + Unsupported search must stay .absent (ROD-347), not .unknown.
     var mega_miss = StubCatalog{ .canon_key = "404", .alive_id = "", .search_unsupported = true };
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_miss.provider(), canonical, .sub, false, null) == .absent);
 
-    // No mal_id → no tier-A key; the Unsupported search then learned nothing, so a
-    // stale absence must NOT be cached (a show that gains a mal_id later isn't
-    // blocked). This is the case the megaplay Unsupported contract protects.
+    // No key + Unsupported search: .unknown so a later mal_id is not blocked by cached absent.
     const no_mal: Anime = .{ .id = "2", .name = "Romaji Title", .anilist_id = 2 };
     var mega_nokey = StubCatalog{ .search_unsupported = true };
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_nokey.provider(), no_mal, .sub, false, null) == .unknown);
 
-    // Play skips the episode probe: the tier-A key resolves immediately, the
-    // downstream fetch is the confirmation (parity with the search arm).
+    // Play: tier-A key resolves without episode probe.
     var mega_play = StubCatalog{ .canon_key = "66624", .alive_id = "", .search_unsupported = true };
     const played = resolveViaSearch(arena_state.allocator(), std.testing.io, mega_play.provider(), canonical, .sub, true, null);
     try std.testing.expectEqualStrings("66624", played.match);
 
-    // A tier-A probe that dies on TRANSPORT (not a clean empty) taints the walk to
-    // unknown even when a subsequent search comes back clean-empty: the error may
-    // have hidden a hit, so the miss is never a cacheable absence (ROD-278/347). Here
-    // the search runs (not Unsupported) and finds nothing, yet the verdict must stay
-    // unknown because of the tier-A transport failure.
+    // Tier-A transport fail + clean empty search → still .unknown (ROD-278/347).
     var mega_flaky = StubCatalog{ .canon_key = "66624", .episodes_fail = true };
     try std.testing.expect(resolveViaSearch(arena_state.allocator(), std.testing.io, mega_flaky.provider(), canonical, .sub, false, null) == .unknown);
-    try std.testing.expect(mega_flaky.searches > 0); // tier-A transport fail still fell through to search
+    try std.testing.expect(mega_flaky.searches > 0);
 }
 
 test "resolveViaSearch tier-A: an empty tier-A probe still falls through to a title search (ROD-366)" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    // senshi's shape: it keys episodes by mal_id (tier-A) AND has a title search.
-    // The canonical's mal_id lists empty on the direct route, but the show is
-    // cataloged under a different id a title search recovers, so the tier-A miss
-    // must not short-circuit that.
+    // Dual-capability: empty tier-A must not skip title search that finds a different id.
     const canonical: Anime = .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 };
     var senshi = StubCatalog{
-        .canon_key = "52991", // direct route: lists empty (alive_id below is the search id)
+        .canon_key = "52991",
         .romaji = &.{.{ .id = "found", .name = "Romaji Title", .mal_id = 52991 }},
         .alive_id = "found",
     };
     const got = resolveViaSearch(arena_state.allocator(), std.testing.io, senshi.provider(), canonical, .sub, false, null);
     try std.testing.expectEqualStrings("found", got.match);
-    try std.testing.expect(senshi.searches > 0); // tier-A empty → search still ran
+    try std.testing.expect(senshi.searches > 0);
 }
 
 test "prewarmTask: a dual-capability empty tier-A falls through to search, no false absence (ROD-367)" {
     const gpa = std.testing.allocator;
-    // senshi's shape: keys episodes by mal_id (tier-A) AND has a title search. The
-    // canonical's mal_id lists empty on the direct route, but a title search recovers
-    // the show under a different id. Pre-367 prewarm posted `.absent` off the empty
-    // tier-A probe alone (a false negative that also spared future searches and
-    // stranded a flip); routing through resolveViaSearch makes it fall through and
-    // mint the real binding instead.
+    // Empty tier-A alone must not post false .absent (strands flip); resolveViaSearch fallthrough.
     var senshi = StubCatalog{
-        .canon_key = "52991", // direct route lists empty (alive_id is the search id)
+        .canon_key = "52991",
         .romaji = &.{.{ .id = "found", .name = "Romaji Title", .mal_id = 52991 }},
         .alive_id = "found",
     };
-    // prewarmTask frees `providers` and `canonical` itself (its own defers).
+    // prewarmTask frees providers + canonical.
     const providers = try gpa.dupe(SourceProvider, &.{senshi.provider()});
     const canonical = try dupeOwnedAnime(gpa, .{ .id = "1", .name = "Romaji Title", .english_name = "English Title", .anilist_id = 1, .mal_id = 52991 });
 
     var loop = Loop{ .io = std.testing.io, .tty = undefined, .vaxis = undefined, .queue = .{ .io = std.testing.io } };
     var cancel = std.atomic.Value(bool).init(false);
     var drain = ThreadDrain{};
-    drain.begin(); // the task's `defer drain.finish()` rebalances to zero
+    drain.begin();
 
-    // Single provider: no inter-provider sleep fires (gated on i > 0), so this runs
-    // synchronously and posts straight to the queue.
+    // One provider: no inter-provider sleep (i > 0); posts synchronously.
     prewarmTask(&loop, gpa, std.testing.io, providers, canonical, 154587, .sub, &cancel, &drain);
 
     var saw_match = false;
     while (loop.queue.tryPop() catch null) |ev| {
         switch (ev) {
             .prewarm_result => |r| {
-                try std.testing.expect(!r.absent); // NOT a false absence
+                try std.testing.expect(!r.absent);
                 try std.testing.expectEqualStrings("found", r.source_id);
                 saw_match = true;
                 if (r.source_id.len > 0) gpa.free(r.source_id);
@@ -2044,9 +1726,7 @@ test "resolveAcrossProviders: walks registry order, first confident match wins (
     const arena = arena_state.allocator();
     const canonical: Anime = .{ .id = "154587", .name = "Romaji Title", .anilist_id = 154587, .mal_id = 52991 };
 
-    // First provider's catalog misses, second's id-matches: the match must carry
-    // the SECOND provider's name (the bind is keyed under it, never the default).
-    // The clean miss before the winner is a learned fact and lands in absent_out.
+    // Miss then hit: bind under second provider; first clean miss → absent_out.
     var miss = StubCatalog{ .catalog_name = "alpha" };
     var hit = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2454", .name = "Romaji Title", .mal_id = 52991 }} };
     var absent: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2056,8 +1736,7 @@ test "resolveAcrossProviders: walks registry order, first confident match wins (
     try std.testing.expectEqual(@as(usize, 1), absent.items.len);
     try std.testing.expectEqualStrings("alpha", absent.items[0]);
 
-    // Both match: first in registry order wins the tie; nothing was ruled absent
-    // (the runner-up was never even searched).
+    // Tie: first in order wins; runner-up never searched.
     var hit_first = StubCatalog{ .catalog_name = "alpha", .romaji = &.{.{ .id = "1111", .name = "Romaji Title", .mal_id = 52991 }} };
     var hit_second = StubCatalog{ .catalog_name = "beta", .romaji = &.{.{ .id = "2222", .name = "Romaji Title", .mal_id = 52991 }} };
     var absent_tie: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -2066,8 +1745,7 @@ test "resolveAcrossProviders: walks registry order, first confident match wins (
     try std.testing.expectEqualStrings("alpha", tie.source);
     try std.testing.expectEqual(@as(usize, 0), absent_tie.items.len);
 
-    // Nobody matches → null, every provider got its shot, and only the CLEAN
-    // misses are collected: the transport-dead provider stays unknown (ROD-347).
+    // All miss: only clean absences collected; transport-dead stays unknown (ROD-347).
     var m1 = StubCatalog{ .catalog_name = "alpha" };
     var m2 = StubCatalog{ .catalog_name = "beta", .search_fails = true };
     var absent_miss: std.ArrayListUnmanaged([]const u8) = .empty;

@@ -1,19 +1,16 @@
-//! Shared HLS master-playlist parsing + quality-cap selection (ROD-302). Lifted out
-//! of allanime.zig so every provider that hands back an adaptive m3u8 master can honor
-//! the user's quality preference through one implementation. Providers fetch the master
-//! themselves (the CDN headers differ per source) and feed the bytes here; the cap
-//! policy and the variant math live in this one place.
+//! Shared HLS master-playlist parsing + quality-cap selection (ROD-302).
+//! Providers fetch the master themselves (CDN headers differ per source) and feed the
+//! bytes here; cap policy and variant math live in one place.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const domain = @import("../domain.zig");
 
-/// One entry of a master playlist: a variant URI (verbatim, possibly relative) and
-/// its vertical resolution when the STREAM-INF advertised one.
+/// Master playlist entry: variant URI (verbatim, possibly relative) + vertical
+/// resolution when STREAM-INF advertised one.
 pub const Variant = struct { url: []const u8, resolution: ?u32 = null };
 
-/// Vertical pixel count from a `RESOLUTION=1920x1080` attribute on an
-/// EXT-X-STREAM-INF line; null if absent or malformed.
+/// Height from `RESOLUTION=WxH` on EXT-X-STREAM-INF; null if absent or malformed.
 fn streamInfHeight(inf_line: []const u8) ?u32 {
     const key = "RESOLUTION=";
     const at = std.mem.indexOf(u8, inf_line, key) orelse return null;
@@ -24,11 +21,9 @@ fn streamInfHeight(inf_line: []const u8) ?u32 {
     return std.fmt.parseInt(u32, rest[x + 1 .. end], 10) catch null;
 }
 
-/// Parse an m3u8 *master* playlist: each `#EXT-X-STREAM-INF:` (its resolution)
-/// paired with the URI on the next non-comment line. URIs come back verbatim;
-/// relative ones are joined against the playlist URL by the network caller. A
-/// playlist with no STREAM-INF is already a media playlist (no variants) and
-/// yields an empty slice; the caller then treats the link as one best stream.
+/// Master playlist: each `#EXT-X-STREAM-INF:` (resolution) paired with the next
+/// non-comment URI (verbatim). Network caller joins relatives against the playlist URL.
+/// No STREAM-INF → media playlist, empty slice; caller treats the link as one stream.
 pub fn parseMasterPlaylist(arena: Allocator, text: []const u8) ![]Variant {
     var out: std.ArrayList(Variant) = .empty;
     var expect_uri = false;
@@ -51,12 +46,10 @@ pub fn parseMasterPlaylist(arena: Allocator, text: []const u8) ![]Variant {
     return out.toOwnedSlice(arena);
 }
 
-/// Resolve a possibly-relative m3u8 URI against the playlist URL it came from.
-/// Absolute (`http…`) passes through; `/rooted` keeps scheme+host; otherwise
-/// it's relative to the playlist's directory.
+/// Join a possibly-relative m3u8 URI against the playlist URL. Absolute http(s)
+/// passes through; `/rooted` keeps scheme+host; else relative to playlist dir.
 pub fn joinUrl(arena: Allocator, base: []const u8, ref: []const u8) ![]u8 {
-    // Absolute refs pass through. `./`/`../` segments are left literal: the
-    // URL is handed to mpv, which normalizes them, so we don't resolve here.
+    // Leave `./`/`../` literal: mpv normalizes; we don't resolve here.
     if (std.mem.startsWith(u8, ref, "http://") or std.mem.startsWith(u8, ref, "https://"))
         return arena.dupe(u8, ref);
     const scheme_end = (std.mem.indexOf(u8, base, "://") orelse return error.BadBaseUrl) + 3;
@@ -67,13 +60,10 @@ pub fn joinUrl(arena: Allocator, base: []const u8, ref: []const u8) ![]u8 {
     return std.mem.concat(arena, u8, &.{ base[0..dir_end], ref });
 }
 
-/// Pick the variant matching the user's quality preference from the gathered candidates,
-/// or null when there are none (ROD-152). Cap policy:
-///   `best`:  highest resolution
-///   `worst`: lowest resolution
-///   a rung:  the highest variant at or below the rung; if every variant exceeds it, the
-///            lowest available (never bump a capped user over their ceiling when we can
-///            avoid it, but always return something the source offers, nearest-available).
+/// Pick by quality preference, or null if none (ROD-152). Cap policy:
+///   best / worst: highest / lowest resolution
+///   rung: highest ≤ cap; if every variant exceeds it, the lowest available
+///         (never invent a ceiling breach; always return something the source offers)
 pub fn selectVariant(variants: []const domain.StreamLink, quality: domain.Quality) ?domain.StreamLink {
     if (variants.len == 0) return null;
     var pick = variants[0];
@@ -83,31 +73,27 @@ pub fn selectVariant(variants: []const domain.StreamLink, quality: domain.Qualit
     return pick;
 }
 
-/// True if candidate `a` beats incumbent `b` for `quality`. A KNOWN resolution always
-/// beats an unknown one (null), and two unknowns tie: we never pick a stream on a
-/// resolution we can't see over one we can. This is sharpest under a rung cap, where an
-/// unknown stream (a BANDWIDTH-only STREAM-INF) could be any bitrate, so treating it as
-/// "0p, safely in budget" would hand a capped user the exact firehose the cap prevents.
-/// Unknowns are thus a last resort, chosen only when EVERY candidate is unknown. Over
-/// known resolutions this is a strict weak order, so the fold yields the winner
-/// regardless of arrival order.
+/// Whether candidate `a` beats incumbent `b` for `quality`.
+/// Landmine: a KNOWN resolution always beats unknown (null). Under a rung cap, a
+/// BANDWIDTH-only STREAM-INF (null res) could be any bitrate; treating it as "0p, in
+/// budget" would hand a capped user the firehose the cap prevents. Unknowns are last
+/// resort, only when EVERY candidate is unknown. Known-vs-known is a strict weak order
+/// (fold is arrival-order independent).
 fn preferred(a: domain.StreamLink, b: domain.StreamLink, quality: domain.Quality) bool {
     const ra = a.resolution orelse return false; // unknown `a` never beats `b`
     const rb = b.resolution orelse return true; // known `a` beats unknown `b`
     return switch (quality) {
         .best => ra > rb,
         .worst => ra < rb,
-        // A rung: compare by cap-rank so a single `>` implements the policy.
+        // Rung: one `>` via qualityRank encodes the whole cap policy.
         else => qualityRank(ra, quality.cap().?) > qualityRank(rb, quality.cap().?),
     };
 }
 
-/// Rank a resolution against a cap so one `>` comparison is the whole cap
-/// policy. In-budget variants (≤ cap) score non-negative and rise with
-/// resolution → the highest-≤-cap wins. Over-budget variants score negative
-/// and rise toward zero as resolution shrinks → the smallest over-budget wins,
-/// and any in-budget variant always outranks any over-budget one. i64 so the
-/// negated u32 can't overflow.
+/// Cap rank for a single `>` comparison. ≤ cap: non-negative, rises with res
+/// (highest-≤-cap wins). Over budget: negative, rises toward zero as res shrinks
+/// (smallest over-budget wins). Any in-budget always outranks any over-budget.
+/// i64 so negated u32 cannot overflow.
 fn qualityRank(res: u32, cap_px: u32) i64 {
     if (res <= cap_px) return @as(i64, res);
     return -@as(i64, res);
@@ -169,17 +155,14 @@ test "selectVariant: cap policy picks the right rung (ROD-152)" {
     var over = [_]domain.StreamLink{ mk(720), mk(1080) };
     try std.testing.expectEqual(@as(?u32, 720), selectVariant(&over, .p480).?.resolution);
 
-    // A known resolution always beats an unknown (null) one, in *every* mode:
-    // we never act on a resolution we can't see. For a rung cap this is the H1
-    // fix: an unknown could be any bitrate, so it must not masquerade as a safe
-    // in-budget pick and beat a real (if over-budget) 720p.
+    // Known always beats unknown, every mode (rung-cap landmine: null must not
+    // masquerade as safe in-budget and beat a real over-budget 720p).
     var withnull = [_]domain.StreamLink{ mk(null), mk(720) };
     try std.testing.expectEqual(@as(?u32, 720), selectVariant(&withnull, .best).?.resolution);
     try std.testing.expectEqual(@as(?u32, 720), selectVariant(&withnull, .worst).?.resolution);
     try std.testing.expectEqual(@as(?u32, 720), selectVariant(&withnull, .p480).?.resolution);
 
-    // …but when *every* candidate is unknown, we still return one; never error
-    // out when a stream actually exists.
+    // All unknown: still return one (a stream exists; do not error out).
     var allnull = [_]domain.StreamLink{ mk(null), mk(null) };
     try std.testing.expect(selectVariant(&allnull, .p720) != null);
 }

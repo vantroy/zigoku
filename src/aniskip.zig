@@ -1,14 +1,11 @@
-//! AniSkip — intro/outro auto-skip for the mpv playback path (ROD-83).
+//! AniSkip intro/outro auto-skip for mpv (ROD-83).
 //!
-//! AniSkip is a community database of opening/ending timestamps keyed on a MyAnimeList id. We
-//! fetch the intervals for one episode, drop a tiny Lua script into the cache dir, and hand
-//! mpv `--script` + `--script-opts` so it seeks past the OP/ED on its own. Best-effort: any
-//! failure (no MAL id, network down, empty data, unwritable cache) collapses to "no skip" and
-//! the episode plays normally, with no error shown.
+//! Community OP/ED timestamps keyed on MAL id: fetch intervals, drop skip.lua into cache,
+//! hand mpv `--script` + `--script-opts`. Best-effort: any failure (no MAL id, network down,
+//! empty data, unwritable cache) collapses to no skip with no error shown.
 //!
-//! The MAL id comes from AniList enrichment (`domain.Anime.mal_id`) and falls back to Jikan
-//! (ROD-82). In the TUI these network calls run on the playback worker thread, never the UI
-//! thread; the CLI calls them inline on its already-blocking main thread.
+//! MAL id from AniList enrichment (`domain.Anime.mal_id`), else Jikan (ROD-82). TUI: network
+//! on the playback worker only, never the UI thread. CLI: blocking main (already blocking).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -26,15 +23,13 @@ pub const SkipMode = enum {
     outro,
     both,
 
-    /// Parse the `config.skip_mode` string, defaulting to `.both` for anything
-    /// unrecognized — a typo in the config never silently disables skipping.
+    /// Unrecognized config string → `.both`. A typo must not silently disable skip.
     pub fn fromString(s: []const u8) SkipMode {
         return std.meta.stringToEnum(SkipMode, s) orelse .both;
     }
 };
 
-/// Resolved skip window for one episode. Any field left `null` means AniSkip had
-/// no timestamp for that segment.
+/// Skip window for one episode. Null field = AniSkip had no timestamp for that segment.
 pub const SkipTimes = struct {
     op_start: ?f64 = null,
     op_end: ?f64 = null,
@@ -42,7 +37,7 @@ pub const SkipTimes = struct {
     ed_end: ?f64 = null,
 };
 
-// ── AniSkip API response shapes (only the fields we read) ──────────────────────
+// AniSkip API response shapes (fields we read).
 
 const Interval = struct {
     startTime: f64 = 0,
@@ -51,8 +46,7 @@ const Interval = struct {
 
 const ResultItem = struct {
     interval: Interval = .{},
-    // AniSkip sends this camelCase; std.json matches field names verbatim, so the
-    // Zig field must be camelCase too or it silently parses to "".
+    // camelCase required: std.json matches field names verbatim; snake_case silently parses to "".
     skipType: []const u8 = "",
 };
 
@@ -60,14 +54,13 @@ const Resp = struct {
     results: []ResultItem = &.{},
 };
 
-/// Fetch OP/ED timestamps for `(mal_id, episode)`. Never errors — every failure
-/// path returns an empty `SkipTimes`, so callers degrade silently.
+/// Fetch OP/ED for `(mal_id, episode)`. Never errors: every failure returns empty SkipTimes.
 pub fn fetch(arena: Allocator, io: Io, mal_id: u32, episode: u32) SkipTimes {
     return fetchInner(arena, io, mal_id, episode) catch .{};
 }
 
 fn fetchInner(arena: Allocator, io: Io, mal_id: u32, episode: u32) !SkipTimes {
-    // Bounded: endpoint + two u32s + fixed query string is well under 256 bytes.
+    // Endpoint + two u32s + fixed query is well under 256 bytes.
     var url_buf: [256]u8 = undefined;
     const url = try std.fmt.bufPrint(
         &url_buf,
@@ -95,9 +88,8 @@ fn fetchInner(arena: Allocator, io: Io, mal_id: u32, episode: u32) !SkipTimes {
     return timesFromResults(parsed.value.results);
 }
 
-/// Fold AniSkip's result list into a single `SkipTimes`. First op/ed wins.
-/// Degenerate intervals (negative start, or end ≤ start) are dropped — the
-/// community DB has them, and a 0→0 window would make mpv seek-loop at the start.
+/// First op/ed wins. Drop degenerate intervals (community DB has them); a 0→0 window
+/// would make mpv seek-loop at the start.
 fn timesFromResults(results: []const ResultItem) SkipTimes {
     var t: SkipTimes = .{};
     for (results) |r| {
@@ -113,18 +105,16 @@ fn timesFromResults(results: []const ResultItem) SkipTimes {
     return t;
 }
 
-/// Minimum OP/ED length we'll act on. Below this a skip isn't worth announcing,
-/// and — since the script announces then seeks 0.4s later — a sub-second window
-/// could be overrun by natural playback and turn the absolute seek into a rewind.
+/// Min OP/ED length. Script announces then seeks 0.4s later; a sub-second window can be
+/// overrun by natural playback and turn the absolute seek into a rewind.
 const min_interval_secs: f64 = 1.0;
 
 fn validInterval(iv: Interval) bool {
     return iv.startTime >= 0 and iv.endTime - iv.startTime >= min_interval_secs;
 }
 
-/// Build the `--script-opts` value for `times` under `mode`, or `null` when there
-/// is nothing worth skipping (mode `.none`, or no interval relevant to the mode).
-/// Missing segments are emitted as `-1`, which the Lua script reads as "disabled".
+/// `--script-opts` for `times` under `mode`, or null (mode `.none` / no relevant interval).
+/// Missing segments emit as `-1` (Lua: disabled).
 fn buildOpts(arena: Allocator, t: SkipTimes, mode: SkipMode) !?[]const u8 {
     if (mode == .none) return null;
     const want_op = mode == .intro or mode == .both;
@@ -146,20 +136,17 @@ fn buildOpts(arena: Allocator, t: SkipTimes, mode: SkipMode) !?[]const u8 {
     );
 }
 
-/// AniSkip wants an integer episode number. Prefer the integer parsed from the
-/// provider's raw label; fall back to the 1-based list ordinal when it isn't one.
-/// Caveat: for non-integer labels (OVA, "1.5") or gapped numbering the ordinal
-/// can disagree with the real episode number — a wrong AniSkip lookup at worst,
-/// which just yields no skip. Acceptable for a best-effort feature.
+/// Integer from the provider label; else 1-based list ordinal. Non-integer labels
+/// (OVA, "1.5") or gapped numbering can disagree with the real episode number: a wrong
+/// AniSkip lookup at worst, which yields no skip. Fine for best-effort.
 pub fn episodeNumber(raw: []const u8, ordinal: u32) u32 {
     const trimmed = std.mem.trim(u8, raw, " \t");
     return std.fmt.parseInt(u32, trimmed, 10) catch ordinal;
 }
 
-/// Resolve everything mpv needs to auto-skip this episode, or `null` to play
-/// without skipping. Runs network calls (Jikan + AniSkip) — call it off the UI
-/// thread. `known_mal_id` is the cached/enriched MAL id (ROD-82 cache read);
-/// when absent we fall back to a Jikan lookup on `title`.
+/// Everything mpv needs to auto-skip, or null for plain play. Runs Jikan + AniSkip
+/// network: call off the UI thread. `known_mal_id` is the cached/enriched id (ROD-82);
+/// absent → Jikan lookup on `title`.
 pub fn prepare(
     arena: Allocator,
     io: Io,
@@ -177,17 +164,12 @@ pub fn prepare(
     return .{ .path = path, .opts = opts };
 }
 
-// ── Lua script provisioning ────────────────────────────────────────────────────
+// Lua script provisioning
 
-/// The mpv user-script. Reads the OP/ED window from `--script-opts` and seeks past whichever
-/// segment the current `time-pos` falls inside. `-1` disables a segment; `mode` gates intro
-/// vs outro.
-///
-/// UX: announce the skip BEFORE cutting so the jump reads as intentional, not a glitch
-/// (`skip_section` shows a calm OSD line, then seeks a beat later). The `skipped` flags
-/// debounce the high-frequency time-pos observer so the deferred seek fires exactly once per
-/// segment; `file-loaded` resets them in case episodes are ever chained in one mpv process. To
-/// restyle the toast (dim/top-left), prefix the label with ASS tags, e.g. `{\an7\fs18\alpha&H80&}`.
+/// mpv user-script: OP/ED from `--script-opts`; `-1` disables a segment; `mode` gates intro/outro.
+/// Announce before the seek so the jump reads intentional, not a glitch. `skipped` flags
+/// debounce the high-frequency time-pos observer (one deferred seek per segment); `file-loaded`
+/// resets them if episodes are chained in one mpv. Restyle toast with ASS tags on the label.
 const LUA_SCRIPT =
     \\local opts = require("mp.options")
     \\local o = { op_start = -1, op_end = -1, ed_start = -1, ed_end = -1, mode = "both" }
@@ -223,13 +205,10 @@ const LUA_SCRIPT =
     \\
 ;
 
-/// Write `skip.lua` to the cache dir and return its absolute path. Always
-/// rewrites: the script evolves between app versions, and a ~900-byte write once
-/// per playback launch is cheaper than reasoning about staleness.
+/// Write skip.lua to the cache dir; return absolute path. Always rewrite: the script
+/// evolves across versions, and ~900B once per play is cheaper than staleness tracking.
+/// `prepare` swallows cache/home errors (`catch return null` → plain play).
 fn ensureScript(arena: Allocator, io: Io) ![]const u8 {
-    // Pre-ROD-89 this resolver returned `error.NoCacheDir`; `paths.cacheDir` now
-    // reports the same condition as `error.NoHomeDir`. `prepare` swallows either
-    // (`catch return null` → no skip script), so the rename is purely internal.
     const dir = try paths.cacheDir(arena);
     paths.ensureDir(dir);
     const path = try std.fmt.allocPrint(arena, "{s}/skip.lua", .{dir});

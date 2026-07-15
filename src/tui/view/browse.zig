@@ -1,5 +1,4 @@
-//! Zigoku — Browse view list render pass (search results).
-//! Extracted from app.zig along the tick/draw seam (ROD-144).
+//! Browse view list render (search results). Extracted from app.zig (ROD-144).
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -15,14 +14,11 @@ const fillRow = render.fillRow;
 const centerText = render.centerText;
 const centerKeyHint = render.centerKeyHint;
 
-// `self` is `*const App`: this pass reads list state (cursor/viewport/results)
-// and writes only `scratch` — the compiler proves it mutates no app state (ROD-155).
+// `*const App`: reads list state; writes only `scratch` (ROD-155).
 pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Window, pane_h: u16, pane_w: u16) void {
     const w = pane_w;
     if (self.search.len == 0) {
-        // First-run absent state (§9.5): name the view, then teach its two
-        // actions. Browse is search-first and never auto-fills, so "no feed yet"
-        // read as broken/waiting — this says what to do instead (ROD-211).
+        // First-run absent (§9.5 / ROD-211): search-first, never auto-fills; teach / and P.
         const mid = pane_h / 2;
         centerText(win, mid -| 2, w, "search the catalogue", self.s(self.palette.fg2, .{ .italic = true }));
         centerKeyHint(win, mid, w, "/", self.s(self.palette.focus, .{ .bold = true }), "  type a show name to begin", self.s(self.palette.fg2, .{}));
@@ -36,9 +32,7 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         return;
     }
     if (!search_pending and self.search.results.items.len == 0) {
-        // Centered to match the §9.5 absent state (ROD-211), not stranded
-        // top-left. The bottom-bar search prompt stays visible (chrome.zig), so
-        // the user keeps their query and the next-step hint sits under it.
+        // Centered like absent state; bottom-bar keeps the query (chrome.zig).
         const q = self.search.querySlice();
         const mid = pane_h / 2;
         const msg = std.fmt.bufPrint(&scratch.msg, "no results for \"{s}\"", .{q}) catch "no results";
@@ -47,10 +41,8 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         return;
     }
 
-    // Results list — col offsets relative to list_win (no x=2 leading margin).
-    // The viewport (list_top) is settled by app.layout() before this draw pass
-    // (ROD-155); here we only read it.
-    const list_title_col: u16 = 2; // marker is col 0–1, title starts at 2
+    // Viewport settled by app.layout() before draw (ROD-155).
+    const list_title_col: u16 = 2; // marker col 0-1
 
     var row: u16 = 0;
     var slot: usize = 0;
@@ -59,10 +51,7 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         const a = self.search.results.items[i];
         const selected = i == self.list_cursor;
 
-        // ROD-194: the selection affordance (band + cyan-bold ▸/title) is earned only
-        // when the list pane holds focus. With the detail pane focused the selected row
-        // steps down — band drops, ▸ dims, title loses bold — mirroring History so the
-        // active pane is unmistakable.
+        // ROD-194: band + cyan-bold only when list pane focused; detail focus steps row down.
         const list_focused = self.active_pane == .list;
         const sel_focused = selected and list_focused;
         const row_bg = if (sel_focused) self.palette.bg_surface else self.palette.bg_base;
@@ -75,48 +64,30 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
             self.s(self.palette.focus, .{ .bg = row_bg, .bold = list_focused })
         else
             self.s(self.palette.fg, .{ .bg = row_bg });
-        // ── Meta zone: AniList score (right) + episode count (left) ──────────
-        // §4.1/§4.3: the row is glyph + title + score, the score taking the rightmost
-        // `score_w` cols, right-anchored and §2.2 tier-coloured. All columns are
-        // PANE-RELATIVE: the Browse layout is the split list pane (~38%, `PaneSplit.list_w`),
-        // so a fixed meta column would fall outside it.
-        //
-        // Priority on a tight pane is title > score > eps. The title is the primary
-        // identifier, so it falls off last; the eps count drops first (two floors below). The
-        // score is a tiny high-value badge worth clipping a long title slightly for, so it
-        // persists down to `min_title`. The eps count only appears once the title clears a
-        // COMFORTABLE width (`comfort_title`), so it drops before the title is squeezed, never
-        // the other way round (ROD-226).
-        //
-        // Compact list form `[NN]` (no `/100`): the denominator is redundant in a tight row
-        // (the tier colour already reads it as a score). The detail pane keeps `[NN/100]`.
-        const score_w: u16 = 5; // "[100]" = 5 chars
-        const eps_w: u16 = 9; // "1000 sub" worst case + slack
-        const meta_gap: u16 = 2; // keeps the title/eps/score fields from touching
-        const min_title: u16 = 12; // score may clip the title down to this (it's tiny + high-value)
-        const comfort_title: u16 = 28; // eps appears only while the title still clears this
-        // Fixed left edges of the score / eps fields (independent of the per-row
-        // score-string length, so the title width never jitters between rows).
+
+        // Meta zone (§4.1/§4.3, ROD-226): glyph + title + score [NN] right-anchored.
+        // Pane-relative (split list ~38%). Priority on tight width: title > score > eps.
+        // Score persists to min_title; eps only when title clears comfort_title.
+        // Fixed score/eps left edges so title width does not jitter row-to-row.
+        const score_w: u16 = 5; // "[100]"
+        const eps_w: u16 = 9; // "1000 sub" worst case
+        const meta_gap: u16 = 2;
+        const min_title: u16 = 12;
+        const comfort_title: u16 = 28;
         const score_zone: u16 = w -| score_w;
         const show_score = score_zone >= list_title_col + min_title + meta_gap;
         const eps_zone: u16 = score_zone -| meta_gap -| eps_w;
         const show_eps = show_score and eps_zone >= list_title_col + comfort_title + meta_gap;
-        // Title clips before the leftmost meta field it has to make room for. The
-        // gap prevents the last title char from touching the meta (vaxis writes
-        // cells; the later write wins, so without it the title tail bleeds through).
+        // Gap so title tail cannot bleed under meta (later write wins).
         const title_right: u16 = if (show_eps) eps_zone else if (show_score) score_zone else w;
         const title_w: u16 = if (show_score or show_eps)
             title_right -| list_title_col -| meta_gap
         else if (w > list_title_col) w - list_title_col else 0;
-        // Primary label under the title-language preference (ROD-205); the resolver
-        // returns a borrow of one of `a`'s title fields, same lifetime as `a.name`.
+        // ROD-205: borrow of a title field; same lifetime as `a.name`.
         putClipped(win, row, list_title_col, title_w, a.displayTitle(self.config.titleLanguageEnum()), title_style);
 
         if (show_score and slot < scratch.score.len) {
-            // Score, right-anchored against the pane edge. A null score (unenriched
-            // / no AniList hit) degrades to a static "[--]" — no buffer needed; the
-            // tier colour comes from the shared App.scoreStyle so the detail pane
-            // and this row can never drift.
+            // Null score → "[--]"; tier via App.scoreStyle (shared with detail).
             const score_str: []const u8 = if (a.score) |sc|
                 std.fmt.bufPrint(&scratch.score[slot], "[{d}]", .{sc}) catch "[--]"
             else
@@ -124,17 +95,11 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
             const score_at: u16 = w -| @as(u16, @intCast(score_str.len));
             put(win, row, score_at, score_str, self.scoreStyle(a.score, row_bg));
 
-            // Episode count, right-aligned within its field so it clusters against
-            // the score instead of leaving a loose gap before it (ROD-226).
-            // Only rendered when the pane seats it (the `show_eps` floor).
+            // Right-align within eps field (ROD-226). Track-agnostic total when
+            // per-track is 0 (senshi-style / AniList hits); never show false "0 dub".
             if (show_eps and slot < scratch.meta.len) {
                 const tt = self.translation;
                 const per_track = if (tt == .dub) a.eps_dub else a.eps_sub;
-                // A source that splits sub/dub reports a real per-track count; one
-                // that lists episodes track-agnostically (senshi) leaves the off-track
-                // at 0 but knows the total — show the track-agnostic total rather than
-                // a false "0 dub", and "[--]" when even that is unknown (mirrors
-                // selection.zig's episode-count fallback and the score column's idiom).
                 const meta = if (per_track > 0)
                     std.fmt.bufPrint(&scratch.meta[slot], "{d} {s}", .{ per_track, tt.str() }) catch ""
                 else if (a.total_episodes) |t|
@@ -142,7 +107,7 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
                 else
                     "[--]";
                 const eps_len: u16 = @min(@as(u16, @intCast(meta.len)), eps_w);
-                const eps_at: u16 = eps_zone + (eps_w - eps_len); // right-align within [eps_zone, eps_zone+eps_w)
+                const eps_at: u16 = eps_zone + (eps_w - eps_len);
                 putClipped(win, row, eps_at, eps_len, meta, self.s(self.palette.fg3, .{ .bg = row_bg }));
             }
             slot += 1;
@@ -150,7 +115,6 @@ pub fn drawBrowseList(self: *const App, scratch: *RenderScratch, win: vaxis.Wind
         row += 1;
     }
 
-    // Load-more footer.
     if (row < pane_h and
         self.search.page > 0 and
         self.search.results.items.len % source_mod.search_page_size == 0 and
@@ -173,7 +137,7 @@ test "drawBrowseList renders the primary title under title_language (ROD-205)" {
         .english_name = "Frieren: Beyond Journey's End",
         .native_name = "葬送のフリーレン",
     });
-    app.search.len = 1; // nonzero query length → skip the first-run absent state
+    app.search.len = 1;
 
     const scratch = try t.allocator.create(RenderScratch);
     defer t.allocator.destroy(scratch);
@@ -182,14 +146,13 @@ test "drawBrowseList renders the primary title under title_language (ROD-205)" {
     defer screen.deinit(t.allocator);
     const win: vaxis.Window = .{ .x_off = 0, .y_off = 0, .parent_x_off = 0, .parent_y_off = 0, .width = 60, .height = 12, .screen = &screen };
 
-    // First result row is row 0; the title starts at list_title_col (col 2).
     app.config.title_language = "romaji";
     drawBrowseList(&app, scratch, win, 12, 60);
-    try t.expectEqualStrings("S", win.readCell(2, 0).?.char.grapheme); // "Sousou no Frieren"
+    try t.expectEqualStrings("S", win.readCell(2, 0).?.char.grapheme);
 
     app.config.title_language = "english";
     drawBrowseList(&app, scratch, win, 12, 60);
-    try t.expectEqualStrings("F", win.readCell(2, 0).?.char.grapheme); // "Frieren: Beyond…"
+    try t.expectEqualStrings("F", win.readCell(2, 0).?.char.grapheme);
 }
 
 test "drawBrowseList shows the track-agnostic total for a zero-per-track AniList hit (ROD-327)" {
@@ -197,9 +160,7 @@ test "drawBrowseList shows the track-agnostic total for a zero-per-track AniList
     var app: App = .{};
     app.gpa = t.allocator;
     defer app.search.results.deinit(t.allocator);
-    // An AniList discovery hit: no per-track counts (senshi splits sub/dub; AniList
-    // reports a single total), a populated total_episodes. The list must show the total,
-    // never a false "0 sub".
+    // AniList hit: no per-track counts, populated total; never false "0 sub".
     try app.search.results.append(t.allocator, .{
         .id = "182255",
         .name = "Sousou no Frieren",
@@ -220,7 +181,6 @@ test "drawBrowseList shows the track-agnostic total for a zero-per-track AniList
 
     drawBrowseList(&app, scratch, win, 12, 80);
 
-    // Scan row 0 into an ASCII buffer (title + score + eps zone are all ASCII here).
     var buf: [80]u8 = undefined;
     var n: usize = 0;
     var col: u16 = 0;

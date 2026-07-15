@@ -1,66 +1,41 @@
-//! Zigoku — Discover grid multi-cover coordinator (ROD-243).
+//! Discover grid multi-cover coordinator (ROD-243).
 //!
-//! The single-cover `CoverState` renders ONE poster; the Discover grid shows many at once.
-//! This owns a URL-keyed pool of cover slots (each with its own decoded pixels, Kitty image,
-//! and failure cooldown) plus the PURE logic deciding which visible cards to fetch
-//! (`FetchPlan`) and which off-screen slots to evict (`planEvictions`). It shares App's
-//! mutex-guarded `CoverCaches`, so a cover fetched in Browse is reused here for free, and it
-//! never reaches into App.
-//!
-//! Phase boundary (ROD-243): this cut is the data shape, the pure decision core, and the
-//! per-slot pixel/image lifecycle, with NO threads and NO rendering. The fetch worker, the
-//! events, and the geometry-aware pump live in app.zig; the transmit/half-block render pass
-//! lives in view/discover.zig. Storage is a bounded `ArrayListUnmanaged` with linear lookup,
-//! matching `util/lru.zig`'s array style (the codebase keeps no std hashmaps) and the small
-//! pool size (capacity is ROD-241).
+//! URL-keyed pool of cover slots (pixels, Kitty image, failure cooldown) plus pure
+//! fetch/eviction plans. Shares App's mutex-guarded `CoverCaches`. No threads here:
+//! pump/workers in app.zig; transmit/half-block in view/discover.zig. Bounded ArrayList
+//! (no std hashmaps); capacity is ROD-241.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
 const cover_mod = @import("../cover.zig");
-const workers = @import("workers.zig");
 const log = @import("../log.zig");
 
 const Allocator = std.mem.Allocator;
-const CoverCaches = workers.CoverCaches;
 const CoverState = @import("cover_state.zig").CoverState;
 
-/// Capacity of the deferred Kitty-image-free queue. Bounds one frame's evictions
-/// (drained every draw): the pool is `discover_cover_cap` + at most one grid, and
-/// each evicted slot contributes at most 2 ids (its image + a superseded one), so
-/// 256 clears the realistic worst case with margin. A fixed array (vs a growable
-/// list) means an eviction can never OOM and silently drop an id (ROD-243 review).
+/// Deferred Kitty free queue capacity (one frame of evictions). Fixed array so eviction
+/// never OOMs and drops an id (ROD-243 review).
 pub const max_pending_free = 256;
 
-/// A failed cover suppresses refetch of the same url for this long, then allows one
-/// retry — shared with the single-cover policy so both back off identically
-/// (ROD-110). A changed selection elsewhere doesn't reset it; only cooldown expiry
-/// or a successful fetch does.
+/// Shared with single-cover policy (ROD-110). Only cooldown expiry or success resets it.
 pub const retry_cooldown_ms = CoverState.retry_cooldown_ms;
 
-/// One grid cover. Owns an INDEPENDENT decoded-pixel copy — the shared decoded LRU
-/// is tiny (cap 5) and is decode-avoidance, not the render store, so the slot is
-/// the durable source that survives eviction and re-transmits on window re-entry.
+/// One grid cover. Owns an independent decoded-pixel copy (shared decoded LRU is tiny;
+/// slot is the durable render store).
 pub const CoverSlot = struct {
     pub const Status = enum { idle, loading, ready, failed };
 
-    /// gpa-owned key: the cover url. Duped on insert so a slot never borrows an
-    /// `Anime.thumb` that a page-1 refetch (`DiscoverState.clearSlot`) could free
-    /// out from under it (ROD-243).
+    /// gpa-owned key. Duped so a page-1 refetch cannot free `Anime.thumb` under us (ROD-243).
     url: []const u8,
     status: Status = .idle,
-    /// gpa-owned decoded pixels for `url`.
     pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
-    /// Quantized dominant colour for the non-Kitty half-block / flat fallback.
     fallback_color: vaxis.Color = .default,
-    /// Uploaded Kitty image, once transmitted (render pass, UI thread).
     image: ?vaxis.Image = null,
-    /// Superseded Kitty image id awaiting a `freeImage` on the next render flush
-    /// (a same-url re-decode retires the old image here).
+    /// Superseded Kitty id awaiting freeImage on next flush.
     pending_free_id: ?u32 = null,
-    /// `now_ms` of the last failed fetch; gates the retry cooldown. 0 = never failed.
+    /// Last failed fetch; 0 = never. Gates retry cooldown.
     failed_at_ms: i64 = 0,
-    /// Render-frame stamp of the last time this slot was visible — recency for
-    /// `planEvictions`, which keeps the slots nearest the viewport.
+    /// Last visible frame stamp for eviction recency.
     last_seen_frame: u64 = 0,
 
     fn invalidateImage(self: *CoverSlot) void {
@@ -78,17 +53,13 @@ pub const CoverSlot = struct {
         self.fallback_color = .default;
     }
 
-    /// Free everything the slot owns on the gpa: its url key and its pixels. The
-    /// Kitty image id is NOT freed here (it needs `vx`/`writer` on the UI thread) —
-    /// the pool lifts it into `pending_free` before dropping the slot.
+    /// Free gpa-owned url + pixels. Kitty id needs vx/writer; pool lifts to pending_free first.
     fn freeOwned(self: *CoverSlot, gpa: Allocator) void {
         self.freeBuffers(gpa);
         gpa.free(self.url);
     }
 
-    /// Adopt freshly decoded pixels (caller transfers ownership of `rgba`) and
-    /// derive the fallback colour. Retires any prior image into `pending_free_id`
-    /// and frees prior pixels first — mirrors `CoverState.acceptPixels`.
+    /// Adopt pixels (caller transfers `rgba`). Retires prior image; frees prior pixels.
     pub fn acceptPixels(self: *CoverSlot, gpa: Allocator, rgba: []u8, w: u32, h: u32) void {
         self.invalidateImage();
         self.freeBuffers(gpa);
@@ -99,18 +70,10 @@ pub const CoverSlot = struct {
     }
 };
 
-/// Pure: pick which of the priority-ordered visible cards to fetch — those with no
-/// pixels yet, not already in flight, and not inside the failure cooldown. Writes
-/// the chosen indices (into the parallel input arrays) to `out` and returns the
-/// count. No threads, no I/O — unit-testable, mirroring `CoverState.Decision.eval`.
-/// The caller (the pump) builds the parallel arrays from live slot state for the
-/// current visible+prefetch url set, then spawns a fetch for `out[0..n]`.
+/// Pure: which priority-ordered cards need a fetch (no pixels, not inflight, not cooling).
 pub const FetchPlan = struct {
-    /// Slot already holds decoded pixels (no fetch needed).
     has_pixels: []const bool,
-    /// A fetch for this url is already in flight (queued or on the worker).
     inflight: []const bool,
-    /// `failed_at_ms` per url (0 = never failed); with `now_ms` gates the cooldown.
     failed_at: []const i64,
     now_ms: i64,
 
@@ -129,11 +92,7 @@ pub const FetchPlan = struct {
     }
 };
 
-/// Pure: choose which slots to evict to get back to `cap`, dropping the slots
-/// farthest from the viewport first (smallest `last_seen_frame`) and NEVER a
-/// currently-visible slot. Writes evicted indices to `out` and returns the count.
-/// Allocation-free: the pool is small, so an O(want·n) greedy selection beats
-/// threading a sort scratch buffer through. `last_seen` and `visible` are parallel.
+/// Pure: evict farthest from viewport first; never a currently-visible slot.
 pub fn planEvictions(last_seen: []const u64, visible: []const bool, cap: usize, out: []usize) usize {
     std.debug.assert(last_seen.len == visible.len);
     const total = last_seen.len;
@@ -143,7 +102,6 @@ pub fn planEvictions(last_seen: []const u64, visible: []const bool, cap: usize, 
     for (visible) |v| {
         if (!v) non_visible += 1;
     }
-    // Can't evict visible slots, so we can only shed down to `non_visible` of them.
     const want = @min(total - cap, non_visible);
 
     var n: usize = 0;
@@ -154,7 +112,7 @@ pub fn planEvictions(last_seen: []const u64, visible: []const bool, cap: usize, 
             if (containsIdx(out[0..n], i)) continue;
             if (best == null or ls < last_seen[best.?]) best = i;
         }
-        std.debug.assert(best != null); // want ≤ non_visible guarantees a candidate
+        std.debug.assert(best != null);
         out[n] = best.?;
     }
     return n;
@@ -167,25 +125,14 @@ fn containsIdx(chosen: []const usize, i: usize) bool {
     return false;
 }
 
-/// The Discover grid multi-cover coordinator. Embed by value on App
-/// (`discover_covers: DiscoverCovers = .{}`); the shared `CoverCaches` and the
-/// fetch worker are wired in the next chunk. Holds the slot pool and the lifecycle.
+/// Embed on App by value. Holds slot pool + lifecycle; fetch worker wired by app.
 pub const DiscoverCovers = struct {
-    /// URL-keyed slot pool, linear-scanned. Bounded by the eviction cap; each slot
-    /// owns its url key and pixels.
     slots: std.ArrayListUnmanaged(CoverSlot) = .empty,
-    /// Kitty image ids awaiting release on the next render flush — populated when a
-    /// slot is evicted (the slot is gone, but its image must still be freed on the
-    /// UI thread). Same-url re-decodes use the slot's own `pending_free_id`. Fixed
-    /// array + length (drained every frame), so an eviction can never OOM here.
+    /// Kitty ids for next render flush (eviction). Fixed array; never OOM here.
     pending_free: [max_pending_free]u32 = undefined,
     pending_free_len: usize = 0,
-    /// Monotonic render-frame counter; stamps `last_seen_frame` for eviction recency.
     frame: u64 = 0,
 
-    /// Queue a Kitty image id for release on the next render flush. Drops with a
-    /// debug log only if a single frame somehow evicts past `max_pending_free`
-    /// (bounded not to in practice — see the const).
     fn queueFree(self: *DiscoverCovers, id: u32) void {
         if (self.pending_free_len < max_pending_free) {
             self.pending_free[self.pending_free_len] = id;
@@ -207,14 +154,12 @@ pub const DiscoverCovers = struct {
         return &self.slots.items[i];
     }
 
-    /// Const lookup for the render pass (`view/discover.zig` holds `*const App`).
     pub fn getConst(self: *const DiscoverCovers, url: []const u8) ?*const CoverSlot {
         const i = self.indexOf(url) orelse return null;
         return &self.slots.items[i];
     }
 
-    /// Return the slot for `url`, creating an idle one (with an owned key copy) if
-    /// absent. Null only on OOM.
+    /// Slot for `url`, creating idle with owned key. Null only on OOM.
     pub fn ensureSlot(self: *DiscoverCovers, gpa: Allocator, url: []const u8) ?*CoverSlot {
         if (self.indexOf(url)) |i| return &self.slots.items[i];
         const key = gpa.dupe(u8, url) catch return null;
@@ -225,9 +170,7 @@ pub const DiscoverCovers = struct {
         return &self.slots.items[self.slots.items.len - 1];
     }
 
-    /// Adopt freshly decoded pixels for `url` into its slot (creating one if the
-    /// slot was evicted mid-flight). Caller transfers ownership of `rgba`; on OOM
-    /// with no slot to hold it, the pixels are freed rather than leaked.
+    /// Adopt pixels; free `rgba` if no slot can hold them (OOM mid-flight).
     pub fn acceptPixels(self: *DiscoverCovers, gpa: Allocator, url: []const u8, rgba: []u8, w: u32, h: u32) void {
         const slot = self.ensureSlot(gpa, url) orelse {
             gpa.free(rgba);
@@ -236,13 +179,10 @@ pub const DiscoverCovers = struct {
         slot.acceptPixels(gpa, rgba, w, h);
     }
 
-    /// Mark `url`'s slot as a fetch-in-flight (creating it if needed).
     pub fn markLoading(self: *DiscoverCovers, gpa: Allocator, url: []const u8) void {
         if (self.ensureSlot(gpa, url)) |s| s.status = .loading;
     }
 
-    /// Record a failed fetch so `FetchPlan` suppresses a refetch for the cooldown.
-    /// Ensures the slot exists so a failure on the very first fetch still records.
     pub fn noteFailure(self: *DiscoverCovers, gpa: Allocator, url: []const u8, now_ms: i64) void {
         if (self.ensureSlot(gpa, url)) |s| {
             s.status = .failed;
@@ -250,9 +190,7 @@ pub const DiscoverCovers = struct {
         }
     }
 
-    /// Drop the slot for `url`: defer its Kitty image id(s) to `pending_free`, free
-    /// its pixels and key, and swap-remove it. The image is released by the render
-    /// flush (UI thread); a no-op if `url` has no slot.
+    /// Drop slot: defer Kitty ids, free pixels/key, swap-remove.
     pub fn evict(self: *DiscoverCovers, gpa: Allocator, url: []const u8) void {
         const i = self.indexOf(url) orelse return;
         const slot = &self.slots.items[i];
@@ -262,11 +200,7 @@ pub const DiscoverCovers = struct {
         _ = self.slots.swapRemove(i);
     }
 
-    /// Transmit the decoded pixels of every ready slot lacking a Kitty image to the
-    /// terminal (ROD-243). UI-thread only — `transmitPreEncodedImage` mutates
-    /// `vx.next_img_id` and writes the tty. Runs once per slot: a transmitted slot
-    /// keeps its `image` and is skipped next frame. No-op without Kitty graphics
-    /// (the grid uses the half-block fallback then). Mirrors `detail.ensureCoverImage`.
+    /// Transmit ready slots lacking Kitty image. UI-thread only (ROD-243): mutates `vx.next_img_id` and writes the tty.
     pub fn ensureImages(self: *DiscoverCovers, gpa: Allocator, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
         if (!vx.caps.kitty_graphics) return;
         for (self.slots.items) |*slot| {
@@ -281,10 +215,7 @@ pub const DiscoverCovers = struct {
         }
     }
 
-    /// Release Kitty image ids superseded this frame: each slot's `pending_free_id`
-    /// (a same-url re-decode retired the old image) and every id queued by an
-    /// eviction. UI-thread only (`freeImage` writes the tty). Mirrors
-    /// `CoverState.flushPendingFree`, but over the whole pool.
+    /// Release superseded + evicted Kitty ids. UI-thread only.
     pub fn flushPendingFrees(self: *DiscoverCovers, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
         for (self.slots.items) |*slot| {
             if (slot.pending_free_id) |id| {
@@ -296,10 +227,7 @@ pub const DiscoverCovers = struct {
         self.pending_free_len = 0;
     }
 
-    /// Teardown with image release: free every resident + pending Kitty image (UI
-    /// thread), then the owned memory. Call from `deinitOwnedState` after the cover
-    /// workers join. The quit `_exit` path skips this and relies on the global
-    /// `a=d,q=2` clear; this is the error-unwind/test path. Mirrors `CoverState.freeAll`.
+    /// Teardown with image release (error-unwind/test). Quit `_exit` uses global clear.
     pub fn freeAll(self: *DiscoverCovers, gpa: Allocator, vx: *vaxis.Vaxis, writer: *std.Io.Writer) void {
         self.flushPendingFrees(vx, writer);
         for (self.slots.items) |*slot| {
@@ -309,10 +237,7 @@ pub const DiscoverCovers = struct {
         self.deinit(gpa);
     }
 
-    /// Release the pool's owned memory: every slot's url + pixels, then the slot
-    /// list (the pending-free queue is a fixed array — just reset its length). Kitty
-    /// images are NOT freed here — `freeAll` flushes them first on the error-unwind
-    /// path, and the quit-path global clear (`a=d,q=2`) catches them on `_exit`.
+    /// Free urls + pixels. Kitty images via freeAll or quit-path global clear.
     pub fn deinit(self: *DiscoverCovers, gpa: Allocator) void {
         for (self.slots.items) |*s| s.freeOwned(gpa);
         self.slots.deinit(gpa);
@@ -324,8 +249,6 @@ pub const DiscoverCovers = struct {
 const testing = std.testing;
 
 test "FetchPlan.eval selects only missing, not-inflight, not-cooling urls" {
-    // 5 urls: 0 ready, 1 in-flight, 2 cooling (fresh failure), 3 cooled-off failure,
-    // 4 untouched. Only 3 and 4 should be fetched.
     const now: i64 = 100_000;
     const p: FetchPlan = .{
         .has_pixels = &.{ true, false, false, false, false },
@@ -345,7 +268,6 @@ test "FetchPlan.eval re-admits a url exactly at the cooldown boundary" {
     const p: FetchPlan = .{
         .has_pixels = &.{false},
         .inflight = &.{false},
-        // elapsed == retry_cooldown_ms is NOT < cooldown → admitted.
         .failed_at = &.{now - retry_cooldown_ms},
         .now_ms = now,
     };
@@ -354,23 +276,18 @@ test "FetchPlan.eval re-admits a url exactly at the cooldown boundary" {
 }
 
 test "planEvictions drops the farthest-from-viewport slots, never a visible one" {
-    // 5 slots, cap 3 → drop 2. Slots 1 and 3 are visible (protected). Among the
-    // non-visible {0,2,4}, evict the two oldest by last_seen: 4 (10) and 0 (20).
     const last_seen = [_]u64{ 20, 99, 30, 99, 10 };
     const visible = [_]bool{ false, true, false, true, false };
     var out: [5]usize = undefined;
     const n = planEvictions(&last_seen, &visible, 3, &out);
     try testing.expectEqual(@as(usize, 2), n);
-    // Oldest-first: index 4 (10) then index 0 (20).
     try testing.expectEqual(@as(usize, 4), out[0]);
     try testing.expectEqual(@as(usize, 0), out[1]);
-    // A visible slot is never chosen.
     try testing.expect(!containsIdx(out[0..n], 1));
     try testing.expect(!containsIdx(out[0..n], 3));
 }
 
 test "planEvictions can't shed below the visible floor" {
-    // cap 1 but 3 of 4 slots are visible → only the single non-visible one evicts.
     const last_seen = [_]u64{ 5, 6, 7, 8 };
     const visible = [_]bool{ true, true, true, false };
     var out: [4]usize = undefined;
@@ -399,8 +316,6 @@ test "DiscoverCovers.acceptPixels adopts pixels and re-accept frees the prior (l
     try testing.expect(slot.pixels != null);
     try testing.expectEqual(@as(usize, 4), slot.pixels.?.rgba.len);
 
-    // Re-accept for the same url must free the prior buffer (the testing allocator
-    // fails the test on a leak or double-free) and replace it — one slot, not two.
     const second = try testing.allocator.dupe(u8, &[_]u8{ 0x44, 0x55, 0x66, 0xff });
     dc.acceptPixels(testing.allocator, "https://img/a.png", second, 1, 1);
     try testing.expectEqual(@as(usize, 1), dc.slots.items.len);
@@ -412,14 +327,12 @@ test "DiscoverCovers.evict frees the slot and defers a pending image id" {
 
     const rgba = try testing.allocator.dupe(u8, &[_]u8{ 0x01, 0x02, 0x03, 0xff });
     dc.acceptPixels(testing.allocator, "https://img/b.png", rgba, 1, 1);
-    // Stand in for a transmitted image awaiting release (no vaxis.Image needed).
     dc.get("https://img/b.png").?.pending_free_id = 42;
 
     dc.evict(testing.allocator, "https://img/b.png");
     try testing.expectEqual(@as(usize, 0), dc.slots.items.len);
     try testing.expectEqual(@as(usize, 1), dc.pending_free_len);
     try testing.expectEqual(@as(u32, 42), dc.pending_free[0]);
-    // Evicting an absent url is a no-op.
     dc.evict(testing.allocator, "https://img/missing.png");
 }
 
@@ -432,7 +345,6 @@ test "noteFailure records a cooldown that a fetch plan then suppresses" {
     const slot = dc.get("https://img/c.png") orelse return error.TestUnexpectedResult;
     try testing.expect(slot.status == .failed);
 
-    // Feed that slot's state into the pure planner: still cooling → not fetched.
     const p: FetchPlan = .{
         .has_pixels = &.{slot.pixels != null},
         .inflight = &.{false},

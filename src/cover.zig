@@ -4,11 +4,8 @@ const limits = @import("decode_limits.zig");
 
 const Allocator = std.mem.Allocator;
 
-// ── decode path (ROD-110) ────────────────────────────────────────────
-// Decoding runs the same real path in Debug, ReleaseSafe and `zig build test`: commit
-// 11112d5 moved it to `stb_image` (C, via `src/c/stb_image_impl.c`), which sidesteps the
-// Zig 0.16 Debug-codegen blowup that once forced a build-mode gate around the decode. If you
-// ever reintroduce a Zig-native decoder, re-verify Debug codegen before trusting it.
+// Decode path (ROD-110): stb_image (C) for PNG/JPEG so Debug matches ReleaseSafe/test.
+// Reintroducing a Zig-native decoder needs a Debug codegen re-check first.
 
 extern fn stbi_load_from_memory(
     buffer: [*c]const u8,
@@ -20,11 +17,8 @@ extern fn stbi_load_from_memory(
 ) ?[*]u8;
 extern fn stbi_image_free(retval_from_stbi_load: ?*anyopaque) void;
 
-// libwebp decoder (ROD-244). AllAnime cover art is WebP served under a .png/.jpg
-// extension, which stb_image cannot decode. WebPDecodeRGBA handles every WebP
-// flavor — lossy VP8, lossless VP8L, and the extended VP8X container with its
-// ALPH alpha plane — and hands back a freshly malloc'd RGBA buffer that we must
-// return to WebPFree. WebPGetInfo reads dimensions without decoding pixels.
+// libwebp (ROD-244): AllAnime serves WebP under .png/.jpg; stb cannot decode it.
+// WebPDecodeRGBA → WebPFree; WebPGetInfo for dims without pixels.
 extern fn WebPDecodeRGBA(data: [*c]const u8, data_size: usize, width: [*c]c_int, height: [*c]c_int) ?[*]u8;
 extern fn WebPGetInfo(data: [*c]const u8, data_size: usize, width: [*c]c_int, height: [*c]c_int) c_int;
 extern fn WebPFree(ptr: ?*anyopaque) void;
@@ -46,38 +40,29 @@ pub fn probeDimensions(encoded: []const u8) ?Dimensions {
         probeWebpDimensions(encoded);
 }
 
-/// A RIFF/WEBP container? Covers arrive WebP-under-a-lie (the mcovers CDN serves
-/// WebP whatever the extension claims), so both routing and probing sniff the
-/// leading bytes and never trust the filename.
+/// RIFF/WEBP by leading bytes only. CDN extension lies; never trust the filename.
 pub fn isWebp(encoded: []const u8) bool {
     return encoded.len >= 12 and
         std.mem.eql(u8, encoded[0..4], "RIFF") and
         std.mem.eql(u8, encoded[8..12], "WEBP");
 }
 
-/// Upper bound on decoded image dimensions, enforced before the C decoders allocate. Both
-/// libwebp (WebPDecodeRGBA) and stb size their pixel buffer from the image's HEADER-declared
-/// width/height BEFORE validating that the compressed payload holds that many pixels, so a
-/// tiny hostile file can otherwise force a huge allocation (a ~40-byte WebP can legally claim
-/// 16383×16383 → ~1 GiB). This is a decoder-level backstop; callers that know their domain
-/// (cover art is far smaller) apply a tighter policy cap on top (workers.zig). Kept generous
-/// so it never rejects a real image. The stb path enforces the same ceiling via
-/// STBI_MAX_DIMENSIONS, which build.zig derives from this value (src/decode_limits.zig).
+/// Pre-allocate dim cap: C decoders size from HEADER dims before validating payload
+/// (~40B WebP can claim 16383×16383 → ~1 GiB). Generous backstop; workers.zig applies a
+/// tighter cover-art cap. stb uses STBI_MAX_DIMENSIONS from this via decode_limits.zig.
 pub const max_decode_dimension = limits.max_dimension;
 
 fn withinDecodeBounds(dims: Dimensions) bool {
     return dims.w <= max_decode_dimension and dims.h <= max_decode_dimension;
 }
 
-/// Decode PNG/JPEG (stb) or WebP (libwebp) into owned RGBA pixels, routing by
-/// byte signature. For WebP the dimensions are probed and bounded before
-/// WebPDecodeRGBA runs (it allocates from the header dims before validating the
-/// payload — see max_decode_dimension); the stb path is bounded internally.
+/// PNG/JPEG (stb) or WebP (libwebp) → owned RGBA, routed by signature.
+/// WebP: probe+bound before WebPDecodeRGBA (header-dim allocate; see max_decode_dimension).
 pub fn decodeRgba(alloc: Allocator, encoded: []const u8) !Pixels {
     if (encoded.len == 0) return error.DecodeFailed;
 
     if (isWebp(encoded)) {
-        // Reject decode bombs before libwebp allocates from the header dims.
+        // Bound before libwebp allocates from header dims.
         const dims = probeWebpDimensions(encoded) orelse return error.DecodeFailed;
         if (!withinDecodeBounds(dims)) return error.DecodeFailed;
         var w: c_int = 0;
@@ -103,9 +88,7 @@ pub fn decodeRgba(alloc: Allocator, encoded: []const u8) !Pixels {
     return ownRgba(alloc, ptr, w, h);
 }
 
-// Copy a C decoder's RGBA output into an allocator-owned slice, validating the
-// reported dimensions and guarding the size math. Shared by the stb and libwebp
-// paths; the caller still owns freeing the C buffer.
+// C decoder RGBA → allocator-owned; overflow-safe size math. Caller still frees C buffer.
 fn ownRgba(alloc: Allocator, src: [*]const u8, w: c_int, h: c_int) !Pixels {
     if (w <= 0 or h <= 0) return error.DecodeFailed;
     const width: u32 = @intCast(w);
@@ -169,9 +152,7 @@ fn probeJpegDimensions(encoded: []const u8) ?Dimensions {
     return null;
 }
 
-// WebP dimensions come from libwebp itself (WebPGetInfo), which understands all
-// three sub-formats' headers (VP8, VP8L, VP8X) without decoding pixels — far
-// safer than hand-parsing the RIFF chunk layout ourselves.
+// WebPGetInfo for all sub-format headers; do not hand-parse RIFF.
 fn probeWebpDimensions(encoded: []const u8) ?Dimensions {
     if (!isWebp(encoded)) return null;
     var w: c_int = 0;
@@ -244,12 +225,8 @@ test "decodeRgba decodes tiny png into owned rgba pixels" {
     try std.testing.expectEqual(@as(usize, 4), pixels.rgba.len);
 }
 
-// ── WebP fixtures (ROD-244) ──────────────────────────────────────────────────
-// Tiny 2×2 images encoded by libwebp, one per sub-format, so every decode path
-// is exercised in-suite: VP8L lossless, VP8 lossy, and the VP8X container
-// carrying an ALPH alpha plane over VP8. Row-major source pixels are
-// (200,10,10) (10,200,10) / (10,10,200) (240,240,240); the alpha fixture drops
-// the last pixel's alpha to 0x80.
+// WebP fixtures (ROD-244): 2×2 VP8L / VP8 / VP8X+ALPH.
+// Source: (200,10,10)(10,200,10)/(10,10,200)(240,240,240); alpha fixture last a=0x80.
 const webp_lossless = [_]u8{
     0x52, 0x49, 0x46, 0x46, 0x3c, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
     0x56, 0x50, 0x38, 0x4c, 0x2f, 0x00, 0x00, 0x00, 0x2f, 0x01, 0x40, 0x00,
@@ -306,7 +283,7 @@ test "decodeRgba decodes lossless webp exactly" {
 
     try std.testing.expectEqual(@as(u32, 2), px.w);
     try std.testing.expectEqual(@as(u32, 2), px.h);
-    // Lossless round-trips the source pixels byte-for-byte; alpha fills to 255.
+    // Lossless: exact pixels; alpha filled to 255.
     const want = [_]u8{
         200, 10, 10,  255, 10,  200, 10,  255,
         10,  10, 200, 255, 240, 240, 240, 255,
@@ -321,8 +298,7 @@ test "decodeRgba decodes lossy webp to opaque rgba" {
     try std.testing.expectEqual(@as(u32, 2), px.w);
     try std.testing.expectEqual(@as(u32, 2), px.h);
     try std.testing.expectEqual(@as(usize, 16), px.rgba.len);
-    // No alpha in the source → every pixel decodes fully opaque. (Lossy RGB is
-    // approximate, so we assert on the alpha channel, not the colors.)
+    // Lossy RGB approximate: assert alpha only (all opaque).
     var i: usize = 3;
     while (i < px.rgba.len) : (i += 4) {
         try std.testing.expectEqual(@as(u8, 255), px.rgba[i]);
@@ -336,17 +312,14 @@ test "decodeRgba decodes lossy webp carrying an alpha plane" {
     try std.testing.expectEqual(@as(u32, 2), px.w);
     try std.testing.expectEqual(@as(u32, 2), px.h);
     try std.testing.expectEqual(@as(usize, 16), px.rgba.len);
-    // The ALPH plane is stored losslessly, so alpha survives exactly: three
-    // opaque pixels then the 0x80 set on the last one.
+    // ALPH plane is lossless: three opaque, last 0x80.
     try std.testing.expectEqual(@as(u8, 255), px.rgba[3]);
     try std.testing.expectEqual(@as(u8, 255), px.rgba[7]);
     try std.testing.expectEqual(@as(u8, 255), px.rgba[11]);
     try std.testing.expectEqual(@as(u8, 0x80), px.rgba[15]);
 }
 
-// A real 3×2 baseline JPEG and a 64×48 lossy VP8 WebP — the JPEG closes a gap
-// (nothing else unit-tests the stb JPEG path), the larger WebP exercises the
-// loop filter / chroma upsampling that the 2×2 fixtures never reach.
+// Real 3×2 JPEG (stb path) and 64×48 VP8 (beyond 2×2 fixtures).
 const jpeg_3x2 = [_]u8{
     0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46, 0x00, 0x01,
     0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xff, 0xdb, 0x00, 0x43,
@@ -449,7 +422,7 @@ test "decodeRgba decodes a larger lossy webp beyond the 2x2 fixtures" {
     try std.testing.expectEqual(@as(u32, 64), px.w);
     try std.testing.expectEqual(@as(u32, 48), px.h);
     try std.testing.expectEqual(@as(usize, 64 * 48 * 4), px.rgba.len);
-    // Non-degenerate: fully opaque and not a flat all-zero buffer.
+    // Non-degenerate: opaque, not all-zero.
     var nonzero: usize = 0;
     for (px.rgba, 0..) |b, i| {
         if (i % 4 == 3) try std.testing.expectEqual(@as(u8, 255), b);
@@ -465,23 +438,19 @@ test "isWebp boundary around the 12-byte minimum" {
 }
 
 test "decodeRgba rejects malformed webp without decoding" {
-    // A RIFF/WEBP header with no usable image chunk: sniffed as WebP, but
-    // probing returns null and decode fails cleanly (no WebPDecodeRGBA call).
+    // Sniffed as WebP; probe null → DecodeFailed (no WebPDecodeRGBA).
     const bare = "RIFF\x04\x00\x00\x00WEBP";
     try std.testing.expect(isWebp(bare));
     try std.testing.expect(probeWebpDimensions(bare) == null);
     try std.testing.expectError(error.DecodeFailed, decodeRgba(std.testing.allocator, bare));
 
-    // WEBP fourcc followed by a garbage chunk.
     const garbage = "RIFF\x10\x00\x00\x00WEBPJUNK\x04\x00\x00\x00\xde\xad\xbe\xef";
     try std.testing.expect(isWebp(garbage));
     try std.testing.expectError(error.DecodeFailed, decodeRgba(std.testing.allocator, garbage));
 }
 
 test "decodeRgba rejects a decode-bomb webp via the dimension cap" {
-    // A ~40-byte VP8L that legally declares a 16383×16383 canvas — decoding it
-    // would allocate ~1 GiB before the payload is ever validated. probeDimensions
-    // sees the giant header; decodeRgba must refuse before libwebp allocates.
+    // ~40B VP8L claiming 16383×16383; refuse before libwebp allocates (~1 GiB).
     const bomb = [_]u8{
         0x52, 0x49, 0x46, 0x46, 0x1e, 0x00, 0x00, 0x00, 0x57, 0x45, 0x42, 0x50,
         0x56, 0x50, 0x38, 0x4c, 0x11, 0x00, 0x00, 0x00, 0x2f, 0xfe, 0xbf, 0xff,

@@ -1,19 +1,10 @@
-//! Zigoku — platform base-directory resolution (ROD-89).
+//! Platform base-directory resolution (ROD-89): config, data, cache, runtime.
 //!
-//! Single source of truth for WHERE Zigoku keeps its files. Folds together the four
-//! near-identical resolvers that grew independently (data, config, cache, runtime/socket dir)
-//! so the XDG precedence, the macOS conventions, and the Windows stance live in one place
-//! instead of being re-derived (and drifting) per subsystem.
+//! Caller-owned `{base}/zigoku` from the passed allocator; none create the dir
+//! (call `ensureDir`). `ensureDir` is io-free (raw `mkdir`) so pre-event-loop
+//! callers like `Store.open` still work.
 //!
-//! Every resolver returns a caller-owned `{base}/zigoku` subdirectory from the passed
-//! allocator. None create the directory (call `ensureDir`). Dir creation is deliberately
-//! `io`-free (raw `mkdir`) so resolvers that run before the event loop exists (`Store.open`)
-//! can still make their directories.
-//!
-//!   * Linux honors the XDG base-directory spec.
-//!   * macOS uses the Apple conventions (`~/Library/...`).
-//!   * Windows is an explicit `error.Unsupported` stub (a clear message rather than
-//!     scattering files somewhere surprising).
+//! Linux: XDG. macOS: `~/Library/...`. Windows: `error.Unsupported` (no silent scatter).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -25,8 +16,8 @@ const c = @cImport({
 
 pub const Error = error{ NoHomeDir, Unsupported, OutOfMemory };
 
-/// `$XDG_CONFIG_HOME/zigoku` → `~/.config/zigoku` (Linux);
-/// `~/Library/Application Support/zigoku` (macOS). Holds `config.zon` (ROD-85).
+/// config.zon home (ROD-85). Linux: `$XDG_CONFIG_HOME` → `~/.config/zigoku`.
+/// macOS: `~/Library/Application Support/zigoku`.
 pub fn configDir(gpa: Allocator) Error![]u8 {
     return switch (builtin.os.tag) {
         .windows => error.Unsupported,
@@ -35,9 +26,8 @@ pub fn configDir(gpa: Allocator) Error![]u8 {
     };
 }
 
-/// `$XDG_DATA_HOME/zigoku` → `~/.local/share/zigoku` (Linux);
-/// `~/Library/Application Support/zigoku` (macOS). Holds `zigoku.db` (ROD-65) and
-/// the debug log (ROD-88).
+/// zigoku.db (ROD-65) + debug log (ROD-88). Linux: `$XDG_DATA_HOME` → `~/.local/share/zigoku`.
+/// macOS: same Application Support path as config.
 pub fn dataDir(gpa: Allocator) Error![]u8 {
     return switch (builtin.os.tag) {
         .windows => error.Unsupported,
@@ -46,9 +36,8 @@ pub fn dataDir(gpa: Allocator) Error![]u8 {
     };
 }
 
-/// `$XDG_CACHE_HOME/zigoku` → `~/.cache/zigoku` (Linux);
-/// `~/Library/Caches/zigoku` (macOS). Holds the AniSkip `skip.lua` (ROD-83) and
-/// cover-art cache (ROD-79).
+/// AniSkip skip.lua (ROD-83) + cover cache (ROD-79). Linux: `$XDG_CACHE_HOME` → `~/.cache/zigoku`.
+/// macOS: `~/Library/Caches/zigoku`.
 pub fn cacheDir(gpa: Allocator) Error![]u8 {
     return switch (builtin.os.tag) {
         .windows => error.Unsupported,
@@ -57,9 +46,8 @@ pub fn cacheDir(gpa: Allocator) Error![]u8 {
     };
 }
 
-/// `$XDG_RUNTIME_DIR/zigoku`, falling back to `/tmp/zigoku`. Unlike the others
-/// this never reports `NoHomeDir`: an ephemeral mpv IPC socket (ROD-80) always
-/// has somewhere to live, even on a stripped-down session with no HOME.
+/// `$XDG_RUNTIME_DIR/zigoku`, else `/tmp/zigoku`. Never `NoHomeDir`: the mpv IPC
+/// socket (ROD-80) must have a home even with no HOME env.
 pub fn runtimeDir(gpa: Allocator) Error![]u8 {
     return switch (builtin.os.tag) {
         .windows => error.Unsupported,
@@ -67,22 +55,17 @@ pub fn runtimeDir(gpa: Allocator) Error![]u8 {
     };
 }
 
-/// Collapse a leading `$HOME/` in `abs` to `~` for display, returning a fresh
-/// slice owned by `gpa`. Paths outside `$HOME` — e.g. a custom `$XDG_CACHE_HOME`
-/// pointed at another volume — are duped verbatim, so the caller always frees
-/// exactly one slice regardless of which branch hit. Display-only: lets the
-/// Settings view (ROD-225) show the real, XDG-aware path without leaking the
-/// absolute home prefix.
+/// Display: collapse leading `$HOME/` to `~` (ROD-225 Settings). Outside HOME
+/// (custom XDG on another volume, etc.) is duped verbatim. Caller always frees
+/// exactly one slice, either branch.
 pub fn collapseHome(gpa: Allocator, abs: []const u8) Allocator.Error![]u8 {
     return collapseHomeWith(gpa, abs, env("HOME"));
 }
 
-/// Pure core of `collapseHome` with `home` injected, so the prefix logic is
-/// unit-testable without touching process env (mirrors `resolveXdg`).
+/// Pure `collapseHome` with `home` injected (testable without process env).
 fn collapseHomeWith(gpa: Allocator, abs: []const u8, home: ?[]const u8) Allocator.Error![]u8 {
     if (home) |h| {
-        // Require the `/` after HOME so `/home/rod` can't swallow a sibling
-        // like `/home/rodney/...`.
+        // Path boundary after HOME: `/home/rod` must not swallow `/home/rodney/...`.
         if (h.len > 0 and abs.len > h.len and abs[h.len] == '/' and
             std.mem.startsWith(u8, abs, h))
         {
@@ -92,9 +75,8 @@ fn collapseHomeWith(gpa: Allocator, abs: []const u8, home: ?[]const u8) Allocato
     return gpa.dupe(u8, abs);
 }
 
-/// `mkdir -p`, best-effort. Walks `path` creating each component, ignoring every
-/// error — "already exists" is the common case, and a real failure surfaces
-/// later when the caller tries to open a file underneath. No `io` required.
+/// `mkdir -p`, best-effort, no `io`. Ignores errors (EEXIST is common); real
+/// failure surfaces on the later open underneath.
 pub fn ensureDir(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len == 0 or path.len >= buf.len) return;
@@ -112,17 +94,14 @@ pub fn ensureDir(path: []const u8) void {
     }
 }
 
-// ── internals ─────────────────────────────────────────────────────────────────
+// internals
 
-/// Read an environment variable as a Zig slice, or null if unset.
 fn env(name: [*:0]const u8) ?[]const u8 {
     return if (c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
-/// Pure base-dir join: prefer a non-empty XDG base (`{xdg}/zigoku`), else build
-/// from HOME (`{home}/{home_rel}`), else `NoHomeDir`. Extracted out of the getenv
-/// shells so the precedence is unit-testable without touching process env. On
-/// macOS the caller passes `xdg = null`, collapsing this to the HOME branch.
+/// Prefer non-empty `{xdg}/zigoku`, else `{home}/{home_rel}`, else `NoHomeDir`.
+/// Pure (env injected) so precedence is unit-testable. macOS passes `xdg = null`.
 fn resolveXdg(gpa: Allocator, xdg: ?[]const u8, home: ?[]const u8, home_rel: []const u8) Error![]u8 {
     if (xdg) |base| {
         if (base.len > 0) return std.fmt.allocPrint(gpa, "{s}/zigoku", .{base});
@@ -133,8 +112,7 @@ fn resolveXdg(gpa: Allocator, xdg: ?[]const u8, home: ?[]const u8, home_rel: []c
     return error.NoHomeDir;
 }
 
-/// Like `resolveXdg` but for the runtime dir: `/tmp/zigoku` is always a valid
-/// last resort, so this never fails for want of an env var.
+/// Runtime: XDG_RUNTIME_DIR or `/tmp/zigoku`. Never fails for want of an env var.
 fn resolveRuntime(gpa: Allocator, xdg_runtime: ?[]const u8) Error![]u8 {
     if (xdg_runtime) |base| {
         if (base.len > 0) return std.fmt.allocPrint(gpa, "{s}/zigoku", .{base});
@@ -176,14 +154,14 @@ test "collapseHomeWith collapses a $HOME prefix to ~" {
 }
 
 test "collapseHomeWith leaves a path outside $HOME verbatim" {
-    // A custom $XDG_CACHE_HOME on another volume — must show the real absolute path.
+    // Custom XDG on another volume must stay absolute.
     const got = try collapseHomeWith(testing.allocator, "/mnt/fast/zigoku/covers", "/home/rod");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("/mnt/fast/zigoku/covers", got);
 }
 
 test "collapseHomeWith requires a path boundary after $HOME" {
-    // `/home/rodney/...` must not be collapsed against HOME `/home/rod`.
+    // `/home/rodney/...` must not collapse against HOME `/home/rod`.
     const got = try collapseHomeWith(testing.allocator, "/home/rodney/.cache/zigoku", "/home/rod");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("/home/rodney/.cache/zigoku", got);
@@ -200,7 +178,7 @@ test "collapseHomeWith tolerates a null or empty HOME" {
 }
 
 test "collapseHomeWith leaves a bare $HOME (no trailing slash) verbatim" {
-    // Exactly HOME with nothing after it: no `/`, so no collapse — duped as-is.
+    // Exactly HOME, no `/` after: no collapse, dupe as-is.
     const got = try collapseHomeWith(testing.allocator, "/home/rod", "/home/rod");
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("/home/rod", got);
@@ -223,14 +201,11 @@ test "resolveRuntime falls back to /tmp" {
 }
 
 test "macOS resolvers use the Apple Library conventions" {
-    // The `.macos` arms are comptime-dead off Darwin, and the resolver-level
-    // functions (configDir/dataDir/cacheDir) are otherwise untested — the unit
-    // tests above exercise only the pure `resolveXdg`/`resolveRuntime` cores. On
-    // macOS CI (ROD-149) this pins the actual Library literals so a green build
-    // proves the paths are *right*, not merely that they compile.
+    // Pure cores are tested above; this pins the Library literals on macOS CI
+    // (ROD-149) so a green build proves the paths are right, not only that they compile.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const home = env("HOME") orelse return error.SkipZigTest;
-    if (home.len == 0) return error.SkipZigTest; // empty HOME → resolveXdg errors, not our case under test
+    if (home.len == 0) return error.SkipZigTest; // empty HOME → resolveXdg errors
 
     const app_support = try std.fmt.allocPrint(testing.allocator, "{s}/Library/Application Support/zigoku", .{home});
     defer testing.allocator.free(app_support);
@@ -249,9 +224,7 @@ test "macOS resolvers use the Apple Library conventions" {
     defer testing.allocator.free(cache);
     try testing.expectEqualStrings(caches, cache);
 
-    // No XDG_RUNTIME_DIR on Darwin → the ephemeral socket dir lands in /tmp.
-    // Assert *both* branches rather than skipping if a runner happens to set it,
-    // so the XDG-wins claim is actually verified instead of assumed.
+    // Assert both branches (XDG set vs /tmp fallback), not only the lucky one.
     const runtime = try runtimeDir(testing.allocator);
     defer testing.allocator.free(runtime);
     if (env("XDG_RUNTIME_DIR")) |xdg| {
@@ -271,13 +244,11 @@ test "ensureDir tolerates empty and over-long paths" {
 }
 
 test "ensureDir creates a nested directory tree" {
-    // `ensureDir` is io-free, so the whole test stays io-free: build a unique
-    // scratch path, verify the chain with libc `stat`, tear down with libc
-    // `rmdir` (declared locally to keep `unistd.h` out of the module surface).
+    // io-free ensureDir: verify with libc stat, tear down with local rmdir (no unistd import).
     const libc = struct {
         extern fn rmdir(path: [*:0]const u8) c_int;
     };
-    var anchor: u8 = 0; // a stack address is unique-enough; ensureDir is idempotent anyway
+    var anchor: u8 = 0;
     const root = try std.fmt.allocPrint(testing.allocator, "/tmp/zigoku-ensuredir-{x}", .{@intFromPtr(&anchor)});
     defer testing.allocator.free(root);
     const nested = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/a/b/c", .{root}, 0);

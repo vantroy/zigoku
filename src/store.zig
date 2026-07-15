@@ -1,20 +1,15 @@
-//! Zigoku — persistence (M2: ROD-65..69).
-//!
-//! One `Store` over raw SQLite C-interop (`@cImport` libsqlite3, no wrapper —
-//! the raw API is the point, this is a learning project). Holds the watch
-//! history, per-episode resume positions, and a status-aware episode-list cache.
+//! Persistence (ROD-65..69). One `Store` over raw SQLite C-interop.
+//! Watch history, per-episode resume, status-aware episode-list cache.
 //!
 //! ## Why `anime` is keyed on `(source, source_id)`, not `anilist_id`
 //!
-//! The playable identity is the provider's opaque show handle; `anilist_id`/`mal_id`
-//! arrive only later with enrichment, so keying `anime` on them would make every
-//! fresh row a NULL primary key. The pair also keeps a dead provider's id namespace
-//! from colliding with its replacement's when the `SourceProvider` seam is swapped.
-//! `anilist_id`/`mal_id` ride along as nullable enrichment columns; the canonical
-//! identity spine keyed on `anilist_id` lives in `canonical_anime` (see MIGRATION_V14).
+//! Playable identity is the provider handle; `anilist_id`/`mal_id` arrive later with
+//! enrichment, so keying on them would make every fresh row a NULL PK. The pair also
+//! keeps a dead provider's id namespace from colliding with its replacement.
+//! Enrichment ids ride nullable columns; the anilist-keyed spine is `canonical_anime`
+//! (MIGRATION_V14).
 //!
-//! Likewise `episode` is **TEXT**, not INTEGER: `domain.EpisodeNumber.raw` is a
-//! string because anime labels aren't integers ("1.5" recaps, "SP1" specials).
+//! `episode` is TEXT, not INTEGER: labels aren't always integers ("1.5", "SP1").
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,46 +22,30 @@ const c = @cImport({
 });
 const paths = @import("paths.zig");
 
-// NoHomeDir/Unsupported are NOT here: `Store` itself only ever sees a
-// pre-resolved path. `defaultDbPath` reaches those through `paths.Error` and
-// carries them via its inferred error set — keeping them out of `Store.Error`
-// stops a reader from writing handlers for errors `Store` can't produce.
+// NoHomeDir/Unsupported stay out of Store.Error: Store only sees a pre-resolved path.
+// defaultDbPath carries those via paths.Error's inferred set.
 pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaTooNew };
 
-/// Schema version this build expects. Bump + add a `MIGRATION_Vn` + a branch in
-/// `migrate` when the shape changes — never ALTER-and-ignore.
+/// Schema version this build expects. Bump + add `MIGRATION_Vn` + migrate branch;
+/// never ALTER-and-ignore.
 const SCHEMA_VERSION: c_int = 17;
 
-/// Milliseconds SQLite waits on a held write lock before giving up with SQLITE_BUSY,
-/// set once per connection in `open` (ROD-287). Two processes share one DB (the TUI
-/// plus a standalone/cron'd `zigoku sync`), so a writer can find the lock held. WAL
-/// lets readers through, so this only gates writer-vs-writer. Kept short because the
-/// TUI runs its checkpoint/recordPlay writes on the render/input thread, so a long
-/// wait freezes the UI: real collisions resolve far below this (migration <20ms, a
-/// lone checkpoint UPDATE sub-ms), so 250ms is ~10x the realistic worst case yet caps
-/// a foreground stall at a quarter-second, and failing fast is right for a render loop
-/// (a dropped checkpoint is recoverable). Does NOT cover the WAL-mode flip in `open`;
-/// SQLite skips its busy handler for that lock upgrade, so `enableWal` retries by hand.
+/// SQLITE_BUSY wait (ms) set in `open` (ROD-287). Writer-vs-writer only (WAL lets
+/// readers through). Short: TUI writes on the render thread; 250ms caps a stall while
+/// real collisions are sub-20ms. Does not cover the WAL flip (`enableWal` retries).
 const BUSY_TIMEOUT_MS: c_int = 250;
 
-/// `enableWal` retry budget: attempts × backoff. The WAL-mode flip can return
-/// SQLITE_BUSY under a fresh-open race that `busy_timeout` doesn't cover (see
-/// `enableWal`), so we retry it manually. 100 × 5ms is a 500ms ceiling — orders of
-/// magnitude above the microseconds the winner actually needs, so it converges on the
-/// first retry or two in practice; the ceiling only bounds a pathologically wedged peer.
+/// `enableWal` retry budget. busy_timeout does not cover the WAL-mode flip.
 const WAL_RETRY_LIMIT: usize = 100;
 const WAL_RETRY_BACKOFF_MS: c_int = 5;
 
-/// Resume thresholds (ROD-67). `fully_watched` is recorded past 95%; the
-/// natural-end window (80%) is where the player path stops offering a mid-episode
-/// resume and treats the episode as effectively done.
+/// Resume thresholds (ROD-67). fully_watched past 95%; natural-end (80%) stops
+/// mid-episode resume offer.
 pub const WATCHED_RATIO = 0.95;
 pub const NATURAL_END_RATIO = 0.80;
 
-/// Reserved pseudo-`source`: a canonical resolved (real AniList id) but no play provider
-/// stocks it (ROD-329). Distinct from the enrichment "confirmed-unmatched" state
-/// (canonical_id NULL, see MIGRATION_V14 comment), which is an id-miss; this is a
-/// provider-miss. Never a real provider name: the History gate keys on this exact string.
+/// Pseudo-`source` when canonical is real but no play provider stocks it (ROD-329).
+/// Not enrichment id-miss (canonical_id NULL). History gates on this exact string.
 pub const SOURCE_UNBOUND = "unbound";
 
 const SqliteDb = ?*c.sqlite3;
@@ -142,12 +121,8 @@ const MIGRATION_V4 =
     \\END;
 ;
 
-// ROD-185: persist the ROD-140 enrichment widening so History (which reads only
-// the store via animeFromHistoryRecord) shows the season chip / native title /
-// genres, not just the V2 subset. `season` stores the canonical lowercase tag
-// (@tagName, round-trips through domain.Season.fromString). `genres` is a
-// '\n'-joined blob — display-only, never queried by genre, so it mirrors
-// episode_cache.episodes_blob rather than earning a normalized side table.
+// ROD-185: persist enrichment widening (season/native/genres) for History.
+// season = lowercase @tagName; genres = '\n'-joined display blob (not queried).
 const MIGRATION_V5 =
     \\ALTER TABLE anime ADD COLUMN season       TEXT;
     \\ALTER TABLE anime ADD COLUMN native_name  TEXT;
@@ -158,44 +133,26 @@ const MIGRATION_V5 =
     \\ALTER TABLE anime ADD COLUMN genres       TEXT;    -- '\n'-joined; see note above
 ;
 
-// enrichment_fetched_at stamps the last successful AniList pull so a status-aware
-// TTL (`enrichmentTtl`) can drive refresh-on-view (ROD-182). NULL = never enriched
-// or pre-v6, both read as stale (`enrichmentStale`). It rides `anime` rather than a
-// side table because the freshness key is the row's own live `status`, computed at
-// read.
-//
-// enrichment_fieldset_version records which set of enriched columns a row was last
-// filled under (see `ENRICHMENT_FIELDSET_VERSION`). Widening the persisted set
-// (ROD-261 added studios/source/duration) leaves old rows fresh-by-clock but missing
-// the new columns; bumping the constant marks every older-fieldset row stale so they
-// heal on next view instead of waiting out the TTL.
+// enrichment_fetched_at: last AniList pull for status-aware TTL (ROD-182). NULL =
+// never / pre-v6 → stale. On anime (freshness uses live status at read).
+// enrichment_fieldset_version: which column set was filled; bump
+// ENRICHMENT_FIELDSET_VERSION so older-fieldset rows heal on view, not full TTL.
 const MIGRATION_V6 =
     \\ALTER TABLE anime ADD COLUMN enrichment_fetched_at       INTEGER;
     \\ALTER TABLE anime ADD COLUMN enrichment_fieldset_version INTEGER;
 ;
 
-// ROD-261: the first field of the AniList "shopping trip" widening to land in the
-// store. `studios` was already fetched (`GQL_FIELDS`) and carried on domain.Anime,
-// but never persisted — so History (which never re-enriches in place) always
-// rendered an empty studios list. Same '\n'-joined-blob shape as `genres`; the
-// ENRICHMENT_FIELDSET_VERSION bump alongside this heals rows enriched before the
-// column existed (see the note above MIGRATION_V6).
+// ROD-261: studios '\n'-joined (like genres). Fieldset bump heals pre-column rows.
 const MIGRATION_V7 =
     \\ALTER TABLE anime ADD COLUMN studios TEXT;    -- '\n'-joined; same shape as genres
 ;
 
-// ROD-261: per-episode runtime in minutes, the second field of the AniList
-// widening. A plain nullable scalar (mirrors total_episodes); the fieldset bump
-// alongside heals rows enriched before the column existed.
+// ROD-261: duration minutes. Fieldset bump heals pre-column rows.
 const MIGRATION_V8 =
     \\ALTER TABLE anime ADD COLUMN duration INTEGER;
 ;
 
-// ROD-261: adaptation source + the pre-selected AniList ranking. `source` is the
-// raw enum (prettified at render). The ranking is stored pre-selected (selectRank
-// chose the best row at enrich time) as three scalars — position, type, and year
-// (null year = an all-time ranking) — rather than a raw blob, so render just
-// composes them. The fieldset bump alongside heals rows enriched before these.
+// ROD-261: source_material + pre-selected rank (position/type/year; null year = all-time).
 const MIGRATION_V9 =
     \\ALTER TABLE anime ADD COLUMN source_material TEXT;
     \\ALTER TABLE anime ADD COLUMN rank            INTEGER;
@@ -203,40 +160,24 @@ const MIGRATION_V9 =
     \\ALTER TABLE anime ADD COLUMN rank_year       INTEGER;
 ;
 
-// ROD-261 chips slice: the next-episode airing (stored ABSOLUTE — `airingAt` unix
-// seconds + episode — so the countdown recomputes from the live clock at render,
-// never a stale relative delta) and `countryOfOrigin` for the non-JP marker. Not
-// rail fields: these ride the §4.4 chips row, but they persist like any other
-// enrichment. The fieldset bump alongside heals rows enriched before them.
+// ROD-261: next airing ABSOLUTE (unix + ep) so countdown is live at render; country.
 const MIGRATION_V10 =
     \\ALTER TABLE anime ADD COLUMN next_airing_at      INTEGER;
     \\ALTER TABLE anime ADD COLUMN next_airing_episode INTEGER;
     \\ALTER TABLE anime ADD COLUMN country             TEXT;
 ;
 
-// synced_status/synced_progress snapshot the (list_status, progress) pair AniList
-// last accepted (ROD-284). A row is dirty (needs push) when it has an anilist_id and
-// its live pair differs from this snapshot, or the snapshot is NULL (never synced).
-// Snapshot-vs-live, NOT a synced_at clock: last_watched_at only moves on playback, so
-// a wall-clock watermark would miss a manual drop/pause. Both NULL pre-v11, so the
-// first push treats the engaged library as dirty and backfills. Also the
-// last-known-synced baseline for the ROD-285 pull/reconcile merge, not push-only.
+// synced_status/progress: last pair AniList accepted (ROD-284). Dirty when live pair
+// differs or snapshot NULL. Snapshot-vs-live, not a clock (last_watched_at only moves
+// on play). Also ROD-285 pull/reconcile baseline.
 const MIGRATION_V11 =
     \\ALTER TABLE anime ADD COLUMN synced_status   TEXT;
     \\ALTER TABLE anime ADD COLUMN synced_progress INTEGER;
 ;
 
-// ROD-304: re-key rows off the captcha-dead AllAnime provider onto senshi so a
-// watchlist survives the default-provider swap. senshi's handle IS the stringified
-// MAL id already stored in `anime.mal_id`, so every enriched row re-keys offline:
-// `(allanime, opaque_id) -> (senshi, CAST(mal_id AS TEXT))`. NULL-mal_id rows can't
-// map to a MAL-keyed provider and stay in place for ROD-307 to backfill.
-//
-// In-place UPDATE, not a copy: `loadHistory` reads every row regardless of `source`,
-// so additive senshi rows would double each show. FKs are ON DELETE CASCADE only, so
-// moving a parent key transiently orphans its children; `defer_foreign_keys` pushes
-// the checks to COMMIT, consistent again by then (resets per transaction, and this
-// ladder runs inside migrate()'s one BEGIN IMMEDIATE).
+// ROD-304: re-key allanime → senshi via stringified mal_id. NULL mal stays for ROD-307.
+// In-place UPDATE (additive would double History rows). defer_foreign_keys: parent key
+// move would otherwise orphan children mid-txn (migrate's one BEGIN IMMEDIATE).
 const MIGRATION_V12 =
     \\PRAGMA defer_foreign_keys = ON;
     \\
@@ -282,11 +223,7 @@ const MIGRATION_V12 =
     \\DROP TABLE _rekey_304;
 ;
 
-// ROD-308: a tiny key/value table for app-level one-time flags that are DB-scoped
-// rather than schema-versioned — the first user is the provider-cutover backfill
-// marker (`app_meta['provider_backfill_v1'] = 'done'`), stamped once the network
-// idMal backfill has fully widened the senshi re-key so it never re-runs. Distinct
-// from `SCHEMA_VERSION` (which gates DDL) and from enrichment metadata.
+// ROD-308: DB-scoped one-time flags (not SCHEMA_VERSION). e.g. provider_backfill_v1.
 const MIGRATION_V13 =
     \\CREATE TABLE app_meta (
     \\    key   TEXT NOT NULL PRIMARY KEY,
@@ -294,26 +231,18 @@ const MIGRATION_V13 =
     \\);
 ;
 
-// canonical_anime: one row per distinct AniList id. Provider rows (senshi, megaplay,
-// …) bind UP to it via `anime.canonical_id`, so identity + enrichment
-// live once here and survive a provider swap instead of being duplicated per row.
+// canonical_anime: one row per AniList id. Provider bindings link via anime.canonical_id
+// so identity+enrichment survive provider swaps once.
 //
-// PK is anilist_id because AniList is the identity superset: every enriched entity
-// has one, not every has a mal_id. mal_id is a nullable, non-unique secondary so
-// MAL-native providers resolve free; it never keys the spine.
+// PK = anilist_id (superset). mal_id nullable secondary for MAL-native providers.
 //
-// INVARIANT: canonical holds identity + enrichment only. User-state (list_status,
-// progress, ratings, notes, sync snapshots, clocks) and the binding key (source,
-// source_id) stay on anime; they are per-binding, never move them here.
+// INVARIANT: identity + enrichment only here. User-state and (source, source_id)
+// stay on anime (per-binding). Never move them onto canonical.
 //
-// Backfill picks one source row per anilist_id (freshest enrichment, then senshi,
-// then lowest rowid) and recovers a mal_id from any sibling the winner lacked. Both
-// are dormant while every anilist_id is unique; the suite drives BACKFILL alone
-// against seeded rows to pin them before two providers ever co-bind one id.
-//
-// DDL + BACKFILL split run back to back inside migrate()'s one BEGIN IMMEDIATE, so
-// V14 commits atomically with the version bump. defer_foreign_keys is V12 parity
-// only: canonical is fully populated before the link UPDATE, so nothing defers.
+// Backfill picks best source row per id (freshest enrichment, senshi, rowid) and
+// recovers mal_id from siblings. DDL+BACKFILL run in migrate's one BEGIN IMMEDIATE.
+// defer_foreign_keys is V12 parity only: canonical is fully populated before the
+// link UPDATE, so nothing actually defers here.
 const MIGRATION_V14_DDL =
     \\PRAGMA defer_foreign_keys = ON;
     \\
@@ -357,10 +286,7 @@ const MIGRATION_V14_DDL =
     \\CREATE INDEX idx_anime_anilist   ON anime(anilist_id);
 ;
 
-// The data lift, held apart from the DDL above so the migrate test can run it in
-// isolation against a seeded anime table. Idempotent-safe to run once against an
-// empty canonical_anime (the ladder's case, and the test's after openMemory seeds a
-// fresh v14). All the dormant multi-provider logic lives here.
+// Data lift, separate from DDL so tests can run BACKFILL alone against a seeded table.
 const MIGRATION_V14_BACKFILL =
     \\-- One canonical row per distinct anilist_id; the ROW_NUMBER window picks the
     \\-- best source row when two bindings ever co-bind an id (dormant today: every
@@ -414,9 +340,8 @@ const MIGRATION_V14_BACKFILL =
     \\UPDATE anime SET canonical_id = anilist_id WHERE anilist_id IS NOT NULL;
 ;
 
-// ROD-345: per-show preferred-provider pin, keyed on the canonical spine. User
-// state, so it gets its own table rather than a column on canonical_anime: the
-// enrichment upsert must never be able to touch it (the V14 INVARIANT).
+// ROD-345: preferred-provider pin on canonical. Own table so enrichment upsert
+// cannot touch it (V14 INVARIANT).
 const MIGRATION_V15 =
     \\CREATE TABLE provider_pins (
     \\    canonical_id INTEGER PRIMARY KEY REFERENCES canonical_anime(anilist_id),
@@ -424,11 +349,8 @@ const MIGRATION_V15 =
     \\);
 ;
 
-// ROD-347: the negative arm of the per-(canonical, provider) availability
-// tri-state. Only definitive "searched, not stocked" verdicts are persisted;
-// "bound" is derived from the anime table and "unchecked" is the absence of a
-// row, so this table never mirrors either. Own table for the same reason as
-// provider_pins: the enrichment upsert must never be able to touch it.
+// ROD-347: definitive "not stocked" per (canonical, provider). Bound/unchecked are
+// not stored (derived / no row). Own table: enrichment must not touch it.
 const MIGRATION_V16 =
     \\CREATE TABLE provider_absences (
     \\    canonical_id INTEGER NOT NULL REFERENCES canonical_anime(anilist_id),
@@ -438,34 +360,15 @@ const MIGRATION_V16 =
     \\);
 ;
 
-// ROD-359: retire anipub. Its API served episode lists from a collection that had
-// drifted head-first from reality, so every anipub row is suspect: bindings may
-// point at the wrong site id's content and episode_progress labels are provably
-// shifted (+1) on affected shows: poisoned state that the cross-provider union
-// join (ROD-346) would keep spreading onto healthy siblings. So drop the poisoned
-// progress/cache and the anipub bindings outright (megaplay re-mints via a real
-// probe, ROD-351 pre-warm; the union join re-derives true watch state from the
-// surviving siblings).
+// ROD-359: retire anipub (poisoned progress labels / wrong site ids). Drop anipub
+// progress, cache, bindings; megaplay re-mints (ROD-351); union join re-derives
+// watch state from siblings (ROD-346).
 //
-// LANDMINE the delete alone would trip: a visible card backed ONLY by an anipub
-// row (a show anipub stocked but senshi does not, the exact case a 2nd provider
-// exists for) would vanish from History with its list_status/rating/notes. So
-// before the delete, re-key one such orphan per canonical to the ROD-329 unbound
-// sentinel: the card survives with its user-state, the poisoned provider id and
-// progress are gone (already deleted above), and a later megaplay resolve
-// supersedes the sentinel. FK is ON DELETE CASCADE only, so the progress/cache
-// deletes MUST precede the re-key (no children may dangle across the key change).
-//
-// A stale unbound sentinel may ALREADY sit on such a canonical (not reachable via
-// app code, which supersedes a sentinel on any real bind, but a pre-ROD-329 or
-// hand-edited DB can carry it). Left alone it would block the re-key and leave the
-// poorer no-provider stub as the surviving card while the orphan's real state is
-// deleted. So drop that sentinel first and let the orphan (real user-state) take
-// its place. Orphan-ness is judged against REAL providers only, so the sibling
-// checks exclude both 'anipub' and 'unbound'.
-//
-// Pins carry provider PREFERENCE, not stock, so they transfer to megaplay;
-// absences don't (a different catalog).
+// LANDMINE: delete-only would erase History cards that had only anipub. Re-key one
+// visible orphan per canonical to unbound (ROD-329) first so user-state survives.
+// Progress/cache deletes MUST precede re-key (FK CASCADE only). Drop any stale
+// unbound sibling first so it cannot block re-key. Sibling checks exclude anipub
+// and unbound. Pins → megaplay (preference); absences deleted (catalog differs).
 const MIGRATION_V17 =
     \\DELETE FROM episode_progress WHERE source = 'anipub';
     \\DELETE FROM episode_cache WHERE source = 'anipub';
@@ -485,18 +388,14 @@ const MIGRATION_V17 =
 
 // ── Records ─────────────────────────────────────────────────────────────────
 
-/// A library/history row. Text fields returned from `loadHistory` are owned by
-/// the arena passed to it.
+/// Library/history row. Text from `loadHistory` is owned by the caller's arena.
 pub const AnimeRecord = struct {
     source: []const u8,
     source_id: []const u8,
     title: []const u8,
-    /// ROD-312: true AniList romaji, write-only carrier for the canonical heal.
-    /// `upsertCanonical` heals `canonical.title` to this when present (non-empty),
-    /// preserving a prior heal on a seed-only re-persist rather than downgrading — see
-    /// its anti-downgrade CASE. The anime-local `title` always keeps the provider seed.
-    /// Never read back onto a record; the healed title returns via the COALESCE read as
-    /// `title`. Left null by `loadHistory`/`getAnime`.
+    /// ROD-312: write-only true AniList romaji for `upsertCanonical` title heal
+    /// (anti-downgrade CASE there). anime.title keeps provider seed. Not loaded back;
+    /// healed value returns as `title` via COALESCE. Null from loadHistory/getAnime.
     title_romaji: ?[]const u8 = null,
     title_english: ?[]const u8 = null,
     mal_id: ?i64 = null,
@@ -507,25 +406,19 @@ pub const AnimeRecord = struct {
     description: ?[]const u8 = null,
     score: ?i64 = null,
     total_episodes: ?i64 = null,
-    /// ROD-261: per-episode runtime in minutes (AniList `duration`).
+    /// ROD-261: runtime minutes (AniList duration).
     duration: ?i64 = null,
-    /// ROD-261: raw AniList adaptation source enum (prettified at render). Named
-    /// `source_material`, not `source` — `source` is the provider PK key above.
+    /// ROD-261: adaptation source enum. Not `source` (that is the provider PK).
     source_material: ?[]const u8 = null,
-    /// ROD-261: the pre-selected ranking — position, type ("RATED"/"POPULAR"),
-    /// and year (null = all-time). Composed into `#{rank} {type} {year}` at render.
+    /// ROD-261: pre-selected rank (position, type, year; null year = all-time).
     rank: ?i64 = null,
     rank_type: ?[]const u8 = null,
     rank_year: ?i64 = null,
-    /// ROD-261: next-episode airing, stored absolute (unix seconds) + episode, so
-    /// the §4.4 countdown recomputes from the live clock. `country` = AniList
-    /// countryOfOrigin (non-JP marker).
+    /// ROD-261: absolute next-air (unix + ep) for live countdown; country origin.
     next_airing_at: ?i64 = null,
     next_airing_episode: ?i64 = null,
     country: ?[]const u8 = null,
-    // ROD-185 enrichment. `season` is the canonical lowercase tag; `genres` is
-    // the split list (arena-owned on read, borrowed from domain on construct) —
-    // the '\n' blob lives only in the column, joined at upsert / split at load.
+    // ROD-185: season tag; genres split list (blob only in column).
     season: ?[]const u8 = null,
     native_name: ?[]const u8 = null,
     kind: ?[]const u8 = null,
@@ -533,16 +426,11 @@ pub const AnimeRecord = struct {
     start_month: ?i64 = null,
     start_day: ?i64 = null,
     genres: []const []const u8 = &.{},
-    /// ROD-261: main animation studios, same '\n'-blob shape and borrowed/owned
-    /// contract as `genres` — the column joins at upsert, splits at load.
+    /// ROD-261: studios, same '\n'-blob contract as genres.
     studios: []const []const u8 = &.{},
-    /// ROD-182: unix seconds of the last successful AniList enrichment pull, or
-    /// null if never enriched (also null for rows written before the v6 column).
-    /// Drives `enrichmentStale` → refresh-on-view; never touched by user edits.
+    /// ROD-182: last successful AniList pull (null = never/pre-v6). Drives enrichmentStale.
     enrichment_fetched_at: ?i64 = null,
-    /// ROD-182: the `ENRICHMENT_FIELDSET_VERSION` this row was last enriched under;
-    /// null = never enriched / pre-v6. Lets a field-set widening (ROD-261) mark old
-    /// rows stale by version, not just by clock. Stamped alongside `fetched_at`.
+    /// ROD-182: ENRICHMENT_FIELDSET_VERSION last filled under; version-based stale.
     enrichment_fieldset_version: ?i64 = null,
     list_status: domain.ListStatus = .planning,
     user_rating: ?f64 = null,
@@ -551,18 +439,14 @@ pub const AnimeRecord = struct {
     progress: i64 = 0,
     added_at: i64 = 0,
     last_watched_at: ?i64 = null,
-    /// Whether this row should appear in the History view. Search-only metadata
-    /// cache rows stay hidden until the user explicitly tracks or plays them.
+    /// History visibility; search-only cache rows stay false until track/play.
     history_visible: bool = true,
-    /// ROD-312: the binding's link to its canonical entity (== anilist_id today).
-    /// NULL until enrichment resolves an id; set by `upsertEnriched` only after the
-    /// canonical row exists (the FK target). `fromDomain` leaves it null — a plain
-    /// search persist never mints the link.
+    /// ROD-312: link to canonical (== anilist_id). Set by upsertEnriched after FK target
+    /// exists. fromDomain leaves null (search persist does not mint the link).
     canonical_id: ?i64 = null,
 
-    /// Build a row from a freshly-searched show. Only carries what the source
-    /// gives us; user state (status/rating/notes/counts) takes table defaults
-    /// and is preserved across re-searches by `upsertAnime`.
+    /// From a search hit: source-derived fields only; user state uses table defaults
+    /// and is preserved by upsertAnime on re-search.
     pub fn fromDomain(source: []const u8, a: domain.Anime, tt: domain.Translation) AnimeRecord {
         const eps = a.episodeCount(tt);
         return .{
@@ -571,8 +455,7 @@ pub const AnimeRecord = struct {
             .title = a.name,
             .title_romaji = a.title_romaji,
             .title_english = a.english_name,
-            // A corrupt provider id past i64 range degrades to "not provided"
-            // rather than panicking on the cast.
+            // Out-of-i64 range → null, not panic.
             .mal_id = if (a.mal_id) |m| std.math.cast(i64, m) else null,
             .anilist_id = if (a.anilist_id) |x| std.math.cast(i64, x) else null,
             .cover_url = a.thumb,
@@ -589,8 +472,7 @@ pub const AnimeRecord = struct {
             .next_airing_at = a.next_airing_at,
             .next_airing_episode = if (a.next_airing_episode) |e| @intCast(e) else null,
             .country = a.country,
-            // Store the canonical tag ("winter"…) so it round-trips through
-            // domain.Season.fromString on the way back out.
+            // @tagName for Season.fromString round-trip.
             .season = if (a.season) |s| @tagName(s) else null,
             .native_name = a.native_name,
             .kind = a.kind,
@@ -602,9 +484,7 @@ pub const AnimeRecord = struct {
         };
     }
 
-    /// Rebuild a `domain.Date` from the split start_year/month/day columns. A
-    /// missing or out-of-range year collapses the whole date to null (a date with
-    /// no year isn't a date); month/day independently degrade to "not provided".
+    /// Rebuild Date from split columns. Missing/out-of-range year → null whole date.
     pub fn startDate(rec: AnimeRecord) ?domain.Date {
         const y = rec.start_year orelse return null;
         const year = std.math.cast(u32, y) orelse return null;
@@ -621,28 +501,22 @@ pub const Resume = struct {
     duration_secs: f64,
     fully_watched: bool,
 
-    /// The offset to hand mpv's `--start`. Returns 0 once past the natural-end
-    /// window or already fully watched — no point dropping the viewer two
-    /// minutes from the credits.
+    /// mpv `--start` offset. 0 past natural-end or fully watched.
     pub fn startSeconds(self: Resume) u64 {
         if (self.fully_watched) return 0;
         if (self.duration_secs > 0 and self.position_secs / self.duration_secs >= NATURAL_END_RATIO) return 0;
         if (self.position_secs <= 0) return 0;
-        // NaN slips past every comparison above; a corrupt huge value overflows
-        // the cast. Either way, just start from the top.
+        // NaN / overflow → start from top.
         const u64_max_f: f64 = @floatFromInt(std.math.maxInt(u64));
         if (!std.math.isFinite(self.position_secs) or self.position_secs >= u64_max_f) return 0;
         return @intFromFloat(self.position_secs);
     }
 
-    /// `startSeconds`, rewound by `rewind_sec` so the viewer drops back into
-    /// context instead of mid-action (ROD-84, `Config.resume_offset_sec`). Only
-    /// the value handed to mpv's `--start` should use this; `startSeconds` stays
-    /// the raw "is there a resume point" truth for UI cursor seeding. A rewind
-    /// past the start just begins from the top (saturating).
+    /// startSeconds rewound by `rewind_sec` for mpv (ROD-84). UI cursor still uses
+    /// startSeconds raw. Saturates at 0.
     pub fn startSecondsRewound(self: Resume, rewind_sec: u32) u64 {
         const raw = self.startSeconds();
-        if (raw == 0) return 0; // top-of-episode / natural-end / watched — nothing to rewind
+        if (raw == 0) return 0;
         return raw -| rewind_sec;
     }
 };
@@ -652,17 +526,13 @@ pub const Resume = struct {
 pub const Store = struct {
     db: SqliteDb,
 
-    /// Open (creating if needed) the DB at `path`, set WAL + foreign keys, and
-    /// migrate to the current schema. `path` must be null-terminated.
+    /// Open DB at `path` (nul-terminated), WAL + FKs, migrate.
     ///
-    /// Threading: this one connection handle is shared across threads (the main loop,
-    /// the history worker at startup, and interrupt() at quit), which is safe ONLY under
-    /// SQLite's serialized mode. We rely on NOT passing SQLITE_OPEN_NOMUTEX (which
-    /// downgrades to multi-thread mode, where one connection is not thread-safe). Do not
-    /// add NOMUTEX/FULLMUTEX without auditing every cross-thread call site; the assert
-    /// below trips loud if a build links a non-serialized SQLite.
+    /// Threading: one connection shared across threads is safe only in SQLite serialized
+    /// mode. Do not add SQLITE_OPEN_NOMUTEX without auditing every cross-thread site.
+    /// Assert trips if the linked SQLite is not serialized.
     pub fn open(path: [:0]const u8) Error!Store {
-        std.debug.assert(c.sqlite3_threadsafe() == 1); // 1 = serialized (see Threading note)
+        std.debug.assert(c.sqlite3_threadsafe() == 1); // 1 = serialized
         var db: SqliteDb = null;
         const flags = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE;
         if (c.sqlite3_open_v2(path.ptr, &db, flags, null) != c.SQLITE_OK) {
@@ -672,10 +542,7 @@ pub const Store = struct {
         }
         var self: Store = .{ .db = db };
         errdefer self.close();
-        // Bound lock-contention waits before the first statement so migrate()'s
-        // BEGIN IMMEDIATE and every later writer sit out a concurrent holder instead
-        // of erroring (ROD-287, see BUSY_TIMEOUT_MS). enableWal handles the WAL flip
-        // it can't rescue.
+        // Before first stmt so migrate BEGIN IMMEDIATE can wait (ROD-287). WAL flip: enableWal.
         _ = c.sqlite3_busy_timeout(self.db, BUSY_TIMEOUT_MS);
         try self.enableWal();
         try self.exec("PRAGMA foreign_keys = ON;");
@@ -683,17 +550,13 @@ pub const Store = struct {
         return self;
     }
 
-    /// A private in-memory DB — for tests. Each call is an isolated, blank store.
+    /// Isolated blank in-memory DB for tests.
     pub fn openMemory() Error!Store {
         return open(":memory:");
     }
 
-    /// Abort any statement currently running on this connection. `sqlite3_interrupt`
-    /// is documented thread-safe regardless of threading mode, and a no-op when no
-    /// statement is running. Used on quit to abandon an in-flight loadHistory so
-    /// teardown doesn't block on the query (ROD-179). (The broader cross-thread
-    /// sharing of this handle — see open() — relies on serialized mode, not this
-    /// call specifically.)
+    /// Abort in-flight statements (thread-safe; no-op if idle). Quit uses this so
+    /// loadHistory cannot block teardown (ROD-179).
     pub fn interrupt(self: *Store) void {
         _ = c.sqlite3_interrupt(self.db);
     }
@@ -703,31 +566,20 @@ pub const Store = struct {
         self.db = null;
     }
 
-    /// Current unix time in seconds. Injected at call sites so tests stay
-    /// deterministic (they pass fixed values; the app passes this).
+    /// Unix seconds. Call sites inject fixed values in tests.
     pub fn nowSecs() i64 {
         return @intCast(c.time(null));
     }
 
     // ── ROD-66: anime history CRUD + load_all ────────────────────────────────
 
-    /// Insert a show, or refresh *source-derived* metadata if it already exists.
-    /// INVARIANT: never touches user state on conflict (play_count, progress,
-    /// list_status, user_rating, notes, added_at, last_watched_at, and the ROD-284
-    /// sync snapshot synced_status/synced_progress). A re-run search must not wipe
-    /// history or reset the sync snapshot (which would make every re-viewed show
-    /// permanently dirty). Concretely: none of those columns appear in the
-    /// `ON CONFLICT DO UPDATE SET` clause below; keep it that way when adding columns.
+    /// Insert or refresh source-derived metadata.
+    /// INVARIANT: conflict path never touches user state (play_count, progress,
+    /// list_status, user_rating, notes, added_at, last_watched_at, synced_*): keep
+    /// those out of ON CONFLICT DO UPDATE when adding columns (ROD-284).
     ///
-    /// `cover_url` breaks plain COALESCE to prefer a fetchable absolute url over a
-    /// relative ref (ROD-267), so an enriched AniList/MAL cover is never clobbered by a
-    /// later `mcovers/…` re-search on surfaces that don't re-enrich (History). The
-    /// "absolute" test is a case-sensitive `http(s)://` GLOB mirroring
-    /// `domain.isAbsoluteUrl` so the two layers can't drift.
-    ///
-    /// `scratch` joins genres/studios into '\n' blobs and, like `putCachedEpisodes`,
-    /// does not free them: they ride the caller's arena to teardown. Passing a
-    /// non-arena is safe ONLY when both lists are empty (nothing is allocated).
+    /// cover_url prefers absolute over relative (ROD-267); GLOB mirrors domain.isAbsoluteUrl.
+    /// `scratch` joins genre/studio blobs (arena; free only if both lists empty and non-arena).
     pub fn upsertAnime(self: *Store, a: AnimeRecord, now: i64, scratch: Allocator) Error!void {
         const sql =
             \\INSERT INTO anime (source, source_id, title, title_english, mal_id, anilist_id,
@@ -803,9 +655,7 @@ pub const Store = struct {
         try bindOptI64(stmt, 24, a.start_year);
         try bindOptI64(stmt, 25, a.start_month);
         try bindOptI64(stmt, 26, a.start_day);
-        // Empty list → bind NULL so the COALESCE preserves any genres already
-        // persisted by an earlier enrichment (same "re-search never wipes" rule
-        // the scalar fields lean on).
+        // Empty → NULL so COALESCE keeps prior enrichment (re-search never wipes).
         if (a.genres.len == 0) {
             try checkBind(stmt, c.sqlite3_bind_null(stmt, 27));
         } else {
@@ -813,8 +663,7 @@ pub const Store = struct {
         }
         try bindOptI64(stmt, 28, a.enrichment_fetched_at);
         try bindOptI64(stmt, 29, a.enrichment_fieldset_version);
-        // Same empty→NULL rule as genres, so a re-search that carries no studios
-        // never wipes a list an earlier enrichment persisted (ROD-261).
+        // Same empty→NULL as genres (ROD-261).
         if (a.studios.len == 0) {
             try checkBind(stmt, c.sqlite3_bind_null(stmt, 30));
         } else {
@@ -836,17 +685,11 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Persist enrichment onto the canonical spine (ROD-312), one entity per AniList
-    /// id, called ONLY for id-bearing rows (see `upsertEnriched`'s M1 guard). The
-    /// ON CONFLICT set mirrors `upsertAnime`: COALESCE(excluded, canonical) keeps
-    /// anything the incoming row lacks, plus the same absolute-cover preference
-    /// (ROD-267). `title` is the exception (anti-downgrade): it refreshes only when
-    /// this row carries real romaji (the `?29` flag), never back to a provider seed;
-    /// see the bind block. A fresh INSERT bootstraps `title` via `romaji orelse a.title`.
+    /// Persist enrichment on the canonical spine (ROD-312), id-bearing rows only.
+    /// ON CONFLICT mirrors upsertAnime COALESCE + absolute cover (ROD-267). title is the
+    /// exception: refreshes only when this row carries real romaji (?29), never seed.
     ///
-    /// M1 (ROD-311): `anilist_id` is asserted non-null. It is INTEGER PRIMARY KEY, so a
-    /// NULL insert auto-assigns a rowid and would mint a bogus canonical entity for an
-    /// unresolved title; the assert makes that a loud invariant.
+    /// M1 (ROD-311): assert anilist_id non-null (INTEGER PK would auto-rowid a NULL).
     fn upsertCanonical(self: *Store, a: AnimeRecord, scratch: Allocator) Error!void {
         std.debug.assert(a.anilist_id != null);
         const sql =
@@ -893,12 +736,8 @@ pub const Store = struct {
         const stmt = try self.prepare(sql);
         defer _ = c.sqlite3_finalize(stmt);
 
-        // ROD-312 heal: romaji only when non-empty (an empty string is "no romaji").
-        // Anti-downgrade: once canonical.title holds real romaji, a later seed-only
-        // re-persist (a Discover/search hydrate that backfilled anilist_id but carries
-        // no romaji) must NOT clobber it back to the seed, so the ON CONFLICT overwrites
-        // `title` only when this row carries romaji (the ?29 flag). A fresh INSERT still
-        // bootstraps with romaji-or-seed; anime-local `title` stays the provider seed.
+        // ROD-312: non-empty romaji only. ?29 gates title anti-downgrade (seed must not
+        // clobber healed romaji). INSERT bootstraps romaji-or-seed.
         const romaji: ?[]const u8 = if (a.title_romaji) |r| (if (r.len > 0) r else null) else null;
 
         try bindOptI64(stmt, 1, a.anilist_id);
@@ -917,8 +756,7 @@ pub const Store = struct {
         try bindOptI64(stmt, 14, a.start_year);
         try bindOptI64(stmt, 15, a.start_month);
         try bindOptI64(stmt, 16, a.start_day);
-        // Same empty→NULL rule as upsertAnime: a re-enrich that carries no genres
-        // never wipes a list an earlier one persisted (the COALESCE preserves it).
+        // Empty → NULL so COALESCE keeps prior (same as upsertAnime).
         if (a.genres.len == 0) {
             try checkBind(stmt, c.sqlite3_bind_null(stmt, 17));
         } else {
@@ -939,24 +777,17 @@ pub const Store = struct {
         try bindOptI64(stmt, 26, a.next_airing_at);
         try bindOptI64(stmt, 27, a.next_airing_episode);
         try bindOptText(stmt, 28, a.country);
-        // ?29: "this row carries real romaji" — gates the anti-downgrade title CASE.
+        // ?29: real romaji present (title anti-downgrade CASE).
         try checkBind(stmt, c.sqlite3_bind_int64(stmt, 29, if (romaji != null) 1 else 0));
 
         try self.stepDone(stmt);
     }
 
-    /// Persist a search hit as a canonical entity only, no binding row (ROD-326): writes
-    /// `canonical_anime`, never `anime` (the provider binding is the resolver's job,
-    /// ROD-328). `source` is unused by the canonical write; `.sub` only feeds `fromDomain`'s
-    /// `episodeCount`, which is 0 for a search hit, so neither placeholder reaches a column.
-    /// A caller passing a row with real per-track counts would break that: scope this to
-    /// search hits.
+    /// Search hit → canonical only, no binding (ROD-326). Binding is the resolver (ROD-328).
+    /// Scope to search hits (fromDomain .sub episodeCount is 0).
     ///
-    /// `stamp_fresh` gates the freshness stamp (same contract as `upsertEnriched`, ROD-182):
-    /// pass true only when `anime` carries the full enrichment field set from a confirmed
-    /// answer. Both current callers qualify: AniList discovery search (ROD-326) and the
-    /// AniList Discover feed (ROD-336) return the full `GQL_FIELDS`. A caller with a
-    /// partial row MUST pass false, or its gaps never draw a refresh.
+    /// stamp_fresh (ROD-182): true only for full confirmed field sets (discovery search /
+    /// Discover feed). Partial rows must pass false or gaps never refresh.
     pub fn upsertCanonicalOnly(self: *Store, anime: domain.Anime, stamp_fresh: bool, now: i64, scratch: Allocator) Error!void {
         var rec = AnimeRecord.fromDomain("", anime, .sub);
         if (stamp_fresh) {
@@ -966,29 +797,16 @@ pub const Store = struct {
         return self.upsertCanonical(rec, scratch);
     }
 
-    /// Mint (or link) the provider binding row for a canonical entity (ROD-327): the
-    /// tier-A resolver's write, once `provider.episodes()` confirms the provider stocks
-    /// the show. `anilist_id` must already own a canonical row (search persisted it via
-    /// `upsertCanonicalOnly`). Creates the `(source, source_id)` binding, links
-    /// `canonical_id`, reveals it when `visible`. Display columns resolve through canonical
-    /// (loadHistory/getAnime COALESCE), so the binding carries only identity plus the NOT
-    /// NULL `title`. `upsertAnime`'s ON CONFLICT preserves user state and MAX-merges
-    /// `history_visible`, so a re-resolve of an already-tracked show never clobbers it.
-    ///
-    /// Returns false if no canonical row exists for `anilist_id` (persist ran out of order
-    /// or silently failed): the caller must not report success, since persist is
-    /// best-effort and a false "success" here means an Add toasts a lie or a later
-    /// `recordPlay` FK-fails.
+    /// Mint/link provider binding for a canonical (ROD-327) after stock probe. Needs an
+    /// existing canonical row. Binding holds identity + NOT NULL title; display via
+    /// COALESCE. Returns false if no canonical (caller must not toast success).
     pub fn bindCanonical(self: *Store, source: []const u8, source_id: []const u8, anilist_id: i64, visible: bool, now: i64, scratch: Allocator) Error!bool {
         const canon = try self.getCanonicalByAnilistId(scratch, anilist_id) orelse {
             std.log.debug("store: bindCanonical found no canonical row for anilist_id {d}", .{anilist_id});
             return false;
         };
-        // ROD-329: a real bind supersedes any prior `unbound` sentinel for this canonical
-        // (shared `canonical_id`). A lingering sentinel (NULL last_watched, lower rowid)
-        // wins loadHistory's ROD-313 collapse and would mask the now-playable row, so
-        // delete it. Inherit its visibility: the sentinel always mints visible, so a hidden
-        // Play-path bind must reveal here or the show drops out of History.
+        // ROD-329: real bind supersedes unbound sentinel (else ROD-313 collapse masks playable).
+        // Inherit visibility: sentinel is always visible.
         var effective_visible = visible;
         if (!std.mem.eql(u8, source, SOURCE_UNBOUND) and try self.supersedeUnbound(anilist_id)) {
             effective_visible = true;
@@ -1003,18 +821,14 @@ pub const Store = struct {
             .history_visible = effective_visible,
         };
         try self.upsertAnime(rec, now, scratch);
-        // ROD-347 invariant: bound and absent never coexist. A real mint proves the
-        // provider stocks the show, so it supersedes any cached negative. The unbound
-        // sentinel is not a provider verdict and clears nothing.
+        // ROD-347: bound and absent never coexist. Unbound is not a provider verdict.
         if (!std.mem.eql(u8, source, SOURCE_UNBOUND)) {
             try self.clearProviderAbsence(anilist_id, source);
         }
         return true;
     }
 
-    /// Delete the `unbound` sentinel for `anilist_id`, if present (ROD-329). A plain row
-    /// delete is safe: the sentinel owns no episode_progress rows (Play is gated off it),
-    /// so nothing cascades.
+    /// Drop unbound sentinel for anilist_id if present (ROD-329). No progress to cascade.
     fn supersedeUnbound(self: *Store, anilist_id: i64) Error!bool {
         var buf: [24]u8 = undefined;
         const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
@@ -1026,29 +840,20 @@ pub const Store = struct {
         return c.sqlite3_changes(self.db) > 0;
     }
 
-    /// Persist the ROD-329 unbound terminal state: the add-time resolver found no play
-    /// provider, so mint a visible `SOURCE_UNBOUND` binding. A thin wrapper over
-    /// `bindCanonical` (reuses its conflict/merge semantics) rather than a bespoke insert,
-    /// to keep `bindCanonical`'s "provider stocks the show" contract honest. Returns false
-    /// when no canonical row exists yet: the caller must not toast success on that.
+    /// ROD-329: mint visible unbound binding (no play provider). Via bindCanonical.
     pub fn markUnbound(self: *Store, anilist_id: i64, now: i64, scratch: Allocator) Error!bool {
         var buf: [24]u8 = undefined;
         const source_id = unboundSourceId(&buf, anilist_id) orelse return false;
         return self.bindCanonical(SOURCE_UNBOUND, source_id, anilist_id, true, now, scratch);
     }
 
-    /// The sentinel's `source_id`, in one place so `markUnbound` and `supersedeUnbound`
-    /// can't key the row differently (ROD-329).
+    /// Unbound source_id in one place (ROD-329).
     fn unboundSourceId(buf: []u8, anilist_id: i64) ?[]const u8 {
         return std.fmt.bufPrint(buf, "{d}", .{anilist_id}) catch null;
     }
 
-    /// Hard-delete a show and everything under it (ROD-220). The single DELETE on
-    /// `anime` cascades to `episode_progress` and `episode_cache` via their
-    /// ON DELETE CASCADE FKs (see the schema + the cascade test). Keyed on
-    /// (source, source_id) so it hits exactly the watchlist row the History cursor
-    /// names, never its canonical siblings on other providers. Returns whether a row
-    /// was actually removed so the caller can suppress a success toast on a no-op.
+    /// Hard-delete one binding; CASCADE progress/cache (ROD-220). Keyed (source, source_id)
+    /// only (not siblings). Returns whether a row was removed.
     pub fn deleteAnime(self: *Store, source: []const u8, source_id: []const u8) Error!bool {
         const stmt = try self.prepare("DELETE FROM anime WHERE source = ? AND source_id = ?");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1058,20 +863,10 @@ pub const Store = struct {
         return c.sqlite3_changes(self.db) > 0;
     }
 
-    /// Map a freshly-fetched domain row into the store, set `history_visible`, and
-    /// (ONLY when `stamp_fresh`) advance the enrichment freshness clock, then upsert
-    /// (ROD-280).
-    ///
-    /// `stamp_fresh` must be true only when AniList returned a *confirmed* answer (a
-    /// match or a confirmed no-match), never on a transport/parse failure (the ROD-278
-    /// `EnrichError` contract). Folding the gate here keeps it in ONE place: search,
-    /// Discover, and refresh-on-view all route through this, so no caller can
-    /// reintroduce an un-gated stamp (the bug ROD-278 fixed across 3 sites).
-    ///
-    /// `now` timestamps the stamp and `upsertAnime`'s `added_at`; pass one value per
-    /// page so a batch shares it. `scratch` is the genres-blob arena (see `upsertAnime`).
-    /// Id-bearing rows write canonical FIRST then link `canonical_id` (the FK target
-    /// must exist first); rows with no anilist_id skip canonical (the M1 guard).
+    /// Domain → store with history_visible; stamp freshness only when stamp_fresh
+    /// (ROD-280). stamp_fresh only on confirmed AniList answers, never transport
+    /// (ROD-278). Single gate for search/Discover/refresh. Id-bearing: canonical first
+    /// then link (FK); no anilist_id skips canonical.
     pub fn upsertEnriched(
         self: *Store,
         source: []const u8,
@@ -1095,27 +890,15 @@ pub const Store = struct {
         return self.upsertAnime(rec, now, scratch);
     }
 
-    /// All shows, most-recently-watched first (then most-recently-added). Every
-    /// text field is duped into `arena`.
+    /// Engaged shows, most-recently-watched then added. Text into arena.
     pub fn loadHistory(self: *Store, arena: Allocator) Error![]AnimeRecord {
-        // ROD-312: resolve enrichment through the canonical spine. Every identity/
-        // enrichment column reads COALESCE(canonical, anime-local): canonical wins where
-        // a binding resolved to one, anime-local is the fallback for the unmatched tail
-        // (canonical_id NULL, the LEFT JOIN yields NULLs). User-state and the binding key
-        // stay anime-only; column ORDER is unchanged (the row builder reads by index).
+        // ROD-312: COALESCE(canonical, anime-local) for enrichment; user-state anime-only.
         //
-        // ROD-313: collapse multi-binding shows (senshi sub+dub, or senshi +
-        // megaplay) to one History card via a ROW_NUMBER representative per group. Two
-        // invariants:
-        //   1. PARTITION BY COALESCE(canonical_id, -rowid), never bare canonical_id: the
-        //      unmatched tail is all NULL, which SQLite groups as one, so bare
-        //      partitioning would fuse the whole tail into a single card. -rowid is unique
-        //      and never collides with a real (positive) anilist_id.
-        //   2. The representative is an explicit TOTAL order (most-recently-watched, then
-        //      furthest progress, then rowid), so a never-played co-bound pair still
-        //      resolves deterministically. Its user-state is what the card shows and what
-        //      Play resumes; enrichment columns are group-invariant.
-        // Display-only: no row deleted, no user-state merged.
+        // ROD-313: one card per group via ROW_NUMBER.
+        //   1. PARTITION BY COALESCE(canonical_id, -rowid): bare NULL would fuse the
+        //      unmatched tail; -rowid is unique and never collides with real anilist_id.
+        //   2. Total order (last_watched, progress, rowid) for deterministic co-bind pick.
+        // Display-only: no delete, no user-state merge.
         const sql =
             \\SELECT anime.source, anime.source_id,
             \\    COALESCE(c.title, anime.title), COALESCE(c.title_english, anime.title_english),
@@ -1144,6 +927,7 @@ pub const Store = struct {
         defer _ = c.sqlite3_finalize(stmt);
 
         var rows: std.ArrayList(AnimeRecord) = .empty;
+        // Column order below must match the SELECT above exactly; the row-builder reads by index.
         while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
             try rows.append(arena, .{
                 .source = try dupeText(arena, stmt, 0) orelse "",
@@ -1191,11 +975,8 @@ pub const Store = struct {
 
     // ── AniList sync (ROD-284) ────────────────────────────────────────────────
 
-    /// The minimal projection the AniList push needs for one dirty row: the PK to
-    /// stamp the snapshot back onto, the media id to target, and the (status,
-    /// progress) pair to send. `title` rides along only for the CLI's log line.
-    /// `anilist_id` is non-optional here — `loadDirtyForSync` filters out the rows
-    /// that lack one (no id → nothing to push them to).
+    /// Push projection for one dirty row: PK, media id, status/progress. title for CLI.
+    /// anilist_id always set (loadDirtyForSync filters no-id rows).
     pub const SyncRow = struct {
         source: []const u8,
         source_id: []const u8,
@@ -1205,13 +986,9 @@ pub const Store = struct {
         progress: i64,
     };
 
-    /// Rows whose local (list_status, progress) differs from what AniList last
-    /// accepted — the push work-list (ROD-284). Scoped to the engaged library
-    /// (`history_visible`, the same gate as `loadHistory`) so a merely-browsed
-    /// search-cache row never floods the user's AniList planning list, and to rows
-    /// carrying an `anilist_id` (no id → no push target). A NULL snapshot
-    /// (`synced_status IS NULL`) reads as never-synced, so the first run returns the
-    /// whole engaged, id-bearing library. Text fields are duped into `arena`.
+    /// Push work-list (ROD-284): engaged + anilist_id + live pair ≠ snapshot (or
+    /// snapshot NULL = never synced). history_visible so search-cache never floods
+    /// AniList planning. Text into arena.
     pub fn loadDirtyForSync(self: *Store, arena: Allocator) Error![]SyncRow {
         const sql =
             \\SELECT source, source_id, title, anilist_id, list_status, progress
@@ -1241,9 +1018,7 @@ pub const Store = struct {
         return rows.toOwnedSlice(arena);
     }
 
-    /// Record that AniList accepted `(status, progress)` for one show — advance the
-    /// sync snapshot so the row reads clean on `loadDirtyForSync` until it changes
-    /// again. Called once per successful `SaveMediaListEntry`.
+    /// Advance sync snapshot after AniList accepts (status, progress).
     pub fn markSynced(
         self: *Store,
         source: []const u8,
@@ -1265,10 +1040,7 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// How many engaged rows can't be pushed for lack of an `anilist_id` (ROD-284).
-    /// The push's work-list (`loadDirtyForSync`) filters these out — there's no
-    /// media to target — so this count is how the CLI reports "the rest" it skipped:
-    /// shows with no AniList link yet (enrichment never resolved an id).
+    /// Engaged rows with no anilist_id (ROD-284). CLI "skipped" count.
     pub fn countEngagedWithoutAniListId(self: *Store) Error!i64 {
         const stmt = try self.prepare("SELECT COUNT(*) FROM anime WHERE history_visible != 0 AND anilist_id IS NULL");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1276,11 +1048,7 @@ pub const Store = struct {
         return c.sqlite3_column_int64(stmt, 0);
     }
 
-    /// The titles behind `countEngagedWithoutAniListId` — the engaged shows that can't
-    /// be pushed for lack of an `anilist_id` — so `zigoku sync` can list *which* shows
-    /// have no AniList link yet (enrichment never resolved one), not just how many. The
-    /// actionable half: the user can re-open these to re-enrich. Most-recently-active
-    /// first (matches the push work-list ordering); titles duped into `arena`.
+    /// Titles for that set (CLI list which to re-enrich). Most-recently-active first.
     pub fn loadEngagedWithoutAniListId(self: *Store, arena: Allocator) Error![]const []const u8 {
         const sql =
             \\SELECT title FROM anime
@@ -1296,13 +1064,8 @@ pub const Store = struct {
         return out.toOwnedSlice(arena);
     }
 
-    /// One local row eligible for pull/reconcile (ROD-285): the join key + PK to
-    /// write back through, the current local (list_status, progress), and the
-    /// last-synced snapshot — the 3-way-merge ancestor. `synced_status`/
-    /// `synced_progress` are optional: NULL = never synced (no ancestor), which the
-    /// merge treats as a first-contact bootstrap. `anilist_id` is non-optional —
-    /// `loadReconcileRows` filters out rows without one (nothing to join a remote
-    /// entry to).
+    /// Pull/reconcile row (ROD-285): PK, anilist_id, local pair, snapshot ancestor.
+    /// NULL snapshot = first-contact bootstrap. anilist_id always set.
     pub const ReconcileRow = struct {
         source: []const u8,
         source_id: []const u8,
@@ -1313,12 +1076,8 @@ pub const Store = struct {
         synced_progress: ?i64,
     };
 
-    /// The pull/reconcile candidate set (ROD-285): every engaged, id-bearing row with
-    /// its last-synced snapshot for the 3-way merge. Same gate as `loadDirtyForSync`
-    /// (engaged + `anilist_id`) but NOT dirty-filtered: reconcile must see clean rows
-    /// too, since a remote change lands on a locally-unchanged row. `history_visible`
-    /// keeps a merely-browsed search-cache row from being reshaped by a remote list.
-    /// Text fields are duped into `arena`.
+    /// Reconcile candidates (ROD-285): engaged + anilist_id with snapshot. Not
+    /// dirty-filtered (clean rows can still receive remote changes).
     pub fn loadReconcileRows(self: *Store, arena: Allocator) Error![]ReconcileRow {
         const sql =
             \\SELECT source, source_id, anilist_id, list_status, progress, synced_status, synced_progress
@@ -1344,21 +1103,9 @@ pub const Store = struct {
         return rows.toOwnedSlice(arena);
     }
 
-    /// Apply a reconciled pull to one row (ROD-285), but only if the row still holds
-    /// the `(expected_status, expected_progress)` pair the merge was computed from.
-    /// Sets the merged local (list_status, progress) and advances the sync snapshot to
-    /// what AniList now holds, in one guarded UPDATE. Returns `true` when the write
-    /// landed, `false` when the guard matched zero rows: a concurrent writer (the TUI's
-    /// `recordPlay`/`setListStatus`) moved the row between the bulk `loadReconcileRows`
-    /// read and this write. `reconcileAll` merges from a point-in-time snapshot with no
-    /// spanning transaction, so without this guard a mid-flight local edit would be
-    /// silently clobbered (a lost update); the guard turns that into a skip that
-    /// re-reconciles next run.
-    ///
-    /// The snapshot becomes the *remote* pair (server truth), not the merged pair: if
-    /// the merge kept a locally-ahead value, the row then reads dirty against the
-    /// snapshot and the next push carries that delta up. Pull sets the baseline to the
-    /// server; push closes any remaining local gap.
+    /// Apply reconciled pull (ROD-285) only if row still holds expected pair (CAS-style
+    /// guard against concurrent recordPlay/setListStatus). false = skip, retry next run.
+    /// Snapshot is *remote* pair (server truth), not merged: local-ahead stays dirty for push.
     pub fn applyPulled(
         self: *Store,
         source: []const u8,
@@ -1387,17 +1134,13 @@ pub const Store = struct {
         try bindText(stmt, 7, expected_status.str());
         try checkBind(stmt, c.sqlite3_bind_int64(stmt, 8, expected_progress));
         try self.stepDone(stmt);
-        // sqlite3_changes counts rows the WHERE matched — 0 means the guard failed
-        // (the row changed underneath us), not an error.
+        // 0 matched rows = guard failed (concurrent edit), not an error.
         return c.sqlite3_changes(self.db) > 0;
     }
 
-    /// Full stored metadata for one show, or null if it was never persisted.
+    /// Full stored metadata for one show, or null.
     pub fn getAnime(self: *Store, arena: Allocator, source: []const u8, source_id: []const u8) Error!?AnimeRecord {
-        // ROD-312: same canonical-resolution join as loadHistory — enrichment
-        // reads COALESCE(canonical, anime-local), user-state/binding stay local.
-        // `history_visible` (index 28) is anime-only and keeps its mid-list slot;
-        // column ORDER is unchanged so the fixed-index row builder stays valid.
+        // ROD-312: COALESCE join like loadHistory. history_visible mid-list (index 28).
         const sql =
             \\SELECT anime.source, anime.source_id,
             \\    COALESCE(c.title, anime.title), COALESCE(c.title_english, anime.title_english),
@@ -1419,6 +1162,7 @@ pub const Store = struct {
         try bindText(stmt, 1, source);
         try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        // Column order below must match the SELECT above exactly; the row-builder reads by index.
         return .{
             .source = try dupeText(arena, stmt, 0) orelse "",
             .source_id = try dupeText(arena, stmt, 1) orelse "",
@@ -1448,8 +1192,7 @@ pub const Store = struct {
             .genres = try dupeStrBlob(arena, stmt, 25),
             .enrichment_fetched_at = colOptI64(stmt, 26),
             .enrichment_fieldset_version = colOptI64(stmt, 27),
-            // ROD-182: surface real visibility (loadHistory hardcodes true since it
-            // only returns visible rows) so refresh-on-view can gate on "tracked".
+            // ROD-182: real visibility (loadHistory hardcodes true for its filter).
             .history_visible = c.sqlite3_column_int64(stmt, 28) != 0,
             .studios = try dupeStrBlob(arena, stmt, 29),
             .duration = colOptI64(stmt, 30),
@@ -1463,11 +1206,8 @@ pub const Store = struct {
         };
     }
 
-    /// Read the canonical entity for `anilist_id` as an `AnimeRecord` (ROD-327): the
-    /// hydrate reader for AniList search hits, which are anilist_id-keyed with no
-    /// binding row (`upsertCanonicalOnly`). `source` is empty and `source_id` is the
-    /// stringified anilist_id: this is a canonical entity, not a provider binding, so
-    /// user-state columns take their record defaults (canonical carries none).
+    /// Canonical entity as AnimeRecord (ROD-327) for id-keyed search hits. Empty source;
+    /// source_id = stringified anilist_id. User-state defaults (canonical has none).
     pub fn getCanonicalByAnilistId(self: *Store, arena: Allocator, anilist_id: i64) Error!?AnimeRecord {
         const sql =
             \\SELECT title, title_english, mal_id, cover_url, year, status, description,
@@ -1515,19 +1255,9 @@ pub const Store = struct {
         };
     }
 
-    /// The persisted provider id for `anilist_id` on `source`, or null when this provider
-    /// has no binding for that canonical yet (ROD-328, tier 0). The resolver's short-circuit:
-    /// a Browse re-search of a show already bound on this provider reuses the stored id
-    /// instead of re-deriving (tier A) or re-searching the catalog (tier C, a wasted round
-    /// trip and the ROD-309 rate-scoring surface).
-    ///
-    /// A canonical can carry MORE than one binding on one provider (a MAL multi-cour split
-    /// that AniList merges: N mal-keyed senshi rows, one anilist_id; the ROD-313 collapse
-    /// case), so this is NOT a unique lookup. It picks the SAME representative loadHistory
-    /// surfaces: `history_visible` rows first (loadHistory ranks only visible rows), then
-    /// most-recently-watched, then furthest progress, then rowid. So tier 0 replays the cour
-    /// the user is actually watching, and never a hidden binding when a visible one exists.
-    /// Uses `idx_anime_canonical`. Arena owns the returned string.
+    /// Stored provider id for (anilist_id, source), or null (ROD-328 tier 0 short-circuit).
+    /// Not unique: multi-cour co-binds share anilist_id. Same representative as loadHistory
+    /// (visible first, then last_watched, progress, rowid). Arena owns the string.
     pub fn bindingSourceId(self: *Store, arena: Allocator, source: []const u8, anilist_id: i64) Error!?[]const u8 {
         const stmt = try self.prepare(
             \\SELECT source_id FROM anime
@@ -1542,10 +1272,8 @@ pub const Store = struct {
         return try dupeText(arena, stmt, 0);
     }
 
-    /// ROD-345: the per-show provider pin, or null when unpinned. Callers layer
-    /// this over the global preference (App.effectivePreference); a pin naming a
-    /// provider that is no longer registered degrades there via Registry.ordered's
-    /// unknown-name contract, so it is returned verbatim here.
+    /// ROD-345: per-show provider pin, or null. Returned verbatim; unknown names degrade
+    /// at Registry.ordered.
     pub fn getProviderPin(self: *Store, arena: Allocator, canonical_id: i64) Error!?[]const u8 {
         const stmt = try self.prepare("SELECT provider FROM provider_pins WHERE canonical_id = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1571,16 +1299,10 @@ pub const Store = struct {
 
     // ── ROD-347: provider-absence negative cache ─────────────────────────────
 
-    /// How long a persisted "not stocked" verdict stays authoritative. Catalogs
-    /// move (a currently-airing show can appear on a provider days after
-    /// premiere), so an absence past this window reads as unchecked and the next
-    /// resolve or pre-warm re-probes.
+    /// TTL for "not stocked" rows. Stale reads as unchecked so resolve re-probes.
     pub const ABSENCE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
-    /// Persist (or refresh) a definitive "this provider doesn't stock this show"
-    /// verdict (ROD-347). Callers must hold the ROD-278 line: only a completed
-    /// search/probe with no confident match earns a row here. A transport
-    /// failure proves nothing and must not poison the cache.
+    /// Persist definitive not-stocked (ROD-347). ROD-278: only clean miss, never transport.
     pub fn markProviderAbsent(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!void {
         const stmt = try self.prepare(
             \\INSERT INTO provider_absences (canonical_id, provider, checked_at) VALUES (?, ?, ?)
@@ -1593,9 +1315,7 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Whether a fresh (within-TTL) absence verdict exists for this
-    /// (canonical, provider) pair. A stale row reads false, indistinguishable
-    /// from unchecked by design, so consumers re-probe naturally.
+    /// Fresh (within-TTL) absence for (canonical, provider). Stale == unchecked.
     pub fn providerAbsentFresh(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!bool {
         const stmt = try self.prepare("SELECT checked_at FROM provider_absences WHERE canonical_id = ? AND provider = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1606,16 +1326,11 @@ pub const Store = struct {
         return now < checked_at + ABSENCE_TTL_SECONDS;
     }
 
-    /// One provider's read-side availability for a canonical (ROD-348): what the
-    /// detail rail renders per registry provider.
+    /// Detail-rail availability (ROD-348).
     pub const ProviderAvailability = enum { unchecked, bound, absent };
 
-    /// Fold the provider picture for one (canonical, provider) pair: `bound` when
-    /// any binding row joins the canonical on that source, else `absent` under a
-    /// fresh negative, else `unchecked`. Bound is checked first, the same
-    /// binding-outranks-negative rule the fallback walk applies; `bindCanonical`
-    /// deletes the negative on mint, so a coexisting pair only appears through
-    /// external DB edits and must still read as bound.
+    /// bound > fresh absent > unchecked. Bound wins even if a negative coexists
+    /// (external edit); bindCanonical clears negatives on mint.
     pub fn providerAvailability(self: *Store, canonical_id: i64, provider: []const u8, now: i64) Error!ProviderAvailability {
         const stmt = try self.prepare("SELECT 1 FROM anime WHERE canonical_id = ? AND source = ? LIMIT 1;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1626,9 +1341,7 @@ pub const Store = struct {
         return .unchecked;
     }
 
-    /// Drop the absence row for one (canonical, provider) pair. `bindCanonical`
-    /// calls this on every real-source mint so bound and absent can never
-    /// coexist; the ROD-345 'v' flip's re-probe lands here too via its mint.
+    /// Clear absence so bound and absent never coexist (bindCanonical on real mint).
     fn clearProviderAbsence(self: *Store, canonical_id: i64, provider: []const u8) Error!void {
         const stmt = try self.prepare("DELETE FROM provider_absences WHERE canonical_id = ? AND provider = ?;");
         defer _ = c.sqlite3_finalize(stmt);
@@ -1637,18 +1350,10 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// (list_status, progress high-water, total episodes, still-airing) for one
-    /// show, or null if it isn't tracked. `airing` folds the airing-status column
-    /// via `domain.isStillAiring` (ROD-296). The minimal read the watch-state
-    /// machine needs — no arena, no full AnimeRecord — and a uniform unknown-show
-    /// guard for the transition paths.
+    /// Minimal watch-state read: list_status, progress, total, still-airing (ROD-296).
     const StatusRow = struct { status: domain.ListStatus, progress: i64, total: ?i64, airing: bool };
     fn statusRow(self: *Store, source: []const u8, source_id: []const u8) Error!?StatusRow {
-        // `status` is the airing-status text (RELEASING/FINISHED), the "still releasing"
-        // signal `afterPlay` gates on (ROD-296); read transiently and folded to a bool.
-        // ROD-312: the gate reads its enrichment inputs (total_episodes, status) through
-        // the canonical join like loadHistory, so a co-bound entity uses the freshest
-        // canonical truth. list_status/progress stay anime-local (user state).
+        // ROD-312: total/airing status via canonical COALESCE; user-state local.
         const stmt = try self.prepare(
             \\SELECT anime.list_status, anime.progress,
             \\    COALESCE(c.total_episodes, anime.total_episodes), COALESCE(c.status, anime.status)
@@ -1660,10 +1365,7 @@ pub const Store = struct {
         try bindText(stmt, 1, source);
         try bindText(stmt, 2, source_id);
         if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
-        // Fold the status text to a bool before it escapes — the sqlite pointer is
-        // only valid until the next step/finalize, so `isStillAiring` consumes the
-        // transient slice here and nothing stores it. NULL status → still airing
-        // (isStillAiring's "don't trust an unclassified total" default).
+        // Fold airing text before finalize invalidates the pointer.
         const status_ptr = c.sqlite3_column_text(stmt, 3);
         const status_opt: ?[]const u8 = if (status_ptr == null) null else blk: {
             const n: usize = @intCast(c.sqlite3_column_bytes(stmt, 3));
@@ -1677,17 +1379,9 @@ pub const Store = struct {
         };
     }
 
-    /// Record a play of `episode_index` (1-based) and advance the watch-state machine
-    /// (ROD-139). Always bumps play_count, last_watched_at and history visibility (a
-    /// play is a play). The `progress` high-water only advances when `completed`
-    /// (ROD-168): a partial watch belongs in history but must not mark the episode
-    /// watched-through.
-    ///
-    /// The new `list_status` comes from `ListStatus.afterPlay`, a pure function of
-    /// (current status, post-play progress, total, still-airing); the last input keeps a
-    /// mid-broadcast show from auto-completing at the latest aired episode (ROD-296). We
-    /// read the row first so the transition is testable Zig, not a SQL CASE. Unknown
-    /// show is a silent no-op.
+    /// Record play of episode_index (1-based) (ROD-139). Always bumps play_count /
+    /// last_watched / visible. progress only when completed (ROD-168). Status via
+    /// ListStatus.afterPlay (+ airing, ROD-296). Unknown show: no-op.
     pub fn recordPlay(self: *Store, source: []const u8, source_id: []const u8, episode_index: i64, now: i64, completed: bool) Error!void {
         const cur = try self.statusRow(source, source_id) orelse return;
         const new_progress = if (completed) @max(cur.progress, episode_index) else cur.progress;
@@ -1712,18 +1406,11 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Manually set the watch-state (ROD-139 §1 manual transitions: pause / drop /
-    /// force-complete / re-plan / resume-to-watching). Unlike `recordPlay` this
-    /// never bumps play_count or last_watched_at — moving a show to paused/dropped
-    /// is not a watch event. It does make the row history-visible: an explicit
-    /// status means the user is tracking it. Force-complete snaps `progress` up to
-    /// `total_episodes` (when it's a real count) so the bar reads full; every other
-    /// transition leaves progress untouched. Unknown show → silent no-op.
+    /// Manual list_status (ROD-139). No play_count/last_watched. Sets history_visible.
+    /// completed snaps progress to total when total > 0. Unknown: no-op.
     pub fn setListStatus(self: *Store, source: []const u8, source_id: []const u8, status: domain.ListStatus) Error!void {
         const cur = try self.statusRow(source, source_id) orelse return;
-        // Snap to the finale on force-complete — but only for a real total. The
-        // `t > 0` guard mirrors `ListStatus.afterPlay`: AllAnime's
-        // `total_episodes = 0` quirk must not reset progress to zero.
+        // Force-complete snap only for real total (total=0 must not zero progress).
         var new_progress = cur.progress;
         if (status == .completed) {
             if (cur.total) |t| {
@@ -1747,11 +1434,7 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Restore an exact (list_status, progress) pair for undo (ROD-193 §B).
-    /// Unlike `setListStatus`, this writes `progress` verbatim and never applies
-    /// the force-complete snap — undo must reinstate the captured prior value, not
-    /// re-derive it. Mirrors `setListStatus`'s `history_visible = 1` so an undone
-    /// row stays on the watchlist.
+    /// Undo restore of exact (list_status, progress) (ROD-193 §B). No force-complete snap.
     pub fn restoreListStatus(self: *Store, source: []const u8, source_id: []const u8, status: domain.ListStatus, progress: i64) Error!void {
         const sql =
             \\UPDATE anime
@@ -1771,30 +1454,14 @@ pub const Store = struct {
 
     // ── ROD-193: recompute progress from episode_progress ────────────────────
 
-    /// Recompute `anime.progress` for one show from its `episode_progress` rows
-    /// (ROD-193). Returns the new high-water so the caller can patch in-memory
-    /// state without a re-read.
+    /// Recompute anime.progress from episode_progress (ROD-193). Returns new high-water.
     ///
-    /// CONTRACT: progress is the 1-based ordinal of the last fully-watched episode
-    /// among the rows present (sorted by `EpisodeNumber.sortKey`, matching the detail
-    /// grid), NOT a count of watched episodes and NOT an absolute episode number. Only
-    /// started episodes have `episode_progress` rows, so gap-watching under-counts on
-    /// purpose: eps 3 and 5 fully watched with nothing else stored gives 2. No
-    /// fully-watched row gives 0.
+    /// CONTRACT: 1-based ordinal of last fully-watched among present rows (sortKey
+    /// order), not a count and not absolute ep number. Gap-watch under-counts on
+    /// purpose. Translation-scoped. Recompute only (no deletes).
     ///
-    /// Translation-scoped: `anime.progress` tracks the tracked translation's high-water;
-    /// mixing sub and dub rows would give a meaningless combined count. Accepted
-    /// limitation (ROD-193): if the session's translation has no rows but another does,
-    /// this returns 0. Recompute-only: no `episode_progress` rows are deleted.
-    ///
-    /// ROD-346: rows are the UNION across sibling bindings through `canonical_id`
-    /// (per-episode watched = MAX across siblings), so a freshly-minted fallback
-    /// binding recomputes to the show's true high-water instead of 0, which would
-    /// otherwise push an AniList progress downgrade (the ROD-323 shape). The
-    /// UPDATE still targets only the queried binding. NULL `canonical_id` never
-    /// cross-joins (see getResume). Siblings correlate per episode by RAW LABEL:
-    /// providers that label the same episode differently ("9" vs "09") count it
-    /// twice; the codebase-wide raw-label identity scheme, not a new assumption.
+    /// ROD-346: UNION across canonical siblings (MAX per raw label); UPDATE targets
+    /// this binding only. NULL canonical_id never cross-joins.
     pub fn recomputeProgress(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
         const high_water = try self.unionHighWater(scratch, source, source_id, tt);
         const sql_upd = "UPDATE anime SET progress = ? WHERE source = ? AND source_id = ?";
@@ -1807,12 +1474,8 @@ pub const Store = struct {
         return high_water;
     }
 
-    /// Raise-only twin of `recomputeProgress` for a fallback-walk landing (ROD-346):
-    /// never LOWERS the binding's progress, so landing on a force-completed sibling
-    /// (the ROD-131 c-key snap, which has no episode_progress rows behind it) can't
-    /// silently un-complete it. The exact recompute stays the afterPlay/r-key
-    /// contract; this one only closes the "fresh or stale binding under-reads the
-    /// union" gap. Returns the binding's resulting progress.
+    /// Raise-only recompute for fallback landing (ROD-346). Never lowers progress
+    /// (force-complete sibling with no progress rows must not un-complete).
     pub fn raiseProgressToUnion(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
         const high_water = try self.unionHighWater(scratch, source, source_id, tt);
         const sql_upd = "UPDATE anime SET progress = MAX(progress, ?) WHERE source = ? AND source_id = ?";
@@ -1835,10 +1498,9 @@ pub const Store = struct {
         };
     }
 
-    /// The cross-sibling watched high-water (see recomputeProgress for the contract);
-    /// pure read, shared by the exact and raise-only writers.
+    /// Cross-sibling watched high-water (see recomputeProgress contract).
     fn unionHighWater(self: *Store, scratch: Allocator, source: []const u8, source_id: []const u8, tt: domain.Translation) Error!i64 {
-        // 1. Fetch the union of episode_progress rows across sibling bindings.
+        // Union episode_progress across sibling bindings.
         const sql_sel =
             \\SELECT ep.episode, MAX(ep.fully_watched)
             \\FROM episode_progress ep
@@ -1892,8 +1554,7 @@ pub const Store = struct {
 
     // ── ROD-67: episode resume read/write ────────────────────────────────────
 
-    /// Upsert the resume point for one (show, track, episode). `fully_watched`
-    /// is derived from the ratio so callers never have to compute it.
+    /// Upsert resume for (show, track, episode). fully_watched from WATCHED_RATIO.
     pub fn saveProgress(
         self: *Store,
         source: []const u8,
@@ -1928,13 +1589,9 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// The saved resume point, or null if this episode was never started.
-    ///
-    /// ROD-346: reads aggregate across sibling bindings through `canonical_id`
-    /// (writes stay per-binding) so watch state follows a show across a provider
-    /// fallback/flip. Freshest sibling row wins; the queried binding wins ties.
-    /// A NULL `canonical_id` must never cross-join (the ROD-313 lesson: SQLite
-    /// would fuse the whole unmatched tail), so the EXISTS arm requires it non-null.
+    /// Resume point or null. ROD-346: read across canonical siblings (write still
+    /// per-binding); freshest wins, queried binding wins ties. NULL canonical_id
+    /// never cross-joins (ROD-313).
     pub fn getResume(
         self: *Store,
         source: []const u8,
@@ -1976,37 +1633,21 @@ pub const Store = struct {
 
     // ── ROD-68: episode-list cache with status-aware TTL ──────────────────────
 
-    /// TTL in seconds for a cached episode list, keyed off airing status:
-    /// finished shows almost never change (7d), ongoing ones gain an episode a
-    /// week (6h keeps "new ep?" snappy), unknown splits the difference (24h).
+    /// Episode-list cache TTL by airing status: finished 7d, releasing 6h, else 24h.
     pub fn cacheTtl(airing_status: ?[]const u8) i64 {
-        // eqIgnoreCase folds case on both sides, so only distinct *words* are
-        // worth listing (AllAnime "RELEASING" vs an AniList-ish "ongoing").
         const s = airing_status orelse return 24 * 60 * 60;
         if (eqIgnoreCase(s, "FINISHED")) return 7 * 24 * 60 * 60;
         if (eqIgnoreCase(s, "RELEASING") or eqIgnoreCase(s, "ongoing")) return 6 * 60 * 60;
         return 24 * 60 * 60;
     }
 
-    // ── ROD-182: enrichment-content TTL (status/score/description drift) ────────
+    // ── ROD-182: enrichment-content TTL ──────────────────────────────────────
 
-    /// The current version of the *persisted enrichment field set* — the columns an
-    /// enrich pull fills (`anilist.GQL_FIELDS` → `upsertAnime`). BUMP THIS whenever a
-    /// migration adds enrichment columns that a fresh enrich would populate (ROD-261:
-    /// studios/source/duration → 2). A row stamped below this reads stale in
-    /// `enrichmentStale` no matter its clock, so widened columns heal on next view
-    /// rather than waiting out the TTL. Not a schema knob — `SCHEMA_VERSION` gates
-    /// migrations; this gates enrichment freshness, and the two move independently.
+    /// Persisted enrichment field-set version. Bump when migrations add enrich columns
+    /// so old rows heal on view (not full TTL). Independent of SCHEMA_VERSION.
     pub const ENRICHMENT_FIELDSET_VERSION: i64 = 5; // ROD-261: +studios/duration/source/rank, +airing/country
 
-    /// TTL in seconds for cached *enrichment metadata* on the `anime` row, keyed off
-    /// airing status. A deliberately longer curve than `cacheTtl` (which governs the
-    /// episode LIST): a score/synopsis/status flips far slower than a weekly episode
-    /// drop, so refresh is conservative. A finished show is all but frozen (30d), an
-    /// airing one can flip RELEASING→FINISHED and gain votes (1d), an unknown status
-    /// splits the difference (7d). "Never enriched" is not modelled here (that is
-    /// `fetched_at == null` in `enrichmentStale`), so a fetched-but-status-null row
-    /// still gets 7d of grace instead of re-fetching on every view.
+    /// Enrichment metadata TTL: finished 30d, releasing 1d, else 7d. Longer than cacheTtl.
     pub fn enrichmentTtl(airing_status: ?[]const u8) i64 {
         const s = airing_status orelse return 7 * 24 * 60 * 60;
         if (eqIgnoreCase(s, "FINISHED")) return 30 * 24 * 60 * 60;
@@ -2014,14 +1655,7 @@ pub const Store = struct {
         return 7 * 24 * 60 * 60;
     }
 
-    /// Whether a row's persisted enrichment is stale enough to refresh on view.
-    /// Stale when ANY of:
-    ///   * `fetched_at` is null: never enriched, or a row predating the v6 column
-    ///     (also the backfill predicate for pre-ROD-181 rows with no `anilist_id`).
-    ///   * `fieldset_version` predates `ENRICHMENT_FIELDSET_VERSION`: the row was filled
-    ///     under a narrower column set, so widened columns are missing (null reads as 0).
-    ///   * the clock has passed `fetched_at + enrichmentTtl(status)`.
-    /// Pure: unit-tested without a DB.
+    /// Stale if never fetched, fieldset behind ENRICHMENT_FIELDSET_VERSION, or past TTL.
     pub fn enrichmentStale(fetched_at: ?i64, fieldset_version: ?i64, airing_status: ?[]const u8, now: i64) bool {
         const t = fetched_at orelse return true;
         if ((fieldset_version orelse 0) < ENRICHMENT_FIELDSET_VERSION) return true;
@@ -2038,7 +1672,7 @@ pub const Store = struct {
         now: i64,
         scratch: Allocator,
     ) Error!void {
-        // Join raw labels with '\n' — labels never contain newlines.
+        // Labels never contain newlines.
         var blob: std.ArrayList(u8) = .empty;
         for (episodes, 0..) |e, i| {
             if (i != 0) try blob.append(scratch, '\n');
@@ -2063,8 +1697,7 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Cached episode list if present AND unexpired, else null (caller refetches).
-    /// Results are duped into `arena`.
+    /// Cached episode list if unexpired, else null. Arena-owned.
     pub fn getCachedEpisodes(
         self: *Store,
         arena: Allocator,
@@ -2100,26 +1733,14 @@ pub const Store = struct {
 
     // ── internals ────────────────────────────────────────────────────────────
 
-    /// Switch the journal to WAL, retrying on SQLITE_BUSY. This can't ride on
-    /// `busy_timeout` (ROD-287): when two fresh connections race to promote the journal
-    /// to WAL, the loser needs a brief exclusive lock the winner holds, and SQLite does
-    /// NOT run the busy handler for that lock upgrade (it could deadlock two mutually
-    /// waiting upgraders), so the pragma returns SQLITE_BUSY at once regardless of the
-    /// timeout. We retry by hand: the winner finishes in microseconds, then the loser's
-    /// retry sees WAL already set and returns without the lock, converging in a round or
-    /// two. Bounded so a wedged peer surfaces as error.Exec (best-effort no-store) rather
-    /// than hanging open() forever. Uses sqlite3_sleep so the store needn't thread an Io
-    /// handle through just for this.
+    /// Switch to WAL, retrying SQLITE_BUSY by hand (ROD-287). busy_timeout does not
+    /// cover this lock upgrade (deadlock risk). Bounded so open cannot hang forever.
     fn enableWal(self: *Store) Error!void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
             const rc = c.sqlite3_exec(self.db, "PRAGMA journal_mode = WAL;", null, null, null);
             if (rc == c.SQLITE_OK) return;
-            // Match on the PRIMARY result code (low byte). If a future caller ever
-            // enables extended result codes on this connection, BUSY/LOCKED would
-            // arrive as SQLITE_BUSY_* / SQLITE_LOCKED_* and stop matching the bare
-            // constants — silently turning a normal contention wobble into a first-try
-            // error.Exec. Masking keeps the retry robust to that (ROD-287 re-review).
+            // Primary code only (low byte): extended BUSY_* must still retry.
             const primary = rc & 0xff;
             if ((primary == c.SQLITE_BUSY or primary == c.SQLITE_LOCKED) and attempt < WAL_RETRY_LIMIT) {
                 _ = c.sqlite3_sleep(WAL_RETRY_BACKOFF_MS);
@@ -2132,13 +1753,8 @@ pub const Store = struct {
 
     // ── ROD-304 / ROD-308: legacy-provider cutover ───────────────────────────
 
-    /// Re-key `(allanime, opaque)` rows that carry a `mal_id` onto `(senshi, <mal>)`
-    /// — the exact transform the v12 schema migration runs, factored out so the
-    /// ROD-308 backfill can invoke it again after it populates fresh `mal_id`s over
-    /// the network. Runs in its own write transaction; the schema-migration path
-    /// instead folds the identical `MIGRATION_V12` SQL into `migrate()`'s ladder txn.
-    /// Idempotent: with no eligible allanime rows the temp table is empty and every
-    /// statement is a no-op.
+    /// allanime→senshi re-key (same SQL as MIGRATION_V12) for post-network backfill
+    /// (ROD-308). Own txn; migrate ladder embeds the SQL instead. Idempotent.
     pub fn rekeyLegacyProvider(self: *Store) Error!void {
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
@@ -2146,10 +1762,7 @@ pub const Store = struct {
         try self.exec("COMMIT;");
     }
 
-    /// AniList ids of the allanime rows that COULD re-key but for a missing `mal_id`
-    /// (enriched before `idMal` joined the enrichment fieldset). These are the
-    /// ROD-308 backfill's work-list: one deterministic AniList `id -> idMal` lookup
-    /// turns each into a migratable row. Returned slice is arena-owned.
+    /// allanime rows missing mal_id (ROD-308 backfill work-list). Arena-owned.
     pub fn listBackfillAnilistIds(self: *Store, arena: Allocator) Error![]i64 {
         var ids: std.ArrayList(i64) = .empty;
         const stmt = try self.prepare(
@@ -2163,10 +1776,7 @@ pub const Store = struct {
         return ids.toOwnedSlice(arena);
     }
 
-    /// Stamp a resolved `mal_id` onto the allanime row(s) with this `anilist_id`,
-    /// but only where it's still missing — never overwrite an id already present.
-    /// Scoped to `source = 'allanime'` so the backfill can't touch already-migrated
-    /// senshi rows. A no-op if nothing matches.
+    /// Stamp mal_id on allanime rows for anilist_id only if still null (never overwrite).
     pub fn setMalIdByAnilistId(self: *Store, anilist_id: i64, mal_id: i64) Error!void {
         const stmt = try self.prepare(
             \\UPDATE anime SET mal_id = ?
@@ -2178,9 +1788,7 @@ pub const Store = struct {
         try self.stepDone(stmt);
     }
 
-    /// Count allanime rows still carrying a `mal_id` — rows pending an offline re-key.
-    /// The ROD-308 backfill reads this just before `rekeyLegacyProvider` to report how
-    /// many rows its network pass made eligible to move onto senshi.
+    /// allanime rows with mal_id still pending re-key (ROD-308 report).
     pub fn countMigratableAllanime(self: *Store) Error!usize {
         const stmt = try self.prepare(
             \\SELECT COUNT(*) FROM anime WHERE source = 'allanime' AND mal_id IS NOT NULL
@@ -2215,32 +1823,22 @@ pub const Store = struct {
     }
 
     fn migrate(self: *Store) Error!void {
-        // Fast path: read the version WITHOUT a write lock (reads never block under
-        // WAL). The common case — an already-current DB — writes nothing, so routine
-        // opens (every launch, every `zigoku sync`) never contend for the write lock.
+        // Fast path: version read without write lock (WAL).
         var v = try self.userVersion();
-        // A DB written by a newer Zigoku knows a schema we don't. Refuse it as a
-        // real error (the best-effort caller falls back to no persistence) rather
-        // than asserting our way into a panic — and before taking any write lock.
+        // Newer schema than we know: real error (no panic), before any write lock.
         if (v > SCHEMA_VERSION) return error.SchemaTooNew;
-        if (v == SCHEMA_VERSION) return; // nothing to migrate
+        if (v == SCHEMA_VERSION) return;
 
-        // A migration is needed. Run the whole check-and-apply under ONE write
-        // transaction (ROD-287): BEGIN IMMEDIATE takes the write lock up front, and
-        // busy_timeout makes a second opener racing the same schema window wait rather
-        // than error with 'duplicate column name'. Atomicity is the prize: the ALTERs
-        // and the version bump commit or roll back together, so an interrupted migrate
-        // never leaves the half-applied state (columns added, user_version un-bumped)
-        // that used to brick every future open. (Prevents new half-applied states; does
-        // not heal one an older build already wrote, which needs idempotent ALTERs.)
+        // ROD-287: whole ladder under one BEGIN IMMEDIATE so ALTER + version bump
+        // are atomic (no half-applied state). busy_timeout waits out concurrent open.
         try self.exec("BEGIN IMMEDIATE;");
         errdefer self.exec("ROLLBACK;") catch {};
 
-        // Re-read under the lock: whoever we just waited out may have already migrated.
+        // Re-read under lock: peer may have finished the ladder while we waited.
         v = try self.userVersion();
-        if (v > SCHEMA_VERSION) return error.SchemaTooNew; // errdefer rolls back
+        if (v > SCHEMA_VERSION) return error.SchemaTooNew;
         if (v == SCHEMA_VERSION) {
-            try self.exec("COMMIT;"); // someone else finished the ladder; nothing to do
+            try self.exec("COMMIT;");
             return;
         }
 
@@ -2315,9 +1913,9 @@ pub const Store = struct {
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
-        // left the DB stuck at the old version — annoying but honest. Here the final
+        // left the DB stuck at the old version, annoying but honest. Here the final
         // bump below is unconditional, so the same slip would stamp a half-applied
-        // schema as current under ReleaseFast, where `std.debug.assert` compiles out —
+        // schema as current under ReleaseFast, where `std.debug.assert` compiles out :
         // the exact bug this ticket closes. So we check for real, in every build mode,
         // and unwind through the errdefer instead of trusting a strippable assert.
         if (v != SCHEMA_VERSION) return error.Exec;
@@ -2363,9 +1961,7 @@ pub const Store = struct {
 
 // ── Default DB location ───────────────────────────────────────────────────────
 
-/// `{dataDir}/zigoku.db` (see `paths.dataDir`). Creates the directory
-/// (best-effort) and returns a null-terminated path. The error set is inferred so
-/// `paths.Error` (incl. `Unsupported` on Windows) propagates to the caller.
+/// `{dataDir}/zigoku.db`. Best-effort mkdir; nul-terminated. paths.Error propagates.
 pub fn defaultDbPath(arena: Allocator) ![:0]const u8 {
     const dir = try paths.dataDir(arena);
     paths.ensureDir(dir);
@@ -2374,27 +1970,17 @@ pub fn defaultDbPath(arena: Allocator) ![:0]const u8 {
 
 // ── C-API binding/reading helpers ─────────────────────────────────────────────
 
-// SQLite's text/blob destructor sentinels. `@cImport` can't surface these —
-// they're function-pointer macro casts (`(sqlite3_destructor_type)0` and `-1`),
-// not enum values — so we name them locally. SQLITE_STATIC tells SQLite the
-// buffer outlives the step, so it binds by reference without copying;
-// SQLITE_TRANSIENT makes SQLite copy the bytes for callers whose slice does not.
+// Destructor sentinels: @cImport can't surface the macro casts. STATIC = no copy;
+// TRANSIENT = SQLite copies.
 const SQLITE_STATIC: c.sqlite3_destructor_type = null;
 const SQLITE_TRANSIENT: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
 
-// Map a `sqlite3_bind_*` return code to the module error set. Side-effect-free
-// (no logging) so the failure path is unit-testable without tripping the test
-// runner's logged-error guard; `checkBind` wraps it with the diagnostic log.
+// Map bind return to Error. No log (testable); checkBind adds the diagnostic.
 fn bindCode(code: c_int) Error!void {
     if (code != c.SQLITE_OK) return error.Bind;
 }
 
-// Check a `sqlite3_bind_*` return code, mirroring `prepare`/`stepDone`: a non-OK code
-// is logged and surfaced as `error.Bind`, not discarded. A swallowed failure would let
-// the statement run with a NULL where a value was expected: silent data corruption.
-// Reachable via SQLITE_RANGE (a column index drifting past a schema change) and
-// SQLITE_NOMEM/SQLITE_TOOBIG on pathological inputs. The bind helpers hold only a
-// `Stmt`, so we recover the owning connection with `sqlite3_db_handle(stmt)`.
+// Non-OK bind → log + error.Bind. Swallowed bind would run with silent NULLs.
 fn checkBind(stmt: Stmt, code: c_int) Error!void {
     bindCode(code) catch |e| {
         std.log.err("store: bind failed: {s}", .{c.sqlite3_errmsg(c.sqlite3_db_handle(stmt))});
@@ -2403,8 +1989,7 @@ fn checkBind(stmt: Stmt, code: c_int) Error!void {
 }
 
 fn bindText(stmt: Stmt, idx: c_int, s: []const u8) Error!void {
-    // SQLITE_STATIC: caller guarantees `s` outlives the step (always true here —
-    // bind args live in the calling method's frame across its single step).
+    // STATIC: s outlives the step (caller frame).
     return checkBind(stmt, c.sqlite3_bind_text(stmt, idx, s.ptr, @intCast(s.len), SQLITE_STATIC));
 }
 fn bindOptText(stmt: Stmt, idx: c_int, s: ?[]const u8) Error!void {
@@ -2426,9 +2011,7 @@ fn dupeText(arena: Allocator, stmt: Stmt, idx: c_int) Error!?[]const u8 {
     const n: usize = @intCast(c.sqlite3_column_bytes(stmt, idx));
     return try arena.dupe(u8, ptr[0..n]);
 }
-/// Read a `list_status` column straight into the enum — no arena alloc, since the
-/// status is a fixed vocabulary, not free text. NULL/unknown → `planning` (matches
-/// the column default and `ListStatus.fromString`).
+/// list_status column → enum. NULL/unknown → planning.
 fn colStatus(stmt: Stmt, idx: c_int) domain.ListStatus {
     const ptr = c.sqlite3_column_text(stmt, idx);
     if (ptr == null) return .planning;
@@ -2439,10 +2022,7 @@ fn colOptI64(stmt: Stmt, idx: c_int) ?i64 {
     if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
     return c.sqlite3_column_int64(stmt, idx);
 }
-/// Like `colStatus`, but preserves the NULL-vs-set distinction: a NULL column
-/// returns null (never synced), not `.planning`. The ROD-285 reconcile needs this —
-/// a NULL snapshot means "no 3-way-merge ancestor", which is a different case from a
-/// snapshot of `planning`.
+/// Like colStatus but NULL stays null (ROD-285: no merge ancestor vs snapshot planning).
 fn colOptStatus(stmt: Stmt, idx: c_int) ?domain.ListStatus {
     if (c.sqlite3_column_type(stmt, idx) == c.SQLITE_NULL) return null;
     return colStatus(stmt, idx);
@@ -2456,10 +2036,7 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-// A string list persists as a single '\n'-joined blob (display-only — never
-// queried by element, so a column beats a side table). Genre and studio names
-// never contain newlines, the same guarantee episode labels lean on in
-// episode_cache. Shared by both `genres` and `studios` (ROD-261).
+// '\n'-joined display blob (genres/studios); names never contain newlines (ROD-261).
 fn joinStrBlob(scratch: Allocator, items: []const []const u8) Error![]const u8 {
     var blob: std.ArrayList(u8) = .empty;
     for (items, 0..) |g, i| {
@@ -2469,8 +2046,7 @@ fn joinStrBlob(scratch: Allocator, items: []const []const u8) Error![]const u8 {
     return blob.items;
 }
 
-/// Split a stored '\n'-blob column back into an arena-owned list. A NULL/empty
-/// column is an empty list, never a one-element list of "".
+/// Split '\n'-blob to arena list. NULL/empty → empty slice, not [""].
 fn dupeStrBlob(arena: Allocator, stmt: Stmt, idx: c_int) Error![]const []const u8 {
     const blob = (try dupeText(arena, stmt, idx)) orelse return &.{};
     if (blob.len == 0) return &.{};
@@ -2491,9 +2067,7 @@ test "open + migrate sets user_version" {
     try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
 }
 
-/// Absolute, null-terminated path to a file inside a fresh test tmp dir. `:memory:`
-/// can't be shared between connections, so the concurrent-opener tests below need a
-/// real file. The caller owns `tmp_dir` — it must outlive the returned path.
+/// Nul-terminated path inside test tmp dir (file DB for concurrent open; not :memory:).
 fn tmpDbPath(arena: Allocator, tmp_dir: *std.testing.TmpDir, name: []const u8) ![:0]const u8 {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     _ = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.GetCwdFailed;
@@ -2501,7 +2075,7 @@ fn tmpDbPath(arena: Allocator, tmp_dir: *std.testing.TmpDir, name: []const u8) !
     return std.fmt.allocPrintSentinel(arena, "{s}/.zig-cache/tmp/{s}/{s}", .{ cwd_str, tmp_dir.sub_path, name }, 0);
 }
 
-test "concurrent open migrates atomically — no double-apply, no half-applied schema (ROD-287)" {
+test "concurrent open migrates atomically: no double-apply, no half-applied schema (ROD-287)" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
@@ -2512,11 +2086,8 @@ test "concurrent open migrates atomically — no double-apply, no half-applied s
     defer tmp_dir.cleanup();
     const db_path = try tmpDbPath(arena, &tmp_dir, "concurrent.db");
 
-    // Two independent connections open the same fresh (v0) file at once, both racing
-    // the full 0→N ladder. The BEGIN IMMEDIATE txn + busy_timeout must serialize them:
-    // exactly one applies the ALTERs, the other waits, re-reads the bumped version,
-    // and skips every step. Neither errors, and the schema lands consistent. Under the
-    // old two-exec migrate this raced to 'duplicate column name' or a half-applied brick.
+    // Two openers race the 0→N ladder; BEGIN IMMEDIATE + busy_timeout serialize:
+    // one applies, the other waits and skips. Schema must stay consistent.
     const Worker = struct {
         fn run(path: [:0]const u8, err_slot: *?anyerror) void {
             var s = Store.open(path) catch |e| {
@@ -2544,13 +2115,7 @@ test "concurrent open migrates atomically — no double-apply, no half-applied s
 }
 
 test "open() wires the busy_timeout on the connection (ROD-287)" {
-    // Directly assert `open()` configured a non-zero busy_timeout, the half of the fix that
-    // lets a second writer wait out a briefly-held lock instead of erroring at once (the
-    // markSynced-vs-checkpoint collision). The query form of `PRAGMA busy_timeout` reads back
-    // exactly what `sqlite3_busy_timeout` set, so this fails deterministically if the wiring
-    // in `open()` is ever dropped. A prior draft drove a real contention timeout, but that
-    // passes on SQLite's own busy mechanics even with our wiring removed (caught in review)
-    // and was timing-dependent. Asserting against the const, not a literal, survives a retune.
+    // PRAGMA busy_timeout must match BUSY_TIMEOUT_MS (wiring, not a contention race).
     var s = try Store.openMemory();
     defer s.close();
     const stmt = try s.prepare("PRAGMA busy_timeout;");
@@ -2563,13 +2128,7 @@ test "bind error surfaces instead of writing a silent NULL" {
     var s = try Store.openMemory();
     defer s.close();
 
-    // A single-parameter statement: valid bind indices are 1..1, so binding column
-    // 2 is out of range and SQLite returns SQLITE_RANGE. Pre-ROD-217 that code was
-    // discarded and the statement would have executed with a NULL where a value was
-    // expected. We drive the real failing bind, then map its actual return code
-    // through the side-effect-free `bindCode` (checkBind's core) to assert it
-    // surfaces as error.Bind — without emitting the diagnostic .err log the test
-    // runner counts as a failure.
+    // Out-of-range bind → SQLITE_RANGE → bindCode error.Bind (no .err log spam).
     const stmt = try s.prepare("SELECT ?1");
     defer _ = c.sqlite3_finalize(stmt);
 
@@ -2645,7 +2204,7 @@ test "loadDirtyForSync re-flags a row after a status or progress change (ROD-284
     try s.markSynced(T_SOURCE, "a", .watching, 4);
     try testing.expectEqual(@as(usize, 0), (try s.loadDirtyForSync(arena)).len); // clean baseline
 
-    // A manual status change with progress unchanged must re-flag the row — the
+    // A manual status change with progress unchanged must re-flag the row, the
     // exact case a `last_watched_at` clock would miss, since no play occurred.
     try s.setListStatus(T_SOURCE, "a", .paused);
     {
@@ -2737,7 +2296,7 @@ test "applyPulled: writes merged local pair + a server-truth snapshot; leaves a 
     try testing.expectEqual(domain.ListStatus.completed, rec.list_status);
     try testing.expectEqual(@as(i64, 12), rec.progress);
 
-    // The snapshot is the remote pair, not the merged one — so the row reads DIRTY
+    // The snapshot is the remote pair, not the merged one, so the row reads DIRTY
     // (local completed@12 ≠ snapshot watching@8) and the next push carries it up.
     const dirty = try s.loadDirtyForSync(arena);
     try testing.expectEqual(@as(usize, 1), dirty.len);
@@ -2760,7 +2319,7 @@ test "applyPulled: the optimistic guard skips a row that changed underneath (ROD
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .anilist_id = 42, .list_status = .watching, .progress = 5, .history_visible = true }, 1000, arena);
 
     // Reconcile read the row as watching@5. Then a concurrent play (the TUI) advances
-    // it to 7 before this write lands — the exact read-then-write race.
+    // it to 7 before this write lands, the exact read-then-write race.
     try s.recordPlay(T_SOURCE, "a", 7, 2000, true);
     try testing.expectEqual(@as(i64, 7), (try s.getAnime(arena, T_SOURCE, "a")).?.progress);
 
@@ -2782,13 +2341,13 @@ test "upsertAnime cover_url: an absolute cover survives a later relative re-sear
 
     // 1) First search seeds a bare, relative `mcovers/…` cover.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "mcovers/a/b.webp" }, 1000, arena);
-    // 2) Enrichment upserts the absolute AniList cover — an absolute url wins.
+    // 2) Enrichment upserts the absolute AniList cover, an absolute url wins.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "https://s4.anilist.co/x/bx1.jpg" }, 1001, arena);
     try testing.expectEqualStrings(
         "https://s4.anilist.co/x/bx1.jpg",
         (try s.getAnime(arena, T_SOURCE, "x")).?.cover_url.?,
     );
-    // 3) A later re-search brings the relative cover again — it must NOT clobber the
+    // 3) A later re-search brings the relative cover again, it must NOT clobber the
     //    stored absolute one, so History (which never re-enriches) keeps the good cover.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "Solo Leveling", .cover_url = "mcovers/a/b.webp" }, 1002, arena);
     try testing.expectEqualStrings(
@@ -3066,7 +2625,7 @@ test "Resume.startSecondsRewound rewinds for context, saturating at the top (ROD
     const early: Resume = .{ .position_secs = 3, .duration_secs = 1400, .fully_watched = false };
     try testing.expectEqual(@as(u64, 0), early.startSecondsRewound(5));
 
-    // Rewind exactly equal to position — the boundary, begins from top not underflow.
+    // Rewind exactly equal to position, the boundary, begins from top not underflow.
     const exact: Resume = .{ .position_secs = 5, .duration_secs = 1400, .fully_watched = false };
     try testing.expectEqual(@as(u64, 0), exact.startSecondsRewound(5));
 
@@ -3075,7 +2634,7 @@ test "Resume.startSecondsRewound rewinds for context, saturating at the top (ROD
     const near_end: Resume = .{ .position_secs = 1200, .duration_secs = 1400, .fully_watched = false }; // ~86%
     try testing.expectEqual(@as(u64, 0), near_end.startSecondsRewound(5));
 
-    // Fully-watched stays 0 — nothing to rewind into.
+    // Fully-watched stays 0, nothing to rewind into.
     const done: Resume = .{ .position_secs = 500, .duration_secs = 1400, .fully_watched = true };
     try testing.expectEqual(@as(u64, 0), done.startSecondsRewound(5));
 }
@@ -3139,7 +2698,7 @@ test "recordPlay transitions planning → watching and commits to the store" {
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 12 }, 1000, arena);
 
     // Default state is planning; a play of ep 1 flips it to watching. The
-    // getAnime below is a fresh SELECT against the (autocommitted) DB — it reads
+    // getAnime below is a fresh SELECT against the (autocommitted) DB, it reads
     // committed state, not the in-memory record, so this is the persistence proof
     // (under SQLite autocommit a successful UPDATE is durable; a file reopen would
     // assert nothing more).
@@ -3156,7 +2715,7 @@ test "recordPlay auto-completes at the finale and stays completed on rewatch" {
     var s = try Store.openMemory();
     defer s.close();
     // FINISHED: total_episodes = 3 is the real finale, so reaching it completes.
-    // (A show with no/unsettled status won't auto-complete — that's the ROD-296
+    // (A show with no/unsettled status won't auto-complete, that's the ROD-296
     // gate; see the still-airing test below.)
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "a", .title = "A", .total_episodes = 3, .status = "FINISHED" }, 1000, arena);
 
@@ -3260,7 +2819,7 @@ test "setListStatus: force-complete snaps progress to the known finale" {
     try testing.expectEqual(domain.ListStatus.completed, a.list_status);
     try testing.expectEqual(@as(i64, 12), a.progress);
 
-    // Unknown total: complete is honored but progress can't be snapped — left as-is.
+    // Unknown total: complete is honored but progress can't be snapped, left as-is.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "b", .title = "B" }, 1001, arena);
     try s.recordPlay(T_SOURCE, "b", 3, 2000, true); // progress 3, total unknown
     try s.setListStatus(T_SOURCE, "b", .completed);
@@ -3269,7 +2828,7 @@ test "setListStatus: force-complete snaps progress to the known finale" {
     try testing.expectEqual(@as(i64, 3), b.progress); // unchanged, no total to snap to
 
     // total_episodes = 0 (AllAnime quirk) is NOT a real finale: force-complete
-    // must NOT reset progress to zero (regression — the `t > 0` guard).
+    // must NOT reset progress to zero (regression, the `t > 0` guard).
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "c", .title = "C", .total_episodes = 0 }, 1002, arena);
     try s.recordPlay(T_SOURCE, "c", 5, 2001, true); // progress 5, total 0
     try s.setListStatus(T_SOURCE, "c", .completed);
@@ -3293,7 +2852,7 @@ test "setListStatus on an unknown show is a silent no-op" {
 // rather than a dedicated store method: its ON CONFLICT clause already preserves
 // list_status/progress/play_count and MAX-merges history_visible, which is
 // exactly the upsert-or-reveal-as-planning contract the ticket wants. These two
-// tests lock the behaviors `P` depends on — if a future change to upsertAnime
+// tests lock the behaviors `P` depends on, if a future change to upsertAnime
 // starts clobbering list_status on conflict, `P` breaks and these catch it.
 test "ROD-189: P on an untracked show saves it as planning, not as watched" {
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3324,7 +2883,7 @@ test "ROD-189: P reveals an existing row without clobbering its user state" {
     defer s.close();
 
     // A hidden search-cache row (ROD-185) the user had already moved to paused
-    // with real progress — the state `P` must not trample.
+    // with real progress, the state `P` must not trample.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .list_status = .paused, .progress = 5, .history_visible = false }, 1000, arena);
     try testing.expectEqual(@as(usize, 0), (try s.loadHistory(arena)).len); // hidden
 
@@ -3352,7 +2911,7 @@ test "ROD-189: P on an actively-watched show leaves all user state untouched" {
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "x", .title = "X", .total_episodes = 12 }, 1000, arena);
     try s.recordPlay(T_SOURCE, "x", 7, 2000, true); // watching, progress 7, play_count 1
 
-    // Re-adding it from browse (P) must be a pure no-op on user state — a silent
+    // Re-adding it from browse (P) must be a pure no-op on user state, a silent
     // demote to planning here would be the single most destructive regression.
     try s.upsertAnime(AnimeRecord.fromDomain(T_SOURCE, .{ .id = "x", .name = "X" }, .sub), 3000, arena);
 
@@ -3449,7 +3008,7 @@ test "episode cache: TTL is status-keyed and expiry is boundary-exact" {
     const six_h = 6 * 60 * 60; // RELEASING TTL
     const day = 24 * 60 * 60; // unknown/null TTL
 
-    // Same clock, two shows — the only difference is airing status, so any
+    // Same clock, two shows, the only difference is airing status, so any
     // divergence in expiry proves putCachedEpisodes keys the TTL off status
     // (line: now + cacheTtl(status)) rather than baking in a constant.
     try s.putCachedEpisodes(T_SOURCE, "r", .sub, &eps, "RELEASING", t0, arena);
@@ -3461,7 +3020,7 @@ test "episode cache: TTL is status-keyed and expiry is boundary-exact" {
     try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "r", .sub, t0 + six_h)) == null);
 
     // At the RELEASING show's expiry, the null-status show cached at the SAME
-    // instant is still fresh — it was stamped with 24h, not 6h. This is the
+    // instant is still fresh, it was stamped with 24h, not 6h. This is the
     // assertion the existing FINISHED-only test can't make.
     try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "u", .sub, t0 + six_h)) != null);
     try testing.expect((try s.getCachedEpisodes(arena, T_SOURCE, "u", .sub, t0 + day - 1)) != null);
@@ -3480,7 +3039,7 @@ test "enrichmentTtl by airing status" {
     try testing.expectEqual(@as(i64, 30 * 24 * 60 * 60), Store.enrichmentTtl("FINISHED"));
     try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.enrichmentTtl("RELEASING"));
     try testing.expectEqual(@as(i64, 24 * 60 * 60), Store.enrichmentTtl("ongoing"));
-    // Unknown/unmodelled status still gets grace (7d), NOT always-stale — that
+    // Unknown/unmodelled status still gets grace (7d), NOT always-stale, that
     // case belongs to a null fetched_at, not a null status.
     try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), Store.enrichmentTtl(null));
     try testing.expectEqual(@as(i64, 7 * 24 * 60 * 60), Store.enrichmentTtl("WEIRD"));
@@ -3495,7 +3054,7 @@ test "enrichmentStale: missing/old-fieldset always stale, else TTL-gated by stat
 
     // Enriched under an OLDER field set → stale even with a fresh clock, so a ROD-261
     // widening heals old rows on view instead of waiting out the 30d TTL. A null
-    // stored version reads as 0 — older than any real field set.
+    // stored version reads as 0, older than any real field set.
     try testing.expect(Store.enrichmentStale(1000, V - 1, "FINISHED", 1001));
     try testing.expect(Store.enrichmentStale(1000, null, "FINISHED", 1001));
 
@@ -3504,7 +3063,7 @@ test "enrichmentStale: missing/old-fieldset always stale, else TTL-gated by stat
     try testing.expect(!Store.enrichmentStale(1000, V, "FINISHED", 1000 + finished_ttl - 1));
     try testing.expect(Store.enrichmentStale(1000, V, "FINISHED", 1000 + finished_ttl));
 
-    // RELEASING refreshes on a 1d clock — stale a day after the fetch.
+    // RELEASING refreshes on a 1d clock, stale a day after the fetch.
     const day = 24 * 60 * 60;
     try testing.expect(!Store.enrichmentStale(1000, V, "RELEASING", 1000 + day - 1));
     try testing.expect(Store.enrichmentStale(1000, V, "RELEASING", 1000 + day));
@@ -3532,7 +3091,7 @@ test "enrichment stamp (fetched_at + fieldset_version) round-trips and survives 
     try testing.expectEqual(@as(?i64, 5000), first.enrichment_fetched_at);
     try testing.expectEqual(@as(?i64, V), first.enrichment_fieldset_version);
 
-    // A plain re-search (no stamp) must NOT wipe either field — COALESCE keeps them,
+    // A plain re-search (no stamp) must NOT wipe either field, COALESCE keeps them,
     // same "re-search never wipes enrichment" rule the content fields lean on.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "e", .title = "E" }, 6000, arena);
     const kept = (try s.getAnime(arena, T_SOURCE, "e")).?;
@@ -3564,7 +3123,7 @@ test "upsertEnriched gates the freshness stamp on stamp_fresh, honors visible (R
     const row: domain.Anime = .{ .id = "u", .name = "U", .status = "RELEASING" };
 
     // stamp_fresh=false (a failed/transport-miss enrich): caches the row but leaves the
-    // freshness clock null — the single canonical gate ROD-278 needed at 3 call sites.
+    // freshness clock null, the single canonical gate ROD-278 needed at 3 call sites.
     try s.upsertEnriched(T_SOURCE, row, .sub, false, false, 5000, arena);
     const unstamped = (try s.getAnime(arena, T_SOURCE, "u")).?;
     try testing.expectEqualStrings("U", unstamped.title); // content cached
@@ -3581,7 +3140,7 @@ test "upsertEnriched gates the freshness stamp on stamp_fresh, honors visible (R
     try testing.expect(stamped.history_visible);
 
     // Independent variation (visible=false, stamp_fresh=true) on a fresh row pins the
-    // argument order — a swap between `visible` and `stamp_fresh` would flip both.
+    // argument order, a swap between `visible` and `stamp_fresh` would flip both.
     try s.upsertEnriched(T_SOURCE, .{ .id = "v", .name = "V" }, .sub, false, true, 7000, arena);
     const stamp_only = (try s.getAnime(arena, T_SOURCE, "v")).?;
     try testing.expectEqual(@as(?i64, 7000), stamp_only.enrichment_fetched_at); // stamped...
@@ -3595,7 +3154,7 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
     var s = try Store.openMemory();
     defer s.close();
 
-    // Read the UNREAD spine directly — getCanonical() is a later slice.
+    // Read the UNREAD spine directly, getCanonical() is a later slice.
     const Q = struct {
         fn int(st: *Store, sql: [*c]const u8) !?i64 {
             const stmt = try st.prepare(sql);
@@ -3613,7 +3172,7 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
     };
 
     // 1) An id-bearing enrich (anilist_id resolved) mints a canonical entity, stamps it
-    //    fresh, and links the binding — then getAnime reads it all back THROUGH canonical
+    //    fresh, and links the binding, then getAnime reads it all back THROUGH canonical
     //    (slice-1 join), closing the write→read loop on the spine.
     const resolved: domain.Anime = .{
         .id = "s1",
@@ -3640,7 +3199,7 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
     try testing.expectEqual(@as(?i64, 9000), got.enrichment_fetched_at);
 
     // 2) M1 guard: an id-less enrich (an unmatched provider row / a Discover idMal=null)
-    //    mints NO canonical row — a NULL PRIMARY KEY insert would fabricate a rowid and a
+    //    mints NO canonical row, a NULL PRIMARY KEY insert would fabricate a rowid and a
     //    bogus entity. Its enrichment persists to anime-local and reads back via fallback.
     const unresolved: domain.Anime = .{ .id = "s2", .name = "Unmatched", .score = 55 };
     try s.upsertEnriched(T_SOURCE, unresolved, .sub, true, true, 9000, arena);
@@ -3650,7 +3209,7 @@ test "upsertEnriched routes id-bearing enrichment onto canonical (mint + link + 
 
     // 3) Re-enrich never wipes canonical: a partial refresh (no score, fresh romaji +
     //    status + stamp) preserves the prior score via COALESCE, refreshes the title
-    //    (real romaji wins — see the dedicated no-downgrade test for the seed-only
+    //    (real romaji wins, see the dedicated no-downgrade test for the seed-only
     //    case), lets the fresh non-null status win, and advances the clock.
     const partial: domain.Anime = .{ .id = "s1", .name = "Resolved v2", .title_romaji = "Resolved v2", .anilist_id = 500, .status = "FINISHED" };
     try s.upsertEnriched(T_SOURCE, partial, .sub, true, true, 12000, arena);
@@ -4147,7 +3706,7 @@ test "romaji heals canonical.title; anime-local title stays the provider seed; n
     try testing.expectEqualStrings("Sousou no Frieren", (try s.getAnime(arena, T_SOURCE, "f1")).?.title);
 
     // A resolved show with NO romaji falls back to the provider seed on canonical too
-    // (the `orelse` guard) — never a NULL title.
+    // (the `orelse` guard), never a NULL title.
     const no_romaji: domain.Anime = .{ .id = "f2", .name = "Only Seed", .anilist_id = 999 };
     try s.upsertEnriched(T_SOURCE, no_romaji, .sub, true, true, 9000, arena);
     try testing.expectEqualStrings("Only Seed", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 999;")).?);
@@ -4175,21 +3734,21 @@ test "canonical title never downgrades: a seed-only re-persist after a heal keep
     try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
 
     // The regression review caught: a seed-only re-persist (a Discover/search
-    // hydrate-then-persist — anilist_id backfilled, NO romaji) must NOT clobber the
+    // hydrate-then-persist, anilist_id backfilled, NO romaji) must NOT clobber the
     // healed title back to the provider seed. Ordinary, frequent path.
     try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .anilist_id = 700 }, .sub, true, true, 2000, arena);
     try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
 
-    // An empty-string romaji counts as no-romaji — never blanks the surfaced title.
+    // An empty-string romaji counts as no-romaji, never blanks the surfaced title.
     try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .title_romaji = "", .anilist_id = 700 }, .sub, true, true, 2500, arena);
     try testing.expectEqualStrings("Romaji Title", (try Q.text(arena, &s, canon)).?);
 
-    // A later REAL romaji still refreshes — romaji always wins; only seeds are ignored.
+    // A later REAL romaji still refreshes, romaji always wins; only seeds are ignored.
     try s.upsertEnriched(T_SOURCE, .{ .id = "d1", .name = "Provider Seed", .title_romaji = "Romaji Fixed", .anilist_id = 700 }, .sub, true, true, 3000, arena);
     try testing.expectEqualStrings("Romaji Fixed", (try Q.text(arena, &s, canon)).?);
 
     // Bootstrap: a brand-new canonical row with NO romaji still gets a title (the seed),
-    // never NULL — and a romaji then upgrades it.
+    // never NULL, and a romaji then upgrades it.
     try s.upsertEnriched(T_SOURCE, .{ .id = "d2", .name = "Only Seed", .anilist_id = 800 }, .sub, true, true, 1000, arena);
     try testing.expectEqualStrings("Only Seed", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 800;")).?);
     try s.upsertEnriched(T_SOURCE, .{ .id = "d2", .name = "Only Seed", .title_romaji = "Seed Romaji", .anilist_id = 800 }, .sub, true, true, 2000, arena);
@@ -4204,7 +3763,7 @@ test "afterPlay completion gate reads airing status through canonical, not the l
     defer s.close();
 
     // Canonical holds the fresher truth: the show FINISHED airing. The binding's own
-    // shadow still says RELEASING — the stale per-binding value a provider swap strands.
+    // shadow still says RELEASING, the stale per-binding value a provider swap strands.
     // (Constructed by hand; single-provider dual-write can't diverge them today.)
     try s.exec("INSERT INTO canonical_anime (anilist_id, title, status, total_episodes) VALUES (700, 'X', 'FINISHED', 12);");
     try s.upsertAnime(.{
@@ -4233,7 +3792,7 @@ test "loadHistory collapses two bindings of one canonical entity to a single car
     var s = try Store.openMemory();
     defer s.close();
 
-    // One show, two provider bindings resolving UP to the same canonical entity — a
+    // One show, two provider bindings resolving UP to the same canonical entity, a
     // senshi sub/dub split, or senshi + megaplay. Both tracked (visible). The
     // user watched the sub most recently (last_watched 5000, ep 12); the dub is the
     // older touch (4000, ep 3).
@@ -4268,7 +3827,7 @@ test "loadHistory collapses two bindings of one canonical entity to a single car
     try testing.expectEqual(@as(usize, 1), rows.len);
 
     // The representative is the most-recently-watched binding (the sub), so the card's
-    // resume key and progress come from it — not the dub.
+    // resume key and progress come from it, not the dub.
     try testing.expectEqualStrings("sub", rows[0].source_id);
     try testing.expectEqual(@as(i64, 12), rows[0].progress);
 
@@ -4286,7 +3845,7 @@ test "loadHistory does not collapse the unmatched (NULL canonical_id) tail into 
     var s = try Store.openMemory();
     defer s.close();
 
-    // Two distinct unmatched shows — no anilist_id, no canonical binding. SQLite groups
+    // Two distinct unmatched shows, no anilist_id, no canonical binding. SQLite groups
     // all NULLs together, so a bare `GROUP BY canonical_id` would fuse these (and the
     // whole real-library tail) into a single card. The -rowid fallback keeps them apart.
     try s.upsertAnime(.{ .source = "senshi", .source_id = "u1", .title = "Unmatched One", .history_visible = true }, 1000, arena);
@@ -4302,7 +3861,7 @@ test "loadHistory representative pick is deterministic on a never-played tie (RO
     var s = try Store.openMemory();
     defer s.close();
 
-    // Two bindings of one canonical entity, both freshly added and never played — the
+    // Two bindings of one canonical entity, both freshly added and never played, the
     // natural planning state, and the case where last_watched_at ties at NULL across the
     // whole group. The representative must still resolve deterministically: progress is
     // the tiebreak below last_watched, so the furthest-progress binding wins, never an
@@ -4344,7 +3903,7 @@ test "loadHistory collapses a co-bound group and keeps the unmatched tail in one
 
     // One loadHistory call exercising both paths at once: a three-binding co-bound group
     // (collapses to one card) alongside two independent unmatched rows (stay separate).
-    // Expect 1 + 2 = 3 cards — proving the collapse and the -rowid tail-guard coexist in
+    // Expect 1 + 2 = 3 cards, proving the collapse and the -rowid tail-guard coexist in
     // a single query, not just in isolation.
     try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (902, 'Vinland Saga');");
     try s.upsertAnime(.{ .source = "senshi", .source_id = "b1", .title = "Vinland Saga", .anilist_id = 902, .canonical_id = 902, .progress = 1, .last_watched_at = 3000, .history_visible = true }, 1000, arena);
@@ -4377,7 +3936,7 @@ test "getAnime surfaces history_visible (ROD-182 refresh-on-view gates on tracke
     var s = try Store.openMemory();
     defer s.close();
 
-    // A hidden search/discover cache row vs a tracked (visible) row — the refresh
+    // A hidden search/discover cache row vs a tracked (visible) row, the refresh
     // gate skips the former (its own enrich path owns freshness) and fires the latter.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "hidden", .title = "H", .history_visible = false }, 1, arena);
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "shown", .title = "S", .history_visible = true }, 1, arena);
@@ -4487,13 +4046,8 @@ test "recomputeProgress: no episode_progress rows → 0 (ROD-193)" {
 }
 
 test "recomputeProgress: gap-watch documents strategy-A under-count (ROD-193)" {
-    // recomputeProgress contract: progress = 1-based index of the last fully-watched row
-    // among the rows PRESENT in episode_progress, sorted by sortKey. Episodes never started
-    // are absent from episode_progress, by design. Gap-watching (only eps 3 and 5 present,
-    // both fully_watched, no rows for 1/2/4) yields high_water = 2: the 2-row sorted slice has
-    // its last fully-watched entry at 0-based index 1, i.e. 1-based index 2. This LOCKS the
-    // intentional under-count (correct for contiguous watchers, deliberately under-counting
-    // gaps). Do not change this expectation without updating the recomputeProgress doc comment.
+    // Only present rows count: eps 3+5 fully watched (gaps absent) → high_water 2.
+    // Locks intentional under-count; keep recomputeProgress CONTRACT in sync if changing.
     var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -4618,12 +4172,12 @@ test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor 
     defer s.close();
 
     // Garbage the old loose `LIKE 'http%'` matched but which is NOT an absolute URL
-    // (no `://`). It must not become sticky — a later real relative cover still lands.
+    // (no `://`). It must not become sticky, a later real relative cover still lands.
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "g", .title = "G", .cover_url = "httpzzz-not-a-url" }, 1000, arena);
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "g", .title = "G", .cover_url = "mcovers/real.webp" }, 1001, arena);
     try testing.expectEqualStrings("mcovers/real.webp", (try s.getAnime(arena, T_SOURCE, "g")).?.cover_url.?);
 
-    // Case-variant garbage ("HTTPFOO…") must not clobber a stored absolute cover —
+    // Case-variant garbage ("HTTPFOO…") must not clobber a stored absolute cover :
     // GLOB is case-sensitive, so an uppercase-scheme string is not "absolute".
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "https://s4.anilist.co/real.jpg" }, 1002, arena);
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "HTTPFOO-GARBAGE" }, 1003, arena);
@@ -4639,10 +4193,10 @@ test "MIGRATION_V12 re-keys an enriched allanime row onto senshi, leaves dark ro
     defer s.close();
 
     // `rekeyLegacyProvider` runs the exact SQL the v12 ladder rung runs (MIGRATION_V12),
-    // just in its own transaction — so it exercises the migration transform directly.
+    // just in its own transaction, so it exercises the migration transform directly.
 
     // Enriched allanime row: carries the mal_id AniList enrichment stored, plus resume
-    // state and a cached episode list — the migratable case.
+    // state and a cached episode list, the migratable case.
     try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren", .anilist_id = 182255, .mal_id = 52991 }, 1000, arena);
     try s.saveProgress("allanime", "opaqueA", .sub, "1", 300, 1400, 1001);
     const eps = [_]domain.EpisodeNumber{ .{ .raw = "1" }, .{ .raw = "2" } };
@@ -4687,7 +4241,7 @@ test "MIGRATION_V12 keeps a pre-existing senshi twin and sweeps the allanime dup
     defer s.close();
 
     // The user watched the show under allanime AND, while testing senshi, re-added it
-    // there — both keys exist for MAL 52991, with a live senshi resume position. The
+    // there, both keys exist for MAL 52991, with a live senshi resume position. The
     // re-key must not clobber the senshi row (UPDATE OR IGNORE) and must not leave the
     // losing allanime row behind (the sweep) or orphan its child (deferred FK check).
     try s.upsertAnime(.{ .source = "allanime", .source_id = "opaqueA", .title = "Frieren (allanime)", .mal_id = 52991 }, 1000, arena);
@@ -4702,7 +4256,7 @@ test "MIGRATION_V12 keeps a pre-existing senshi twin and sweeps the allanime dup
     try testing.expectEqualStrings("Frieren (senshi)", twin.title);
     try testing.expectEqual(@as(f64, 500), (try s.getResume("senshi", "52991", .sub, "1")).?.position_secs);
 
-    // The losing allanime duplicate — row and progress — is swept: no orphan, no double.
+    // The losing allanime duplicate, row and progress, is swept: no orphan, no double.
     try testing.expect((try s.getAnime(arena, "allanime", "opaqueA")) == null);
     try testing.expect((try s.getResume("allanime", "opaqueA", .sub, "1")) == null);
     try testing.expectEqual(@as(usize, 1), (try s.loadHistory(arena)).len);
@@ -4717,7 +4271,7 @@ test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned pr
 
     // Two distinct allanime opaque ids that both enriched to the same MAL id (a
     // re-upload, or a sub/dub split allanime listed separately). Each carries its own
-    // resume state — one episode overlaps ("1"), the rest are disjoint ("2" vs "3").
+    // resume state, one episode overlaps ("1"), the rest are disjoint ("2" vs "3").
     try s.upsertAnime(.{ .source = "allanime", .source_id = "dupA", .title = "Dup A", .mal_id = 5956 }, 1000, arena);
     try s.upsertAnime(.{ .source = "allanime", .source_id = "dupB", .title = "Dup B", .mal_id = 5956 }, 1001, arena);
     try s.saveProgress("allanime", "dupA", .sub, "1", 100, 1400, 1002);
@@ -4728,7 +4282,7 @@ test "MIGRATION_V12 collapses two allanime rows sharing a mal_id, no orphaned pr
     try s.rekeyLegacyProvider();
 
     // Collapses to exactly one row at the shared senshi key, no allanime leftover, and
-    // crucially no orphaned child — an orphan would have failed the COMMIT's deferred
+    // crucially no orphaned child, an orphan would have failed the COMMIT's deferred
     // FK check inside rekeyLegacyProvider, so reaching these asserts already proves it.
     try testing.expect((try s.getAnime(arena, "senshi", "5956")) != null);
     try testing.expect((try s.getAnime(arena, "allanime", "dupA")) == null);
@@ -4751,7 +4305,7 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     var s = try Store.openMemory();
     defer s.close();
 
-    // Scalar readers for the UNREAD shadow — no getCanonical() exists yet (ROD-312),
+    // Scalar readers for the UNREAD shadow, no getCanonical() exists yet (ROD-312),
     // so the test reads canonical_anime / the link column directly.
     const Q = struct {
         fn int(st: *Store, sql: [*c]const u8) !?i64 {
@@ -4769,17 +4323,8 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
         }
     };
 
-    // openMemory already ran MIGRATION_V14 (DDL + BACKFILL) on empty tables, so
-    // canonical_anime exists and is empty. Seed bindings by hand (a raw INSERT, not
-    // upsertAnime, because the tiebreak keys on enrichment_fetched_at, which the upsert API
-    // doesn't take). Six distinct anilist_ids exercise every tier of the pick:
-    //   100  singleton (senshi)                           → 1:1 lift, mal_id carries
-    //   NULL the unmatched tail                           → no canonical row, stays unlinked
-    //   999  senshi(fresher, NO mal) vs allanime(mal=555) → fresher wins; NULL mal recovers 555
-    //   777  allanime(FRESHER, mal=333) vs senshi(stale)  → freshness is PRIMARY, beats senshi
-    //   888  allanime vs senshi, TIED on enrichment       → senshi wins the tie (secondary key)
-    //   666  two allanime tied on enrichment+source       → lowest rowid wins (final key)
-    //   321  allanime(enriched) vs senshi(NULL enrich)    → NULL sorts LAST, enriched wins
+    // V14 already applied on openMemory. Raw INSERT seeds (upsert lacks enrichment_fetched_at).
+    // Pick tiers: singleton; unmatched NULL; fresher; primary freshness; source tie; rowid; NULL last.
     try s.exec(
         \\INSERT INTO anime (source, source_id, title, anilist_id, mal_id, enrichment_fetched_at, added_at) VALUES
         \\  ('senshi',   'solo', 'Solo Show',    100,  700,  3000, 1000),
@@ -4796,7 +4341,7 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
         \\  ('allanime', 'ee',   'Has Enrich',   321,  812,  100,  1000);
     );
 
-    // Run the exact data lift the ladder runs — the DDL is already applied, so this is
+    // Run the exact data lift the ladder runs, the DDL is already applied, so this is
     // the isolated backfill the const split exists to make testable.
     try s.exec(MIGRATION_V14_BACKFILL);
 
@@ -4824,20 +4369,20 @@ test "MIGRATION_V14 backfill: singletons lift 1:1; shared anilist_id collapses v
     try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'pa';"));
     try testing.expectEqual(@as(?i64, 888), try Q.int(&s, "SELECT canonical_id FROM anime WHERE source_id = 'qs';"));
 
-    // Shared 777: freshness is the PRIMARY sort key — the fresher allanime binding
+    // Shared 777: freshness is the PRIMARY sort key, the fresher allanime binding
     // ('fa', enrichment 5000) beats the staler senshi one ('ss', 1000), proving the
     // enrichment DESC sort outranks the senshi CASE. Guards against a key reorder.
     try testing.expectEqualStrings("Fresh AL", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 777;")).?);
     try testing.expectEqual(@as(?i64, 333), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 777;"));
 
     // Shared 666: two same-source bindings tied on enrichment resolve by lowest rowid
-    // (insertion order) — the first-seeded 'r1' wins deterministically, pinning the
+    // (insertion order), the first-seeded 'r1' wins deterministically, pinning the
     // final tiebreak so a group can never collapse to two rows or a nondeterministic one.
     try testing.expectEqualStrings("Rowid First", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 666;")).?);
     try testing.expectEqual(@as(?i64, 661), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 666;"));
 
     // Shared 321: a never-enriched binding (NULL enrichment_fetched_at) sorts LAST under
-    // the DESC primary key, so the enriched allanime 'ee' beats senshi 'ne' — the tie the
+    // the DESC primary key, so the enriched allanime 'ee' beats senshi 'ne', the tie the
     // two-provider future is most likely to hit (a freshly-added, un-enriched binding).
     try testing.expectEqualStrings("Has Enrich", (try Q.text(arena, &s, "SELECT title FROM canonical_anime WHERE anilist_id = 321;")).?);
     try testing.expectEqual(@as(?i64, 812), try Q.int(&s, "SELECT mal_id FROM canonical_anime WHERE anilist_id = 321;"));
@@ -5005,11 +4550,11 @@ test "loadHistory/getAnime resolve enrichment through canonical: linked row read
     var s = try Store.openMemory();
     defer s.close();
 
-    // Seed the spine by hand (no getCanonical/upsertCanonical yet — that's slice 2)
+    // Seed the spine by hand (no getCanonical/upsertCanonical yet, that's slice 2)
     // with values that DIFFER from the anime shadow, so a wrong join is visible: a
     // read that returned the local column would report the stale seed, not these.
     // `description` is left NULL on canonical to prove the resolution is per-column
-    // COALESCE, not a whole-row swap — it must fall back to the local description.
+    // COALESCE, not a whole-row swap, it must fall back to the local description.
     // The FK (anime.canonical_id -> canonical_anime.anilist_id) forces canonical first.
     try s.exec(
         \\INSERT INTO canonical_anime

@@ -1,5 +1,5 @@
-//! Zigoku — cover/image subsystem (ROD-160). Owns one selection's poster art; see
-//! `CoverState` below for the full contract.
+//! Cover/image subsystem (ROD-160): one selection's poster art, fetch policy, Kitty state.
+//! Driven via explicit deps; no `@fieldParentPtr`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -14,37 +14,25 @@ const CoverCaches = workers.CoverCaches;
 const SourceProvider = @import("../source.zig").SourceProvider;
 const coverTask = workers.coverTask;
 
-/// The cover/image subsystem (ROD-160). Owns one selection's poster art: the
-/// fetch/suppress/retry policy, the decoded-pixel + Kitty-image state, and the worker-thread
-/// lifecycle. The pattern-setter for the controller/subsystem split, driven through explicit
-/// dependencies (`gpa`/`loop`/`io`/`now`/`vx`). It never reaches back into App: the caller
-/// resolves the target id/url and passes them into `sync`. Embed by value; no `@fieldParentPtr`.
+/// One selection's poster art: fetch/suppress/retry, pixels, Kitty image, worker lifecycle.
 pub const CoverState = struct {
-    /// Cover fetch/decode failure suppression window (ROD-110). After a failure
-    /// we suppress refetch of the *same id+url* for this long, then allow one
-    /// retry on the next event — a lightweight backoff instead of permanent
-    /// sticky suppression. A changed `thumb` URL clears suppression immediately
-    /// (recovery without moving the selection); see `Decision`.
+    /// Same id+url failure suppress window (ROD-110). Changed `thumb` URL clears immediately.
     pub const retry_cooldown_ms: i64 = 10_000;
 
-    /// What `sync` should do for the current selection. Extracted from the
-    /// side effects so the fetch/suppress/retry policy is unit-testable without
-    /// spawning threads or relying on `builtin.is_test` (ROD-110).
+    /// Pure `sync` decision (ROD-110): unit-testable without threads / `builtin.is_test`.
     pub const Action = enum {
-        /// Nothing to do — no target, or target already matches in-flight/loaded.
         none,
-        /// Target has no art and stale cover state belongs to a different id; drop it.
+        /// Stale cover belongs to a different id; no art for target.
         clear,
-        /// A recent same-id+same-url failure is still inside the cooldown window.
+        /// Same-id+same-url failure still inside cooldown.
         suppress,
-        /// We're already loading or holding pixels for this exact id.
+        /// Already loading or holding pixels for this id.
         up_to_date,
-        /// Start a fresh fetch (clears any superseded failure record).
+        /// Fresh fetch (clears superseded failure record).
         fetch,
     };
 
-    /// Pure inputs for the cover fetch decision. `now_ms`/`failed_at_ms` drive
-    /// the cooldown; `failed_url` vs `target_url` drives URL-change recovery.
+    /// Pure inputs for the cover fetch decision.
     pub const Decision = struct {
         target_id: ?[]const u8,
         target_url: ?[]const u8,
@@ -60,25 +48,21 @@ pub const CoverState = struct {
             const target_id = d.target_id orelse return .none;
 
             const target_url = d.target_url orelse {
-                // No art for this show. Only act if stale state belongs elsewhere.
+                // No art: clear only if loaded state is for another id.
                 const stale = d.cover_for_id != null and
                     !std.mem.eql(u8, d.cover_for_id.?, target_id);
                 return if (stale) .clear else .none;
             };
 
-            // Already loading or holding pixels for this exact id → leave it be.
-            // Checked before suppression so a live cover always wins over a stale
-            // failure record, independent of the `clear` invariant.
+            // Live cover wins over a stale failure record (before suppress).
             if (d.cover_for_id) |id| {
                 if (std.mem.eql(u8, id, target_id) and (d.cover_loading or d.has_pixels)) {
                     return .up_to_date;
                 }
             }
 
-            // Failure suppression: same id + same url, still within cooldown. A
-            // changed URL or an elapsed cooldown both fall through to a retry.
-            // Failure records persist across navigation — they are cleared only by
-            // cooldown expiry, a thumb URL change, or a successful fetch.
+            // Same id + same url + within cooldown → suppress. Failure records survive
+            // navigation; cleared only by cooldown expiry, URL change, or successful fetch.
             if (d.failed_id) |fid| {
                 if (std.mem.eql(u8, fid, target_id)) {
                     const same_url = d.failed_url != null and
@@ -92,29 +76,26 @@ pub const CoverState = struct {
         }
     };
 
-    /// Letterboxed placement of an image inside a half-block mosaic grid (ROD-110).
+    /// Letterboxed placement inside a half-block mosaic grid (ROD-110).
     pub const HalfBlockFit = struct { w: u32, h: u32, off_x: u32, off_y: u32 };
 
-    /// Fit `img_w × img_h` into a `grid_w × grid_h` half-pixel grid, preserving aspect. A
-    /// half-block cell (`▀`) is full-cell wide but half-cell tall, so a half-pixel is `ppc`
-    /// wide and `pph/2` tall (square only on 2:1 cells). We compare in physical-pixel space
-    /// via the terminal's reported `ppc`/`pph`. Pass `ppc == 0`/`pph == 0` when the terminal
-    /// won't report metrics, which falls back to assuming square half-pixels (correct on 2:1,
-    /// off elsewhere). Pure so the aspect math is unit-testable.
+    /// Fit image into half-pixel grid, aspect preserved. Half-block `▀` is full-cell wide,
+    /// half tall: compare in physical pixels via terminal `ppc`/`pph`. Zero metrics assume
+    /// square half-pixels (correct on 2:1 cells only). Pure for unit tests.
     pub fn halfBlockFit(img_w: u32, img_h: u32, grid_w: u32, grid_h: u32, ppc: u32, pph: u32) HalfBlockFit {
         var fit_w = grid_w;
         var fit_h = grid_h;
         if (img_w != 0 and img_h != 0 and grid_w != 0 and grid_h != 0) {
             if (ppc != 0 and pph != 0) {
-                // phys_w = grid_w*ppc, phys_h = grid_h*pph/2. Compare aspects:
-                //   img_w*phys_h vs img_h*phys_w  →  img_w*grid_h*pph vs 2*img_h*grid_w*ppc
+                // phys_w = grid_w*ppc, phys_h = grid_h*pph/2:
+                //   img_w*grid_h*pph vs 2*img_h*grid_w*ppc
                 const lhs = @as(u64, img_w) * grid_h * pph;
                 const rhs = @as(u64, img_h) * grid_w * ppc * 2;
                 if (lhs > rhs) {
-                    // width-bound: fit_h = 2*img_h*grid_w*ppc / (img_w*pph)
+                    // width-bound
                     fit_h = @intCast(@max(1, @as(u64, img_h) * grid_w * ppc * 2 / (@as(u64, img_w) * pph)));
                 } else {
-                    // height-bound: fit_w = img_w*grid_h*pph / (2*img_h*ppc)
+                    // height-bound
                     fit_w = @intCast(@max(1, @as(u64, img_w) * grid_h * pph / (@as(u64, img_h) * ppc * 2)));
                 }
             } else if (img_w * grid_h > img_h * grid_w) {
@@ -128,33 +109,23 @@ pub const CoverState = struct {
         return .{ .w = fit_w, .h = fit_h, .off_x = (grid_w - fit_w) / 2, .off_y = (grid_h - fit_h) / 2 };
     }
 
-    // ── state ────────────────────────────────────────────────────────────────
-    /// Handle for the most recent cover-fetch thread. Joined before a new spawn.
+    /// Joined before each new spawn.
     thread: ?std.Thread = null,
-    /// Decoded cover pixels for the currently tracked show id.
     pixels: ?struct { rgba: []u8, w: u32, h: u32 } = null,
-    /// Which show id the current cover state belongs to.
     for_id: ?[]const u8 = null,
-    /// Whether a cover fetch/decode is in flight.
     loading: bool = false,
-    /// Last show id whose cover fetch/decode failed. With `failed_url` +
-    /// `failed_at_ms` this drives the cooldown-based retry policy (ROD-110).
+    /// Last failed id; with `failed_url` + `failed_at_ms` drives ROD-110 cooldown.
     failed_for_id: ?[]const u8 = null,
-    /// GPA-owned copy of the URL that failed, for URL-change recovery.
+    /// GPA-owned; URL-change recovery.
     failed_url: ?[]const u8 = null,
-    /// `now_ms` timestamp of the last cover failure; gates the retry cooldown.
     failed_at_ms: i64 = 0,
-    /// GPA-owned copy of the URL currently being fetched. Recorded so a failure
-    /// can attribute the exact url even if the selection moved mid-flight.
+    /// GPA-owned URL in flight (attribute failure if selection moves mid-fetch).
     inflight_url: ?[]const u8 = null,
-    /// Dominant fallback color when Kitty graphics are unavailable.
     fallback_color: vaxis.Color = .default,
-    /// Uploaded Kitty image for the current cover, if any.
     image: ?vaxis.Image = null,
-    /// Old Kitty image id to delete on the next draw pass.
+    /// Deferred Kitty free: delete on next draw pass.
     pending_free_id: ?u32 = null,
 
-    // ── methods ────────────────────────────────────────────────────────────────
     fn invalidateImage(self: *CoverState) void {
         if (self.image) |img| {
             self.pending_free_id = img.id;
@@ -182,9 +153,7 @@ pub const CoverState = struct {
         self.failed_at_ms = 0;
     }
 
-    /// Record a fetch/decode failure for the cooldown-based retry policy. `url`
-    /// is the URL that failed (borrowed; duped here) so a later selection on the
-    /// same id can detect whether the `thumb` changed and a retry is warranted.
+    /// Record failure for cooldown retry. Dupes `url` so same-id later can detect thumb change.
     pub fn noteFailure(self: *CoverState, gpa: Allocator, now: i64, id: []const u8, url: ?[]const u8) void {
         self.clearFailure(gpa);
         self.failed_for_id = gpa.dupe(u8, id) catch null;
@@ -199,14 +168,10 @@ pub const CoverState = struct {
         }
     }
 
-    /// Take ownership of freshly decoded pixels for the current selection and
-    /// derive the non-Kitty fallback colour. Owns the staging the controller
-    /// used to do inline (ROD-160 review): supersede any failure record,
-    /// drop the spent in-flight url, retire the old Kitty image, and free the
-    /// previous pixel buffer before adopting `rgba` (caller transfers ownership).
+    /// Take ownership of decoded pixels; supersede failure, drop inflight, retire Kitty/pixels.
     pub fn acceptPixels(self: *CoverState, gpa: Allocator, rgba: []u8, w: u32, h: u32) void {
         self.clearFailure(gpa);
-        self.clearInflight(gpa); // fetch succeeded; in-flight url no longer needed
+        self.clearInflight(gpa);
         self.invalidateImage();
         self.freeBuffers(gpa);
         self.pixels = .{ .rgba = rgba, .w = w, .h = h };
@@ -246,10 +211,8 @@ pub const CoverState = struct {
         }
     }
 
-    /// Reconcile cover state with the current selection. The caller resolves
-    /// `target_id`/`target_url` from navigation state — this struct never does.
-    /// Returns true iff a fetch thread was started, so the caller can mark its
-    /// own async-start clock (kept on App, since it's shared across loaders).
+    /// Reconcile with caller-resolved `target_id`/`target_url`. True iff a fetch thread started
+    /// (caller marks shared async-start clock on App).
     pub fn sync(
         self: *CoverState,
         gpa: Allocator,
@@ -282,7 +245,7 @@ pub const CoverState = struct {
             },
             .fetch => {},
         }
-        // .fetch implies a non-null target and supersedes any prior failure.
+        // .fetch: non-null target; supersedes prior failure.
         self.clearFailure(gpa);
         const tid = target_id.?;
         const url = target_url.?;

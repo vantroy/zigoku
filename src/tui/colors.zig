@@ -1,39 +1,27 @@
 //! Terminal Ghost color tokens (DESIGN.md §7.7).
 //!
-//! The single source of truth for every styled cell in the TUI. Component code
-//! references these names — never inline hex. Tweak a color once, here.
-//!
-//! The system is dark-only and non-negotiable (Mission Control is always dark).
-//! Color carries hierarchy: green = alive, cyan = focused, magenta = the one
-//! thing happening now.
+//! Sole source for styled TUI cells: components use these names, never inline hex.
+//! Dark-only. Hierarchy: green = alive, cyan = focused, magenta = now.
 
 const vaxis = @import("vaxis");
 
 const Color = vaxis.Color;
 
-// ── Palette ──────────────────────────────────────────────────────────────────
-
-/// All semantic color tokens for one theme. `App` holds a `*const Palette`
-/// set from the user's config; render functions reference it instead of the
-/// module-level constants so switching themes takes effect immediately.
+/// Semantic tokens for one theme. `App` holds `*const Palette` from config.
+/// Map aliases to DESIGN.md §1.2 (`fg2 // text.muted` convention) so code and spec stay aligned.
 pub const Palette = struct {
     bg_base: Color,
     bg_surface: Color,
     bg_elevated: Color,
     chrome: Color, // border.hair
-    // Semantic aliases — canonical mapping lives in DESIGN.md §1.2 (color.* table).
-    // Keep code that references these annotated with the token (the established
-    // convention, e.g. chrome.zig `fg2 // text.muted`) so the alias and the
-    // spec never drift apart.
-    fg: Color, //   text.primary
-    fg2: Color, //  text.muted
-    fg3: Color, //  text.dim
+    fg: Color, // text.primary
+    fg2: Color, // text.muted
+    fg3: Color, // text.dim
     focus: Color, // state.focus
-    hot: Color, //  state.now
+    hot: Color, // state.now
     warn: Color, // state.warn
 };
 
-/// Current default: Terminal Ghost (unchanged hex values).
 pub const terminal_ghost: Palette = .{
     .bg_base = bg_base,
     .bg_surface = bg_surface,
@@ -47,8 +35,7 @@ pub const terminal_ghost: Palette = .{
     .warn = warn,
 };
 
-/// Pure monochrome phosphor. Focus/fg share the same hue; bold styling
-/// handles visual distinction. `hot` is the complementary orange-red.
+/// Monochrome phosphor. Focus/fg same hue; bold distinguishes. `hot` is complementary.
 pub const phosphor: Palette = .{
     .bg_base = Color{ .rgb = .{ 0x01, 0x09, 0x04 } },
     .bg_surface = Color{ .rgb = .{ 0x04, 0x11, 0x08 } },
@@ -57,13 +44,12 @@ pub const phosphor: Palette = .{
     .fg = Color{ .rgb = .{ 0x50, 0xff, 0x7a } },
     .fg2 = Color{ .rgb = .{ 0x20, 0x70, 0x3a } },
     .fg3 = Color{ .rgb = .{ 0x10, 0x30, 0x18 } },
-    .focus = Color{ .rgb = .{ 0xa8, 0xff, 0xbe } }, // overdriven — brighter than fg so bold isn't the only diff
+    .focus = Color{ .rgb = .{ 0xa8, 0xff, 0xbe } }, // brighter than fg so bold isn't the only diff
     .hot = Color{ .rgb = .{ 0xff, 0x6a, 0x39 } },
     .warn = Color{ .rgb = .{ 0xff, 0xe3, 0x39 } },
 };
 
-/// Nord adaptation. Semantic tokens mapped to Nord's polar night + snow storm
-/// + aurora palette (https://www.nordtheme.com/docs/colors-and-palettes).
+/// Nord polar night + snow + aurora (https://www.nordtheme.com/docs/colors-and-palettes).
 pub const nord: Palette = .{
     .bg_base = Color{ .rgb = .{ 0x2e, 0x34, 0x40 } }, // nord0
     .bg_surface = Color{ .rgb = .{ 0x3b, 0x42, 0x52 } }, // nord1
@@ -73,54 +59,40 @@ pub const nord: Palette = .{
     .fg2 = Color{ .rgb = .{ 0x81, 0xa1, 0xc1 } }, // nord9
     .fg3 = Color{ .rgb = .{ 0x4c, 0x56, 0x6a } }, // nord3 (dim text)
     .focus = Color{ .rgb = .{ 0x88, 0xc0, 0xd0 } }, // nord8
-    .hot = Color{ .rgb = .{ 0xd0, 0x87, 0x70 } }, // nord12 (aurora orange — more urgency than nord15 purple)
+    .hot = Color{ .rgb = .{ 0xd0, 0x87, 0x70 } }, // nord12 (urgency over nord15 purple)
     .warn = Color{ .rgb = .{ 0xeb, 0xcb, 0x8b } }, // nord13
 };
 
-/// TokyoNight ("night" variant) — Rod's daily-driver theme elsewhere, so it
-/// should feel native here too. Semantic tokens mapped to the canonical
-/// TokyoNight palette (https://github.com/folke/tokyonight.nvim).
+/// TokyoNight night (https://github.com/folke/tokyonight.nvim).
 pub const tokyonight: Palette = .{
     .bg_base = Color{ .rgb = .{ 0x1a, 0x1b, 0x26 } }, // night bg
     .bg_surface = Color{ .rgb = .{ 0x24, 0x28, 0x3b } }, // storm bg (focused-row band)
     .bg_elevated = Color{ .rgb = .{ 0x29, 0x2e, 0x42 } }, // bg_highlight (toasts)
     .chrome = Color{ .rgb = .{ 0x3b, 0x42, 0x61 } }, // border
     .fg = Color{ .rgb = .{ 0xc0, 0xca, 0xf5 } }, // fg
-    .fg2 = Color{ .rgb = .{ 0x9a, 0xa5, 0xce } }, // muted fg — tuned between TN fg_dark #a9b1d6 and dark5 #737aa2 for even fg/fg2/fg3 spacing
-    .fg3 = Color{ .rgb = .{ 0x56, 0x5f, 0x89 } }, // comment (dim text)
-    .focus = Color{ .rgb = .{ 0xb0, 0xe8, 0xff } }, // lifted cyan — TN cyan #7dcfff (L≈0.56) reads dimmer than fg; brightened (L≈0.75) so the focused row out-reads fg per §1.4
-    .hot = Color{ .rgb = .{ 0xf7, 0x76, 0x8e } }, // red — urgency/resume
+    // Muted between TN fg_dark and dark5 for even fg/fg2/fg3 spacing.
+    .fg2 = Color{ .rgb = .{ 0x9a, 0xa5, 0xce } },
+    .fg3 = Color{ .rgb = .{ 0x56, 0x5f, 0x89 } }, // comment
+    // TN cyan L≈0.56 reads under fg; lifted (L≈0.75) so focus out-reads fg (§1.4).
+    .focus = Color{ .rgb = .{ 0xb0, 0xe8, 0xff } },
+    .hot = Color{ .rgb = .{ 0xf7, 0x76, 0x8e } }, // red / urgency
     .warn = Color{ .rgb = .{ 0xe0, 0xaf, 0x68 } }, // yellow
 };
 
-// ── Backgrounds ─────────────────────────────────────────────────────────────
-/// Void. The base canvas everything floats on.
+// Terminal Ghost literals (default palette source)
+
 pub const bg_base = Color{ .rgb = .{ 0x02, 0x0d, 0x06 } };
-/// Surface — a panel lifted just off the void.
 pub const bg_surface = Color{ .rgb = .{ 0x06, 0x14, 0x10 } };
-/// Elevated — overlays, the active selection band.
 pub const bg_elevated = Color{ .rgb = .{ 0x0b, 0x1f, 0x18 } };
-/// Hairline chrome — separators, inactive borders. Barely there by design.
 pub const chrome = Color{ .rgb = .{ 0x1a, 0x40, 0x30 } };
 
-// ── Foregrounds (the green ramp) ────────────────────────────────────────────
-/// Terminal Green. Primary text — "alive."
 pub const fg = Color{ .rgb = .{ 0x39, 0xff, 0x6a } };
-/// Secondary text — metadata, supporting detail.
 pub const fg2 = Color{ .rgb = .{ 0x2a, 0x60, 0x40 } };
-/// Tertiary text — disabled, placeholder, the dimmest legible green.
 pub const fg3 = Color{ .rgb = .{ 0x16, 0x35, 0x25 } };
 
-// ── Accents ─────────────────────────────────────────────────────────────────
-/// Cyan. Focus — the pane/element the keyboard is driving. Overdriven (was
-/// 0x00,0xe5,0xcc) so the focused row clears fg-green's luminance instead of
-/// reading dimmer than its neighbours — the same fix phosphor's focus already
-/// has. 0x00ffee read too hot on a real terminal; this warmer teal (luminance
-/// 0.770) still beats fg-green (0.734). Stays cyan-hued to keep the "cyan ghost"
-/// identity (§1.1) (ROD-156 #4).
+/// Focus cyan, overdriven so focused row clears fg-green luminance (ROD-156 #4).
+/// 0x00ffee was too hot; warmer teal L≈0.770 > fg L≈0.734; keeps cyan-ghost identity (§1.1).
 pub const focus = Color{ .rgb = .{ 0x20, 0xff, 0xdd } };
-/// Spectral Magenta. The signature. The one thing happening now (cursor, the
-/// live action). Used sparingly — two magentas dilute the pointer semantic.
+/// Spectral magenta: one-thing-now pointer. Sparse; two magentas dilute the semantic.
 pub const hot = Color{ .rgb = .{ 0xff, 0x2d, 0x78 } };
-/// Amber. Warnings, degraded/stale states.
 pub const warn = Color{ .rgb = .{ 0xe5, 0xb8, 0x00 } };
