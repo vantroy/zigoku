@@ -21,6 +21,7 @@ const log = @import("../log.zig");
 const http = @import("http.zig");
 const hls = @import("hls.zig");
 const fetchguard = @import("../util/fetchguard.zig");
+const json_escape = @import("../util/json_escape.zig");
 
 const API = "https://senshi.live";
 // Chrome UA: Cloudflare edge serves a plain client with this without a challenge.
@@ -171,7 +172,7 @@ pub const Senshi = struct {
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"searchTerm\":\"{s}\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"{s}\"}}",
-            .{ try jsonEscape(arena, query), opts.page, source.search_page_size, langPref(opts.translation) },
+            .{ try json_escape.escape(arena, query), opts.page, source.search_page_size, langPref(opts.translation) },
         );
 
         const raw = try request(arena, io, .POST, API ++ "/anime/filter", body);
@@ -508,25 +509,6 @@ pub const Senshi = struct {
         for (s) |c| if (c < 0x21 or c > 0x7e) return false;
         return true;
     }
-
-    /// Escape for a JSON string literal (search body). Sub-0x20 → `\u00XX`.
-    fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
-        var out: std.ArrayList(u8) = .empty;
-        for (s) |c| switch (c) {
-            '"' => try out.appendSlice(arena, "\\\""),
-            '\\' => try out.appendSlice(arena, "\\\\"),
-            '\n' => try out.appendSlice(arena, "\\n"),
-            '\r' => try out.appendSlice(arena, "\\r"),
-            '\t' => try out.appendSlice(arena, "\\t"),
-            else => if (c < 0x20) {
-                const hex = "0123456789abcdef";
-                try out.appendSlice(arena, "\\u00");
-                try out.append(arena, hex[(c >> 4) & 0xf]);
-                try out.append(arena, hex[c & 0xf]);
-            } else try out.append(arena, c),
-        };
-        return out.items;
-    }
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────────────
@@ -598,15 +580,6 @@ test "parseLeadingUint takes the digit prefix only" {
     try testing.expectEqual(@as(?u32, 16), Senshi.parseLeadingUint(u32, "16"));
     try testing.expect(Senshi.parseLeadingUint(u32, "unknown") == null);
     try testing.expect(Senshi.parseLeadingUint(u32, "") == null);
-}
-
-test "jsonEscape escapes quotes and backslashes for the search body" {
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try testing.expectEqualStrings("a\\\"b", try Senshi.jsonEscape(a, "a\"b"));
-    try testing.expectEqualStrings("c\\\\d", try Senshi.jsonEscape(a, "c\\d"));
-    try testing.expectEqualStrings("plain", try Senshi.jsonEscape(a, "plain"));
 }
 
 test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {

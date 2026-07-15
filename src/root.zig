@@ -127,6 +127,7 @@ test {
     _ = @import("util/deadline.zig"); // ROD-262: run the lifted withDeadline tests
     _ = @import("util/fetchguard.zig"); // ROD-266: run the lifted SSRF-guard tests
     _ = @import("util/semver.zig"); // ROD-370: run the version-compare tests
+    _ = @import("util/json_escape.zig"); // ROD-401: run the lifted JSON-escape tests
     _ = updatecheck; // ROD-370: run the cache/parse tests
     _ = update; // ROD-371: run the install-detection decision tests
 }
