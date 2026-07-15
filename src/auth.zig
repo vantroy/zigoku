@@ -1,62 +1,48 @@
-//! Zigoku — AniList OAuth credentials (ROD-283).
+//! AniList OAuth credentials (ROD-283).
 //!
-//! One ZON file at `{configDir}/auth.zon` (→ `~/.config/zigoku/auth.zon`) holds the OAuth
-//! Implicit Grant bearer token and the identity it was minted for. Kept separate from
-//! `config.zon` (ROD-85) on purpose: the secret gets its own `0600` file and never rides
-//! along in the config the Settings tab round-trips on every edit.
+//! `{configDir}/auth.zon` holds the Implicit Grant bearer + identity, separate from
+//! `config.zon` (ROD-85): secret is `0600` and never rides Settings round-trips.
+//! Per-provider nest (`.anilist = .{…}`) for future MAL/Kitsu blocks.
 //!
-//! Credentials nest per-provider (`.anilist = .{ … }`) so a future MAL/Kitsu block slots in
-//! without reshaping the file.
-//!
-//! Loading is TOTAL, like `config.zig`: a missing, unreadable, oversized, or malformed file
-//! is never an error (it yields `Auth{}`, signed out), so a corrupt token file can't wedge
-//! startup. `save` surfaces errors and writes `0600`; the capture flow decides how to report
-//! a failed write.
+//! Load is total (missing/bad → `Auth{}` signed-out). `save` surfaces errors, writes `0600`.
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const paths = @import("paths.zig");
 
-/// A JWT is ~1KB; a token file an order of magnitude larger isn't ours — refuse it
-/// and fall back to signed-out rather than slurp an arbitrary blob into memory.
+/// JWT ~1KB; refuse oversized files (signed-out) rather than slurp arbitrary blobs.
 const max_bytes: usize = 16 * 1024;
 
-/// AniList credential block. An empty `access_token` means signed out. AniList
-/// mints ~1-year JWTs with **no refresh token** (ROD-282), so `expires_at` is the
-/// whole expiry story — when it passes, the user re-auths from scratch.
+/// AniList credentials. Empty `access_token` = signed out.
+/// ~1-year JWTs, no refresh (ROD-282): `expires_at` is the whole expiry story.
 pub const AniListAuth = struct {
     access_token: []const u8 = "",
     token_type: []const u8 = "Bearer",
-    /// Unix seconds. 0 = unknown (e.g. a hand-written file that omitted it).
+    /// Unix seconds. 0 = unknown (e.g. hand-written file omitted it).
     expires_at: i64 = 0,
-    /// The AniList user the token belongs to. Cached here because the pull query
-    /// (`MediaListCollection`) needs an explicit userId — auth doesn't infer it.
+    /// Cached: MediaListCollection needs explicit userId; auth does not infer it.
     user_id: i64 = 0,
     user_name: []const u8 = "",
 
-    /// True once the token has aged out. `now_unix` is injected for testability.
-    /// A zero (unknown) `expires_at` is treated as *not* expired: we'd rather send
-    /// the token and let AniList 401 than refuse one we simply can't date.
+    /// `now_unix` injected for tests. Zero `expires_at` is not expired (prefer AniList 401
+    /// over refusing an undated token).
     pub fn isExpired(self: AniListAuth, now_unix: i64) bool {
         return self.expires_at != 0 and now_unix >= self.expires_at;
     }
 };
 
-/// The deserialized auth file. Every field defaults, so `Auth{}` is always valid
-/// and means "no credentials". String fields are either static defaults or owned
-/// by `gpa`; they live for the process and are never freed (auth loads once).
+/// Deserialized auth file. `Auth{}` is always valid (no credentials).
+/// Strings: static defaults or GPA-owned for process life (auth loads once; never freed).
 pub const Auth = struct {
     anilist: AniListAuth = .{},
 
-    /// True when we hold a non-empty AniList token.
     pub fn hasAniList(self: Auth) bool {
         return self.anilist.access_token.len > 0;
     }
 };
 
-/// Read and parse the auth file at `path`. Total: any failure — missing file,
-/// unreadable, oversized, malformed ZON, wrong field type — yields `Auth{}`.
+/// Total load: any failure → `Auth{}`.
 pub fn load(gpa: Allocator, io: Io, path: []const u8) Auth {
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return .{};
     defer file.close(io);
@@ -68,16 +54,13 @@ pub fn load(gpa: Allocator, io: Io, path: []const u8) Auth {
         .of(u8),
         0,
     ) catch return .{};
-    defer gpa.free(source); // parse dupes every string it keeps; source is ours to drop.
+    defer gpa.free(source); // parse dupes kept strings; source is ours to drop.
 
     return parse(gpa, source);
 }
 
-/// Serialize `auth` to `path` as ZON, creating the parent directory if needed.
-/// The file is created **owner-only (0600) atomically** — it carries a bearer
-/// token, so it must never exist group/world-readable, not even for the span of
-/// the write (the parent `~/.config/zigoku` is 0755/world-traversable). Unlike
-/// `load`, this surfaces errors.
+/// Write ZON at `path`. File created owner-only `0600` atomically (bearer must never be
+/// group/world-readable, even mid-write; parent dir is world-traversable). Surfaces errors.
 pub fn save(io: Io, auth: Auth, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| paths.ensureDir(dir);
 
@@ -96,32 +79,24 @@ pub fn defaultPath(arena: Allocator) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/auth.zon", .{dir});
 }
 
-/// The pure half of `load`: ZON text → `Auth`, signed-out on any parse failure.
-/// Unknown fields are ignored so a newer file never breaks an older binary.
+/// Pure load half: ZON → Auth; signed-out on parse failure. Unknown fields ignored.
 fn parse(gpa: Allocator, source: [:0]const u8) Auth {
     const auth = std.zon.parse.fromSliceAlloc(Auth, gpa, source, null, .{
         .ignore_unknown_fields = true,
     }) catch return .{};
-    // A token carrying a C0 control byte (< 0x20) is a corrupt or hand-edited file:
-    // placed in a `Bearer` header, a CR/LF trips std.http's line-terminator assert
-    // (a ReleaseSafe abort), and a bare LF slips that assert and rides onto the wire
-    // as a header-injection vector. Refuse it — signed-out, the same degrade as any
-    // malformed file — so a corrupt token can never reach the network layer. A real
-    // AniList JWT is base64url dot-separated and never contains a control byte.
+    // C0 control in token (< 0x20): CR/LF trips std.http line assert (ReleaseSafe abort);
+    // bare LF can inject headers. Refuse → signed-out. Real AniList JWT is base64url.
     if (hasControlBytes(auth.anilist.access_token)) return .{};
     return auth;
 }
 
-/// True if `s` carries any C0 control byte (< 0x20) — the bytes (CR, LF, tab, NUL…)
-/// that would break out of, or smuggle into, an HTTP header value.
+/// Any C0 control (< 0x20) that could break out of or smuggle into an HTTP header value.
 fn hasControlBytes(s: []const u8) bool {
     for (s) |ch| {
         if (ch < 0x20) return true;
     }
     return false;
 }
-
-// ── Tests ──────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
@@ -130,7 +105,7 @@ test "empty struct literal is signed out" {
     defer arena.deinit();
     const a = parse(arena.allocator(), ".{}");
     try testing.expect(!a.hasAniList());
-    try testing.expectEqualStrings("Bearer", a.anilist.token_type); // default holds
+    try testing.expectEqualStrings("Bearer", a.anilist.token_type);
 }
 
 test "a populated anilist block parses through" {
@@ -160,9 +135,7 @@ test "a token carrying control bytes degrades to signed out (ROD-284 hardening)"
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // A hand-corrupted auth.zon: the ZON `\n`/`\r`/`\t` escapes decode to real
-    // control bytes in the token. Each must refuse to load — a Bearer header built
-    // from it would abort the process (CR/LF) or inject a header (bare LF).
+    // ZON escapes become real C0 bytes; each must refuse (abort / header-injection).
     try testing.expect(!parse(a,
         \\.{ .anilist = .{ .access_token = "eyJfake\ntok" } }
     ).hasAniList());
@@ -172,7 +145,6 @@ test "a token carrying control bytes degrades to signed out (ROD-284 hardening)"
     try testing.expect(!parse(a,
         \\.{ .anilist = .{ .access_token = "eyJfake\ttok" } }
     ).hasAniList());
-    // A clean JWT-shaped token is untouched by the guard.
     try testing.expect(parse(a,
         \\.{ .anilist = .{ .access_token = "eyJfake.tok.en" } }
     ).hasAniList());
@@ -214,9 +186,8 @@ test "serialized auth round-trips back through parse" {
 
 test "isExpired honors the boundary and treats unknown expiry as live" {
     const tok: AniListAuth = .{ .expires_at = 1000 };
-    try testing.expect(!tok.isExpired(999)); // before
-    try testing.expect(tok.isExpired(1000)); // exactly at expiry counts as expired
-    try testing.expect(tok.isExpired(1001)); // after
-    // expires_at == 0 (unknown) is never treated as expired.
+    try testing.expect(!tok.isExpired(999));
+    try testing.expect(tok.isExpired(1000)); // at boundary = expired
+    try testing.expect(tok.isExpired(1001));
     try testing.expect(!(AniListAuth{}).isExpired(std.math.maxInt(i64)));
 }
