@@ -1292,6 +1292,7 @@ pub const App = struct {
     pub fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, registry: Registry) !void {
         // Cursor snapshot for post-dispatch cover sync: move → debounce, discrete nav → now (ROD-202).
         const cursor_before = self.list_cursor;
+        // A handler returning true skips the post-switch cover-settle pass (ROD-202).
         switch (event) {
             .key_press => |key| input.onKey(self, key, loop, io, registry),
             .winsize => |ws| {

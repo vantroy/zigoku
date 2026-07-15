@@ -1426,6 +1426,20 @@ test "dupeOwnedStrList returns the empty sentinel without allocating" {
     try std.testing.expectEqual(@as(usize, 0), out.len);
 }
 
+test "dupeAll commits all sources or frees the partial set on failure (ROD-401)" {
+    const a = std.testing.allocator;
+
+    const ok = try dupeAll(a, 3, .{ "one", "two", "three" });
+    defer for (ok) |s| a.free(s);
+    try std.testing.expectEqualStrings("two", ok[1]);
+
+    // Failing at each index must free the slots already taken; testing.allocator flags any leak.
+    for (0..3) |fail_at| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_at });
+        try std.testing.expectError(error.OutOfMemory, dupeAll(failing.allocator(), 3, .{ "one", "two", "three" }));
+    }
+}
+
 test "observedPlaybackWasMeaningful requires positive observed position" {
     try std.testing.expect(!observedPlaybackWasMeaningful(null));
     try std.testing.expect(!observedPlaybackWasMeaningful(.{ .time_pos = 0, .duration = 1440 }));
