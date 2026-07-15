@@ -1,35 +1,16 @@
-//! megaplay.buzz: a tier-A `SourceProvider` (ROD-359), promoted from a bare
-//! stream extractor (ROD-341).
+//! megaplay.buzz: tier-A `SourceProvider` (ROD-359; promoted from ROD-341 extractor).
 //!
-//! megaplay indexes its catalog by MyAnimeList id: `/stream/mal/{mal}/{ep}/{lang}`
-//! answers the embed page for that exact MAL episode number (live-verified across
-//! a 1998 classic, 1100-episode long-runners, movies and 2025 seasonals). So, like
-//! senshi, the show handle IS the stringified MAL id, and episode labels align with
-//! true MAL numbering by construction, which keeps the cross-provider watch-state
-//! label join (`getResume`/`unionHighWater`) safe with no matching at all.
+//! Catalog is MAL-keyed: `/stream/mal/{mal}/{ep}/{lang}`. Show handle = stringified
+//! MAL id; episode labels are true MAL numbers, so cross-provider watch-state join
+//! needs no matching. Replaces the retired AniPub catalog (ROD-342/350 → ROD-359).
 //!
-//! This module replaces the AniPub catalog (ROD-342/350, retired by ROD-359):
-//! that third-party catalog had drifted from source truth, corrupting watch
-//! state (see the ROD-359 migration comment in store.zig for the mechanism).
-//! The direct MAL route needs no third-party catalog at all.
+//! Two-step resolve:
+//!   1. GET embed → scrape `data-id` (only sub/dub fork). 200 with no data-id = not stocked.
+//!   2. GET /stream/getSources?id=… → cleartext JSON (master m3u8, softsubs, skip stamps).
 //!
-//! The two-step resolve (spike-verified on ROD-340; MAL route on ROD-359):
-//!   1. GET /stream/mal/{mal}/{ep}/{sub|dub} → embed HTML; scrape `data-id="N"`,
-//!      megaplay's internal id and the ONLY place sub/dub diverges. A show or
-//!      episode megaplay doesn't stock answers 200 with NO data-id: a clean
-//!      existence probe.
-//!   2. GET /stream/getSources?id={data-id} → cleartext JSON: the master m3u8,
-//!      softsub vtt tracks, and intro/outro skip stamps. No decryption anywhere.
-//!
-//! No listing endpoint exists, so `episodes()` probes episode 1 for existence and
-//! mints positional labels "1".."N" from the canonical count hint
-//! (`domain.expectedEpisodeCount`, ROD-359).
-//!
-//! The whole delivery chain (master on cdn.mewstream.buzz, segments on rotating
-//! *.glimmeron.click, vtts on lostproject.club) 403s without the megaplay
-//! referer + a browser UA; megaplay's OWN referer, not senshi's. mpv propagates
-//! one --referrer across the chain, so the `StreamLink.referer`/`.user_agent`
-//! fields (ROD-309) carry the entire gate.
+//! No listing endpoint: `episodes()` probes ep 1, mints "1".."N" from
+//! `domain.expectedEpisodeCount` (ROD-359). Whole CDN chain 403s without megaplay
+//! referer + browser UA (`StreamLink` fields, ROD-309).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -43,19 +24,14 @@ const fetchguard = @import("../util/fetchguard.zig");
 const HOST = "https://megaplay.buzz";
 // Every downstream CDN host gates on this exact origin.
 pub const STREAM_REFERER = "https://megaplay.buzz/";
-// A current Chrome UA; no-UA requests 403 on every megaplay host. Keep it
-// recent and unremarkable (same posture as senshi's).
+// Current Chrome UA; no-UA requests 403 on every megaplay host.
 const UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-// Bound on the scraped data-id before it's spliced into the getSources URL.
-// Real ids are 4–6 digits today.
+// Bound on scraped data-id before URL splice. Real ids are 4–6 digits today.
 const max_data_id_len = 20;
 
-/// One subtitle/thumbnail track from getSources `tracks[]`. Softsubs arrive as
-/// external vtts (multi-language); a `kind` of "thumbnails" is the seekbar
-/// sprite sheet, not a subtitle. `pickSubtitle` selects one onto the
-/// StreamLink (ROD-354); the full list is carried through for a future
-/// language preference.
+/// Softsub/thumbnail track from getSources `tracks[]`. `kind` "thumbnails" is the
+/// seekbar sprite, not a subtitle. `pickSubtitle` selects one (ROD-354).
 pub const Track = struct {
     file: []const u8,
     label: ?[]const u8 = null,
@@ -63,15 +39,13 @@ pub const Track = struct {
     default: bool = false,
 };
 
-/// An OP/ED skip window in seconds. megaplay hands these for free where AniSkip
-/// needs a round-trip; feeding them into the aniskip path is parked (ROD-340).
+/// OP/ED skip window (seconds). Parked until a player seam exists (ROD-340).
 pub const Skip = struct {
     start: f64,
     end: f64,
 };
 
-/// A resolved megaplay stream: the mpv-ready link plus the bonus payload
-/// (softsub tracks, skip stamps) the getSources response carries.
+/// Resolved stream: mpv-ready link plus getSources bonus payload.
 pub const Stream = struct {
     link: domain.StreamLink,
     tracks: []const Track = &.{},
@@ -80,19 +54,16 @@ pub const Stream = struct {
 };
 
 pub const MegaPlay = struct {
-    /// Stable identity used by persistence keys `(source_name, show_id)`. The show
-    /// handle is the stringified MAL id, same key discipline as senshi.
+    /// Persistence key `(source_name, show_id)`. Show handle = stringified MAL id.
     pub const source_name = "megaplay";
 
-    /// Human-facing name for user-visible copy (toasts, banners, CLI).
     pub const display_name = "MegaPlay";
 
     pub fn init() MegaPlay {
         return .{};
     }
 
-    /// Pack this concrete provider into the erased `SourceProvider` the app holds.
-    /// `self` must outlive every call made through the returned value.
+    /// `self` must outlive every call through the returned value.
     pub fn provider(self: *MegaPlay) source.SourceProvider {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -122,18 +93,13 @@ pub const MegaPlay = struct {
         _ = io;
         _ = query;
         _ = opts;
-        // No catalog search exists: the MAL route IS the whole index, so a
-        // canonical without a mal_id is unreachable here by design (there is
-        // nothing for tier C to search). The resolver reads this error as
-        // "nothing learned", never an absence verdict (ROD-347), so a show
-        // that gains a mal_id later isn't blocked by a stale negative.
+        // No catalog: MAL route is the index. Unsupported = "nothing learned", never
+        // an absence verdict (ROD-347), so a later mal_id is not blocked by a stale negative.
         return error.Unsupported;
     }
     fn canonicalKeyErased(ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8 {
         _ = ptr;
-        // Tier A: the MAL route keys the catalog by mal_id directly, so a
-        // canonical with one resolves for free (same shape as senshi). No MAL
-        // id → null; there is no tier-C recovery for this provider (see search).
+        // Tier A: mal_id → free key (senshi shape). No mal_id → null; no tier-C recovery.
         const mal = canonical.mal_id orelse return null;
         return try std.fmt.allocPrint(arena, "{d}", .{mal});
     }
@@ -147,10 +113,7 @@ pub const MegaPlay = struct {
     }
     fn coverRequestErased(ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!source.CoverRequest {
         _ = ptr;
-        // megaplay serves no covers and its bindings mint from the canonical
-        // entity, whose cover refs are absolute AniList/MAL CDN URLs: pass
-        // those through (ungated hosts). Anything relative has no host to
-        // resolve against here; reject rather than guess.
+        // No covers; absolute AniList/MAL CDN refs pass through. Relative → reject.
         if (ref.len == 0 or !domain.isAbsoluteUrl(ref) or !cleanArg(ref))
             return error.InvalidCoverRef;
         return .{ .url = try gpa.dupe(u8, ref) };
@@ -160,26 +123,20 @@ pub const MegaPlay = struct {
 
     pub fn episodes(self: *MegaPlay, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) ![]domain.EpisodeNumber {
         _ = self;
-        // Track-agnostic list, same as senshi: the probe uses sub (the dominant
-        // track; bindings and the ROD-347 cache are per-show, not per-track,
-        // so a dub-mode probe must not read a sub-only show as "not stocked").
-        // A missing dub surfaces at resolve as a clean error, never a shorter list.
+        // Track-agnostic: probe sub always. Bindings/ROD-347 cache are per-show, so a
+        // dub-mode probe must not read a sub-only show as not stocked. Missing dub
+        // surfaces at resolve.
         _ = tt;
         try guardShowId(show_id);
         const html = try request(arena, io, try embedUrl(arena, show_id, "1", .sub), .embed);
-        // 200 with no data-id = megaplay doesn't stock this MAL id (the
-        // vtable's empty-is-authoritative contract, ROD-347).
+        // 200 with no data-id = not stocked (empty-is-authoritative, ROD-347).
         if (parseDataId(html) == null) return try arena.alloc(domain.EpisodeNumber, 0);
         return labels(arena, count_hint orelse 1);
     }
 
-    /// Positional labels "1".."n". A hint-less caller (existence probes, an
-    /// unenriched canonical) degrades to one episode, never zero: zero would
-    /// collide with megaplay's "not stocked" signal (ROD-347).
+    /// Positional "1".."n". Hint-less degrades to 1, never 0 (0 collides with not-stocked, ROD-347).
     fn labels(arena: Allocator, n: u32) ![]domain.EpisodeNumber {
-        // Callers hint through domain.expectedEpisodeCount, which already clamps;
-        // re-clamp here so a provider never sizes an alloc off an unbounded value
-        // regardless of how the hint arrived (defense in depth, ROD-359).
+        // Re-clamp: never size an alloc off an unbounded hint (ROD-359).
         const count = @max(@min(n, domain.max_episode_hint), 1);
         const out = try arena.alloc(domain.EpisodeNumber, count);
         for (out, 1..) |*ep, i| ep.* = .{ .raw = try std.fmt.allocPrint(arena, "{d}", .{i}) };
@@ -188,27 +145,21 @@ pub const MegaPlay = struct {
 
     // ── resolve ──────────────────────────────────────────────────────────────────
 
-    /// Resolve one episode into a playable stream: embed page (existence + the
-    /// sub/dub fork) then getSources. Two GETs, no decryption.
+    /// Embed (existence + sub/dub fork) then getSources. Two GETs, no decryption.
     pub fn resolve(self: *MegaPlay, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
-        // megaplay hands back an adaptive HLS master; mpv picks off the bandwidth
-        // ladder. Honoring the quality cap waits on the shared hls.zig extraction,
-        // same rationale as senshi (ROD-301 follow-up).
+        // Adaptive HLS master; quality cap waits on shared hls.zig (ROD-301 follow-up).
         _ = quality;
         try guardShowId(show_id);
-        // Labels are our own episodes() mint: 1-based integers. A cross-provider
-        // landing can hand a foreign fractional label ("13.5", senshi's recap
-        // slots); no MAL-route address exists for it, so reject clean.
+        // Own mint is 1-based integers. Foreign fractional labels (senshi "13.5") have
+        // no MAL-route address.
         const n = std.fmt.parseInt(u32, ep.raw, 10) catch return error.InvalidEpisode;
         if (n == 0) return error.InvalidEpisode;
 
         const embed_url = try embedUrl(arena, show_id, ep.raw, tt);
         const html = try request(arena, io, embed_url, .embed);
         const data_id = parseDataId(html) orelse {
-            // Past-end episode, or the requested track is missing (the sub/dub
-            // fork lives on this page): distinct from transport failure, and the
-            // receipt says which episode the host wouldn't serve.
+            // Past-end or missing track (sub/dub fork lives here), not transport failure.
             log.warn("megaplay embed {s}: no data-id in {d} byte(s) of HTML", .{ embed_url, html.len });
             return error.NoDataId;
         };
@@ -216,32 +167,26 @@ pub const MegaPlay = struct {
         const src_url = try std.fmt.allocPrint(arena, HOST ++ "/stream/getSources?id={s}", .{data_id});
         const raw = try request(arena, io, src_url, .xhr);
         var stream = try mapSources(arena, raw, tt);
-        // Softsub pick rides link.sub_url (ROD-354). mapSources' metadata pick trusts
-        // the host `default` flag, which marks a signs-only track over the real
-        // dialogue on some shows (ROD-377); when the host ships several English
-        // tracks, upgrade to the highest-cue one by content. Never downgrades below
-        // the metadata pick, so any probe failure keeps subs intact.
+        // Softsub pick (ROD-354). Host `default` sometimes marks signs-only over dialogue
+        // (ROD-377); with ≥2 English tracks, upgrade to highest-cue by content. Never
+        // downgrades below metadata pick.
         if (tt == .sub) if (stream.link.sub_url) |baseline| {
             const cands = try englishCaptions(arena, stream.tracks);
             if (cands.len >= 2) {
                 if (refineSubtitleByCues(arena, io, cands, baseline)) |best| stream.link.sub_url = best;
             }
         };
-        // intro/outro skip stamps still ride `stream` unused, parked until a
-        // player seam exists (ROD-340).
+        // intro/outro still unused until player seam (ROD-340).
         return stream.link;
     }
 
-    /// The MAL-keyed embed URL. `{sub|dub}` is exactly Translation's tagname, so
-    /// `str()` (the cross-provider wire literal) is the segment.
+    /// MAL-keyed embed URL. `{sub|dub}` is Translation's wire tag (`str()`).
     fn embedUrl(arena: Allocator, mal_id: []const u8, ep_label: []const u8, tt: domain.Translation) ![]const u8 {
         return std.fmt.allocPrint(arena, HOST ++ "/stream/mal/{s}/{s}/{s}", .{ mal_id, ep_label, tt.str() });
     }
 
-    // ── the getSources JSON shape ───────────────────────────────────────────────────
-    // Cleartext (verified live): {"sources":{"file":"…master.m3u8"},"tracks":[…],
-    // "intro":{"start":N,"end":N},"outro":{…}}. Every field tolerated as absent so
-    // a host-side shape drift degrades to a clean error, not a parse crash.
+    // ── getSources JSON ─────────────────────────────────────────────────────────
+    // Cleartext: sources.file, tracks[], intro/outro. Absent fields degrade cleanly.
 
     const RawTrack = struct {
         file: ?[]const u8 = null,
@@ -257,17 +202,13 @@ pub const MegaPlay = struct {
         outro: ?RawSkip = null,
     };
 
-    /// Map a raw getSources body onto a `Stream`. Pure over the response bytes so
-    /// it's unit-testable without the network. `tt` gates the softsub pick: only a
-    /// `sub` resolve attaches a subtitle url (a dub is voiced; auto-loading full
-    /// dialogue subs over it would be wrong, and a signs-only pick needs the
-    /// language preference this deliberately isn't yet).
+    /// Pure over response bytes (unit-testable). Softsub only on `sub` resolve
+    /// (auto-loading dialogue over dub would be wrong).
     fn mapSources(arena: Allocator, raw: []const u8, tt: domain.Translation) !Stream {
         const parsed = try std.json.parseFromSlice(SourcesResp, arena, raw, .{ .ignore_unknown_fields = true });
         const src = parsed.value.sources orelse return error.NoStreamSource;
         const file = src.file orelse return error.NoStreamSource;
-        // Host-provided data about to enter mpv's argv: require an absolute
-        // http(s) url carrying only clean argv bytes (mirrors senshi/AllAnime).
+        // Host data → mpv argv: absolute http(s) + clean argv bytes only.
         if (!domain.isAbsoluteUrl(file) or !cleanArg(file)) return error.BadStreamUrl;
 
         var tracks: std.ArrayList(Track) = .empty;
@@ -282,8 +223,7 @@ pub const MegaPlay = struct {
                 .url = file,
                 .referer = STREAM_REFERER,
                 .user_agent = UA,
-                // The segment CDN serves its .ts as .jpg (same content-filter dodge
-                // as senshi, ROD-301); relax ffmpeg's HLS extension gate.
+                // Segment CDN serves .ts as .jpg (content-filter dodge, ROD-301).
                 .cloaked_segments = true,
                 .sub_url = if (tt == .sub) pickSubtitle(tracks.items) else null,
             },
@@ -293,13 +233,8 @@ pub const MegaPlay = struct {
         };
     }
 
-    /// Pick the one subtitle track to hand mpv: the host's `default` flag wins
-    /// (live it marks English), else an English-labeled track, else the first
-    /// subtitle at all. Only a `captions` or kind-less track qualifies (both
-    /// live-observed as subs); an unknown future kind fails safe as "no pick",
-    /// never as a wrong `--sub-file` (the seekbar's "thumbnails" sprite sheet is
-    /// the known non-sub). Null when nothing qualifies. Tracks reach here already
-    /// argv-vetted by `mapSources`.
+    /// Host `default` wins, else English-labeled, else first subtitle-shaped track.
+    /// Unknown kind fails safe (never wrong `--sub-file`). Tracks already argv-vetted.
     pub fn pickSubtitle(tracks: []const Track) ?[]const u8 {
         var english: ?[]const u8 = null;
         var first: ?[]const u8 = null;
@@ -313,27 +248,16 @@ pub const MegaPlay = struct {
         return english orelse first;
     }
 
-    /// A track shaped like a subtitle: `captions` kind, or no kind at all (both
-    /// live-observed as subs). The seekbar `thumbnails` sprite sheet and any
-    /// unknown future kind are not. Shared by both selection paths so they can't
-    /// drift.
+    /// `captions` or kind-less = sub. `thumbnails` and unknown kinds are not.
     fn isSubtitleTrack(t: Track) bool {
         const k = t.kind orelse return true;
         return std.mem.eql(u8, k, "captions");
     }
 
-    /// Ceiling on candidate subtitle probes per resolve (the baseline probe in
-    /// refineSubtitleByCues adds at most one more, so 7 fetches worst case). Real
-    /// shows ship a handful of English tracks (Dungeon Meshi: 4); the cap stops a
-    /// hostile getSources with many bogus "English" entries from turning one
-    /// resolve into an unbounded fetch chain before a stream even returns.
+    /// Cap English subtitle probes per resolve (hostile getSources flood guard).
     const max_subtitle_probes = 6;
 
-    /// The English-labeled caption tracks, in host order (already argv-vetted by
-    /// mapSources), capped at `max_subtitle_probes`. Feeds the content-decided pick
-    /// when a host ships more than one: a signs-only track and the real dialogue
-    /// track are both just labeled "English", so only their content tells them
-    /// apart (ROD-377).
+    /// English-labeled captions in host order, capped (ROD-377 multi-English disambiguation).
     fn englishCaptions(arena: Allocator, tracks: []const Track) ![]const []const u8 {
         var out: std.ArrayList([]const u8) = .empty;
         for (tracks) |t| {
@@ -346,14 +270,8 @@ pub const MegaPlay = struct {
         return out.items;
     }
 
-    /// Upgrade the metadata subtitle pick to the highest-cue English caption track.
-    /// `baseline` is mapSources' metadata pick; we probe it too and override only
-    /// with a candidate that has STRICTLY more cues, so a probe can never downgrade
-    /// below what metadata already chose. A flaky fetch (the vtt CDN rate-scores
-    /// bursts, ROD-309) drops that one candidate, not the whole decision; a failed
-    /// baseline probe returns null and keeps the metadata pick. Returns the winning
-    /// url, or null to keep `baseline`. Most-cues can prefer an SDH track;
-    /// language/SDH preference is out of scope (ROD-377).
+    /// Upgrade metadata pick only when a candidate has strictly more cues. Probe failure
+    /// drops that candidate, not the decision; failed baseline keeps metadata (ROD-377).
     fn refineSubtitleByCues(arena: Allocator, io: Io, candidates: []const []const u8, baseline: []const u8) ?[]const u8 {
         var best = baseline;
         var best_cues = probeCues(arena, io, baseline) catch return null;
@@ -368,10 +286,8 @@ pub const MegaPlay = struct {
         return if (std.mem.eql(u8, best, baseline)) null else best;
     }
 
-    /// Fetch one softsub vtt and count its cue markers. The url is host-controlled
-    /// getSources JSON, so it's SSRF-guarded and redirect-refused (ROD-266) before
-    /// the fetch even though the same Referer+UA gate as the video applies; the
-    /// body is only counted, never handed to argv.
+    /// Count cue markers in one vtt. SSRF-guarded + redirect-refused (ROD-266);
+    /// body counted only, never handed to argv.
     fn probeCues(arena: Allocator, io: Io, url: []const u8) !usize {
         try fetchguard.guardFetchUrl(url);
         const body = try http.request(arena, io, .{
@@ -385,8 +301,7 @@ pub const MegaPlay = struct {
         return std.mem.count(u8, body, " --> ");
     }
 
-    /// Normalize a raw skip stamp: both ends present, finite, and a positive-width
-    /// window; anything else is "no stamp", never a garbage window mpv would jump on.
+    /// Both ends present, finite, positive-width; else no stamp (never garbage mpv jump).
     fn skipFrom(raw: ?RawSkip) ?Skip {
         const r = raw orelse return null;
         const start = r.start orelse return null;
@@ -396,8 +311,7 @@ pub const MegaPlay = struct {
         return .{ .start = start, .end = end };
     }
 
-    /// Scrape the first numeric `data-id` attribute out of the embed HTML. Quoted
-    /// (either quote) or bare. Null when no attribute carries digits.
+    /// First numeric `data-id` (quoted or bare). Null when none.
     fn parseDataId(html: []const u8) ?[]const u8 {
         const needle = "data-id=";
         var from: usize = 0;
@@ -412,16 +326,13 @@ pub const MegaPlay = struct {
         return null;
     }
 
-    /// The show handle is the stringified MAL id and every id we mint is
-    /// digits-only. Enforce that before splicing into a URL path so a corrupt/
-    /// hostile id can't smuggle a traversal or a second segment (mirrors senshi).
+    /// Digits-only before URL path splice (mirrors senshi).
     fn guardShowId(show_id: []const u8) !void {
         if (show_id.len == 0) return error.InvalidShowId;
         for (show_id) |c| if (!std.ascii.isDigit(c)) return error.InvalidShowId;
     }
 
-    /// True if `s` is safe to place in a fetch URL / mpv argv: printable ASCII only
-    /// (0x21–0x7e), rejecting CR/LF, spaces and controls. Mirrors senshi's guard.
+    /// Printable ASCII only (0x21–0x7e): safe in fetch URL / mpv argv.
     fn cleanArg(s: []const u8) bool {
         for (s) |c| if (c < 0x21 or c > 0x7e) return false;
         return true;
@@ -429,12 +340,9 @@ pub const MegaPlay = struct {
 
     // ── HTTP ────────────────────────────────────────────────────────────────────────
 
-    /// What the request is for; picks the header set. Both need the UA + referer
-    /// gate; getSources additionally wants the XHR marker its endpoint checks.
     const Kind = enum { embed, xhr };
 
-    /// One GET to megaplay. The transport + status error taxonomy lives in the shared
-    /// http.zig (ROD-349); megaplay is REST-shaped, so any 2xx is success.
+    /// Shared http.zig taxonomy (ROD-349); any 2xx is success.
     fn request(arena: Allocator, io: Io, url: []const u8, kind: Kind) ![]u8 {
         const extra: []const std.http.Header = switch (kind) {
             .embed => &.{.{ .name = "Referer", .value = STREAM_REFERER }},
@@ -464,12 +372,10 @@ test "parseDataId scrapes the first numeric data-id, any quoting" {
     ).?);
     try testing.expectEqualStrings("13452", MegaPlay.parseDataId("<div data-id='13452'>").?);
     try testing.expectEqualStrings("7", MegaPlay.parseDataId("<div data-id=7 >").?);
-    // First numeric one wins across multiple attributes.
     try testing.expectEqualStrings("11", MegaPlay.parseDataId(
         \\<a data-id="11"></a><a data-id="22"></a>
     ).?);
-    // The live mal-route shape carries sibling data-realid/-mediaid attributes;
-    // data-id must win, not a substring of a longer attribute name.
+    // data-id must win over sibling data-realid / data-mediaid.
     try testing.expectEqualStrings("13461", MegaPlay.parseDataId(
         \\<div class="fix-area" id="megaplay-player"
         \\    data-id="13461"
@@ -479,13 +385,12 @@ test "parseDataId scrapes the first numeric data-id, any quoting" {
 }
 
 test "parseDataId skips empty/non-numeric values and bounds the id" {
-    // An empty or junk value keeps scanning to a later real one.
     try testing.expectEqualStrings("42", MegaPlay.parseDataId(
         \\<a data-id=""></a><b data-id="x9"></b><c data-id="42"></c>
     ).?);
     try testing.expect(MegaPlay.parseDataId("<html>no ids here</html>") == null);
     try testing.expect(MegaPlay.parseDataId("") == null);
-    // Over-long digit runs are rejected, not spliced into a URL.
+    // Over-long digit runs rejected, not spliced into a URL.
     const long = "data-id=\"123456789012345678901\"";
     try testing.expect(MegaPlay.parseDataId(long) == null);
 }
@@ -520,9 +425,8 @@ test "labels mints positional 1..N; a hint-less caller degrades to one episode" 
     try testing.expectEqual(@as(usize, 28), eps.len);
     try testing.expectEqualStrings("1", eps[0].raw);
     try testing.expectEqualStrings("28", eps[27].raw);
-    // Zero normalizes to one episode, never zero (ROD-347: empty means not-stocked).
+    // Zero → one (ROD-347: empty means not-stocked). Hostile count clamps (ROD-359).
     try testing.expectEqual(@as(usize, 1), (try MegaPlay.labels(a, 0)).len);
-    // A hostile count clamps to the ceiling rather than sizing a giant alloc (ROD-359).
     try testing.expectEqual(@as(usize, domain.max_episode_hint), (try MegaPlay.labels(a, 4_294_967_295)).len);
 }
 
@@ -538,7 +442,7 @@ test "canonicalKey derives the stringified mal_id; null without one (ROD-359)" {
         .mal_id = 52991,
     });
     try testing.expectEqualStrings("52991", key.?);
-    // No mal_id: no key, and (unlike senshi) no tier-C search to fall to.
+    // No mal_id: no key, no tier-C search.
     const none = try p.canonicalKey(arena_state.allocator(), .{
         .id = "1",
         .name = "X",
@@ -552,7 +456,7 @@ test "resolve rejects foreign/corrupt episode labels before any network" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    // `undefined` Io proves the guard fires before the wire is touched.
+    // `undefined` Io proves the guard fires before the wire.
     try testing.expectError(error.InvalidEpisode, mp.resolve(a, undefined, "52991", .{ .raw = "13.5" }, .sub, .best));
     try testing.expectError(error.InvalidEpisode, mp.resolve(a, undefined, "52991", .{ .raw = "0" }, .sub, .best));
     try testing.expectError(error.InvalidEpisode, mp.resolve(a, undefined, "52991", .{ .raw = "" }, .sub, .best));
@@ -586,16 +490,14 @@ test "mapSources maps a live-shaped getSources body (ROD-341)" {
     try testing.expectEqualStrings("https://cdn.mewstream.buzz/x/master.m3u8", s.link.url);
     try testing.expectEqualStrings(STREAM_REFERER, s.link.referer.?);
     try testing.expect(s.link.user_agent != null);
-    try testing.expect(s.link.cloaked_segments); // .ts-as-.jpg segments need the relaxed gate
-    try testing.expectEqual(@as(usize, 2), s.tracks.len); // the file-less track is dropped
+    try testing.expect(s.link.cloaked_segments);
+    try testing.expectEqual(@as(usize, 2), s.tracks.len);
     try testing.expectEqualStrings("English", s.tracks[0].label.?);
     try testing.expect(s.tracks[0].default);
     try testing.expectEqualStrings("thumbnails", s.tracks[1].kind.?);
     try testing.expectEqual(@as(f64, 100), s.intro.?.start);
     try testing.expectEqual(@as(f64, 1390), s.outro.?.end);
-    // The softsub seam (ROD-354): sub resolve carries the default vtt…
     try testing.expectEqualStrings("https://1oe.lostproject.club/eng.vtt", s.link.sub_url.?);
-    // …a dub resolve never auto-loads one.
     const d = try MegaPlay.mapSources(a, raw, .dub);
     try testing.expect(d.link.sub_url == null);
 }
@@ -605,19 +507,14 @@ test "pickSubtitle: default wins, english next, first as fallback, thumbnails ne
     const spanish: Track = .{ .file = "https://c/spa.vtt", .label = "Spanish", .kind = "captions" };
     const english: Track = .{ .file = "https://c/eng.vtt", .label = "English - CR", .kind = "captions" };
     const eng_default: Track = .{ .file = "https://c/eng2.vtt", .label = "English", .kind = "captions", .default = true };
-    const bare: Track = .{ .file = "https://c/bare.vtt" }; // no label/kind, live-observed shape
+    const bare: Track = .{ .file = "https://c/bare.vtt" };
 
-    // default beats an earlier english label; a default thumbnails track is not a sub.
     try testing.expectEqualStrings("https://c/eng2.vtt", MegaPlay.pickSubtitle(&.{ thumbs, english, eng_default }).?);
-    // no default: the english label wins over an earlier other language.
     try testing.expectEqualStrings("https://c/eng.vtt", MegaPlay.pickSubtitle(&.{ spanish, english }).?);
-    // no default, no english: first subtitle-shaped track.
     try testing.expectEqualStrings("https://c/spa.vtt", MegaPlay.pickSubtitle(&.{ thumbs, spanish }).?);
     try testing.expectEqualStrings("https://c/bare.vtt", MegaPlay.pickSubtitle(&.{bare}).?);
-    // nothing but the sprite sheet, or nothing at all: no pick.
     try testing.expect(MegaPlay.pickSubtitle(&.{thumbs}) == null);
     try testing.expect(MegaPlay.pickSubtitle(&.{}) == null);
-    // an unknown future kind fails safe (never picked), even flagged default.
     const alien: Track = .{ .file = "https://c/alien.vtt", .kind = "chapters", .default = true };
     try testing.expect(MegaPlay.pickSubtitle(&.{alien}) == null);
     try testing.expectEqualStrings("https://c/spa.vtt", MegaPlay.pickSubtitle(&.{ alien, spanish }).?);
@@ -630,29 +527,23 @@ test "englishCaptions: only english-labeled caption tracks, host order (ROD-377)
 
     const eng_signs: Track = .{ .file = "https://c/eng-3.vtt", .label = "English", .kind = "captions", .default = true };
     const eng_2: Track = .{ .file = "https://c/eng-4.vtt", .label = "English 2", .kind = "captions" };
-    const eng_bare: Track = .{ .file = "https://c/eng-bare.vtt", .label = "English" }; // kind-less, still a sub
+    const eng_bare: Track = .{ .file = "https://c/eng-bare.vtt", .label = "English" };
     const spanish: Track = .{ .file = "https://c/spa.vtt", .label = "Spanish", .kind = "captions" };
     const thumbs: Track = .{ .file = "https://c/thumbs.vtt", .label = "English", .kind = "thumbnails" };
     const unlabeled: Track = .{ .file = "https://c/bare.vtt", .kind = "captions" };
 
-    // The multi-english case the fix disambiguates: every english sub-shaped track,
-    // in order, regardless of the host's `default`. The kind-less "English" track
-    // qualifies (parity with pickSubtitle); Spanish, the sprite sheet (even labeled
-    // English), and the label-less caption are excluded.
+    // Kind-less "English" qualifies; Spanish, thumbs (even labeled English), unlabeled do not.
     const got = try MegaPlay.englishCaptions(a, &.{ eng_signs, spanish, eng_2, thumbs, eng_bare, unlabeled });
     try testing.expectEqual(@as(usize, 3), got.len);
     try testing.expectEqualStrings("https://c/eng-3.vtt", got[0]);
     try testing.expectEqualStrings("https://c/eng-4.vtt", got[1]);
     try testing.expectEqualStrings("https://c/eng-bare.vtt", got[2]);
 
-    // A lone english track: the caller skips the probe and keeps the metadata pick.
     const one = try MegaPlay.englishCaptions(a, &.{ eng_2, spanish });
     try testing.expectEqual(@as(usize, 1), one.len);
-    // No english at all: empty, so the metadata pick stands.
     const none = try MegaPlay.englishCaptions(a, &.{ spanish, thumbs });
     try testing.expectEqual(@as(usize, 0), none.len);
 
-    // The probe cap holds against a flood of bogus english tracks.
     var flood: [12]Track = undefined;
     for (&flood) |*t| t.* = eng_2;
     const capped = try MegaPlay.englishCaptions(a, &flood);
@@ -668,15 +559,13 @@ test "mapSources: missing or unsafe stream url is a clean error" {
     try testing.expectError(error.NoStreamSource, MegaPlay.mapSources(a,
         \\{"sources":{}}
     , .sub));
-    // Relative url and an argv-unsafe url both refuse to reach mpv.
     try testing.expectError(error.BadStreamUrl, MegaPlay.mapSources(a,
         \\{"sources":{"file":"/x/master.m3u8"}}
     , .sub));
     try testing.expectError(error.BadStreamUrl, MegaPlay.mapSources(a,
         \\{"sources":{"file":"https://cdn/x master.m3u8"}}
     , .sub));
-    // An unsafe TRACK url is dropped, not fatal; the stream still resolves,
-    // and the dropped track can never become the sub pick.
+    // Unsafe track dropped, not fatal; cannot become the sub pick.
     const s = try MegaPlay.mapSources(a,
         \\{"sources":{"file":"https://cdn/ok.m3u8"},
         \\ "tracks":[{"file":"/relative.vtt","kind":"captions"}]}
@@ -689,11 +578,11 @@ test "skipFrom rejects degenerate windows, keeps real ones" {
     try testing.expect(MegaPlay.skipFrom(null) == null);
     try testing.expect(MegaPlay.skipFrom(.{ .start = 100, .end = null }) == null);
     try testing.expect(MegaPlay.skipFrom(.{ .start = null, .end = 190 }) == null);
-    try testing.expect(MegaPlay.skipFrom(.{ .start = 190, .end = 100 }) == null); // inverted
-    try testing.expect(MegaPlay.skipFrom(.{ .start = 100, .end = 100 }) == null); // zero-width
+    try testing.expect(MegaPlay.skipFrom(.{ .start = 190, .end = 100 }) == null);
+    try testing.expect(MegaPlay.skipFrom(.{ .start = 100, .end = 100 }) == null);
     try testing.expect(MegaPlay.skipFrom(.{ .start = -5, .end = 90 }) == null);
     try testing.expect(MegaPlay.skipFrom(.{ .start = std.math.inf(f64), .end = 190 }) == null);
-    const w = MegaPlay.skipFrom(.{ .start = 0, .end = 90 }).?; // an OP at 0:00 is real
+    const w = MegaPlay.skipFrom(.{ .start = 0, .end = 90 }).?;
     try testing.expectEqual(@as(f64, 0), w.start);
     try testing.expectEqual(@as(f64, 90), w.end);
 }
