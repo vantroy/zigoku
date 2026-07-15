@@ -1,9 +1,6 @@
-//! AniList metadata enrichment for Zigoku.
-//!
-//! This is deliberately **not** the playback path. AllAnime remains the source of
-//! truth for search -> episodes -> resolve -> play. AniList is an enrichment side
-//! rail that gives us durable metadata (cover art, synopsis, score, MAL/AniList ids)
-//! when we can map a provider row to a single media entry with high confidence.
+//! AniList metadata enrichment. Not the playback path: providers own
+//! search → episodes → resolve → play. AniList is the durable-metadata side rail
+//! (cover, synopsis, score, MAL/AniList ids) when a row maps with high confidence.
 
 const std = @import("std");
 const domain = @import("domain.zig");
@@ -15,36 +12,22 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
 const ENDPOINT = "https://graphql.anilist.co";
-// Wall-clock ceiling on any single enrichment POST (ROD-262). std exposes no
-// per-read socket timeout, so a reachable-but-silent AniList would otherwise hang
-// the worker forever (a real hazard once ROD-251 detached these fetches — each
-// stuck one leaks a thread + the 2 MB buffer below). Tighter than AllAnime's 20 s:
-// enrichment is a background side rail, not the user-blocking playback path, and
-// one GraphQL POST (even a 50-id batch) is a single round trip.
+// Wall-clock ceiling per enrichment POST (ROD-262). No per-read socket timeout in
+// std; a silent host would hang a detached worker (ROD-251). 10s: side rail, one round trip.
 const ANILIST_DEADLINE_S = 10;
-// Shared selection set so the search and by-id queries can never drift apart.
+// Shared selection set so search and by-id never drift.
 const GQL_FIELDS = "id idMal title{romaji english native} episodes duration averageScore status season seasonYear startDate{year month day} format source countryOfOrigin genres studios(isMain:true){nodes{name}} rankings{rank type year allTime} nextAiringEpisode{episode airingAt} description(asHtml:false) coverImage{large}";
-// $page is required: every caller must bind it (enrichBySearch fixes page 1).
+// $page required; enrichBySearch binds page 1.
 const GQL_SEARCH = "query($search:String!,$perPage:Int!,$page:Int!){Page(page:$page,perPage:$perPage){media(search:$search,type:ANIME,sort:SEARCH_MATCH){" ++ GQL_FIELDS ++ "}}}";
-// Deterministic join: when AllAnime handed us an AniList id (mined from the
-// cover url, ROD-181) we look the media up directly — no title matching.
+// Deterministic join when we already have an AniList id (ROD-181); no title matching.
 const GQL_BY_ID = "query($id:Int!){Media(id:$id,type:ANIME){" ++ GQL_FIELDS ++ "}}";
-// ROD-247 batched enrichment: the card-signal subset only. Deliberately NARROWER
-// than GQL_FIELDS (no `description`, title, or studios) so one fetch hydrating a
-// whole page (~30-50 ids) stays light. Its Discover callers died with the AniList
-// cutover (ROD-336); the v13 idMal backfill migration (provider_migrate.zig) still
-// batches through this. Keep this set and GQL_FIELDS divergent on purpose.
+// ROD-247 batch: card-signal subset, narrower than GQL_FIELDS on purpose. Discover
+// cutover (ROD-336) dropped UI callers; provider_migrate still uses this.
 const GQL_BATCH_FIELDS = "id idMal averageScore genres season seasonYear startDate{year}";
-// ROD-334 Discover feed (§9.6): the full GQL_FIELDS set, so one call returns a
-// fully-enriched page, no batch-enrich pass. `sort`/`season`/`seasonYear` ride as
-// variables so all four axes share this one operation; `pageInfo.hasNextPage` is
-// the exhaustion signal (replaces the old "page came back short" heuristic).
+// ROD-334 Discover (§9.6): full GQL_FIELDS; sort/season vars; pageInfo.hasNextPage.
 const GQL_DISCOVER = "query($page:Int!,$perPage:Int!,$sort:[MediaSort],$season:MediaSeason,$seasonYear:Int){Page(page:$page,perPage:$perPage){pageInfo{hasNextPage} media(type:ANIME,sort:$sort,season:$season,seasonYear:$seasonYear){" ++ GQL_FIELDS ++ "}}}";
 
-// Both queries are interpolated raw into a JSON body with `{s}`, so they must
-// contain nothing that needs JSON-string escaping. Enforce at comptime rather
-// than reaching for std.json.stringify on a constant — if someone adds a quote
-// or control char to the selection set, this fails the build, not a 400 at runtime.
+// Queries are `{s}`-interpolated into JSON: no quotes/control chars, or the build fails.
 comptime {
     @setEvalBranchQuota(4000);
     for (GQL_SEARCH ++ GQL_BY_ID ++ GQL_BATCH_FIELDS ++ GQL_DISCOVER) |c| {
@@ -57,43 +40,35 @@ comptime {
 pub const Metadata = struct {
     anilist_id: ?u64 = null,
     mal_id: ?u64 = null,
-    /// True AniList romaji (ROD-312) — heals canonical.title off the provider seed.
+    /// True AniList romaji (ROD-312): heals canonical.title off the provider seed.
     title_romaji: ?[]const u8 = null,
     title_english: ?[]const u8 = null,
     title_native: ?[]const u8 = null,
     thumb: ?[]const u8 = null,
     total_episodes: ?u32 = null,
-    /// Per-episode runtime in minutes (ROD-261).
+    /// Runtime minutes (ROD-261).
     duration: ?u32 = null,
     year: ?u32 = null,
     season: ?domain.Season = null,
     start_date: ?domain.Date = null,
     status: ?[]const u8 = null,
-    /// AniList `format` (TV/MOVIE/OVA…) — populates `domain.Anime.kind`.
+    /// AniList format → domain.Anime.kind.
     kind: ?[]const u8 = null,
-    /// Arena-owned at the call site (borrowed from the parsed JSON); the worker
-    /// deep-copies into GPA before arena teardown. Empty slice = none provided.
+    /// Arena-owned (JSON borrow); worker GPA-copies before arena teardown.
     genres: []const []const u8 = &.{},
     studios: []const []const u8 = &.{},
     description: ?[]const u8 = null,
     score: ?u32 = null,
-    /// AniList `source` enum (MANGA/LIGHT_NOVEL/ORIGINAL…), stored raw and
-    /// prettified at render (ROD-261). Named `source_material` to avoid clashing
-    /// with the provider `source` key used across the store.
+    /// AniList source enum raw (ROD-261). Not provider `source`.
     source_material: ?[]const u8 = null,
-    /// The single ranking selected from AniList's `rankings` array by `selectRank`
-    /// (ROD-261): rank position, type ("RATED"/"POPULAR"), and year — null year
-    /// means an all-time ranking. Rendered rail-only as `#{rank} {type} {year}`.
+    /// selectRank pick (ROD-261): position, type, year (null year = all-time).
     rank: ?u32 = null,
     rank_type: ?[]const u8 = null,
     rank_year: ?u32 = null,
-    /// Next-episode airing (ROD-261): the absolute `airingAt` unix timestamp and
-    /// the episode number. Persisted absolute so the countdown recomputes from the
-    /// live clock at render, surviving restarts (the relative `timeUntilAiring`
-    /// would go stale). Present only for currently-airing shows.
+    /// Absolute next air (unix + ep). Relative airing deltas would go stale (ROD-261).
     next_airing_at: ?i64 = null,
     next_airing_episode: ?u32 = null,
-    /// AniList `countryOfOrigin` (JP/CN/KR…) — surfaced only when not JP (ROD-261).
+    /// countryOfOrigin; UI surfaces non-JP (ROD-261).
     country: ?[]const u8 = null,
 };
 
@@ -117,15 +92,12 @@ const Studio = struct {
     name: ?[]const u8 = null,
 };
 
-// AniList nests studios as `studios{nodes{name}}`; default to an empty node list
-// so a media entry that omits the field parses without error.
+// studios{nodes{name}}; empty default if omitted.
 const Studios = struct {
     nodes: []const Studio = &.{},
 };
 
-// One entry of AniList's `rankings` array (ROD-261). `type` is RATED or POPULAR;
-// `allTime` distinguishes an all-time ranking from a year/season-scoped one. We
-// keep only what `selectRank` needs to pick and render the best one.
+// rankings[] entry for selectRank (ROD-261).
 const Ranking = struct {
     rank: u32 = 0,
     type: ?[]const u8 = null,
@@ -133,8 +105,7 @@ const Ranking = struct {
     allTime: bool = false,
 };
 
-// AniList `nextAiringEpisode` (ROD-261) — the next episode's absolute airing
-// timestamp. Null on the media entirely for a finished/unscheduled show.
+// nextAiringEpisode absolute air time (ROD-261). Null when finished/unscheduled.
 const NextAiring = struct {
     episode: ?u32 = null,
     airingAt: ?i64 = null,
@@ -168,7 +139,7 @@ const PageInfo = struct {
 
 const Page = struct {
     media: []Media,
-    // Requested by GQL_DISCOVER only; null on the search/batch responses.
+    // GQL_DISCOVER only; null on search/batch.
     pageInfo: ?PageInfo = null,
 };
 
@@ -180,7 +151,7 @@ const Resp = struct {
     data: ?Data = null,
 };
 
-// by-id response shape: a single `Media` rather than a `Page` of them.
+// by-id: single Media, not Page.
 const MediaData = struct {
     Media: ?Media = null,
 };
@@ -189,28 +160,17 @@ const MediaResp = struct {
     data: ?MediaData = null,
 };
 
-// NOTE: the show ← Metadata fill-if-null mapping lives in `workers.applyMetadata`,
-// not here. It has to: each filled field is deep-copied into GPA as it goes, so
-// nothing aliases the parse arena that `Metadata`'s slices borrow from. Doing it in
-// anilist.zig would hand back a struct pointing into that soon-dead arena, a UAF
-// trap, so the mapping stays where the GPA-owning copy happens.
+// Fill-if-null mapping is workers.applyMetadata (GPA deep-copy). Doing it here would
+// alias Metadata slices into the soon-dead parse arena (UAF).
 
-/// The three-state enrich contract (ROD-278). Callers that stamp an enrichment freshness
-/// clock (the refresh-on-view path) MUST distinguish a confirmed answer from a failed fetch:
-/// only a confirmed answer may advance the clock.
-///   * `Metadata`:       a confirmed match.            → stamp fresh
-///   * `null`:           a CONFIRMED no-match: AniList was reached and definitively returned
-///                       nothing (no such id, no search hit). → stamp fresh (negative cache)
-///   * `error.NoAnswer`: no confirmed answer: transport error, timeout, non-200, over-cap
-///                       body, a malformed 200, or a `{"data":null}` GraphQL error. → DON'T
-///                       stamp; retry on next view.
-/// Value (incl. `null`) means "AniList answered"; the error arm means "it didn't."
+/// Three-state enrich (ROD-278). Only a confirmed answer may stamp freshness:
+///   * Metadata: match → stamp
+///   * null: confirmed no-match → stamp (negative cache)
+///   * error.NoAnswer: transport/timeout/malformed/`data:null` → do not stamp
 pub const EnrichError = error{NoAnswer} || Allocator.Error;
 
 pub fn enrich(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Metadata {
-    // Deterministic path: AllAnime gave us the AniList id (mined from the cover
-    // url, ROD-181). Look the media up by id — exact, no title matching, so the
-    // "Nth Season" mismatch and sequel-ambiguity failures simply don't apply.
+    // Prefer by-id when anilist_id known (ROD-181): exact, no title match.
     if (show.anilist_id) |id| return enrichById(arena, io, id);
     return enrichBySearch(arena, io, show);
 }
@@ -221,31 +181,25 @@ fn enrichById(arena: Allocator, io: Io, id: u64) EnrichError!?Metadata {
         "{{\"query\":\"{s}\",\"variables\":{{\"id\":{d}}}}}",
         .{ GQL_BY_ID, id },
     );
-    // postGql returns null on any transport failure (network/timeout/non-200/
-    // over-cap) — that is "no answer", not a confirmed no-match, so it errors.
+    // Transport miss → NoAnswer (not confirmed no-match).
     const raw = postGql(arena, io, body) orelse return error.NoAnswer;
     return classifyById(arena, raw);
 }
 
-/// Map a by-id AniList response body to the three-state contract. Split from the
-/// POST so the null-vs-error classification is unit-testable without a live fetch.
+/// by-id body → three-state. Split for unit tests without a live fetch.
 fn classifyById(arena: Allocator, raw: []const u8) EnrichError!?Metadata {
-    // A 200 we can't parse, or a `{"data":null}` GraphQL-level error, is a
-    // malformed/failed answer — not a no-match. Error so the row retries.
+    // Unparseable / data:null = no answer (retry). Media:null = confirmed no-match.
     const parsed = std.json.parseFromSlice(MediaResp, arena, raw, .{
         .ignore_unknown_fields = true,
     }) catch return error.NoAnswer;
     const data = parsed.value.data orelse return error.NoAnswer;
-    // `{"data":{"Media":null}}` IS a confirmed answer: no anime carries that id.
     const media = data.Media orelse return null;
     return try mediaToMeta(arena, media);
 }
 
 fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Metadata {
     const title = show.english_name orelse show.name;
-    // Nothing to look up — a confirmed "no title, no possible match", not a fetch
-    // failure. Return null so the refresh path stamps it (negative cache) rather
-    // than re-attempting a doomed search on every view.
+    // Empty title: confirmed no-match (stamp), not NoAnswer.
     if (title.len == 0) return null;
 
     const body = try std.fmt.allocPrint(
@@ -257,34 +211,24 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Met
     return classifyBySearch(arena, show, raw);
 }
 
-/// Map a search AniList response body to the three-state contract. Split from the
-/// POST so the null-vs-error classification is unit-testable without a live fetch.
+/// Search body → three-state. Split for unit tests.
 fn classifyBySearch(arena: Allocator, show: domain.Anime, raw: []const u8) EnrichError!?Metadata {
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
     }) catch return error.NoAnswer;
     const data = parsed.value.data orelse return error.NoAnswer;
-    // Reached AniList and ran the match: an empty page or a page where nothing
-    // clears bestMatch's guard is a confirmed no-match, not a fetch failure.
+    // Empty page / no bestMatch: confirmed no-match.
     const best = bestMatch(show, data.Page.media) orelse return null;
     return try mediaToMeta(arena, best);
 }
 
-/// Batch-enrich a page of Discover cards in ONE AniList round trip (ROD-247). `ids` are
-/// AniList media ids the caller mined from cover thumbs (cards without one are filtered
-/// upstream). Returns an arena-owned `Metadata` per returned media, each tagged with its
-/// `anilist_id` (via `mediaToMeta`) so the caller can join results back by id, since AniList
-/// doesn't guarantee response order matches `ids`.
-///
-/// Same three-state contract as `enrich` (ROD-278): a returned slice (empty or not) means
-/// AniList was REACHED and the caller may stamp fresh (an empty slice is a confirmed "no
-/// matches"); `error.NoAnswer` is a transport/HTTP/malformed miss where the page degrades to
-/// `[--]` and the caller must NOT stamp, or a failed fetch burns the clock on un-enriched cards.
+/// Batch enrich by AniList ids (ROD-247). Arena Metadata tagged with anilist_id
+/// (order not guaranteed). Three-state like enrich (ROD-278): empty slice stamps;
+/// NoAnswer does not.
 pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]const Metadata {
     if (ids.len == 0) return &.{};
 
-    // `id_in:[1,2,3]` — integers only, so the list is JSON-safe interpolated raw,
-    // the same trust basis as the comptime-guarded GQL_BATCH_FIELDS.
+    // Integers only: safe to interpolate (like GQL_BATCH_FIELDS).
     var ids_buf: std.ArrayList(u8) = .empty;
     try ids_buf.append(arena, '[');
     for (ids, 0..) |id, i| {
@@ -293,14 +237,8 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     }
     try ids_buf.append(arena, ']');
 
-    // `perPage:{d}` is `ids.len`, which relies on AniList capping Page.perPage at 50: the
-    // caller (provider_migrate's v13 backfill) chunks ids at 50, so ids.len ≤ 50 holds. If
-    // the page size is ever raised past 50, AniList 400s the query, postGql returns null,
-    // error.NoAnswer, and the page degrades to `[--]` un-stamped. Chunk the ids first.
-    //
-    // GQL_BATCH_FIELDS is passed as a `{s}` ARG, never concatenated into the format string:
-    // it contains `startDate{year}`, whose braces the format parser would read as a `{year}`
-    // placeholder. As an arg its contents are data, not format syntax.
+    // perPage = ids.len; AniList caps at 50 (callers chunk). GQL_BATCH_FIELDS as {s}
+    // arg (not format concat): contains startDate{year} braces.
     const query = try std.fmt.allocPrint(
         arena,
         "query{{Page(perPage:{d}){{media(id_in:{s},type:ANIME){{{s}}}}}}}",
@@ -308,27 +246,13 @@ pub fn enrichBatch(arena: Allocator, io: Io, ids: []const u64) EnrichError![]con
     );
     const body = try std.fmt.allocPrint(arena, "{{\"query\":\"{s}\"}}", .{query});
 
-    // A transport miss (null response) is "no answer" — error so the caller leaves
-    // the page un-stamped. pageToMetas classifies the rest of the three-state contract
-    // (malformed 200 / {"data":null} → error.NoAnswer, empty page → &.{}) and returns
-    // the same EnrichError set, so it propagates directly — no re-wrap (which would
-    // relabel a genuine OutOfMemory as NoAnswer and lose the diagnostic).
+    // Transport null → NoAnswer. pageToMetas propagates EnrichError (do not rewrap OOM).
     const raw = postGql(arena, io, body) orelse return error.NoAnswer;
     return pageToMetas(arena, raw);
 }
 
-/// Parse a `Page`-shaped AniList response into one `Metadata` per media. Split from
-/// `enrichBatch` so the mapping is unit-testable without a live POST. Arena-borrowed slices;
-/// the worker deep-copies to GPA.
-///
-/// Classifies `data == null` like `classifyById`/`classifyBySearch` (ROD-278): a
-/// `{"data":null}` body is a GraphQL execution error (a 200 with no data), NOT a
-/// confirmed-empty page, so return `error.NoAnswer` and the caller leaves it un-stamped. A
-/// parsed page with zero media IS a confirmed empty answer and returns an empty slice.
+/// Page JSON → Metadata slice. data:null → NoAnswer; empty media → empty slice (ROD-278).
 fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
-    // A malformed 200 (unparseable body) is a failed answer, not an empty page —
-    // error, same as classifyById/classifyBySearch, so pageToMetas honors the
-    // three-state contract on its own (and is unit-testable for it).
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
     }) catch return error.NoAnswer;
@@ -339,19 +263,14 @@ fn pageToMetas(arena: Allocator, raw: []const u8) EnrichError![]const Metadata {
     return out;
 }
 
-/// AniList discovery search (ROD-326): browse-facing, off the `SourceProvider` vtable
-/// (the discovery axis; catalog/binding search stays on the vtable, ROD-328). Rows are
-/// arena-borrowed like `enrichBatch`'s return. Same three-state contract as `enrichBatch`
-/// (ROD-278): `error.NoAnswer` is a transport miss, an empty slice a confirmed no-match.
-/// `page` is 1-based.
+/// Discovery search off SourceProvider vtable (ROD-326). page 1-based. Three-state ROD-278.
 pub fn search(arena: Allocator, io: Io, query: []const u8, page: u32) EnrichError![]domain.Anime {
     if (query.len == 0) return &.{};
     const raw = postGql(arena, io, try searchBody(arena, query, page)) orelse return error.NoAnswer;
     return pageToAnime(arena, raw);
 }
 
-/// Split from `search` so the paging wiring is unit-testable without a POST. `query` is
-/// JSON-escaped: unlike the comptime-guarded selection set, it is untrusted input.
+/// search body (JSON-escape untrusted query). Split for unit tests.
 fn searchBody(arena: Allocator, query: []const u8, page: u32) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
@@ -360,8 +279,7 @@ fn searchBody(arena: Allocator, query: []const u8, page: u32) ![]const u8 {
     );
 }
 
-/// JSON to rows, split from `search` so the mapping is unit-testable. Same three-state
-/// classification as `pageToMetas`: `{"data":null}` is no-answer, an empty page is empty.
+/// Search JSON → rows. data:null → NoAnswer; empty page → empty (ROD-278).
 fn pageToAnime(arena: Allocator, raw: []const u8) EnrichError![]domain.Anime {
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
@@ -376,18 +294,14 @@ fn mediaToRows(arena: Allocator, media: []const Media) ![]domain.Anime {
     return out;
 }
 
-/// The four Discover feed axes (ROD-334, §3.8/§9.6). Off the vtable like `search`:
-/// discovery is a global catalogue concern, not a provider-relative one.
+/// Discover feed axes (ROD-334, §3.8/§9.6). Off the vtable like search.
 pub const DiscoverAxis = enum {
     trending,
     popular,
     top_rated,
     this_season,
 
-    /// This axis's `sort` variable value, as a ready JSON array. Every axis carries
-    /// a secondary tiebreak key: AniList ties on the primary at the tail of a large
-    /// result set, and an unstable order would reshuffle already-loaded pages on
-    /// the next fetch (§9.6).
+    /// sort JSON array. Secondary key stabilizes page order under primary ties (§9.6).
     fn sortJson(self: DiscoverAxis) []const u8 {
         return switch (self) {
             .trending => "[\"TRENDING_DESC\",\"POPULARITY_DESC\"]",
@@ -397,28 +311,23 @@ pub const DiscoverAxis = enum {
     }
 };
 
-/// Feed page stride (§9.6). AniList caps Page.perPage at 50; keep it under that.
+/// Discover page size (§9.6). Under AniList's perPage cap of 50.
 pub const discover_page_size = 20;
 
-/// One parsed feed page: rows plus AniList's own has-more signal, the pagination
-/// gate (§9.6). Rows are arena-borrowed like `search`'s.
+/// One feed page + hasNextPage (§9.6). Rows arena-borrowed.
 pub const DiscoverPage = struct {
     rows: []domain.Anime,
     has_next_page: bool,
 };
 
-/// Fetch one Discover feed page (ROD-334). `page` is 1-based; `now_ms` anchors the
-/// This Season cour (other axes ignore it). Same three-state contract as `search`
-/// (ROD-278): `error.NoAnswer` is a transport miss, an empty page a confirmed one.
+/// One Discover page (ROD-334). page 1-based; now_ms anchors This Season. Three-state ROD-278.
 pub fn discover(arena: Allocator, io: Io, axis: DiscoverAxis, page: u32, now_ms: i64) EnrichError!DiscoverPage {
     const raw = postGql(arena, io, try discoverBody(arena, axis, page, now_ms)) orelse return error.NoAnswer;
     return pageToDiscover(arena, raw);
 }
 
-/// Split from `discover` so the axis→variables wiring is unit-testable without a
-/// POST. `season`/`seasonYear` are OMITTED (not null'd) off the This Season axis:
-/// a declared-but-unprovided nullable variable leaves the argument unset per the
-/// GraphQL spec, whereas an explicit null would filter on `season == null`.
+/// Axis→variables. season/seasonYear OMITTED off This Season: explicit null would
+/// filter season==null; omitted leaves the arg unset (GraphQL).
 fn discoverBody(arena: Allocator, axis: DiscoverAxis, page: u32, now_ms: i64) ![]const u8 {
     const season_vars: []const u8 = switch (axis) {
         .this_season => blk: {
@@ -431,8 +340,7 @@ fn discoverBody(arena: Allocator, axis: DiscoverAxis, page: u32, now_ms: i64) ![
         },
         else => "",
     };
-    // sortJson/seasonEnum are fixed enum-derived literals, JSON-safe interpolated on
-    // the same trust basis as saveMediaListEntry's status value.
+    // sortJson/seasonEnum are fixed literals (JSON-safe).
     return std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"page\":{d},\"perPage\":{d},\"sort\":{s}{s}}}}}",
@@ -440,7 +348,6 @@ fn discoverBody(arena: Allocator, axis: DiscoverAxis, page: u32, now_ms: i64) ![
     );
 }
 
-/// `domain.Season` to AniList's `MediaSeason` enum spelling.
 fn seasonEnum(s: domain.Season) []const u8 {
     return switch (s) {
         .winter => "WINTER",
@@ -450,10 +357,7 @@ fn seasonEnum(s: domain.Season) []const u8 {
     };
 }
 
-/// JSON to a feed page, split from `discover` so the mapping is unit-testable. Same
-/// three-state classification as `pageToAnime`. A response missing `pageInfo` (API
-/// drift) reads as exhausted: pagination stops rather than spinning on a signal
-/// that never arrives.
+/// Discover JSON → page. Missing pageInfo → exhausted (stop, don't spin).
 fn pageToDiscover(arena: Allocator, raw: []const u8) EnrichError!DiscoverPage {
     const parsed = std.json.parseFromSlice(Resp, arena, raw, .{
         .ignore_unknown_fields = true,
@@ -465,11 +369,10 @@ fn pageToDiscover(arena: Allocator, raw: []const u8) EnrichError!DiscoverPage {
     };
 }
 
-/// Arena-borrowed from `meta` (the worker deep-copies to GPA, like `enrichBatch`). `id`
-/// is the stringified `anilist_id`: an opaque UI handle, never a provider show id, so it
-/// must never reach `provider.episodes()`/`resolve()` (the resolver binds those, ROD-328).
+/// meta → Anime (arena-borrowed; worker GPA-copies). id = stringified anilist_id
+/// (UI handle only; never provider.episodes/resolve, ROD-328).
 fn metaToAnime(arena: Allocator, meta: Metadata) !domain.Anime {
-    // anilist_id is set from the non-optional Media.id, so a parsed hit always has one.
+    // Media.id always sets anilist_id.
     const id = try std.fmt.allocPrint(arena, "{d}", .{meta.anilist_id.?});
     const name = meta.title_romaji orelse meta.title_english orelse meta.title_native orelse "";
     return .{
@@ -502,36 +405,20 @@ fn metaToAnime(arena: Allocator, meta: Metadata) !domain.Anime {
     };
 }
 
-/// The raw HTTP outcome of one GraphQL POST — the status code kept alongside the
-/// body so an authed caller (the ROD-284 push) can distinguish a 429 rate-limit
-/// from a 401 from a hard failure. Enrichment collapses all of it to null; see
-/// `postGql`.
+/// GraphQL POST outcome: status + body. Push classifies 429/401 (ROD-284);
+/// enrichment collapses non-success via postGql.
 pub const HttpResult = struct { status: std.http.Status, body: []const u8 };
 
-/// One GraphQL POST to AniList. `bearer`, when present, rides as an `Authorization: Bearer`
-/// header (null for the unauthenticated enrichment queries, set for the authed push
-/// mutations, ROD-284). Returns the raw {status, body}: the status check is deliberately the
-/// caller's, because enrichment wants "non-200 → null" while the push branches on
-/// 429/401 vs. success.
-///
-/// Run as a cancelable unit by `withDeadline` (ROD-262). Kept `!`-returning so the deadline
-/// race can tell a real result from a timeout: on a stalled fetch the cancel turns the
-/// blocked recv into error.Canceled, so this frame unwinds and frees `client` instead of hanging.
+/// One GraphQL POST. Optional bearer (ROD-284). Status left to caller.
+/// Cancelable under withDeadline (ROD-262): stall → Canceled, client frees.
 fn fetchGql(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) !HttpResult {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
-    // Cap the response at a fixed buffer rather than an unbounded Allocating writer
-    // (ROD-247): a hostile/MITM'd server could otherwise dribble a multi-GB body and
-    // OOM the process. Any real AniList reply (even a 50-id batch) is well under
-    // 100 KB; 2 MB is a 20× margin. An over-cap body overflows the fixed writer →
-    // fetch errors → null (graceful "no enrichment"), mirroring the cover path.
+    // Fixed 2 MB cap (ROD-247): unbounded writer could OOM; real replies << 100 KB.
     const resp_buf = try arena.alloc(u8, 2 * 1024 * 1024);
     var resp_w: std.Io.Writer = .fixed(resp_buf);
 
-    // Content-Type/Accept are constant; Authorization is optional, built into the
-    // arena and appended only when a token is supplied. A fixed 3-slot array keeps
-    // the header set on the stack — no allocation for the common unauthed case.
     var header_buf: [3]std.http.Header = .{
         .{ .name = "Content-Type", .value = "application/json" },
         .{ .name = "Accept", .value = "application/json" },
@@ -553,11 +440,8 @@ fn fetchGql(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) !Ht
     return .{ .status = res.status, .body = resp_w.buffered() };
 }
 
-/// A GraphQL POST bounded by `ANILIST_DEADLINE_S` (ROD-262), returning the raw
-/// {status, body} or null when the request never completes — transport error,
-/// over-cap body, or the deadline firing. The HTTP status inside a returned result
-/// may still be non-200; classifying that is the caller's job. Shared by
-/// enrichment (`postGql`) and the authed push (`saveMediaListEntry`).
+/// Deadline-bounded POST (ROD-262). null on transport/over-cap/timeout.
+/// Non-200 status still returned when body arrives; caller classifies.
 fn postGqlRaw(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) ?HttpResult {
     return deadline.withDeadline(io, .fromSeconds(ANILIST_DEADLINE_S), fetchGql, .{ arena, io, body, bearer }) catch |e| {
         if (e == error.Timeout)
@@ -566,10 +450,7 @@ fn postGqlRaw(arena: Allocator, io: Io, body: []const u8, bearer: ?[]const u8) ?
     };
 }
 
-/// Enrichment POST: the unauthenticated queries. Every failure — network error,
-/// non-200, over-cap body, or the deadline firing — collapses to `null`, the "no
-/// enrichment" signal every caller already handles. The push path uses
-/// `postGqlRaw` directly so it can see the status code.
+/// Unauthed enrich POST: any failure → null. Push uses postGqlRaw for status.
 fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
     const r = postGqlRaw(arena, io, body, null) orelse return null;
     if (r.status != .ok) return null;
@@ -578,9 +459,7 @@ fn postGql(arena: Allocator, io: Io, body: []const u8) ?[]const u8 {
 
 // ── AniList push: SaveMediaListEntry (ROD-284) ───────────────────────────────
 
-/// Map a local list status to AniList's `MediaListStatus` enum. Total and clean:
-/// AniList's REPEATING has no local twin, but it only arises on *pull* (ROD-285) —
-/// every local status maps outward to exactly one AniList value.
+/// Local list_status → AniList MediaListStatus. Total outward map; REPEATING is pull-only.
 pub fn aniListStatus(s: domain.ListStatus) []const u8 {
     return switch (s) {
         .planning => "PLANNING",
@@ -591,16 +470,12 @@ pub fn aniListStatus(s: domain.ListStatus) []const u8 {
     };
 }
 
-/// A push either lands (AniList returns the upserted entry id), hits a rate limit
-/// (429 — the engine backs off), finds the token rejected (401 — re-auth needed,
-/// stop the run), or fails otherwise. Distinct arms so the ROD-284 engine reacts
-/// per case instead of collapsing everything to "didn't work".
+/// Push arms (ROD-284): id / 429 RateLimited / 401 Unauthorized / else PushFailed.
 pub const PushError = error{ RateLimited, Unauthorized, PushFailed } || Allocator.Error;
 
 const SAVE_MUTATION = "mutation($mediaId:Int,$status:MediaListStatus,$progress:Int){SaveMediaListEntry(mediaId:$mediaId,status:$status,progress:$progress){id}}";
 
-// Interpolated raw into the JSON body with `{s}` (like the enrichment queries), so
-// it must carry nothing that needs JSON-string escaping — enforced at comptime.
+// {s}-interpolated: no JSON-escape chars (comptime).
 comptime {
     for (SAVE_MUTATION) |ch| {
         if (ch == '"' or ch == '\\' or ch < 0x20)
@@ -608,10 +483,8 @@ comptime {
     }
 }
 
-/// Upsert one show's watch-state to AniList via `SaveMediaListEntry` (ROD-284).
-/// Idempotent — AniList upserts keyed on `mediaId`, so re-pushing an unchanged row
-/// is a no-op on their side. Returns the media-list entry id on success. `bearer`
-/// is the OAuth access token (auth.zon); `media_id` is `anime.anilist_id`.
+/// Upsert watch-state via SaveMediaListEntry (ROD-284). Idempotent on mediaId.
+/// Returns list-entry id. bearer from auth.zon; media_id = anime.anilist_id.
 pub fn saveMediaListEntry(
     arena: Allocator,
     io: Io,
@@ -620,11 +493,7 @@ pub fn saveMediaListEntry(
     status: domain.ListStatus,
     progress: i64,
 ) PushError!i64 {
-    // Values ride as GraphQL variables — never interpolated into the query — so a
-    // media id or status can't break out of the string. The status enum passes as a
-    // JSON string, which AniList accepts for a MediaListStatus variable. The values
-    // are all integers or a fixed enum literal, so the variables object is JSON-safe
-    // built with `{d}`/`{s}` on the same trust basis as GQL_BATCH_FIELDS.
+    // Variables only (never query interpolation). Enum/int literals JSON-safe.
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"mediaId\":{d},\"status\":\"{s}\",\"progress\":{d}}}}}",
@@ -634,15 +503,12 @@ pub fn saveMediaListEntry(
     return classifySave(arena, r);
 }
 
-/// Map the raw {status, body} of a SaveMediaListEntry POST to the PushError
-/// contract. Split from the POST so the branching is unit-testable without a live
-/// mutation. A 200 whose body carries no `SaveMediaListEntry.id` (a GraphQL-level
-/// error, or `{"data":null}`) is a failed push, not a silent success.
+/// HttpResult → PushError. Split for unit tests. 200 without entry id is PushFailed.
 fn classifySave(arena: Allocator, r: HttpResult) PushError!i64 {
     switch (r.status) {
         .ok => {},
-        .too_many_requests => return error.RateLimited, // 429 — engine backs off
-        .unauthorized => return error.Unauthorized, // 401 — token re-auth
+        .too_many_requests => return error.RateLimited, // 429
+        .unauthorized => return error.Unauthorized, // 401
         else => return error.PushFailed,
     }
 
@@ -651,9 +517,7 @@ fn classifySave(arena: Allocator, r: HttpResult) PushError!i64 {
     }) catch return error.PushFailed;
     const data = parsed.value.data orelse return error.PushFailed;
     const entry = data.SaveMediaListEntry orelse return error.PushFailed;
-    // `id` is `?i64`: a 200 whose entry object omits `id` (a `{}` — API/schema drift,
-    // or a MITM) is "field present but empty", which must NOT read as a landed push.
-    // Only a real id counts, or the snapshot would advance on a push that never was.
+    // Missing id on 200 must not count as success (snapshot would advance falsely).
     return entry.id orelse error.PushFailed;
 }
 
@@ -663,56 +527,35 @@ const SaveEntry = struct { id: ?i64 = null };
 
 // ── AniList pull: MediaListCollection (ROD-285) ──────────────────────────────
 
-/// One reconciled entry from the remote list: the AniList media id (== our
-/// `anilist_id`) plus the (status, progress) AniList currently holds. This is the
-/// remote leg of the ROD-285 3-way merge; the reconcile engine joins it to a local
-/// row by `media_id`. REPEATING has already been folded to `.watching` by
-/// `fromAniListStatus`, so `status` is always a local `domain.ListStatus`.
+/// Remote list entry for 3-way merge (ROD-285). status already local (REPEATING → watching).
 pub const PulledEntry = struct {
     media_id: i64,
     status: domain.ListStatus,
     progress: i64,
 };
 
-/// Map an AniList `MediaListStatus` to the local `domain.ListStatus`. AniList's
-/// REPEATING (a re-watch) has no local twin, so it folds to `.watching` — a
-/// re-watch is still "currently watching" locally. An unrecognized status (API/
-/// schema drift, a value we don't model) returns null so the reconcile engine
-/// skips that entry rather than guessing a status onto a local row.
+/// AniList MediaListStatus → local. REPEATING → watching. Unknown → null (skip).
 pub fn fromAniListStatus(s: []const u8) ?domain.ListStatus {
     if (std.mem.eql(u8, s, "CURRENT")) return .watching;
     if (std.mem.eql(u8, s, "PLANNING")) return .planning;
     if (std.mem.eql(u8, s, "PAUSED")) return .paused;
     if (std.mem.eql(u8, s, "COMPLETED")) return .completed;
     if (std.mem.eql(u8, s, "DROPPED")) return .dropped;
-    if (std.mem.eql(u8, s, "REPEATING")) return .watching; // re-watch → watching (no local twin)
+    if (std.mem.eql(u8, s, "REPEATING")) return .watching;
     return null;
 }
 
-/// A pull either lands (the whole collection), hits a rate limit (429), finds the
-/// token rejected (401 — re-auth needed), or fails otherwise. Same arm shape as
-/// `PushError` so the ROD-285 engine reacts per case; distinct type because pull
-/// has no `PushFailed`-vs-success entry-id nuance — a failed fetch is just
-/// `PullFailed`.
+/// Pull arms (ROD-285): RateLimited / Unauthorized / PullFailed.
 pub const PullError = error{ RateLimited, Unauthorized, PullFailed } || Allocator.Error;
 
-/// Upper bound on a pulled `progress` (ROD-285 hardening). AniList `progress` is an episode
-/// count (a few thousand at the extreme; One Piece is ~1100), but it's an UNTRUSTED external
-/// integer: a buggy/hostile API, a MITM, or a devtools-edited account could return an absurd
-/// value that flows unchecked into the `progress` column and then into
-/// `render.drawProgressBar`'s `progress * bar_w`, where a near-i64-max value overflows and
-/// panics (ReleaseSafe keeps the check on). Clamping at this ingestion boundary bounds the
-/// value before it can be persisted: generous (100k, no real list touched) yet small enough
-/// that `progress * bar_w` can't overflow. Negatives clamp to 0. A belt to render.zig's
-/// suspenders: defend at the trust boundary AND the use site.
+/// Cap untrusted AniList progress at ingest (ROD-285). Bounds progress*bar_w overflow.
 const MAX_SANE_PROGRESS: i64 = 100_000;
 
 fn clampProgress(p: i64) i64 {
     return std.math.clamp(p, 0, MAX_SANE_PROGRESS);
 }
 
-// `userId` rides as a GraphQL variable (never interpolated into the query), so the
-// query is a constant with nothing to escape — comptime-guarded like the others.
+// userId is a variable; query constant + comptime guard.
 const MLC_QUERY = "query($userId:Int!){MediaListCollection(userId:$userId,type:ANIME){lists{entries{mediaId status progress}}}}";
 
 comptime {
@@ -722,19 +565,9 @@ comptime {
     }
 }
 
-/// Pull the user's whole anime list from AniList in one round trip (ROD-285).
-/// `MediaListCollection` is NOT paginated (it returns every list, status + custom, in one
-/// response), so one POST covers the account. `bearer` is the OAuth access token; `user_id`
-/// is the AniList id the token was minted for (cached in auth.zon at login; AniList doesn't
-/// infer it from the token). Entries are deduped by `media_id` (a show in a custom list
-/// appears under both its status list and the custom one with identical data).
-///
-/// The response rides `fetchGql`'s 2 MB cap. Each entry is ~45 bytes of JSON, so that holds
-/// tens of thousands of entries; a pathologically huge list overflows the cap, the fetch
-/// errors, and `error.PullFailed` is reported as a failed pull, not a crash.
+/// Full remote list in one POST (not paginated) (ROD-285). Deduped by media_id.
+/// Over 2 MB fetch cap → PullFailed.
 pub fn mediaListCollection(arena: Allocator, io: Io, bearer: []const u8, user_id: i64) PullError![]const PulledEntry {
-    // `userId` is an integer, JSON-safe interpolated as a variable value on the same
-    // trust basis as saveMediaListEntry's `mediaId`.
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"userId\":{d}}}}}",
@@ -744,16 +577,12 @@ pub fn mediaListCollection(arena: Allocator, io: Io, bearer: []const u8, user_id
     return classifyMediaList(arena, r);
 }
 
-/// Map the raw {status, body} of a MediaListCollection POST to the PullError
-/// contract, flattening + deduping the lists into one entry slice. Split from the
-/// POST so the branching and the flatten/dedup are unit-testable without a live
-/// query. A 200 whose body carries no `MediaListCollection` (a GraphQL-level error,
-/// or `{"data":null}`) is a failed pull, not an empty list.
+/// Flatten + dedupe lists. Split for unit tests. data:null → PullFailed, not empty list.
 fn classifyMediaList(arena: Allocator, r: HttpResult) PullError![]const PulledEntry {
     switch (r.status) {
         .ok => {},
-        .too_many_requests => return error.RateLimited, // 429 — engine backs off
-        .unauthorized => return error.Unauthorized, // 401 — token re-auth
+        .too_many_requests => return error.RateLimited, // 429
+        .unauthorized => return error.Unauthorized, // 401
         else => return error.PullFailed,
     }
 
@@ -763,22 +592,18 @@ fn classifyMediaList(arena: Allocator, r: HttpResult) PullError![]const PulledEn
     const data = parsed.value.data orelse return error.PullFailed;
     const mlc = data.MediaListCollection orelse return error.PullFailed;
 
-    // Dedupe by media_id: the same entry rides both its status list and any custom
-    // list it's in, with identical (status, progress) — collapse to one. `seen` maps
-    // media_id → index in `out` so a duplicate overwrites rather than double-counts.
+    // Dedupe media_id across status + custom lists.
     var out: std.ArrayList(PulledEntry) = .empty;
     var seen: std.AutoHashMapUnmanaged(i64, usize) = .empty;
     for (mlc.lists) |list| {
         for (list.entries) |e| {
-            const media_id = e.mediaId orelse continue; // an entry with no media is unusable
-            const status_str = e.status orelse continue; // no status → nothing to reconcile
-            const status = fromAniListStatus(status_str) orelse continue; // unknown enum → skip
-            // Clamp progress at the trust boundary before it can reach a store write
-            // or downstream render arithmetic (see MAX_SANE_PROGRESS).
+            const media_id = e.mediaId orelse continue;
+            const status_str = e.status orelse continue;
+            const status = fromAniListStatus(status_str) orelse continue;
             const entry: PulledEntry = .{ .media_id = media_id, .status = status, .progress = clampProgress(e.progress) };
             const gop = try seen.getOrPut(arena, media_id);
             if (gop.found_existing) {
-                out.items[gop.value_ptr.*] = entry; // dup across lists — last wins (identical anyway)
+                out.items[gop.value_ptr.*] = entry;
             } else {
                 gop.value_ptr.* = out.items.len;
                 try out.append(arena, entry);
@@ -788,10 +613,7 @@ fn classifyMediaList(arena: Allocator, r: HttpResult) PullError![]const PulledEn
     return out.toOwnedSlice(arena);
 }
 
-// MediaListCollection response shape: lists of entries, each carrying just the
-// three fields the reconcile needs. `progress` defaults to 0 (AniList sends 0, not
-// null, for an unstarted entry); `mediaId`/`status` are optional so a malformed
-// entry parses and is skipped rather than failing the whole pull.
+// progress defaults 0; optional mediaId/status so bad entries skip.
 const MlcEntry = struct { mediaId: ?i64 = null, status: ?[]const u8 = null, progress: i64 = 0 };
 const MlcList = struct { entries: []const MlcEntry = &.{} };
 const MediaListCollectionT = struct { lists: []const MlcList = &.{} };
@@ -799,9 +621,7 @@ const MlcData = struct { MediaListCollection: ?MediaListCollectionT = null };
 const MlcResp = struct { data: ?MlcData = null };
 
 fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
-    // Every free-text field is C0-stripped (ROD-247) — these are third-party strings
-    // that render straight to terminal cells; see stripControls. thumb is a URL
-    // (validated separately on fetch), season is an enum, the rest are scalars.
+    // Free-text C0-stripped (ROD-247). thumb URL validated on fetch; season is enum.
     const sel = selectRank(m.rankings);
     return .{
         .anilist_id = m.id,
@@ -833,11 +653,7 @@ fn mediaToMeta(arena: Allocator, m: Media) !Metadata {
 
 const SelectedRank = struct { rank: u32, type: ?[]const u8, year: ?u32 };
 
-/// Pick the single most meaningful ranking from AniList's `rankings` array
-/// (ROD-261, §5.3a): a *contextual* (year/season-scoped) ranking beats an
-/// all-time one, and within a tier RATED beats POPULAR. `year` is carried only
-/// for a contextual pick — an all-time ranking renders without one. Null when the
-/// array is empty.
+/// Best ranking (ROD-261 §5.3a): contextual > all-time; within tier RATED > POPULAR.
 fn selectRank(rankings: []const Ranking) ?SelectedRank {
     var best: ?Ranking = null;
     for (rankings) |r| {
@@ -847,8 +663,7 @@ fn selectRank(rankings: []const Ranking) ?SelectedRank {
     return .{ .rank = b.rank, .type = b.type, .year = if (b.allTime) null else b.year };
 }
 
-/// Preference score: contextual (+2) dominates type (RATED +1), so a contextual
-/// POPULAR still outranks an all-time RATED — the tier ordering §5.3a specifies.
+/// contextual +2, RATED +1 (§5.3a).
 fn rankScore(r: Ranking) i32 {
     var s: i32 = 0;
     if (!r.allTime) s += 2;
@@ -858,17 +673,13 @@ fn rankScore(r: Ranking) i32 {
     return s;
 }
 
-/// Lift AniList's `startDate` into a `domain.Date`. The year anchors the date —
-/// without it AniList sends `{year:null,month:null,day:null}`, which is "no date"
-/// (e.g. an unannounced show), not a partial one.
+/// startDate → domain.Date. No year → null.
 fn startDate(sd: StartDate) ?domain.Date {
     const y = sd.year orelse return null;
     return .{ .year = y, .month = sd.month, .day = sd.day };
 }
 
-/// Flatten `studios{nodes{name}}` into a flat name slice, dropping any node that
-/// somehow lacks a name. Arena-owned (slice + borrowed name bytes); the worker
-/// deep-copies into GPA. Returns `&.{}` when there are no studios.
+/// Flatten studio node names. Empty → &.{} .
 fn studioNames(arena: Allocator, s: Studios) ![]const []const u8 {
     var count: usize = 0;
     for (s.nodes) |node| {
@@ -886,13 +697,8 @@ fn studioNames(arena: Allocator, s: Studios) ![]const []const u8 {
     return out;
 }
 
-/// Drop C0 control bytes (0x00–0x1F) and DEL (0x7F) from an AniList-sourced string
-/// before it reaches a terminal cell (ROD-247 hardening). The escape-injection vector
-/// — an OSC/CSI sequence smuggled in a genre or synopsis — is blocked downstream by
-/// vaxis skipping zero-width graphemes, but that's an *implicit* framework property
-/// (it breaks under `.word` wrap, or if the text is logged/exported). Stripping at
-/// ingestion makes the defense explicit, mode-independent, and testable. Returns the
-/// input unchanged when it's already clean (the common case — no allocation).
+/// Drop C0 + DEL from AniList text before terminal cells (ROD-247). Explicit defense
+/// (not only vaxis zero-width skip). Clean input returned unchanged (no alloc).
 fn stripControls(arena: Allocator, raw: []const u8) ![]const u8 {
     var has_ctrl = false;
     for (raw) |c| {
@@ -992,11 +798,8 @@ fn candidateScore(show: domain.Anime, m: Media) i32 {
     return score;
 }
 
-/// Fuzzy title-match score between two titles (higher = closer; a large negative for
-/// no overlap). Normalizes both (strip whitespace/punctuation, lowercase, canonicalize
-/// "Season N") before comparing, so form differences don't sink a real match. Pub so the
-/// ROD-328 provider resolver's tier-C matcher scores against the SAME primitive as this
-/// module's own `candidateScore`: one title-normalization rule, no drift.
+/// Fuzzy title score (higher = closer; large negative = no overlap). Normalizes then
+/// canonSeason. Pub so resolver tier-C (ROD-328) shares the same rule as candidateScore.
 pub fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
     const b = b_opt orelse return -5000;
     if (a.len == 0 or b.len == 0) return -5000;
@@ -1015,13 +818,8 @@ pub fn titleScore(a: []const u8, b_opt: ?[]const u8) i32 {
     return -5000;
 }
 
-/// Canonicalize an explicit "Season N" / "Nth Season" marker in an
-/// already-normalized title to a single `s<N>` token, so AllAnime's `…season2`
-/// reconciles with AniList's `…2ndseason` form (ROD-181, the fuzzy fallback for
-/// the ~13% of shows with no mineable AniList id). Only the explicit `season`
-/// keyword is coerced — a bare trailing number ("title 2") is left alone, as it
-/// is too ambiguous to fold safely (cf. "86", "Ranma 1/2"). Returns `s` verbatim
-/// when there is no season marker or on any buffer overflow.
+/// Explicit "Season N" / "Nth Season" → s<N> (ROD-181). Bare trailing numbers untouched
+/// ("86", "Ranma 1/2"). No marker or overflow → s unchanged.
 fn canonSeason(out: []u8, s: []const u8) []const u8 {
     const kw = "season";
     const idx = std.mem.indexOf(u8, s, kw) orelse return s;
@@ -1046,7 +844,7 @@ fn canonSeason(out: []u8, s: []const u8) []const u8 {
         }
         var dstart = b.len;
         while (dstart > 0 and std.ascii.isDigit(b[dstart - 1])) dstart -= 1;
-        if (dstart == b.len) return s; // "season" with no adjacent number — leave it
+        if (dstart == b.len) return s; // "season" with no adjacent number, leave it
         num = b[dstart..];
         base_pre = b[0..dstart];
         tail = after;
@@ -1192,7 +990,7 @@ test "classifySave: id on 200, distinct errors for 429/401/failure (ROD-284)" {
     try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = @enumFromInt(500), .body = "oops" }));
 
     // 200 with the entry present but `id` omitted → "field present but empty" is a
-    // failed push, not a landed one — the snapshot must not advance on it.
+    // failed push, not a landed one, the snapshot must not advance on it.
     try std.testing.expectError(error.PushFailed, classifySave(a, .{ .status = .ok, .body = "{\"data\":{\"SaveMediaListEntry\":{}}}" }));
 }
 
@@ -1202,7 +1000,7 @@ test "fromAniListStatus maps every remote status, folding REPEATING (ROD-285)" {
     try std.testing.expectEqual(domain.ListStatus.paused, fromAniListStatus("PAUSED").?);
     try std.testing.expectEqual(domain.ListStatus.completed, fromAniListStatus("COMPLETED").?);
     try std.testing.expectEqual(domain.ListStatus.dropped, fromAniListStatus("DROPPED").?);
-    // REPEATING has no local twin — a re-watch reads as "watching".
+    // REPEATING has no local twin, a re-watch reads as "watching".
     try std.testing.expectEqual(domain.ListStatus.watching, fromAniListStatus("REPEATING").?);
     // An unknown enum is skipped by the caller, not guessed.
     try std.testing.expect(fromAniListStatus("SOMETHING_NEW") == null);
@@ -1239,7 +1037,7 @@ test "classifyMediaList: dedupes an entry shared across custom lists (ROD-285)" 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // media 100 appears in both its status list and a custom list — one entry out.
+    // media 100 appears in both its status list and a custom list, one entry out.
     const body =
         \\{"data":{"MediaListCollection":{"lists":[
         \\{"entries":[{"mediaId":100,"status":"CURRENT","progress":5}]},
@@ -1273,7 +1071,7 @@ test "classifyMediaList: clamps an untrusted progress at the ingestion boundary 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // A near-i64-max progress (hostile/MITM/devtools-edited) and a negative one — both
+    // A near-i64-max progress (hostile/MITM/devtools-edited) and a negative one, both
     // must land bounded so they can never overflow render's `progress * bar_w` or
     // persist as garbage. A normal value passes through untouched.
     const body =
@@ -1327,7 +1125,7 @@ test "selectRank prefers contextual over all-time, RATED over POPULAR (ROD-261)"
     // Empty → no pick.
     try std.testing.expect(selectRank(&.{}) == null);
 
-    // Contextual RATED beats an all-time RATED — and carries its year.
+    // Contextual RATED beats an all-time RATED, and carries its year.
     {
         const rankings = [_]Ranking{
             .{ .rank = 42, .type = "RATED", .allTime = true },
@@ -1412,7 +1210,7 @@ test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // A two-card page: one fully populated, one with no genres / null season —
+    // A two-card page: one fully populated, one with no genres / null season,
     // the card that must degrade to [--] and no season chip. An unknown field
     // (siteUrl) must be skipped by ignore_unknown_fields.
     const json =
@@ -1423,14 +1221,14 @@ test "pageToMetas maps a batch Page, tagging each card by id (ROD-247)" {
     ;
     const metas = try pageToMetas(a, json);
     try std.testing.expectEqual(@as(usize, 2), metas.len);
-    // Fully enriched card — id tags it for join-back, all three signals present.
+    // Fully enriched card, id tags it for join-back, all three signals present.
     try std.testing.expectEqual(@as(?u64, 182255), metas[0].anilist_id);
     try std.testing.expectEqual(@as(?u32, 89), metas[0].score);
     try std.testing.expectEqual(@as(usize, 3), metas[0].genres.len);
     try std.testing.expectEqual(domain.Season.fall, metas[0].season.?);
     try std.testing.expectEqual(@as(u32, 2023), metas[0].start_date.?.year);
     try std.testing.expectEqual(@as(?u32, 2023), metas[0].year);
-    // Graceful-degrade card — still id-tagged, but no score/genre/season+year.
+    // Graceful-degrade card, still id-tagged, but no score/genre/season+year.
     try std.testing.expectEqual(@as(?u64, 1), metas[1].anilist_id);
     try std.testing.expectEqual(@as(?u32, null), metas[1].score);
     try std.testing.expectEqual(@as(usize, 0), metas[1].genres.len);
@@ -1445,7 +1243,7 @@ test "pageToMetas: {\"data\":null} is no-answer, an empty page is a confirmed em
     const a = arena.allocator();
 
     // A `{"data":null}` body is a GraphQL-level execution error (200, no data), NOT a
-    // confirmed-empty page — it must error so `enrichBatch` reports no answer and the
+    // confirmed-empty page, it must error so `enrichBatch` reports no answer and the
     // batch stays un-stamped. Mirrors classifyById/classifyBySearch on the same shape.
     try std.testing.expectError(error.NoAnswer, pageToMetas(a, "{\"data\":null}"));
 
@@ -1615,7 +1413,7 @@ test "pageToDiscover: rows + hasNextPage; missing pageInfo reads exhausted (ROD-
     try std.testing.expectError(error.NoAnswer, pageToDiscover(a, "}{"));
 }
 
-test "classifyById: three-state map — match / confirmed no-match / no answer (ROD-278)" {
+test "classifyById: three-state map: match / confirmed no-match / no answer (ROD-278)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1624,11 +1422,11 @@ test "classifyById: three-state map — match / confirmed no-match / no answer (
     const meta = (try classifyById(a, "{\"data\":{\"Media\":{\"id\":182255,\"episodes\":28}}}")).?;
     try std.testing.expectEqual(@as(?u64, 182255), meta.anilist_id);
 
-    // `{"data":{"Media":null}}` — AniList answered: no anime carries that id. This is
+    // `{"data":{"Media":null}}`, AniList answered: no anime carries that id. This is
     // a CONFIRMED no-match (null), which the refresh path stamps as a negative cache.
     try std.testing.expect((try classifyById(a, "{\"data\":{\"Media\":null}}")) == null);
 
-    // `{"data":null}` (a GraphQL-level error) and unparseable bytes are NOT answers —
+    // `{"data":null}` (a GraphQL-level error) and unparseable bytes are NOT answers,
     // they must error so the refresh path leaves the row un-stamped and retries.
     try std.testing.expectError(error.NoAnswer, classifyById(a, "{\"data\":null}"));
     try std.testing.expectError(error.NoAnswer, classifyById(a, "not json at all"));
@@ -1654,12 +1452,12 @@ test "stripControls drops C0 + DEL bytes from AniList text (ROD-247)" {
     defer arena.deinit();
     const a = arena.allocator();
     // CSI colour smuggled in a title, OSC-52 clipboard in a genre, a lone ESC in a
-    // synopsis, BEL/DEL in a studio name — every control byte must be dropped.
+    // synopsis, BEL/DEL in a studio name, every control byte must be dropped.
     try std.testing.expectEqualStrings("Hero[31m", try stripControls(a, "Hero\x1b[31m"));
     try std.testing.expectEqualStrings("Action]52;c;QQ", try stripControls(a, "Action\x1b]52;c;QQ\x07"));
     try std.testing.expectEqualStrings("A tale.", try stripControls(a, "A \x1btale."));
     try std.testing.expectEqualStrings("Studio", try stripControls(a, "S\x7ftudio"));
-    // Clean input is returned unchanged (and not reallocated — same pointer).
+    // Clean input is returned unchanged (and not reallocated, same pointer).
     const clean = "Slice of Life";
     try std.testing.expectEqual(clean.ptr, (try stripControls(a, clean)).ptr);
 }
