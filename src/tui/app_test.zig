@@ -183,8 +183,8 @@ fn testTick(app: *App, event: Event) !void {
     app.enrich_refresh_drain.drain();
     // ROD-327/328 resolve workers (Add probe + Play/Add tier-C search) detach too; drained
     // defensively so a future test driving the spawn path can't strand one on a torn-down loop.
-    app.add_resolve_drain.drain();
-    app.play_resolve_drain.drain();
+    app.resolve.add_drain.drain();
+    app.resolve.play_drain.drain();
     if (app.play_thread) |t| {
         t.join();
         app.play_thread = null;
@@ -3761,7 +3761,7 @@ test "episodes_done binds the canonical before caching so the FK holds on first 
     // pending_bind carries the canonical id to mint on success.
     app.episodes.for_id = try std.testing.allocator.dupe(u8, "52991");
     app.episodes.for_source = try std.testing.allocator.dupe(u8, "allanime");
-    app.pending_bind = 154587;
+    app.resolve.pending_bind = 154587;
     defer app.episodes.freeResults(std.testing.allocator);
     defer app.episodes.deinit(std.testing.allocator); // release the LRU copy cacheEpisodes inserts
 
@@ -3771,7 +3771,7 @@ test "episodes_done binds the canonical before caching so the FK holds on first 
 
     // pending_bind consumed; the binding row minted (source = dummy provider "allanime"),
     // linked to canonical (title resolves through the join).
-    try testing.expect(app.pending_bind == null);
+    try testing.expect(app.resolve.pending_bind == null);
     const rec = (try st.getAnime(arena, "allanime", "52991")).?;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
     try testing.expectEqualStrings("Sousou no Frieren", rec.title);
@@ -3797,12 +3797,12 @@ test "resolve_add_result binds revealed and toasts success on a hit; clears the 
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true; // fireResolveAdd set it; the handler must clear it
+    app.resolve.add_resolving = true; // fireResolveAdd set it; the handler must clear it
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
-    try testing.expect(!app.add_resolving);
+    try testing.expect(!app.resolve.add_resolving);
     try testing.expect(app.history_dirty);
     try testing.expectEqual(Toast.Kind.success, app.toast_queue[0].?.kind);
     const rec = (try st.getAnime(arena, "allanime", "52991")).?;
@@ -3822,12 +3822,12 @@ test "resolve_add_result miss with no canonical row falls back to the error toas
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
 
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = sid, .source = &.{} } });
 
-    try testing.expect(!app.add_resolving);
+    try testing.expect(!app.resolve.add_resolving);
     try testing.expect(!app.history_dirty);
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) == null); // no marker
@@ -3850,12 +3850,12 @@ test "resolve_add_result miss with a canonical row persists the unbound marker a
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
 
     // A real miss carries an empty source_id (the worker posts &.{} on no match).
     try testTick(&app, .{ .resolve_add_result = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{} } });
 
-    try testing.expect(!app.add_resolving);
+    try testing.expect(!app.resolve.add_resolving);
     try testing.expect(app.history_dirty); // a new marker row → reload so it surfaces this session
     try testing.expectEqual(Toast.Kind.warn, app.toast_queue[0].?.kind);
     // anilist_id is the linchpin that keeps this row in sync's push set.
@@ -3881,7 +3881,7 @@ test "resolve events cache definitive absences on every arm, even a stale one (R
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
 
     // Add miss whose walk ruled megaplay definitively absent: the arm caches the
     // negative alongside the unbound marker (both facts, independently).
@@ -3892,11 +3892,11 @@ test "resolve events cache definitive absences on every arm, even a stale one (R
 
     // A play result the staleness gate drops (play_resolve_aid is null: the user
     // moved on) still banks the catalog fact before the drop.
-    app.play_resolving = true;
+    app.resolve.play_resolving = true;
     const absent_play = try std.testing.allocator.alloc([]const u8, 1);
     absent_play[0] = "senshi";
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = &.{}, .source = &.{}, .absent_sources = absent_play } });
-    try testing.expect(!app.play_resolving);
+    try testing.expect(!app.resolve.play_resolving);
     try testing.expect(try st.providerAbsentFresh(154587, "senshi", store_mod.Store.nowSecs()));
 }
 
@@ -3939,8 +3939,8 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
-    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
+    app.resolve.play_resolving = true; // fireResolvePlaySearch set it; the handler must clear it
+    app.resolve.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
     defer app.episodes.freeResults(std.testing.allocator); // fireEpisodesForId dupes for_id/source
 
     // dummyProvider.episodes returns empty, so the fired fetch's episodes_done never mints
@@ -3948,8 +3948,8 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_play_target = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "allanime" } });
 
-    try testing.expect(!app.play_resolving);
-    try testing.expectEqual(@as(?i64, 154587), app.pending_bind); // armed for the episode fetch
+    try testing.expect(!app.resolve.play_resolving);
+    try testing.expectEqual(@as(?i64, 154587), app.resolve.pending_bind); // armed for the episode fetch
     try testing.expect(app.episodes.for_id != null); // the fetch fired
     try testing.expectEqualStrings("52991", app.episodes.for_id.?);
 }
@@ -3957,13 +3957,13 @@ test "resolve_play_target on a hit arms the bind + fires the episode fetch; clea
 test "resolve_play_target on a miss toasts, arms no bind, fires no fetch (ROD-328)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
-    app.play_resolving = true;
-    app.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
+    app.resolve.play_resolving = true;
+    app.resolve.play_resolve_aid = 154587; // fire-time intent (the ROD-346 staleness gate)
 
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = &.{} } });
 
-    try testing.expect(!app.play_resolving);
-    try testing.expect(app.pending_bind == null);
+    try testing.expect(!app.resolve.play_resolving);
+    try testing.expect(app.resolve.pending_bind == null);
     try testing.expect(app.episodes.for_id == null);
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
 }
@@ -6643,8 +6643,8 @@ test "ROD-346: a failed episode fetch hops to the next provider's tier-A probe" 
     try testing.expect(!alpha.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
     try testing.expectEqualStrings("52991", app.episodes.for_id.?);
-    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
-    try testing.expect(app.fallback != null);
+    try testing.expectEqual(@as(?i64, 154587), app.resolve.pending_bind);
+    try testing.expect(app.resolve.fallback != null);
     try testing.expectEqual(Toast.Kind.warn, app.toast_queue[0].?.kind);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -6691,7 +6691,7 @@ test "ROD-346: a fallback hop reuses an existing sibling binding (tier 0) before
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
     try testing.expectEqualStrings("b7", app.episodes.for_id.?);
     // Tier 0 re-binds nothing: the row already exists.
-    try testing.expect(app.pending_bind == null);
+    try testing.expect(app.resolve.pending_bind == null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
@@ -6734,7 +6734,7 @@ test "ROD-347: the walk skips a fresh-absent provider; a stale verdict re-probes
 
     app.episode_drain.drain();
     try testing.expect(!beta.hit.load(.acquire));
-    try testing.expect(app.fallback == null); // exhausted and freed
+    try testing.expect(app.resolve.fallback == null); // exhausted and freed
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
 
     // Past the TTL the verdict is just history: the same failure now hops to
@@ -6746,7 +6746,7 @@ test "ROD-347: the walk skips a fresh-absent provider; a stale verdict re-probes
     app.episode_drain.drain();
     try testing.expect(beta.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
-    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+    try testing.expectEqual(@as(?i64, 154587), app.resolve.pending_bind);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
@@ -6847,7 +6847,7 @@ test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done c
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.prewarm_active = true;
+    app.prewarm.active = true;
 
     // A stocked verdict mints the sibling binding HIDDEN: the store row exists
     // for tier-0 routing, but History gains nothing until a play reveals it.
@@ -6864,9 +6864,9 @@ test "ROD-351: prewarm_result mints hidden / caches the negative; prewarm_done c
     try testing.expect(try st.providerAbsentFresh(154587, "gamma", store_mod.Store.nowSecs()));
 
     // The walk's close clears the single-flight guard.
-    try testing.expect(app.prewarm_active);
+    try testing.expect(app.prewarm.active);
     try testTick(&app, .prewarm_done);
-    try testing.expect(!app.prewarm_active);
+    try testing.expect(!app.prewarm.active);
 }
 
 test "ROD-348: a prewarm write refreshes the open show's rail snapshot in place" {
@@ -6929,7 +6929,7 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
 
     // The tier-A add success arm fires the warm (under test the spawn is gated;
     // the attempted mark is the observable trace that it would have run). The
@@ -6937,14 +6937,14 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     // stays an unbound candidate worth warming.
     const sid = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 154587), app.prewarm_attempted[0]);
+    try testing.expectEqual(@as(?i64, 154587), app.prewarm.attempted[0]);
 
     // Session dedup: a second add/play of the same show doesn't re-mark (the
     // ring would show a duplicate).
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
     const sid2 = try std.testing.allocator.dupe(u8, "52991");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 154587, .source_id = sid2, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
 
     // An armed fallback walk suppresses the warm outright: mid-rescue the
     // providers are exactly what's failing. now_ms sits past the spacing floor
@@ -6953,38 +6953,38 @@ test "ROD-351: an add success triggers the warm; a busy or repeat fire stays sil
     const canonical: Anime = .{ .id = "999", .name = "Other", .anilist_id = 999 };
     const snap = try workers.dupeOwnedAnime(app.gpa, canonical);
     const provs = try app.gpa.alloc(SourceProvider, 0);
-    app.fallback = .{ .canonical = snap, .anilist_id = 999, .providers = provs, .tried = 0 };
+    app.resolve.fallback = .{ .canonical = snap, .anilist_id = 999, .providers = provs, .tried = 0 };
     defer resolve.clearFallback(&app);
     try st.upsertCanonicalOnly(.{ .id = "999", .name = "Other", .anilist_id = 999, .mal_id = 111 }, true, 5000, arena);
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
     const sid3 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid3, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
 
     // Spacing floor: with the walk gone, a fire inside the 30s window since the
     // last walk START stays silent AND unmarked (so the show retries later);
     // past the window it runs.
     resolve.clearFallback(&app);
-    app.now_ms = app.prewarm_last_start_ms.? + 1_000;
-    app.add_resolving = true;
+    app.now_ms = app.prewarm.last_start_ms.? + 1_000;
+    app.resolve.add_resolving = true;
     const sid4 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid4, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, null), app.prewarm_attempted[1]);
-    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
-    app.add_resolving = true;
+    try testing.expectEqual(@as(?i64, null), app.prewarm.attempted[1]);
+    app.now_ms = app.prewarm.last_start_ms.? + 60_000;
+    app.resolve.add_resolving = true;
     const sid5 = try std.testing.allocator.dupe(u8, "111");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 999, .source_id = sid5, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 999), app.prewarm_attempted[1]);
+    try testing.expectEqual(@as(?i64, 999), app.prewarm.attempted[1]);
 
     // anilist_id 0 is a real value, not the ring's empty state: an
     // i64-with-0-sentinel ring would read aid 0 as always-attempted and
     // silently never warm it.
     try st.upsertCanonicalOnly(.{ .id = "0", .name = "Zero", .anilist_id = 0, .mal_id = 222 }, true, 5000, arena);
-    app.now_ms = app.prewarm_last_start_ms.? + 60_000;
-    app.add_resolving = true;
+    app.now_ms = app.prewarm.last_start_ms.? + 60_000;
+    app.resolve.add_resolving = true;
     const sid6 = try std.testing.allocator.dupe(u8, "222");
     try testTick(&app, .{ .resolve_add_result = .{ .ok = true, .anilist_id = 0, .source_id = sid6, .source = "senshi" } });
-    try testing.expectEqual(@as(?i64, 0), app.prewarm_attempted[2]);
+    try testing.expectEqual(@as(?i64, 0), app.prewarm.attempted[2]);
 }
 
 test "ROD-346: an exhausted walk falls through to the dead-end toast and frees itself" {
@@ -7022,7 +7022,7 @@ test "ROD-346: an exhausted walk falls through to the dead-end toast and frees i
     // The only provider is the one that failed: no hop fires, the existing
     // dead-end copy stands, and no walk is left behind.
     try testing.expect(!alpha.hit.load(.acquire));
-    try testing.expect(app.fallback == null);
+    try testing.expect(app.resolve.fallback == null);
     try testing.expectEqual(Toast.Kind.@"error", app.toast_queue[0].?.kind);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -7064,15 +7064,15 @@ test "ROD-346: a landed fallback grid mints under the hop provider and clears th
     try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
     app.episode_drain.drain();
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
-    try testing.expect(app.fallback != null);
+    try testing.expect(app.resolve.fallback != null);
 
     // The hop's probe lands: episodes_done must mint (beta, 52991) and retire the walk.
     const eps = try workers.dupEpisodesOwned(app.gpa, &.{.{ .raw = "1" }});
     const done_id = try app.gpa.dupe(u8, "52991");
     try app.tick(.{ .episodes_done = .{ .episodes = eps, .for_id = done_id } }, &loop, io, registry);
 
-    try testing.expect(app.fallback == null);
-    try testing.expect(app.pending_bind == null);
+    try testing.expect(app.resolve.fallback == null);
+    try testing.expect(app.resolve.pending_bind == null);
     const rec = (try st.getAnime(arena, "beta", "52991")).?;
     try testing.expectEqual(@as(?i64, 154587), rec.anilist_id);
     // Mint-time recompute through the canonical union: the fresh binding and the
@@ -7108,7 +7108,7 @@ test "ROD-346: a virgin tier-A probe failure walks on via pending_bind (no bindi
     defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
-    app.pending_bind = 154587; // the resolving Browse fire armed it
+    app.resolve.pending_bind = 154587; // the resolving Browse fire armed it
     defer app.episodes.freeResults(app.gpa);
     defer app.episodes.deinit(app.gpa);
 
@@ -7122,8 +7122,8 @@ test "ROD-346: a virgin tier-A probe failure walks on via pending_bind (no bindi
     app.episode_drain.drain();
     try testing.expect(beta.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
-    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
-    try testing.expect(app.fallback != null);
+    try testing.expectEqual(@as(?i64, 154587), app.resolve.pending_bind);
+    try testing.expect(app.resolve.fallback != null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
@@ -7152,7 +7152,7 @@ test "ROD-368: an empty listing walks the ladder instead of binding an empty gri
     defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
-    app.pending_bind = 154587; // the resolving Browse fire armed it
+    app.resolve.pending_bind = 154587; // the resolving Browse fire armed it
     defer app.episodes.freeResults(app.gpa);
     defer app.episodes.deinit(app.gpa);
 
@@ -7170,7 +7170,7 @@ test "ROD-368: an empty listing walks the ladder instead of binding an empty gri
     try testing.expect(try st.providerAbsentFresh(154587, "alpha", store_mod.Store.nowSecs()));
     try testing.expect(beta.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
-    try testing.expect(app.fallback != null);
+    try testing.expect(app.resolve.fallback != null);
     try testing.expect(!app.episodes.unbound); // the hop is in flight, not a dead end
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -7199,7 +7199,7 @@ test "ROD-368: an empty listing with no other provider concedes the unbound stat
     defer resolve.clearFallback(&app);
     app.episodes.for_id = try app.gpa.dupe(u8, "52991");
     app.episodes.for_source = try app.gpa.dupe(u8, "alpha");
-    app.pending_bind = 154587;
+    app.resolve.pending_bind = 154587;
     defer app.episodes.freeResults(app.gpa);
     defer app.episodes.deinit(app.gpa);
 
@@ -7213,7 +7213,7 @@ test "ROD-368: an empty listing with no other provider concedes the unbound stat
     // pane concedes the unbound "no source available" state rather than a blank grid.
     try testing.expect((try st.getAnime(arena, "alpha", "52991")) == null);
     try testing.expect(try st.providerAbsentFresh(154587, "alpha", store_mod.Store.nowSecs()));
-    try testing.expect(app.fallback == null);
+    try testing.expect(app.resolve.fallback == null);
     try testing.expect(app.episodes.unbound);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -7240,7 +7240,7 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true; // the probe that is about to report its miss
+    app.resolve.add_resolving = true; // the probe that is about to report its miss
 
     var loop = initTestLoop();
     const io = std.testing.io;
@@ -7249,9 +7249,9 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
 
     // The probe miss (source names the probed provider) widened instead of
     // persisting unbound: the search worker is in flight over beta only.
-    try testing.expect(app.add_resolving);
+    try testing.expect(app.resolve.add_resolving);
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) == null);
-    app.add_resolve_drain.drain();
+    app.resolve.add_drain.drain();
     try testing.expect(beta.search_hit.load(.acquire));
     try testing.expect(!alpha.search_hit.load(.acquire));
 
@@ -7264,7 +7264,7 @@ test "ROD-346: a tier-A add-probe miss widens the search to the remaining provid
         } else freeTestEvent(app.gpa, ev);
     }
     try app.tick(widened.?, &loop, io, registry);
-    try testing.expect(!app.add_resolving);
+    try testing.expect(!app.resolve.add_resolving);
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -7294,7 +7294,7 @@ test "ROD-347: the add widen skips a fresh-absent provider and goes straight to 
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.add_resolving = true;
+    app.resolve.add_resolving = true;
 
     var loop = initTestLoop();
     const io = std.testing.io;
@@ -7303,9 +7303,9 @@ test "ROD-347: the add widen skips a fresh-absent provider and goes straight to 
 
     // beta filtered out leaves the widen with nothing: no search fired, the
     // unbound marker persists synchronously on this same arm.
-    app.add_resolve_drain.drain();
+    app.resolve.add_drain.drain();
     try testing.expect(!beta.search_hit.load(.acquire));
-    try testing.expect(!app.add_resolving);
+    try testing.expect(!app.resolve.add_resolving);
     try testing.expect((try st.getAnime(arena, store_mod.SOURCE_UNBOUND, "154587")) != null);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
@@ -7411,8 +7411,8 @@ test "ROD-346: a never-played stream failure relaunches on the hop provider, bou
 
     // The walk armed a play continuation and fired beta's tier-A probe.
     try testing.expect(!app.playing);
-    try testing.expect(app.fallback != null);
-    try testing.expect(app.fallback.?.play != null);
+    try testing.expect(app.resolve.fallback != null);
+    try testing.expect(app.resolve.fallback.?.play != null);
     app.episode_drain.drain();
     try testing.expect(beta.hit.load(.acquire));
 
@@ -7429,7 +7429,7 @@ test "ROD-346: a never-played stream failure relaunches on the hop provider, bou
     try testing.expect(app.playing); // the relaunch committed
     try testing.expectEqualStrings("beta", app.session.source);
     try testing.expectEqualStrings("52991", app.session.anime_id);
-    try testing.expect(app.fallback != null); // armed across the relaunch
+    try testing.expect(app.resolve.fallback != null); // armed across the relaunch
 
     // Let the relaunch's worker finish; DROP its play_done unhandled so the
     // session stays armed, then inject failure 2 as another never-played error
@@ -7443,7 +7443,7 @@ test "ROD-346: a never-played stream failure relaunches on the hop provider, bou
 
     // Both providers consumed: the walk exhausts instead of ping-ponging back
     // to alpha (whose fetch never fires), and the dead-end toast lands.
-    try testing.expect(app.fallback == null);
+    try testing.expect(app.resolve.fallback == null);
     try testing.expect(!app.playing);
     try testing.expect(!alpha.hit.load(.acquire));
     var saw_error = false;
@@ -7511,7 +7511,7 @@ test "ROD-346 review: a tier-0 hop's cache-hit landing raises the sibling's stal
     try testing.expect(!beta.hit.load(.acquire)); // cache hit: no network probe
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
     try testing.expectEqualStrings("b7", app.episodes.for_id.?);
-    try testing.expect(app.fallback == null); // synchronous landing completed the walk
+    try testing.expect(app.resolve.fallback == null); // synchronous landing completed the walk
     try testing.expectEqual(@as(u32, 8), app.episodes.progress);
     try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
     // Writes stay per-binding: the origin row's own progress column is untouched.
@@ -7598,7 +7598,7 @@ test "ROD-352: a plain cache-hit open raises a lagging binding (no walk armed)" 
     try testTick(&app, keyEv(vaxis.Key.enter, .{}));
 
     try testing.expect(!app.episodes.loading);
-    try testing.expect(app.fallback == null);
+    try testing.expect(app.resolve.fallback == null);
     try testing.expectEqual(@as(u32, 8), app.episodes.progress);
     try testing.expectEqual(@as(i64, 8), (try st.getAnime(arena, "beta", "b7")).?.progress);
 
@@ -7643,9 +7643,9 @@ test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demot
     try app.tick(.{ .episodes_error = .{ .cause = error.NoAnswer, .for_id = for_id } }, &loop, io, registry);
 
     // The walk hopped to beta's tier-C search; the landing flag must survive the hop.
-    try testing.expect(app.play_resolving);
+    try testing.expect(app.resolve.play_resolving);
     try testing.expect(app.resume_landing_pending);
-    app.play_resolve_drain.drain();
+    app.resolve.play_drain.drain();
     try testing.expect(beta.search_hit.load(.acquire));
 
     // The search misses (empty stub catalog) and the walk exhausts: this dead end
@@ -7658,7 +7658,7 @@ test "ROD-346 review: a resume-landing walk that exhausts on a tier-C miss demot
     }
     try app.tick(miss.?, &loop, io, registry);
 
-    try testing.expect(app.fallback == null);
+    try testing.expect(app.resolve.fallback == null);
     try testing.expect(!app.resume_landing_pending);
     try testing.expect(app.active_view == .history);
     try testing.expect(app.active_pane == .list);
@@ -7681,7 +7681,7 @@ test "ROD-346 review: a superseded resolve_play_target success is dropped, never
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.store = &st;
-    app.play_resolving = true;
+    app.resolve.play_resolving = true;
     // play_resolve_aid stays null: the user fired another show's fetch after this
     // search spawned, which cleared the fire-time intent. The landed grid below is
     // that other show's.
@@ -7694,8 +7694,8 @@ test "ROD-346 review: a superseded resolve_play_target success is dropped, never
 
     // Dropped: the guard cleared, but no fetch fired and no bind was armed; the
     // user's current grid identity is untouched.
-    try testing.expect(!app.play_resolving);
-    try testing.expect(app.pending_bind == null);
+    try testing.expect(!app.resolve.play_resolving);
+    try testing.expect(app.resolve.pending_bind == null);
     try testing.expectEqualStrings("current-show", app.episodes.for_id.?);
     try testing.expectEqualStrings("senshi", app.episodes.for_source.?);
 }
@@ -7753,7 +7753,7 @@ test "ROD-345: v cycles unpinned -> alpha -> beta (tier-0 re-route) -> unpinned"
     try testing.expect(beta.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
     try testing.expectEqualStrings("b7", app.episodes.for_id.?);
-    try testing.expect(app.pending_bind == null); // tier 0 mints nothing
+    try testing.expect(app.resolve.pending_bind == null); // tier 0 mints nothing
 
     // v #3: past the last provider wraps to unpinned; the open grid stands.
     try app.tick(keyEv('v', .{}), &loop, io, registry);
@@ -7929,7 +7929,7 @@ test "ROD-345: v onto an unbound provider resolves fresh (tier-A probe + mint ar
     try testing.expect(beta.hit.load(.acquire));
     try testing.expectEqualStrings("beta", app.episodes.for_source.?);
     try testing.expectEqualStrings("52991", app.episodes.for_id.?);
-    try testing.expectEqual(@as(?i64, 154587), app.pending_bind);
+    try testing.expectEqual(@as(?i64, 154587), app.resolve.pending_bind);
 
     while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
 }
@@ -8071,9 +8071,9 @@ test "ROD-357: a manual flip's tier-C miss toast names the flipped-to provider, 
     const canonical = try workers.dupeOwnedAnime(app.gpa, .{ .id = "154587", .name = "Frieren", .anilist_id = 154587 });
     const provs = try app.gpa.alloc(SourceProvider, 1);
     provs[0] = target.provider();
-    app.fallback = .{ .canonical = canonical, .anilist_id = 154587, .providers = provs, .next = 1, .manual = true };
+    app.resolve.fallback = .{ .canonical = canonical, .anilist_id = 154587, .providers = provs, .next = 1, .manual = true };
     defer resolve.clearFallback(&app);
-    app.play_resolve_aid = 154587; // the show this search is FOR (staleness gate)
+    app.resolve.play_resolve_aid = 154587; // the show this search is FOR (staleness gate)
 
     try testTick(&app, .{ .resolve_play_target = .{ .ok = false, .anilist_id = 154587, .source_id = "", .source = "" } });
 

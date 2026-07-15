@@ -17,6 +17,7 @@ const http = @import("http.zig");
 const hls = @import("hls.zig");
 const deadline = @import("../util/deadline.zig");
 const fetchguard = @import("../util/fetchguard.zig");
+const json_escape = @import("../util/json_escape.zig");
 
 const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
 
@@ -214,7 +215,7 @@ pub const AllAnime = struct {
         _ = self;
         // Search `variables` is a plain object (not stringified; per-op quirk).
         // One page of search_page_size so stride matches load-more (ROD-201).
-        const q = try jsonEscape(arena, query);
+        const q = try json_escape.escape(arena, query);
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"variables\":{{\"search\":{{\"query\":\"{s}\"}},\"limit\":{d},\"page\":{d},\"translationType\":\"{s}\",\"countryOrigin\":\"ALL\"}},\"extensions\":\"{s}\"}}",
@@ -254,7 +255,7 @@ pub const AllAnime = struct {
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"variables\":\"{s}\",\"extensions\":\"{s}\"}}",
-            .{ try jsonEscape(arena, inner), EXT_EPISODES },
+            .{ try json_escape.escape(arena, inner), EXT_EPISODES },
         );
 
         const raw = try post(arena, io, body, REFERER_API);
@@ -308,12 +309,12 @@ pub const AllAnime = struct {
 
     pub fn resolve(self: *AllAnime, arena: Allocator, io: Io, show_id: []const u8, ep: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) !domain.StreamLink {
         _ = self;
-        // Same two-level escape as episodes (videoInner then outer jsonEscape).
+        // Same two-level escape as episodes (videoInner then outer escape).
         const inner = try videoInner(arena, show_id, tt, ep.raw);
         const body = try std.fmt.allocPrint(
             arena,
             "{{\"variables\":\"{s}\",\"extensions\":\"{s}\"}}",
-            .{ try jsonEscape(arena, inner), EXT_VIDEO },
+            .{ try json_escape.escape(arena, inner), EXT_VIDEO },
         );
 
         const raw = try post(arena, io, body, REFERER_VIDEO);
@@ -581,30 +582,9 @@ pub const AllAnime = struct {
     }
 };
 
-/// Escape for a JSON string literal. Bodies are hand-rolled (persisted-query
-/// nested escaping std.json won't reproduce), so user text must be escaped.
-fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (s) |c| switch (c) {
-        '"' => try out.appendSlice(arena, "\\\""),
-        '\\' => try out.appendSlice(arena, "\\\\"),
-        '\n' => try out.appendSlice(arena, "\\n"),
-        '\r' => try out.appendSlice(arena, "\\r"),
-        '\t' => try out.appendSlice(arena, "\\t"),
-        else => if (c < 0x20) {
-            // RFC 8259: raw controls forbidden; `\u00XX` for c < 0x20.
-            const hex = "0123456789abcdef";
-            try out.appendSlice(arena, "\\u00");
-            try out.append(arena, hex[(c >> 4) & 0xf]);
-            try out.append(arena, hex[c & 0xf]);
-        } else try out.append(arena, c),
-    };
-    return out.items;
-}
-
-/// Episodes inner `variables` (id escaped). Caller applies outer jsonEscape.
+/// Episodes inner `variables` (id escaped). Caller applies outer escape.
 fn episodesInner(arena: Allocator, show_id: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{{\"_id\":\"{s}\"}}", .{try jsonEscape(arena, show_id)});
+    return std.fmt.allocPrint(arena, "{{\"_id\":\"{s}\"}}", .{try json_escape.escape(arena, show_id)});
 }
 
 /// get_video inner `variables`. `tt` is only sub/dub. Same outer-escape contract.
@@ -612,37 +592,8 @@ fn videoInner(arena: Allocator, show_id: []const u8, tt: domain.Translation, epi
     return std.fmt.allocPrint(
         arena,
         "{{\"showId\":\"{s}\",\"translationType\":\"{s}\",\"episodeString\":\"{s}\"}}",
-        .{ try jsonEscape(arena, show_id), tt.str(), try jsonEscape(arena, episode) },
+        .{ try json_escape.escape(arena, show_id), tt.str(), try json_escape.escape(arena, episode) },
     );
-}
-
-test "jsonEscape escapes quotes and backslashes" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try std.testing.expectEqualStrings("a\\\"b", try jsonEscape(a, "a\"b"));
-    try std.testing.expectEqualStrings("c\\\\d", try jsonEscape(a, "c\\d"));
-    try std.testing.expectEqualStrings("plain", try jsonEscape(a, "plain"));
-}
-
-test "jsonEscape: newline, tab, carriage-return, mixed, empty" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-
-    try std.testing.expectEqualStrings("a\\nb", try jsonEscape(a, "a\nb"));
-    try std.testing.expectEqualStrings("a\\tb", try jsonEscape(a, "a\tb"));
-    try std.testing.expectEqualStrings("a\\rb", try jsonEscape(a, "a\rb"));
-    try std.testing.expectEqualStrings("\\\"\\\\\\n", try jsonEscape(a, "\"\\\n"));
-    try std.testing.expectEqualStrings("", try jsonEscape(a, ""));
-}
-
-test "jsonEscape: unicode passthrough" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try std.testing.expectEqualStrings("フリーレン", try jsonEscape(a, "フリーレン"));
-    try std.testing.expectEqualStrings("葬送のフリーレン", try jsonEscape(a, "葬送のフリーレン"));
 }
 
 test "relevance: exact > prefix > substring > no match" {
@@ -754,14 +705,6 @@ test "edgeToAnime: score rescale clamps over-range and rejects non-finite (ROD-1
     try std.testing.expectEqual(@as(?u32, null), mk(null));
     try std.testing.expectEqual(@as(?u32, null), mk(std.math.nan(f64)));
     try std.testing.expectEqual(@as(?u32, null), mk(std.math.inf(f64)));
-}
-
-test "jsonEscape: control characters are \\u-escaped (RFC 8259)" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const a = arena_state.allocator();
-    try std.testing.expectEqualStrings("\\u0000", try jsonEscape(a, "\x00"));
-    try std.testing.expectEqualStrings("a\\u000bb", try jsonEscape(a, "a\x0bb"));
 }
 
 // Inner builders must escape ids/labels; unescaped `"` breaks the body (server silent reject).

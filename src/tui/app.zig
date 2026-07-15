@@ -73,6 +73,8 @@ pub const EpisodeState = @import("episode_state.zig").EpisodeState;
 pub const SearchController = @import("search_state.zig").SearchController;
 pub const DiscoverState = @import("discover_state.zig").DiscoverState;
 pub const DiscoverCovers = @import("discover_covers.zig").DiscoverCovers;
+pub const PrewarmState = @import("prewarm_state.zig").PrewarmState;
+pub const ResolveTransport = @import("resolve_state.zig").ResolveTransport;
 
 /// Run the TUI to completion. `store` is optional: a DB hiccup means no history, not a refused launch.
 pub fn run(
@@ -195,12 +197,13 @@ pub fn run(
     defer if (app.sync_thread) |t| t.join();
     // Error-unwind/test: cancel+join+close. Quit `_exit` abandons; worker skips postEvent on cancel (ROD-286).
     defer app.teardownConnect(io);
+    // ThreadDrain contract (all 7, incl. discover_cover below): begin() before spawn, finish() after the worker's last postEvent, drain() only on teardown.
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view
-    defer app.add_resolve_drain.drain(); // ROD-327 tier-A add-resolve
-    defer app.play_resolve_drain.drain(); // ROD-328 tier-C Play resolve
-    defer app.prewarm_drain.drain(); // ROD-351 pre-warm walk
+    defer app.resolve.add_drain.drain(); // ROD-327 tier-A add-resolve
+    defer app.resolve.play_drain.drain(); // ROD-328 tier-C Play resolve
+    defer app.prewarm.drain.drain(); // ROD-351 pre-warm walk
     defer app.cover.joinThread();
     // Error-unwind/test; quit `_exit` abandons (Kitty clear drops images). Blocks until cover workers finish (ROD-240).
     defer app.discover_cover_drain.drain();
@@ -458,15 +461,6 @@ pub const App = struct {
     /// Auto-opened resume grid in flight; on failure demote to History, not a blank detail (ROD-229).
     resume_landing_pending: bool = false,
 
-    /// Canonical id to bind once the current Browse episode probe succeeds (ROD-327).
-    /// fireEpisodesForId nulls at entry so History/Discover cannot inherit a stale bind.
-    pending_bind: ?i64 = null,
-
-    /// Provider-fallback walk, or null (ROD-346). Built at first fetch failure, never at
-    /// fire time: (for_source, for_id) is the keep-check key, live nav is not. Walk hops
-    /// take it out before re-entering fireEpisodesForId (which clears it) and put it back.
-    fallback: ?Fallback = null,
-
     /// Open show's pin, cached at grid-open so render never reads the DB (ROD-345). Null = unpinned.
     show_pin: ?[]u8 = null,
 
@@ -523,29 +517,10 @@ pub const App = struct {
     episode_drain: workers.ThreadDrain = .{},
     /// Refresh-on-view enrich workers (ROD-182).
     enrich_refresh_drain: workers.ThreadDrain = .{},
-    /// Tier-A add-to-watchlist resolve probes (ROD-327).
-    add_resolve_drain: workers.ThreadDrain = .{},
-    /// One Add probe at a time: mashed P must not fan CDN requests (ROD-309/327).
-    add_resolving: bool = false,
-    /// Tier-C Play resolve searches; separate from Add so both may be outstanding (ROD-328).
-    play_resolve_drain: workers.ThreadDrain = .{},
-    /// One Play tier-C search at a time (ROD-309/328).
-    play_resolving: bool = false,
-    /// Aid the in-flight Play search was fired for; late result dropped if nav moved (ROD-346).
-    play_resolve_aid: ?i64 = null,
-    /// Eager pre-warm walk (ROD-351).
-    prewarm_drain: workers.ThreadDrain = .{},
-    /// One walk app-wide; must not block user-facing resolve or vice versa.
-    prewarm_active: bool = false,
-    /// Session ring of pre-warmed aids. Soft dedup (eviction harmless). `?i64` not a 0
-    /// sentinel: nothing enforces anilist_id > 0.
-    prewarm_attempted: [32]?i64 = @splat(null),
-    prewarm_attempted_next: usize = 0,
-    /// Floors walk spacing app-wide; ring alone can burst after eviction (ROD-309/351).
-    /// A floored fire is not marked attempted, so the show retries later.
-    prewarm_last_start_ms: ?i64 = null,
-    /// Cooperative cancel between provider hops; set when a user fallback walk advances.
-    prewarm_cancel: std.atomic.Value(bool) = .init(false),
+    /// Tier-A/tier-C in-flight resolve state + provider-fallback walk (ROD-327/328/346/401).
+    resolve: ResolveTransport = .{},
+    /// Eager pre-warm walk (ROD-351/401).
+    prewarm: PrewarmState = .{},
     /// Episode list/cursor/cache; transport on App (ROD-180).
     episodes: EpisodeState = .{},
     cover: CoverState = .{},
@@ -689,48 +664,35 @@ pub const App = struct {
     /// Like pushToast, with recovery scope (ROD-239): persistent errors clear only
     /// on their own subsystem's recovery, never cross-view.
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
-        const cap = self.toast_queue.len;
+        const q = &self.toast_queue;
 
-        // Per-topic singleton (ROD-293): refresh in place. Without this, repeated
-        // failures fill all 3 slots with persistent toasts and starve transients.
-        if (persistent) {
-            for (&self.toast_queue) |*slot| {
-                if (slot.*) |existing| {
-                    if (existing.persistent and existing.topic == topic) {
-                        slot.* = makeToast(kind, text, persistent, topic);
-                        return;
-                    }
-                }
-            }
-        }
+        // 1. Per-topic singleton (ROD-293): a persistent toast refreshes its topic's
+        // slot in place, so repeated failures can't fill all 3 and starve transients.
+        if (persistent) for (q) |*slot| {
+            if (slot.*) |t| if (t.persistent and t.topic == topic) {
+                slot.* = makeToast(kind, text, persistent, topic);
+                return;
+            };
+        };
 
-        var idx: usize = cap; // no free slot yet
-        for (self.toast_queue, 0..) |slot, i| {
-            if (slot == null) {
-                idx = i;
-                break;
-            }
-        }
-        if (idx == cap) {
-            // Evict oldest non-persistent so a still-showing error survives a
-            // transient (ROD-293). Singleton above should guarantee a victim exists.
-            var victim: usize = 0;
-            const found = for (self.toast_queue, 0..) |slot, i| {
-                if (slot) |t| {
-                    if (!t.persistent) break i;
-                }
-            } else null;
-            if (found) |v| {
-                victim = v;
-            } else {
-                log.debug("toast: queue all-persistent, evicting oldest (unexpected — the per-topic singleton should prevent this)", .{});
-            }
-            // Compact left; preserves oldest→newest for TTL sweep and this evict.
-            var j = victim;
-            while (j + 1 < cap) : (j += 1) self.toast_queue[j] = self.toast_queue[j + 1];
-            idx = cap - 1;
-        }
-        self.toast_queue[idx] = makeToast(kind, text, persistent, topic);
+        // 2. Take a free slot.
+        for (q) |*slot| if (slot.* == null) {
+            slot.* = makeToast(kind, text, persistent, topic);
+            return;
+        };
+
+        // 3. Full: evict the oldest non-persistent so a still-showing error survives
+        // a transient (ROD-293); rule 1 should guarantee one exists. Compact left to
+        // keep oldest→newest for the TTL sweep, then append.
+        const victim = for (q, 0..) |slot, i| {
+            if (slot) |t| if (!t.persistent) break i;
+        } else v: {
+            log.debug("toast: queue all-persistent, evicting oldest (singleton should prevent this)", .{});
+            break :v 0;
+        };
+        var j = victim;
+        while (j + 1 < q.len) : (j += 1) q[j] = q[j + 1];
+        q[q.len - 1] = makeToast(kind, text, persistent, topic);
     }
 
     /// Cap copy to the §4.7 36-col budget here so long payloads get "…" not a silent
@@ -1330,6 +1292,7 @@ pub const App = struct {
     pub fn tick(self: *App, event: Event, loop: *Loop, io: std.Io, registry: Registry) !void {
         // Cursor snapshot for post-dispatch cover sync: move → debounce, discrete nav → now (ROD-202).
         const cursor_before = self.list_cursor;
+        // A handler returning true skips the post-switch cover-settle pass (ROD-202).
         switch (event) {
             .key_press => |key| input.onKey(self, key, loop, io, registry),
             .winsize => |ws| {
@@ -1370,359 +1333,30 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
             },
-            .sync_flushed => |outcome| {
-                // Action flush or launch pull (pushed==0); worker already cleared inflight (ROD-291/293).
-                if (outcome.reconciled > 0) {
-                    self.history_dirty = true;
-                    var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
-                    self.pushToast(.info, msg, false);
-                }
-                // Stop do-nothing flushes; reconnect nudge is ROD-295.
-                if (outcome.expired) self.anilist_connected = false;
-                // Silent on no-op; ↓ then ↑ so both-direction flushes read in order.
-                if (outcome.pushed > 0) {
-                    var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
-                    self.pushToast(.info, msg, false);
-                }
-            },
+            .sync_flushed => |outcome| self.handleSyncFlushed(outcome),
             .update_available => {
                 // Fixed copy so the command never clips; version is in Settings (ROD-370).
                 self.pushToast(.info, "update available · run zigoku update", false);
             },
             .connect_result => |outcome| self.onConnectResult(outcome, loop, io),
-            .search_done => |ev| {
-                // Stale if query moved since fire.
-                if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
-                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
-                    self.gpa.free(ev.for_query);
-                    self.gpa.free(ev.results);
-                    return;
-                }
-                self.search.loading = false;
-                self.async_start_ms = 0;
-                // Clear general persistent errors only; feed errors survive (ROD-239).
-                for (&self.toast_queue) |*slot| {
-                    if (slot.*) |t| {
-                        if (t.persistent and t.kind == .@"error" and t.topic == .general) slot.* = null;
-                    }
-                }
-                if (ev.page == 1) {
-                    self.search.clearResults(self.gpa);
-                }
-                const offset = self.search.results.items.len;
-                self.search.page = ev.page;
-                self.search.results.appendSlice(self.gpa, ev.results) catch |e| {
-                    // Free elements: outer free alone would leak owned Anime.
-                    log.debug("appending search results failed: {s}", .{@errorName(e)});
-                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
-                };
-                self.gpa.free(ev.results);
-                self.gpa.free(ev.for_query);
-                if (ev.page == 1) {
-                    self.list_cursor = 0;
-                    self.list_top = 0;
-                }
-                const added = self.search.results.items.len - offset;
-                // Fully enriched from AniList; hydrate + persist spine only (ROD-327).
-                self.search.hydrateResultsFromStore(self.gpa, self.store, offset, added);
-                self.search.persistResults(self.gpa, self.store, offset, added);
-            },
+            .search_done => |ev| if (self.handleSearchDone(ev)) return,
 
-            .resolve_add_result => |ev| {
-                defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
-                defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
-                // Before any early return: widen filters via providerAbsentFresh (ROD-347).
-                resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
-                self.async_start_ms = 0;
-                self.add_resolving = false;
-                if (!ev.ok) {
-                    // Tier-A miss: widen over remaining providers once (empty source = search walk).
-                    if (ev.source.len > 0 and resolve.fireResolveAddWiden(self, loop, io, registry, ev.anilist_id, ev.source)) return;
-                    // Unbound terminal (ROD-329); never toast success without a write.
-                    const st = self.store orelse {
-                        self.pushToast(.@"error", "couldn't add to watchlist", false);
-                        return;
-                    };
-                    var miss_arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer miss_arena.deinit();
-                    const marked = st.markUnbound(ev.anilist_id, Store.nowSecs(), miss_arena.allocator()) catch |e| {
-                        log.debug("markUnbound failed: {s}", .{@errorName(e)});
-                        self.pushToast(.@"error", "couldn't add to watchlist", false);
-                        return;
-                    };
-                    if (!marked) {
-                        self.pushToast(.@"error", "couldn't add to watchlist", false);
-                        return;
-                    }
-                    self.history_dirty = true;
-                    self.pushToast(.warn, "added, no source available", false);
-                    return;
-                }
-                // Bind + reveal; null store / error / false = toast miss, never false success.
-                const st = self.store orelse {
-                    self.pushToast(.@"error", "couldn't add to watchlist", false);
-                    return;
-                };
-                var arena = std.heap.ArenaAllocator.init(self.gpa);
-                defer arena.deinit();
-                const bound = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
-                    log.debug("bindCanonical (add) failed: {s}", .{@errorName(e)});
-                    self.pushToast(.@"error", "couldn't add to watchlist", false);
-                    return;
-                };
-                if (!bound) {
-                    self.pushToast(.@"error", "couldn't add to watchlist", false);
-                    return;
-                }
-                self.history_dirty = true;
-                self.noteAvailabilityWrite(ev.anilist_id);
-                self.pushToast(.success, "added to watchlist", false);
-                resolve.firePrewarm(self, loop, io, registry, ev.anilist_id); // ROD-351
-            },
+            .resolve_add_result => |ev| if (self.handleResolveAddResult(loop, io, registry, ev)) return,
 
-            .resolve_play_target => |ev| {
-                defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
-                defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
-                // Catalog facts even when the staleness gate drops the result (ROD-347).
-                resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
-                self.async_start_ms = 0;
-                self.play_resolving = false;
-                // Superseded fire: do not hijack the current grid (ROD-346).
-                const wanted = self.play_resolve_aid != null and self.play_resolve_aid.? == ev.anilist_id;
-                self.play_resolve_aid = null;
-                if (!wanted) return;
-                if (!ev.ok) {
-                    // Capture flip name before advance deinits the walk (ROD-357); for_source is stale.
-                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.anilist_id == ev.anilist_id and w.providers.len > 0) w.providers[0].displayName() else null) else null;
-                    if (self.fallback != null and self.fallback.?.anilist_id == ev.anilist_id) {
-                        if (resolve.advanceFallback(self, loop, io, registry, null, null)) return;
-                    }
-                    // Resume walk exhausted on last tier-C hop: demote, not blank pane (ROD-229).
-                    self.demoteResumeLanding();
-                    if (resolve.toastFlipExhaust(self, flip_miss)) return;
-                    self.pushToast(.@"error", "couldn't load episodes", false);
-                    return;
-                }
-                std.debug.assert(self.fallback == null or self.fallback.?.anilist_id == ev.anilist_id);
-                // fireEpisodesForId nulls pending_bind; arm after. Park walk across the fire.
-                const walk = self.fallback;
-                self.fallback = null;
-                resolve.fireEpisodesForId(self, loop, io, registry, ev.source_id, ev.source, if (walk) |w| domain.expectedEpisodeCount(w.canonical) else null);
-                if (self.episodes.loading) {
-                    self.fallback = walk;
-                } else if (walk) |w| {
-                    var done = w;
-                    done.deinit(self.gpa);
-                }
-                self.pending_bind = ev.anilist_id;
-            },
+            .resolve_play_target => |ev| if (self.handleResolvePlayTarget(loop, io, registry, ev)) return,
 
-            .prewarm_result => |ev| {
-                // HIDDEN bind (play reveals) or absence cache; best-effort (ROD-351/347).
-                defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
-                const st = self.store orelse return;
-                if (ev.source_id.len > 0) {
-                    var arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer arena.deinit();
-                    _ = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, false, Store.nowSecs(), arena.allocator()) catch |e|
-                        log.debug("prewarm bind failed: {s}", .{@errorName(e)});
-                } else if (ev.absent) {
-                    st.markProviderAbsent(ev.anilist_id, ev.source, Store.nowSecs()) catch |e|
-                        log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
-                }
-                self.noteAvailabilityWrite(ev.anilist_id);
-            },
+            .prewarm_result => |ev| if (self.handlePrewarmResult(ev)) return,
 
-            .prewarm_done => self.prewarm_active = false,
+            .prewarm_done => self.prewarm.active = false,
 
-            .discover_feed => |ev| {
-                // Land into ev.axis slot, never the active axis mid-switch. No stale drop.
-                const idx = @intFromEnum(ev.axis);
-                const slot = &self.discover.slots[idx];
-                slot.loading = false;
-                slot.failed = false;
-                const is_active = idx == @intFromEnum(self.discover.axis);
-                if (is_active) self.async_start_ms = 0;
-                // Feed-topic only; Browse search errors survive (§9.3b, ROD-239).
-                for (&self.toast_queue) |*ts| {
-                    if (ts.*) |t| {
-                        if (t.persistent and t.kind == .@"error" and t.topic == .feed) ts.* = null;
-                    }
-                }
-                if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
-                const offset = slot.results.items.len;
-                slot.results.appendSlice(self.gpa, ev.results) catch |e| {
-                    // No stamp on OOM: leave page-0 so refreshDiscover refetches (ROD-239).
-                    log.debug("appending feed results failed: {s}", .{@errorName(e)});
-                    for (ev.results) |r| freeOwnedAnime(self.gpa, r);
-                    self.gpa.free(ev.results);
-                    return;
-                };
-                self.gpa.free(ev.results);
-                // Exhaustion: hasNextPage (§9.6) or max_feed_rows (ROD-339), not short-page heuristic.
-                slot.fetched_at = Store.nowSecs();
-                slot.page = ev.page;
-                slot.exhausted = !ev.has_next or slot.results.items.len >= DiscoverState.max_feed_rows;
-                // Full GQL_FIELDS; persist spine like search (ROD-336).
-                const added = slot.results.items.len - offset;
-                self.discover.persistSlot(self.gpa, self.store, idx, offset, added);
-                if (is_active and ev.page == 1) {
-                    self.discover.cursor = 0;
-                    self.discover.scroll = 0;
-                }
-            },
+            .discover_feed => |ev| if (self.handleDiscoverFeed(ev)) return,
 
-            .discover_feed_error => |ev| {
-                // Failed slot + persistent feed toast; retry via refreshDiscover (ROD-239, §9.3b).
-                const slot = &self.discover.slots[@intFromEnum(ev.axis)];
-                slot.loading = false;
-                slot.failed = true;
-                if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
-                log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
-                self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
-            },
-            .enrichment_refreshed => |ev| {
-                // Persist + stamp only when AniList answered; transport fail must not advance TTL (ROD-182/278).
-                if (ev.answered) {
-                    if (self.store) |st| {
-                        // history_visible false: MAX-merge keeps hidden rows hidden.
-                        var arena = std.heap.ArenaAllocator.init(self.gpa);
-                        defer arena.deinit();
-                        st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
-                            log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
-                        self.history_dirty = true;
-                    }
-                }
-                freeOwnedAnime(self.gpa, ev.result);
-                self.gpa.free(ev.source);
-            },
-            .episodes_done => |ev| {
-                defer self.gpa.free(ev.for_id);
-                // Stale: not for the current detail show.
-                if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) {
-                    for (ev.episodes) |ep| self.gpa.free(ep.raw);
-                    self.gpa.free(ev.episodes);
-                    return;
-                }
-                self.episodes.loading = false;
-                self.async_start_ms = 0;
-                // ROD-368: empty 200 = "doesn't stock this", not a 0-ep grid. Walk like
-                // episodes_error; only that path used to hop. pending_bind is tier-A aid.
-                if (ev.episodes.len == 0) {
-                    self.gpa.free(ev.episodes);
-                    const failed_bind = self.pending_bind;
-                    self.pending_bind = null;
-                    if (self.episodes.for_source) |src| {
-                        const aid: ?i64 = failed_bind orelse blk: {
-                            const st = self.store orelse break :blk null;
-                            var a = std.heap.ArenaAllocator.init(self.gpa);
-                            defer a.deinit();
-                            const rec = (st.getAnime(a.allocator(), src, ev.for_id) catch null) orelse break :blk null;
-                            break :blk rec.anilist_id;
-                        };
-                        if (aid) |id| resolve.persistProviderAbsences(self, id, &.{src});
-                    }
-                    const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
-                    if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
-                    // Ladder empty: in-memory unbound only (browse must not mint ROD-329).
-                    self.demoteResumeLanding();
-                    _ = resolve.toastFlipExhaust(self, flip_miss);
-                    self.episodes.unbound = true;
-                    return;
-                }
-                self.resume_landing_pending = false; // ROD-229 auto-open succeeded
-                if (self.episodes.results) |old| {
-                    for (old) |ep| self.gpa.free(ep.raw);
-                    self.gpa.free(old);
-                }
-                // Sole non-applyCached write of results. for_id/for_source stay as fire set
-                // them (syncEpisodeProgress match); keep that pair in lockstep (ROD-193).
-                self.episodes.results = ev.episodes;
-                self.episodes.cursor = 0;
-                self.episodes.progress = 0;
-                self.episodes.resume_idx = null;
-                // §4.6 dim + resume from fire-time (source, id), not live nav (ROD-163).
-                {
-                    var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
-                    defer seed_arena.deinit();
-                    if (selection.detailSeedRecord(self, seed_arena.allocator(), self.episodes.for_source, ev.for_id)) |rec| {
-                        self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
-                    }
-                }
-                // Cache under fire-time for_source even if nav moved (ROD-130/343).
-                const source = self.episodes.for_source orelse selection.currentDetailSourceName(self, registry);
-                const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
-                // Bind BEFORE cache: episode_cache FKs anime (ROD-327). Hidden until play.
-                if (self.pending_bind) |aid| {
-                    self.pending_bind = null;
-                    if (self.store) |st| {
-                        var arena = std.heap.ArenaAllocator.init(self.gpa);
-                        defer arena.deinit();
-                        if (st.bindCanonical(source, ev.for_id, aid, false, Store.nowSecs(), arena.allocator())) |bound| {
-                            if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
-                            if (bound) self.noteAvailabilityWrite(aid);
-                        } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
-                    }
-                }
-                // After mint so a fresh binding has a row; patches seed that ran pre-mint (ROD-352).
-                self.raiseLandingProgress(source, ev.for_id);
-                self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
-                resolve.completeFallback(self, loop, io, registry);
-            },
-            .episodes_error => |ev| {
-                defer self.gpa.free(ev.for_id);
-                // Superseded fetch must not clear live load or toast (ROD-179).
-                if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) return;
-                self.episodes.loading = false;
-                self.async_start_ms = 0;
-                // Capture before clear: virgin probe's only handle on the canonical (ROD-327).
-                const failed_bind = self.pending_bind;
-                self.pending_bind = null;
-                const flip_miss: ?[]const u8 = if (self.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
-                if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return;
-                // Resume auto-open failed: demote to History, not blank detail (ROD-229).
-                self.demoteResumeLanding();
-                if (resolve.toastFlipExhaust(self, flip_miss)) return;
-                // §4.10: blank grid needs an explanation (ROD-173 class or generic).
-                var buf: [128]u8 = undefined;
-                const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "couldn't load episodes";
-                self.pushToast(.@"error", copy, false);
-            },
-            .cover_done => |ev| {
-                defer self.gpa.free(ev.for_id);
-                if (self.cover.for_id == null or !std.mem.eql(u8, ev.for_id, self.cover.for_id.?)) {
-                    self.gpa.free(ev.rgba);
-                    return;
-                }
-                self.cover.loading = false;
-                self.cover.joinThread();
-                if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
-
-                // Same target as cover.sync (list cursor in split browse); else list
-                // prefetch covers always fail the keep-check (ROD-156 #2).
-                const target_id = if (self.detailSyncTarget()) |a| a.id else null;
-                const keep = target_id != null and std.mem.eql(u8, target_id.?, ev.for_id);
-                if (!keep) {
-                    self.cover.clear(self.gpa);
-                    self.gpa.free(ev.rgba);
-                    return;
-                }
-
-                self.cover.acceptPixels(self.gpa, ev.rgba, ev.width, ev.height);
-            },
-            .cover_error => |for_id| {
-                defer self.gpa.free(for_id);
-                if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return;
-                self.cover.loading = false;
-                self.cover.joinThread();
-                if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
-                // Before clear() frees inflight_url.
-                self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
-                self.cover.clear(self.gpa);
-                std.log.debug("cover fetch/decode failed for {s}", .{for_id});
-            },
+            .discover_feed_error => |ev| self.handleDiscoverFeedError(ev),
+            .enrichment_refreshed => |ev| self.handleEnrichmentRefreshed(ev),
+            .episodes_done => |ev| if (self.handleEpisodesDone(loop, io, registry, ev)) return,
+            .episodes_error => |ev| if (self.handleEpisodesError(loop, io, registry, ev)) return,
+            .cover_done => |ev| if (self.handleCoverDone(ev)) return,
+            .cover_error => |for_id| if (self.handleCoverError(for_id)) return,
             .discover_cover_done => |ev| {
                 // URL-keyed; always adopt for ev.url (recreate slot if mid-flight eviction).
                 defer self.gpa.free(ev.url);
@@ -1743,68 +1377,14 @@ pub const App = struct {
                 self.finishPlayback(final_update, watchCompleted(final_update));
                 resolve.clearFallback(self);
             },
-            .play_error => |ev| {
-                const completed = watchCompleted(ev.final);
-                // Hop only if never meaningfully played (CF-penalty shape); mid-episode
-                // death must not relaunch. Capture continuation before finish clears session;
-                // only when detail still shows the played binding (ROD-346).
-                const never_played = if (ev.final) |f| !f.isMeaningful() else true;
-                const cont_ok = !completed and never_played and self.store != null and
-                    self.episodes.for_id != null and self.session.anime_id.len > 0 and
-                    std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?) and
-                    self.episodes.for_source != null and self.session.source.len > 0 and
-                    std.mem.eql(u8, self.session.source, self.episodes.for_source.?);
-                const ep_copy: ?[]const u8 = if (cont_ok) self.gpa.dupe(u8, self.session.episode_raw) catch null else null;
-                const ordinal = self.session.episode_index;
-                self.finishPlayback(ev.final, completed);
-                // §4.10: incomplete error is a real failure; completed late-error took success path.
-                if (!completed) {
-                    if (ep_copy) |raw| {
-                        if (resolve.advancePlayFallback(self, loop, io, registry, raw, ordinal)) return;
-                    } else {
-                        resolve.clearFallback(self);
-                    }
-                    var buf: [128]u8 = undefined;
-                    const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "playback failed";
-                    self.pushToast(.@"error", copy, false);
-                } else {
-                    resolve.clearFallback(self);
-                }
-            },
+            .play_error => |ev| if (self.handlePlayError(loop, io, registry, ev)) return,
             .play_retry => |r| {
                 // CDN 403 backoff: "retrying", not frozen launch (ROD-309).
                 var buf: [48]u8 = undefined;
                 const msg = std.fmt.bufPrint(&buf, "stream didn't open — retrying {d}/{d}", .{ r.attempt, r.max }) catch "stream didn't open — retrying";
                 self.pushToast(.warn, msg, false);
             },
-            .tick => {
-                const now = nowMs(io);
-                self.now_ms = now;
-                self.spinner_frame = (self.spinner_frame + 1) % 10;
-                if (self.debounce_deadline_ms > 0 and now >= self.debounce_deadline_ms) {
-                    self.debounce_deadline_ms = 0;
-                    self.search.clearResults(self.gpa);
-                    self.fireSearch(loop, io, 1);
-                }
-                // Cover settle (ROD-202); up_to_date short-circuit makes same-show re-fire free.
-                if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
-                    self.cover_sync_deadline_ms = 0;
-                    selection.syncCover(self, loop, io, registry);
-                }
-                // Action-sync debounce (ROD-291).
-                if (self.sync_flush_deadline_ms > 0 and now >= self.sync_flush_deadline_ms) {
-                    self.sync_flush_deadline_ms = 0;
-                    self.fireSyncFlush(loop, io);
-                }
-                for (&self.toast_queue) |*slot| {
-                    if (slot.*) |*t| {
-                        if (!t.persistent) {
-                            t.ttl_ms -= 100;
-                            if (t.ttl_ms <= 0) slot.* = null;
-                        }
-                    }
-                }
-            },
+            .tick => self.handleTickEvent(loop, io, registry),
         }
 
         if (event != .tick) {
@@ -1823,6 +1403,427 @@ pub const App = struct {
             } else {
                 // Async/resize: refresh unless a scroll settle is already armed.
                 if (self.cover_sync_deadline_ms == 0) selection.syncCover(self, loop, io, registry);
+            }
+        }
+    }
+
+    fn handleSearchDone(self: *App, ev: anytype) bool {
+        // Stale if query moved since fire.
+        if (!std.mem.eql(u8, ev.for_query, self.search.querySlice())) {
+            for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+            self.gpa.free(ev.for_query);
+            self.gpa.free(ev.results);
+            return true;
+        }
+        self.search.loading = false;
+        self.async_start_ms = 0;
+        // Clear general persistent errors only; feed errors survive (ROD-239).
+        for (&self.toast_queue) |*slot| {
+            if (slot.*) |t| {
+                if (t.persistent and t.kind == .@"error" and t.topic == .general) slot.* = null;
+            }
+        }
+        if (ev.page == 1) {
+            self.search.clearResults(self.gpa);
+        }
+        const offset = self.search.results.items.len;
+        self.search.page = ev.page;
+        self.search.results.appendSlice(self.gpa, ev.results) catch |e| {
+            // Free elements: outer free alone would leak owned Anime.
+            log.debug("appending search results failed: {s}", .{@errorName(e)});
+            for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+        };
+        self.gpa.free(ev.results);
+        self.gpa.free(ev.for_query);
+        if (ev.page == 1) {
+            self.list_cursor = 0;
+            self.list_top = 0;
+        }
+        const added = self.search.results.items.len - offset;
+        // Fully enriched from AniList; hydrate + persist spine only (ROD-327).
+        self.search.hydrateResultsFromStore(self.gpa, self.store, offset, added);
+        self.search.persistResults(self.gpa, self.store, offset, added);
+        return false;
+    }
+
+    fn handleResolveAddResult(self: *App, loop: *Loop, io: std.Io, registry: Registry, ev: anytype) bool {
+        defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+        defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
+        // Before any early return: widen filters via providerAbsentFresh (ROD-347).
+        resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
+        self.async_start_ms = 0;
+        self.resolve.add_resolving = false;
+        if (!ev.ok) {
+            // Tier-A miss: widen over remaining providers once (empty source = search walk).
+            if (ev.source.len > 0 and resolve.fireResolveAddWiden(self, loop, io, registry, ev.anilist_id, ev.source)) return true;
+            // Unbound terminal (ROD-329); never toast success without a write.
+            const st = self.store orelse {
+                self.pushToast(.@"error", "couldn't add to watchlist", false);
+                return true;
+            };
+            var miss_arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer miss_arena.deinit();
+            const marked = st.markUnbound(ev.anilist_id, Store.nowSecs(), miss_arena.allocator()) catch |e| {
+                log.debug("markUnbound failed: {s}", .{@errorName(e)});
+                self.pushToast(.@"error", "couldn't add to watchlist", false);
+                return true;
+            };
+            if (!marked) {
+                self.pushToast(.@"error", "couldn't add to watchlist", false);
+                return true;
+            }
+            self.history_dirty = true;
+            self.pushToast(.warn, "added, no source available", false);
+            return true;
+        }
+        // Bind + reveal; null store / error / false = toast miss, never false success.
+        const st = self.store orelse {
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return true;
+        };
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const bound = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, true, Store.nowSecs(), arena.allocator()) catch |e| {
+            log.debug("bindCanonical (add) failed: {s}", .{@errorName(e)});
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return true;
+        };
+        if (!bound) {
+            self.pushToast(.@"error", "couldn't add to watchlist", false);
+            return true;
+        }
+        self.history_dirty = true;
+        self.noteAvailabilityWrite(ev.anilist_id);
+        self.pushToast(.success, "added to watchlist", false);
+        resolve.firePrewarm(self, loop, io, registry, ev.anilist_id); // ROD-351
+        return false;
+    }
+
+    fn handleResolvePlayTarget(self: *App, loop: *Loop, io: std.Io, registry: Registry, ev: anytype) bool {
+        defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+        defer if (ev.absent_sources.len > 0) self.gpa.free(ev.absent_sources);
+        // Catalog facts even when the staleness gate drops the result (ROD-347).
+        resolve.persistProviderAbsences(self, ev.anilist_id, ev.absent_sources);
+        self.async_start_ms = 0;
+        self.resolve.play_resolving = false;
+        // Superseded fire: do not hijack the current grid (ROD-346).
+        const wanted = self.resolve.play_resolve_aid != null and self.resolve.play_resolve_aid.? == ev.anilist_id;
+        self.resolve.play_resolve_aid = null;
+        if (!wanted) return true;
+        if (!ev.ok) {
+            // Capture flip name before advance deinits the walk (ROD-357); for_source is stale.
+            const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.anilist_id == ev.anilist_id and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+            if (self.resolve.fallback != null and self.resolve.fallback.?.anilist_id == ev.anilist_id) {
+                if (resolve.advanceFallback(self, loop, io, registry, null, null)) return true;
+            }
+            // Resume walk exhausted on last tier-C hop: demote, not blank pane (ROD-229).
+            self.demoteResumeLanding();
+            if (resolve.toastFlipExhaust(self, flip_miss)) return true;
+            self.pushToast(.@"error", "couldn't load episodes", false);
+            return true;
+        }
+        std.debug.assert(self.resolve.fallback == null or self.resolve.fallback.?.anilist_id == ev.anilist_id);
+        // fireEpisodesForId nulls pending_bind; arm after. Park walk across the fire.
+        const walk = self.resolve.fallback;
+        self.resolve.fallback = null;
+        resolve.fireEpisodesForId(self, loop, io, registry, ev.source_id, ev.source, if (walk) |w| domain.expectedEpisodeCount(w.canonical) else null);
+        if (self.episodes.loading) {
+            self.resolve.fallback = walk;
+        } else if (walk) |w| {
+            var done = w;
+            done.deinit(self.gpa);
+        }
+        self.resolve.pending_bind = ev.anilist_id;
+        return false;
+    }
+
+    fn handlePrewarmResult(self: *App, ev: anytype) bool {
+        // HIDDEN bind (play reveals) or absence cache; best-effort (ROD-351/347).
+        defer if (ev.source_id.len > 0) self.gpa.free(ev.source_id);
+        const st = self.store orelse return true;
+        if (ev.source_id.len > 0) {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            _ = st.bindCanonical(ev.source, ev.source_id, ev.anilist_id, false, Store.nowSecs(), arena.allocator()) catch |e|
+                log.debug("prewarm bind failed: {s}", .{@errorName(e)});
+        } else if (ev.absent) {
+            st.markProviderAbsent(ev.anilist_id, ev.source, Store.nowSecs()) catch |e|
+                log.debug("markProviderAbsent failed: {s}", .{@errorName(e)});
+        }
+        self.noteAvailabilityWrite(ev.anilist_id);
+        return false;
+    }
+
+    fn handleDiscoverFeed(self: *App, ev: anytype) bool {
+        // Land into ev.axis slot, never the active axis mid-switch. No stale drop.
+        const idx = @intFromEnum(ev.axis);
+        const slot = &self.discover.slots[idx];
+        slot.loading = false;
+        slot.failed = false;
+        const is_active = idx == @intFromEnum(self.discover.axis);
+        if (is_active) self.async_start_ms = 0;
+        // Feed-topic only; Browse search errors survive (§9.3b, ROD-239).
+        for (&self.toast_queue) |*ts| {
+            if (ts.*) |t| {
+                if (t.persistent and t.kind == .@"error" and t.topic == .feed) ts.* = null;
+            }
+        }
+        if (ev.page == 1) self.discover.clearSlot(self.gpa, idx);
+        const offset = slot.results.items.len;
+        slot.results.appendSlice(self.gpa, ev.results) catch |e| {
+            // No stamp on OOM: leave page-0 so refreshDiscover refetches (ROD-239).
+            log.debug("appending feed results failed: {s}", .{@errorName(e)});
+            for (ev.results) |r| freeOwnedAnime(self.gpa, r);
+            self.gpa.free(ev.results);
+            return true;
+        };
+        self.gpa.free(ev.results);
+        // Exhaustion: hasNextPage (§9.6) or max_feed_rows (ROD-339), not short-page heuristic.
+        slot.fetched_at = Store.nowSecs();
+        slot.page = ev.page;
+        slot.exhausted = !ev.has_next or slot.results.items.len >= DiscoverState.max_feed_rows;
+        // Full GQL_FIELDS; persist spine like search (ROD-336).
+        const added = slot.results.items.len - offset;
+        self.discover.persistSlot(self.gpa, self.store, idx, offset, added);
+        if (is_active and ev.page == 1) {
+            self.discover.cursor = 0;
+            self.discover.scroll = 0;
+        }
+        return false;
+    }
+
+    fn handleEpisodesDone(self: *App, loop: *Loop, io: std.Io, registry: Registry, ev: anytype) bool {
+        defer self.gpa.free(ev.for_id);
+        // Stale: not for the current detail show.
+        if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) {
+            for (ev.episodes) |ep| self.gpa.free(ep.raw);
+            self.gpa.free(ev.episodes);
+            return true;
+        }
+        self.episodes.loading = false;
+        self.async_start_ms = 0;
+        // ROD-368: empty 200 = "doesn't stock this", not a 0-ep grid. Walk like
+        // episodes_error; only that path used to hop. pending_bind is tier-A aid.
+        if (ev.episodes.len == 0) {
+            self.gpa.free(ev.episodes);
+            const failed_bind = self.resolve.pending_bind;
+            self.resolve.pending_bind = null;
+            if (self.episodes.for_source) |src| {
+                const aid: ?i64 = failed_bind orelse blk: {
+                    const st = self.store orelse break :blk null;
+                    var a = std.heap.ArenaAllocator.init(self.gpa);
+                    defer a.deinit();
+                    const rec = (st.getAnime(a.allocator(), src, ev.for_id) catch null) orelse break :blk null;
+                    break :blk rec.anilist_id;
+                };
+                if (aid) |id| resolve.persistProviderAbsences(self, id, &.{src});
+            }
+            const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+            if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return true;
+            // Ladder empty: in-memory unbound only (browse must not mint ROD-329).
+            self.demoteResumeLanding();
+            _ = resolve.toastFlipExhaust(self, flip_miss);
+            self.episodes.unbound = true;
+            return true;
+        }
+        self.resume_landing_pending = false; // ROD-229 auto-open succeeded
+        if (self.episodes.results) |old| {
+            for (old) |ep| self.gpa.free(ep.raw);
+            self.gpa.free(old);
+        }
+        // Sole non-applyCached write of results. for_id/for_source stay as fire set
+        // them (syncEpisodeProgress match); keep that pair in lockstep (ROD-193).
+        self.episodes.results = ev.episodes;
+        self.episodes.cursor = 0;
+        self.episodes.progress = 0;
+        self.episodes.resume_idx = null;
+        // §4.6 dim + resume from fire-time (source, id), not live nav (ROD-163).
+        {
+            var seed_arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer seed_arena.deinit();
+            if (selection.detailSeedRecord(self, seed_arena.allocator(), self.episodes.for_source, ev.for_id)) |rec| {
+                self.episodes.seedHistoryCursor(self.store, self.translation, rec, ev.episodes);
+            }
+        }
+        // Cache under fire-time for_source even if nav moved (ROD-130/343).
+        const source = self.episodes.for_source orelse selection.currentDetailSourceName(self, registry);
+        const status: ?[]const u8 = if (self.currentDetailAnime()) |a| a.status else null;
+        // Bind BEFORE cache: episode_cache FKs anime (ROD-327). Hidden until play.
+        if (self.resolve.pending_bind) |aid| {
+            self.resolve.pending_bind = null;
+            if (self.store) |st| {
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                if (st.bindCanonical(source, ev.for_id, aid, false, Store.nowSecs(), arena.allocator())) |bound| {
+                    if (!bound) log.debug("bindCanonical (play): no canonical for anilist_id {d}", .{aid});
+                    if (bound) self.noteAvailabilityWrite(aid);
+                } else |e| log.debug("bindCanonical (play) failed: {s}", .{@errorName(e)});
+            }
+        }
+        // After mint so a fresh binding has a row; patches seed that ran pre-mint (ROD-352).
+        self.raiseLandingProgress(source, ev.for_id);
+        self.episodes.cacheEpisodes(self.gpa, self.store, source, ev.for_id, self.translation, status, ev.episodes);
+        resolve.completeFallback(self, loop, io, registry);
+        return false;
+    }
+
+    fn handleEpisodesError(self: *App, loop: *Loop, io: std.Io, registry: Registry, ev: anytype) bool {
+        defer self.gpa.free(ev.for_id);
+        // Superseded fetch must not clear live load or toast (ROD-179).
+        if (self.episodes.for_id == null or !std.mem.eql(u8, ev.for_id, self.episodes.for_id.?)) return true;
+        self.episodes.loading = false;
+        self.async_start_ms = 0;
+        // Capture before clear: virgin probe's only handle on the canonical (ROD-327).
+        const failed_bind = self.resolve.pending_bind;
+        self.resolve.pending_bind = null;
+        const flip_miss: ?[]const u8 = if (self.resolve.fallback) |w| (if (w.manual and w.providers.len > 0) w.providers[0].displayName() else null) else null;
+        if (resolve.advanceFallback(self, loop, io, registry, failed_bind, self.owningProvider(registry).displayName())) return true;
+        // Resume auto-open failed: demote to History, not blank detail (ROD-229).
+        self.demoteResumeLanding();
+        if (resolve.toastFlipExhaust(self, flip_miss)) return true;
+        // §4.10: blank grid needs an explanation (ROD-173 class or generic).
+        var buf: [128]u8 = undefined;
+        const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "couldn't load episodes";
+        self.pushToast(.@"error", copy, false);
+        return false;
+    }
+
+    fn handleCoverDone(self: *App, ev: anytype) bool {
+        defer self.gpa.free(ev.for_id);
+        if (self.cover.for_id == null or !std.mem.eql(u8, ev.for_id, self.cover.for_id.?)) {
+            self.gpa.free(ev.rgba);
+            return true;
+        }
+        self.cover.loading = false;
+        self.cover.joinThread();
+        if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
+
+        // Same target as cover.sync (list cursor in split browse); else list
+        // prefetch covers always fail the keep-check (ROD-156 #2).
+        const target_id = if (self.detailSyncTarget()) |a| a.id else null;
+        const keep = target_id != null and std.mem.eql(u8, target_id.?, ev.for_id);
+        if (!keep) {
+            self.cover.clear(self.gpa);
+            self.gpa.free(ev.rgba);
+            return true;
+        }
+
+        self.cover.acceptPixels(self.gpa, ev.rgba, ev.width, ev.height);
+        return false;
+    }
+
+    fn handlePlayError(self: *App, loop: *Loop, io: std.Io, registry: Registry, ev: anytype) bool {
+        const completed = watchCompleted(ev.final);
+        // Hop only if never meaningfully played (CF-penalty shape); mid-episode
+        // death must not relaunch. Capture continuation before finish clears session;
+        // only when detail still shows the played binding (ROD-346).
+        const never_played = if (ev.final) |f| !f.isMeaningful() else true;
+        const cont_ok = !completed and never_played and self.store != null and
+            self.episodes.for_id != null and self.session.anime_id.len > 0 and
+            std.mem.eql(u8, self.session.anime_id, self.episodes.for_id.?) and
+            self.episodes.for_source != null and self.session.source.len > 0 and
+            std.mem.eql(u8, self.session.source, self.episodes.for_source.?);
+        const ep_copy: ?[]const u8 = if (cont_ok) self.gpa.dupe(u8, self.session.episode_raw) catch null else null;
+        const ordinal = self.session.episode_index;
+        self.finishPlayback(ev.final, completed);
+        // §4.10: incomplete error is a real failure; completed late-error took success path.
+        if (!completed) {
+            if (ep_copy) |raw| {
+                if (resolve.advancePlayFallback(self, loop, io, registry, raw, ordinal)) return true;
+            } else {
+                resolve.clearFallback(self);
+            }
+            var buf: [128]u8 = undefined;
+            const copy = failureClassCopy(ev.cause, self.owningProvider(registry).displayName(), &buf) orelse "playback failed";
+            self.pushToast(.@"error", copy, false);
+        } else {
+            resolve.clearFallback(self);
+        }
+        return false;
+    }
+
+    fn handleSyncFlushed(self: *App, outcome: event_mod.SyncFlushOutcome) void {
+        // Action flush or launch pull (pushed==0); worker already cleared inflight (ROD-291/293).
+        if (outcome.reconciled > 0) {
+            self.history_dirty = true;
+            var buf: [40]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
+            self.pushToast(.info, msg, false);
+        }
+        // Stop do-nothing flushes; reconnect nudge is ROD-295.
+        if (outcome.expired) self.anilist_connected = false;
+        // Silent on no-op; ↓ then ↑ so both-direction flushes read in order.
+        if (outcome.pushed > 0) {
+            var buf: [40]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
+            self.pushToast(.info, msg, false);
+        }
+    }
+
+    fn handleDiscoverFeedError(self: *App, ev: anytype) void {
+        // Failed slot + persistent feed toast; retry via refreshDiscover (ROD-239, §9.3b).
+        const slot = &self.discover.slots[@intFromEnum(ev.axis)];
+        slot.loading = false;
+        slot.failed = true;
+        if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
+        log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
+        self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
+    }
+
+    fn handleEnrichmentRefreshed(self: *App, ev: anytype) void {
+        // Persist + stamp only when AniList answered; transport fail must not advance TTL (ROD-182/278).
+        if (ev.answered) {
+            if (self.store) |st| {
+                // history_visible false: MAX-merge keeps hidden rows hidden.
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
+                    log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
+                self.history_dirty = true;
+            }
+        }
+        freeOwnedAnime(self.gpa, ev.result);
+        self.gpa.free(ev.source);
+    }
+
+    fn handleCoverError(self: *App, for_id: []const u8) bool {
+        defer self.gpa.free(for_id);
+        if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return true;
+        self.cover.loading = false;
+        self.cover.joinThread();
+        if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
+        // Before clear() frees inflight_url.
+        self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
+        self.cover.clear(self.gpa);
+        std.log.debug("cover fetch/decode failed for {s}", .{for_id});
+        return false;
+    }
+
+    fn handleTickEvent(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
+        const now = nowMs(io);
+        self.now_ms = now;
+        self.spinner_frame = (self.spinner_frame + 1) % 10;
+        if (self.debounce_deadline_ms > 0 and now >= self.debounce_deadline_ms) {
+            self.debounce_deadline_ms = 0;
+            self.search.clearResults(self.gpa);
+            self.fireSearch(loop, io, 1);
+        }
+        // Cover settle (ROD-202); up_to_date short-circuit makes same-show re-fire free.
+        if (self.cover_sync_deadline_ms > 0 and now >= self.cover_sync_deadline_ms) {
+            self.cover_sync_deadline_ms = 0;
+            selection.syncCover(self, loop, io, registry);
+        }
+        // Action-sync debounce (ROD-291).
+        if (self.sync_flush_deadline_ms > 0 and now >= self.sync_flush_deadline_ms) {
+            self.sync_flush_deadline_ms = 0;
+            self.fireSyncFlush(loop, io);
+        }
+        for (&self.toast_queue) |*slot| {
+            if (slot.*) |*t| {
+                if (!t.persistent) {
+                    t.ttl_ms -= 100;
+                    if (t.ttl_ms <= 0) slot.* = null;
+                }
             }
         }
     }
@@ -2068,16 +2069,10 @@ pub const App = struct {
     /// Detached refresh worker: GPA identity stub (seed_rec dies with fireEpisodes arena).
     fn fireRefreshEnrich(self: *App, loop: *Loop, io: std.Io, source: []const u8, source_id: []const u8, rec: AnimeRecord) void {
         const gpa = self.gpa;
-        const id = gpa.dupe(u8, source_id) catch return;
-        const name = gpa.dupe(u8, rec.title) catch {
-            gpa.free(id);
-            return;
-        };
-        const src = gpa.dupe(u8, source) catch {
-            gpa.free(id);
-            gpa.free(name);
-            return;
-        };
+        const copies = workers.dupeAll(gpa, 3, .{ source_id, rec.title, source }) catch return;
+        const id = copies[0];
+        const name = copies[1];
+        const src = copies[2];
         const english: ?[]const u8 = if (rec.title_english) |e| (gpa.dupe(u8, e) catch null) else null;
         const stub: Anime = .{
             .id = id,

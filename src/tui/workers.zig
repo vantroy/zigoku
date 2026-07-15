@@ -148,6 +148,20 @@ pub fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
     return if (s) |x| try alloc.dupe(u8, x) else null;
 }
 
+/// Dupe `sources` into `alloc` as one commit (ROD-401): any failure frees everything
+/// already duped instead of stranding it, so callers don't hand-roll an N-deep
+/// catch/free ladder per spawn site. Caller arms `loading` only after this succeeds.
+pub fn dupeAll(alloc: Allocator, comptime n: usize, sources: [n][]const u8) ![n][]u8 {
+    var out: [n][]u8 = undefined;
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |s| alloc.free(s);
+    for (sources, 0..) |s, i| {
+        out[i] = try alloc.dupe(u8, s);
+        filled = i + 1;
+    }
+    return out;
+}
+
 /// Deep-copy string list (genres, studios): owned slice + owned elements, freeable by
 /// `freeOwnedAnime`. Empty input returns `&.{}` (no alloc).
 pub fn dupeOwnedStrList(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
@@ -481,7 +495,7 @@ const prewarm_gap_ms: u64 = 1500;
 /// `.prewarm_done` always closes the single-flight guard.
 ///
 /// `providers`/`canonical` gpa-owned here. Match id dups into gpa and transfers on post.
-/// `cancel` (App.prewarm_cancel) polled between hops so an advancing fallback can yield
+/// `cancel` (App.prewarm.cancel) polled between hops so an advancing fallback can yield
 /// CDN budget; `.prewarm_done` still posts.
 pub fn prewarmTask(loop: *Loop, gpa: Allocator, io: std.Io, providers: []const SourceProvider, canonical: Anime, anilist_id: i64, translation: domain.Translation, cancel: *const std.atomic.Value(bool), drain: *ThreadDrain) void {
     defer drain.finish();
@@ -1410,6 +1424,20 @@ test "dupeOwnedStrList returns the empty sentinel without allocating" {
     // &.{} in → &.{} out, freeable as a no-op (len 0). No allocator touch.
     const out = try dupeOwnedStrList(std.testing.allocator, &.{});
     try std.testing.expectEqual(@as(usize, 0), out.len);
+}
+
+test "dupeAll commits all sources or frees the partial set on failure (ROD-401)" {
+    const a = std.testing.allocator;
+
+    const ok = try dupeAll(a, 3, .{ "one", "two", "three" });
+    defer for (ok) |s| a.free(s);
+    try std.testing.expectEqualStrings("two", ok[1]);
+
+    // Failing at each index must free the slots already taken; testing.allocator flags any leak.
+    for (0..3) |fail_at| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_at });
+        try std.testing.expectError(error.OutOfMemory, dupeAll(failing.allocator(), 3, .{ "one", "two", "three" }));
+    }
 }
 
 test "observedPlaybackWasMeaningful requires positive observed position" {

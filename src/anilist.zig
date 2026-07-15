@@ -6,6 +6,7 @@ const std = @import("std");
 const domain = @import("domain.zig");
 const source = @import("source.zig");
 const deadline = @import("util/deadline.zig");
+const json_escape = @import("util/json_escape.zig");
 const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -205,7 +206,7 @@ fn enrichBySearch(arena: Allocator, io: Io, show: domain.Anime) EnrichError!?Met
     const body = try std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":8,\"page\":1}}}}",
-        .{ GQL_SEARCH, try jsonEscape(arena, title) },
+        .{ GQL_SEARCH, try json_escape.escape(arena, title) },
     );
     const raw = postGql(arena, io, body) orelse return error.NoAnswer;
     return classifyBySearch(arena, show, raw);
@@ -275,7 +276,7 @@ fn searchBody(arena: Allocator, query: []const u8, page: u32) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
         "{{\"query\":\"{s}\",\"variables\":{{\"search\":\"{s}\",\"perPage\":{d},\"page\":{d}}}}}",
-        .{ GQL_SEARCH, try jsonEscape(arena, query), source.search_page_size, page },
+        .{ GQL_SEARCH, try json_escape.escape(arena, query), source.search_page_size, page },
     );
 }
 
@@ -943,24 +944,6 @@ fn sanitizeDescription(arena: Allocator, raw: []const u8) ![]const u8 {
     return std.mem.trim(u8, out.items, " ");
 }
 
-fn jsonEscape(arena: Allocator, s: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (s) |c| switch (c) {
-        '"' => try out.appendSlice(arena, "\\\""),
-        '\\' => try out.appendSlice(arena, "\\\\"),
-        '\n' => try out.appendSlice(arena, "\\n"),
-        '\r' => try out.appendSlice(arena, "\\r"),
-        '\t' => try out.appendSlice(arena, "\\t"),
-        else => if (c < 0x20) {
-            const hex = "0123456789abcdef";
-            try out.appendSlice(arena, "\\u00");
-            try out.append(arena, hex[(c >> 4) & 0xf]);
-            try out.append(arena, hex[c & 0xf]);
-        } else try out.append(arena, c),
-    };
-    return out.items;
-}
-
 test "aniListStatus maps every local status to its AniList enum (ROD-284)" {
     try std.testing.expectEqualStrings("PLANNING", aniListStatus(.planning));
     try std.testing.expectEqualStrings("CURRENT", aniListStatus(.watching));
@@ -1303,7 +1286,7 @@ test "searchBody carries search/perPage/page, JSON-escapes the query; GQL_SEARCH
     try std.testing.expect(std.mem.indexOf(u8, GQL_SEARCH, "page:$page") != null);
 
     // A quote in the query must survive as an escaped JSON string, round-tripping back
-    // to the original on parse (proves jsonEscape, not raw interpolation).
+    // to the original on parse (proves the escape ran, not raw interpolation).
     const body = try searchBody(a, "Cowboy \"Bebop\"", 3);
     const parsed = try std.json.parseFromSlice(struct {
         variables: struct { search: []const u8, perPage: u32, page: u32 },

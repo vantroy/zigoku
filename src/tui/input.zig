@@ -423,7 +423,7 @@ pub fn onProviderPinKey(self: *App, key: vaxis.Key, loop: *Loop, io: std.Io, reg
     };
     providers[0] = target;
     resolve.clearFallback(self);
-    self.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0, .manual = true };
+    self.resolve.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0, .manual = true };
     if (!resolve.advanceFallback(self, loop, io, registry, null, null)) {
         var buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "couldn't reach {s}", .{target.displayName()}) catch "couldn't switch provider";
