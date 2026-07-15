@@ -1,10 +1,5 @@
-//! Zigoku — shared cover-art rendering (ROD-243).
-//!
-//! The pixel→terminal half of cover display, extracted from `view/detail.zig` so
-//! the single-cover detail pane and the Discover grid render covers through ONE
-//! implementation (no drift): the aspect-correct Kitty placement and the half-block
-//! mosaic fallback. The fit MATH (`halfBlockFit`) still lives in `cover_state.zig`
-//! and is unit-tested there; this module is the render side that consumes it.
+//! Shared cover-art rendering (ROD-243): pixel → terminal for detail and Discover.
+//! Fit math (`halfBlockFit`) lives in `cover_state.zig`; this module consumes it.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -14,12 +9,8 @@ const CoverState = @import("cover_state.zig").CoverState;
 
 pub const Pixels = cover_mod.Pixels;
 
-/// Place a transmitted Kitty `img` fitted + centered inside `win`, preserving the
-/// poster's aspect against the terminal's reported cell pixel metrics. Returns
-/// false when the geometry is degenerate or the placement faults, so the caller can
-/// fall back (flat fill / placeholder). Extracted verbatim from detail's
-/// `drawKittyCover` (ROD-243) — the only change is returning a bool instead of
-/// calling a detail-specific fallback inline.
+/// Kitty image fitted + centered in `win` (aspect vs cell pixel metrics).
+/// false on degenerate geometry / draw fault (caller falls back).
 pub fn drawKittyFit(img: vaxis.Image, win: vaxis.Window) bool {
     const cols = win.screen.width;
     const rows = win.screen.height;
@@ -56,9 +47,7 @@ pub fn drawKittyFit(img: vaxis.Image, win: vaxis.Window) bool {
     return true;
 }
 
-/// Sample one half-pixel of the letterboxed cover. `(gx, gy)` is a half-pixel grid
-/// coordinate (grid is `cols` wide × `rows*2` tall); cells outside the fitted image
-/// region return `base` so the letterbox matte matches the pane (ROD-164).
+/// One half-pixel sample on a `cols × rows*2` grid; outside fit returns `base` (ROD-164 matte).
 fn sampleHalfBlock(px: Pixels, gx: u32, gy: u32, off_x: u32, off_y: u32, fit_w: u32, fit_h: u32, base: vaxis.Color) vaxis.Color {
     if (gx < off_x or gy < off_y) return base;
     const fx = gx - off_x;
@@ -70,11 +59,7 @@ fn sampleHalfBlock(px: Pixels, gx: u32, gy: u32, off_x: u32, off_y: u32, fit_w: 
     return .{ .rgb = .{ px.rgba[idx], px.rgba[idx + 1], px.rgba[idx + 2] } };
 }
 
-/// Render decoded cover pixels as a half-block mosaic into `win`: each cell packs
-/// two vertically-stacked samples via `▀` (upper half = fg, lower half = bg),
-/// doubling vertical resolution over a flat fill. The image is letterboxed via
-/// `halfBlockFit` (aspect-correct using the terminal's cell pixel metrics) with
-/// `base` as the matte, so posters stay poster-shaped on non-Kitty terminals.
+/// Half-block mosaic: each cell is `▀` (fg top / bg bottom). Letterboxed via halfBlockFit.
 pub fn drawHalfBlock(win: vaxis.Window, px: Pixels, base: vaxis.Color) void {
     const cols = win.width;
     const rows = win.height;
@@ -83,8 +68,7 @@ pub fn drawHalfBlock(win: vaxis.Window, px: Pixels, base: vaxis.Color) void {
     const grid_w: u32 = cols;
     const grid_h: u32 = @as(u32, rows) * 2;
 
-    // Terminal pixels per cell, if reported — lets halfBlockFit correct for non-2:1
-    // cells instead of squishing posters. 0/0 → square-half-pixel assumption.
+    // Cell metrics for non-2:1 correction; 0/0 → square half-pixel assumption.
     const sw = win.screen.width;
     const sh = win.screen.height;
     const ppc: u32 = if (sw != 0) (std.math.divCeil(u32, @intCast(win.screen.width_pix), sw) catch 0) else 0;
