@@ -1,14 +1,9 @@
-//! Boot-time update check (ROD-370). Best-effort: compare our built-in version
-//! against the tag GitHub reports for the latest release, and if we're behind,
-//! hand the caller the newer version to toast. Cached 6h so the network is hit at
-//! most once per window; every failure mode (offline, rate-limited, malformed
-//! body, no cache dir) returns null; the check never blocks startup and never
-//! surfaces an error. Whether to run at all is the caller's config gate
-//! (`check_for_updates`), not this module's concern.
+//! Boot-time update check (ROD-370). Best-effort: compare built-in version to GitHub
+//! latest tag; return newer version for toast, else null. Cached 6h; every failure
+//! (offline, rate-limit, bad body, no cache dir) → null. Never blocks startup, never
+//! surfaces errors. Caller's config (`check_for_updates`) gates whether to run.
 //!
-//! Decoupled from `root` on purpose: the current version and the wall clock come
-//! in as parameters, so the module carries no import cycle and stays unit-testable
-//! without a real clock or network.
+//! Version + wall clock are parameters (no root import cycle; unit-testable).
 
 const std = @import("std");
 const Io = std.Io;
@@ -21,18 +16,13 @@ const deadline = @import("util/deadline.zig");
 
 const log = std.log.scoped(.update_check);
 
-/// Re-check no more than once per this window. A background version poll doesn't
-/// need to be fresher than "sometime today", and 6h keeps us far under GitHub's
-/// unauthenticated rate limit even across many launches.
+/// Ambient re-check window; stays under GitHub unauth rate limit across launches.
 pub const CHECK_TTL_SECS: i64 = 6 * 60 * 60;
 
-/// GitHub rejects API requests without a User-Agent (403). Identify ourselves.
+/// GitHub API rejects requests without User-Agent (403).
 const USER_AGENT = "zigoku-update-check";
 
-/// Wall-clock ceiling for the check's one GET. Without it a reachable-but-silent
-/// host (captive portal, tarpit) hangs the fetch forever, and the boot worker's
-/// join would then stall a clean quit. Short: this is an ambient nicety, not
-/// something worth waiting on.
+/// Cap on the one GET. Without it a silent host hangs boot-worker join on quit.
 const FETCH_DEADLINE_S = 3;
 
 const LATEST_URL = "https://api.github.com/repos/vantroy/zigoku/releases/latest";
@@ -42,27 +32,20 @@ pub const CacheEntry = struct {
     latest_version: []const u8,
 };
 
-/// The one call the app makes. Returns the latest release tag ONLY when it's
-/// strictly newer than `current_version` (so the caller toasts iff there's
-/// something to update to); null otherwise, including on every failure. `now` is
-/// unix seconds (`Store.nowSecs()`), passed in so the module needs no clock.
+/// Latest tag only when strictly newer than `current_version`; null otherwise / on failure.
+/// `now` = unix seconds (injected; no clock in this module).
 pub fn check(arena: Allocator, io: Io, current_version: []const u8, now: i64) ?[]const u8 {
     const latest = resolveLatest(arena, io, now) orelse return null;
     return if (semver.isNewer(latest, current_version)) latest else null;
 }
 
-/// Fetch the latest tag fresh, bypassing the 6h cache and refreshing it as a side
-/// effect. For the explicit `zigoku update` command (ROD-371), which shouldn't act
-/// on a possibly-stale cached answer the way the ambient boot check happily does.
-/// null on any failure.
+/// Fresh network tag (bypasses 6h cache; refreshes it). For `zigoku update` (ROD-371).
 pub fn latestFresh(arena: Allocator, io: Io, now: i64) ?[]const u8 {
     const tag = fetchLatest(arena, io) catch return null;
     writeCache(arena, io, now, tag);
     return tag;
 }
 
-/// The latest tag, from cache if the last check is still fresh, else from the
-/// network (writing the cache on success). null on any failure or missing dir.
 fn resolveLatest(arena: Allocator, io: Io, now: i64) ?[]const u8 {
     if (readCache(arena, io)) |entry| {
         if (isFresh(entry.checked_at, now)) return entry.latest_version;
@@ -76,24 +59,18 @@ fn resolveLatest(arena: Allocator, io: Io, now: i64) ?[]const u8 {
     return latest;
 }
 
-/// A cache write is still fresh if it's within the TTL and not dated in the
-/// future. The future-date guard stops a clock that jumped backward (or a
-/// hand-edited file) from wedging the check on a stale answer forever.
+/// Fresh if within TTL and not future-dated (backward clock / hand-edit must not wedge forever).
 pub fn isFresh(checked_at: i64, now: i64) bool {
     if (checked_at > now) return false;
     return now - checked_at < CHECK_TTL_SECS;
 }
 
-/// `$XDG_CACHE_HOME/zigoku/update_check`, owned by `arena`. null when there's no
-/// resolvable cache dir (no `$XDG_CACHE_HOME`/`$HOME`).
 fn cachePath(arena: Allocator) ?[]const u8 {
     const dir = paths.cacheDir(arena) catch return null;
     return std.fmt.allocPrint(arena, "{s}/update_check", .{dir}) catch null;
 }
 
-/// Read + parse the cache file. null on any problem (missing, unreadable,
-/// malformed): a bad cache is indistinguishable from no cache, and both mean
-/// "re-check".
+/// null on any problem: bad cache ≡ no cache → re-check.
 fn readCache(arena: Allocator, io: Io) ?CacheEntry {
     const path = cachePath(arena) orelse return null;
     var file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
@@ -104,10 +81,7 @@ fn readCache(arena: Allocator, io: Io) ?CacheEntry {
     return parseCache(text);
 }
 
-/// Parse the two-line cache body (`<checked_at>\n<tag>\n`). Pure so the format
-/// contract is unit-tested without touching disk. Returns null on anything that
-/// isn't a valid unix timestamp on line one and a non-empty tag on line two. The
-/// returned tag borrows `text`.
+/// Two-line body (`<checked_at>\n<tag>\n`). Pure; tag borrows `text`.
 pub fn parseCache(text: []const u8) ?CacheEntry {
     var lines = std.mem.splitScalar(u8, text, '\n');
     const ts_line = std.mem.trim(u8, lines.next() orelse return null, " \r\t");
@@ -117,8 +91,7 @@ pub fn parseCache(text: []const u8) ?CacheEntry {
     return .{ .checked_at = checked_at, .latest_version = tag_line };
 }
 
-/// Best-effort cache write. A failure here (no dir, unwritable) just means the
-/// next launch re-checks over the network, never worth surfacing.
+/// Best-effort; failure means next launch re-checks.
 fn writeCache(arena: Allocator, io: Io, now: i64, latest: []const u8) void {
     const dir = paths.cacheDir(arena) catch return;
     paths.ensureDir(dir);
@@ -134,9 +107,7 @@ fn writeCache(arena: Allocator, io: Io, now: i64, latest: []const u8) void {
     file.writeStreamingAll(io, body) catch |e| log.debug("cache write failed: {s}", .{@errorName(e)});
 }
 
-/// GET the latest release and pull its tag. The body is capped by the shared
-/// transport; GitHub's `/releases/latest` skips prereleases and drafts, so the
-/// tag we read is the newest stable cut.
+/// GET latest release tag. `/releases/latest` skips prereleases/drafts.
 fn fetchLatest(arena: Allocator, io: Io) ![]const u8 {
     const body = try deadline.withDeadline(io, .fromSeconds(FETCH_DEADLINE_S), http.request, .{
         arena, io,
@@ -152,24 +123,20 @@ fn fetchLatest(arena: Allocator, io: Io) ![]const u8 {
 
 const LatestRelease = struct { tag_name: []const u8 };
 
-/// Extract `tag_name` from a `/releases/latest` body. Split out so the JSON
-/// contract is testable against a captured payload. The returned tag is owned by
-/// `arena` (the parsed document's strings live there).
+/// Arena-owned tag from JSON body (testable against a captured payload).
 fn parseLatestTag(arena: Allocator, body: []const u8) ![]const u8 {
     const parsed = try std.json.parseFromSlice(LatestRelease, arena, body, .{ .ignore_unknown_fields = true });
     if (parsed.value.tag_name.len == 0) return error.EmptyTag;
     return parsed.value.tag_name;
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────────
-
 test "isFresh: within TTL is fresh, past TTL and future are stale" {
     const now: i64 = 1_000_000;
-    try std.testing.expect(isFresh(now, now)); // just checked
-    try std.testing.expect(isFresh(now - (CHECK_TTL_SECS - 1), now)); // one sec inside
-    try std.testing.expect(!isFresh(now - CHECK_TTL_SECS, now)); // exactly at TTL
-    try std.testing.expect(!isFresh(now - (CHECK_TTL_SECS + 1), now)); // past TTL
-    try std.testing.expect(!isFresh(now + 1, now)); // future-dated → stale, re-check
+    try std.testing.expect(isFresh(now, now));
+    try std.testing.expect(isFresh(now - (CHECK_TTL_SECS - 1), now));
+    try std.testing.expect(!isFresh(now - CHECK_TTL_SECS, now));
+    try std.testing.expect(!isFresh(now - (CHECK_TTL_SECS + 1), now));
+    try std.testing.expect(!isFresh(now + 1, now)); // future-dated → re-check
 }
 
 test "parseCache: valid two-line body" {
@@ -186,8 +153,8 @@ test "parseCache: tolerates trailing CR and no final newline" {
 
 test "parseCache: rejects malformed bodies" {
     try std.testing.expectEqual(@as(?CacheEntry, null), parseCache(""));
-    try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("1700000000\n")); // no tag
-    try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("1700000000\n\n")); // empty tag
+    try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("1700000000\n"));
+    try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("1700000000\n\n"));
     try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("notanumber\nv0.5.0\n"));
     try std.testing.expectEqual(@as(?CacheEntry, null), parseCache("onlyoneline"));
 }
