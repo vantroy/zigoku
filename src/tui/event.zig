@@ -1,4 +1,4 @@
-//! Zigoku — TUI event types and loop alias.
+//! TUI event types and loop alias.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -12,182 +12,133 @@ const AnimeRecord = store_mod.AnimeRecord;
 const Anime = domain.Anime;
 pub const PositionUpdate = player_mod.PositionUpdate;
 
-/// Result of one action-triggered sync flush (ROD-291), distilled from the pull and
-/// push summaries into just what the UI reacts to — a plain POD (no owned memory) so
-/// it ships across the worker→UI seam by value. `pushed`: rows AniList accepted (drives
-/// the whisper). `reconciled`: local rows the pull's 3-way merge changed (drives a
-/// history reload so the view reflects adopted-from-remote progress). `expired`: the
-/// token was rejected either direction (drops the cached connected flag to stop churn
-/// and seed the ROD-295 reconnect nudge).
+/// Result of one action-triggered sync flush (ROD-291). POD (no owned memory);
+/// ships worker→UI by value.
+/// `pushed` / `reconciled` drive whisper + history reload; `expired` drops the
+/// connected flag and seeds the ROD-295 reconnect nudge.
 pub const SyncFlushOutcome = struct {
     pushed: usize = 0,
     reconciled: usize = 0,
     expired: bool = false,
 };
 
-/// Unified event type. vaxis fills key_press / winsize / focus; the rest are our
-/// worker→UI messages, posted from background threads and drained in tick().
+/// Unified event type. vaxis fills key_press / winsize / focus; the rest are
+/// worker→UI messages posted from background threads and drained in tick().
 pub const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
     focus_in,
     focus_out,
-    /// History finished loading. The slice is arena-backed (run() owns the
-    /// history arena and frees it at teardown); App only *borrows* it via
-    /// setHistory — never free this with the gpa. On a quit-time interrupt the
-    /// worker may post a partial slice that the exiting loop never drains.
+    /// History finished loading. Arena-backed (run() owns the arena); App only
+    /// borrows via setHistory. Never free with the gpa. Quit-time interrupt may
+    /// post a partial slice the exiting loop never drains.
     history_loaded: []AnimeRecord,
-    /// History finished RELOADING after playback (ROD-191). Same arena-borrow
-    /// contract as history_loaded; posted only by reloadHistoryTask so run()'s
-    /// double-buffer reaper can tell a reload's outcome from the initial load.
+    /// History reloaded after playback (ROD-191). Same arena-borrow contract as
+    /// history_loaded; only reloadHistoryTask posts this so the double-buffer
+    /// reaper can tell reload from initial load.
     history_reloaded: []AnimeRecord,
-    /// A post-playback history reload failed; the current slice is kept. Distinct
-    /// from task_error so a transient reload failure neither wipes the watchlist nor
-    /// raises the persistent load_error banner — it just clears the reload latch.
+    /// Post-playback reload failed; keep current slice. Distinct from task_error:
+    /// clears the reload latch only, never wipes watchlist or raises load_error.
     history_reload_failed,
-    /// The initial background history load failed; payload is a human-readable
-    /// reason for the load_error banner. Distinct from task_error (ROD-234) so a
-    /// Browse search/enrich failure can never falsely mark History "unavailable" —
-    /// only a real history-load failure raises that banner.
+    /// Initial history load failed. load_error banner only (ROD-234). Distinct from
+    /// task_error so Browse search/enrich cannot mark History "unavailable".
     history_load_failed: []const u8,
-    /// A background BROWSE task (search/enrich) failed; payload is a human-readable
-    /// reason. Surfaces as a toast only — never touches History state (ROD-234).
+    /// Browse search/enrich failed. Toast only; never touches History (ROD-234).
     task_error: []const u8,
-    /// An AniList sync settled: the action-triggered pull-then-push flush (ROD-291), or
-    /// the ROD-293 launch pull-refresh (same event, always `pushed = 0`). Payload is a
-    /// distilled `SyncFlushOutcome` (POD, ships by value). The handler reloads history if
-    /// the pull changed local rows, drops the connected flag on expiry, and whispers the
-    /// git-style direction pair — `↓ N from AniList` when the pull reconciled changes,
-    /// `↑ N to AniList` when a push landed (both `.info`, either or both per flush). Soft
-    /// failures stay silent (rows stay dirty, retry next flush).
+    /// Sync settled: action flush (ROD-291) or launch pull-refresh (ROD-293, always
+    /// `pushed = 0`). Handler reloads history if reconciled, drops connected on
+    /// expiry, whispers ↓/↑ counts. Soft failures stay silent (rows stay dirty).
     sync_flushed: SyncFlushOutcome,
-    /// The boot update check found a newer release (ROD-370). Payloadless: the toast
-    /// names only the command to run, not the version, so the worker keeps its fetched
-    /// tag entirely thread-local and posts a bare signal. Fired only when strictly behind.
+    /// Boot update check found a newer release (ROD-370). Payloadless: toast names
+    /// the command only; worker keeps the tag thread-local. Fired only when behind.
     update_available,
-    /// The in-TUI AniList connect flow settled (ROD-286). Posted once by `connectTask`
-    /// when the loopback worker resolves to a real outcome (a state-valid callback or a
-    /// hard listener error) — NEVER on `.canceled` (esc tears the modal down directly,
-    /// so the worker skips its post, and this event can't race a freed connect arena).
-    /// A POD union (an `anyerror` is a plain error code), so it ships by value: `.ok`
-    /// carries nothing — the handler reloads auth.zon for the freshly-connected identity.
+    /// In-TUI AniList connect settled (ROD-286). Posted once on real outcome
+    /// (valid callback or hard listener error); NEVER on `.canceled` (esc tears
+    /// the modal down; worker skips post so this cannot race a freed connect arena).
+    /// POD by value. `.ok` carries nothing; handler reloads auth.zon.
     connect_result: login_loopback.ConnectOutcome,
-    /// Search results from background thread. `results` is gpa-allocated; app takes ownership.
-    /// `for_query` is a gpa-duped copy of the query string at search time (for stale check).
-    /// `page` is the page number this result set belongs to.
+    /// Search results. `results` gpa-owned (app takes ownership). `for_query` gpa-duped
+    /// for stale check. `page` is the result set's page number.
     search_done: struct {
         results: []Anime,
         for_query: []const u8,
         page: u32,
     },
-    /// A tier-A add-to-watchlist resolve settled (ROD-327): the worker probed the play
-    /// provider by the stringified mal_id (`source_id`) for an anilist_id-keyed Browse hit.
-    /// `ok` true: the UI thread mints the binding (`bindCanonical`) revealed and reloads
-    /// History. `ok` false: no provider stocks it, so the UI thread persists the unbound
-    /// marker (`markUnbound`, ROD-329), or falls back to a "couldn't add" toast when no
-    /// canonical row exists. `source_id` is gpa-owned, freed by the UI thread on either arm;
-    /// `anilist_id` links the binding to its canonical row.
+    /// Tier-A add-to-watchlist resolve (ROD-327). `ok`: mint binding (bindCanonical)
+    /// and reload History. `!ok`: markUnbound (ROD-329) or "couldn't add" toast.
+    /// `source_id` gpa-owned, freed by UI on either arm.
     resolve_add_result: struct {
         ok: bool,
         anilist_id: i64,
         source_id: []const u8,
-        /// The provider that resolved the candidate (ROD-343): the binding is minted
-        /// under THIS name, never the registry default. A static vtable `name()`
-        /// string, never freed. Meaningful only when `ok`.
+        /// Provider that resolved (ROD-343): bind under THIS name, not registry default.
+        /// Static vtable `name()`, never freed. Meaningful only when `ok`.
         source: []const u8,
-        /// Providers whose walk verdict was a definitive "not stocked" (ROD-347):
-        /// the UI thread persists each as an absence row, on BOTH arms (a walk
-        /// that found a match later still learned these). Names are static vtable
-        /// strings; the slice itself is gpa-owned and freed by the UI thread.
+        /// Definitive "not stocked" providers (ROD-347): persist absence rows on BOTH
+        /// arms. Names static; slice gpa-owned, freed by UI.
         absent_sources: []const []const u8 = &.{},
     },
-    /// A tier-C Play resolve settled (ROD-328): the worker title-searched the play provider
-    /// for an anilist_id-keyed Browse hit that could not tier-A (`canonicalKey` returned
-    /// null, e.g. a canonical with no MAL id). `ok` true: `source_id` is the provider's
-    /// opaque id for the best catalog match (gpa-owned): the UI thread arms the bind
-    /// (`pending_bind` = `anilist_id`) and fires the episode fetch, which confirms, caches,
-    /// and mints the binding through the shared `.episodes_done` path. `ok` false: just a
-    /// "couldn't load episodes" toast (the Play path never mints an unbound marker; that's
-    /// the add path only, ROD-329). `source_id` is gpa-owned and freed by the UI thread when
-    /// non-empty.
+    /// Tier-C Play resolve (ROD-328): title-search when canonicalKey is null.
+    /// `ok`: arm pending_bind and fire episode fetch (bind via `.episodes_done`).
+    /// `!ok`: toast only; Play never mints unbound (add path only, ROD-329).
+    /// `source_id` gpa-owned, freed by UI when non-empty.
     resolve_play_target: struct {
         ok: bool,
         anilist_id: i64,
         source_id: []const u8,
-        /// The provider whose catalog matched (ROD-343): the episode fetch fires on
-        /// it and the eventual bind is keyed under it. Static vtable `name()`
-        /// string, never freed. Meaningful only when `ok`.
+        /// Matching provider (ROD-343). Static vtable name. Meaningful only when `ok`.
         source: []const u8,
-        /// Same contract as `resolve_add_result.absent_sources` (ROD-347); persisted
-        /// even when the staleness gate drops the result itself, since a definitive
-        /// absence is a fact about the catalog, not about which show is on screen.
+        /// Same contract as resolve_add_result.absent_sources (ROD-347); persist even
+        /// if the staleness gate drops the result (catalog fact, not on-screen show).
         absent_sources: []const []const u8 = &.{},
     },
-    /// One provider settled by the eager pre-warm walk (ROD-351). Non-empty
-    /// `source_id` (gpa-owned, freed by the UI thread): the provider stocks the
-    /// show, mint the binding HIDDEN (a play reveals it; History must not grow
-    /// rows the user never engaged). Empty + `absent`: cache the negative
-    /// (ROD-347). Empty + !absent never posts (unknown verdicts stay silent).
-    /// `source` is a static vtable `name()` string, never freed.
+    /// Eager pre-warm settled one provider (ROD-351). Non-empty `source_id` (gpa-owned):
+    /// mint binding HIDDEN (play reveals; History must not grow unengaged rows).
+    /// Empty + `absent`: cache negative (ROD-347). Empty + !absent never posts.
+    /// `source` is static vtable name.
     prewarm_result: struct {
         anilist_id: i64,
         source: []const u8,
         source_id: []const u8,
         absent: bool,
     },
-    /// The pre-warm walk finished (every provider settled or skipped): clears the
-    /// single-flight guard so the next add/play may warm another show.
+    /// Pre-warm walk finished: clear single-flight guard for the next add/play.
     prewarm_done,
-    /// One Discover feed page from a background thread (ROD-336): AniList rows for
-    /// `axis`, fully enriched (full GQL_FIELDS; no follow-up enrich pass exists).
-    /// `results` is gpa-allocated (each Anime's strings owned); App takes ownership
-    /// into the slot for `axis`, carried so a page lands in its own per-axis cache
-    /// slot even if the active axis changed mid-flight. `has_next` is AniList's
-    /// `pageInfo.hasNextPage`, the pagination/exhaustion signal (§9.6).
+    /// One Discover feed page (ROD-336). Fully enriched AniList rows for `axis`.
+    /// `results` gpa-owned; App takes into the per-axis slot. `has_next` is
+    /// pageInfo.hasNextPage (§9.6).
     discover_feed: struct {
         results: []Anime,
         axis: anilist.DiscoverAxis,
         page: u32,
         has_next: bool,
     },
-    /// A Discover feed fetch failed (ROD-336). `axis` is the slot it was for (so
-    /// the handler clears that slot's loading + marks it failed); `cause` names the
-    /// failure class. Distinct from task_error so the feed owns its own error UX
-    /// (in-view "can't reach the feed" + a feed toast) without touching Browse.
+    /// Discover feed fetch failed (ROD-336). Distinct from task_error: feed owns its
+    /// error UX without touching Browse.
     discover_feed_error: struct {
         axis: anilist.DiscoverAxis,
         cause: anyerror,
     },
-    /// ROD-182: refresh-on-view re-enriched a stale show. `result` is a gpa-owned identity
-    /// stub filled with fresh AniList metadata (or unchanged on a miss); `source` is
-    /// gpa-owned. `answered` (ROD-278) is true on a confirmed answer (match or confirmed
-    /// no-match), false on transport failure: the handler stamps freshness + persists ONLY
-    /// when `answered`. On a confirmed answer it persists (upsert stamps + COALESCE-overwrites
-    /// drift) and flags a history reload. Both fields freed here.
+    /// Refresh-on-view re-enriched a stale show (ROD-182). `result` / `source` gpa-owned.
+    /// `answered` (ROD-278): stamp freshness + persist ONLY when true (confirmed match
+    /// or no-match). Transport failure keeps `answered` false. Both fields freed in handler.
     enrichment_refreshed: struct {
         result: Anime,
         source: []const u8,
         answered: bool,
     },
-    /// Episode list from background fetch. `episodes` is gpa-allocated (each .raw owned);
-    /// `for_id` is a gpa-duped copy of the show id (for stale check). App takes ownership.
+    /// Episode list. `episodes` gpa-owned (each .raw owned); `for_id` gpa-duped for stale check.
     episodes_done: struct {
         episodes: []domain.EpisodeNumber,
         for_id: []const u8,
     },
-    /// Episode fetch failed. `cause` names the failure class for the toast
-    /// (network / blocked / server / generic — ROD-173); `anyerror` is a POD
-    /// error code, safe to ship across the worker→UI boundary. `for_id` is a
-    /// gpa-duped copy of the show id (transferred from the worker) so the handler
-    /// can keep-check a superseded failure and drop it — concurrent episode
-    /// fetches became possible once supersede stopped joining (ROD-179). The
-    /// handler frees `for_id`.
+    /// Episode fetch failed (ROD-173). `for_id` gpa-duped so handler can drop superseded
+    /// failures (ROD-179 concurrent fetches). Handler frees `for_id`.
     episodes_error: struct {
         cause: anyerror,
         for_id: []const u8,
     },
-    /// Cover image bytes were fetched + decoded. `rgba` and `for_id` are
-    /// GPA-owned; App takes ownership on the fresh path.
+    /// Cover decoded. `rgba` / `for_id` GPA-owned; App takes ownership on fresh path.
     cover_done: struct {
         rgba: []u8,
         width: u32,
@@ -196,41 +147,30 @@ pub const Event = union(enum) {
     },
     /// Cover fetch/decode failed for this show id.
     cover_error: []const u8,
-    /// One Discover-grid cover finished fetching+decoding (ROD-243). `url` and
-    /// `rgba` are gpa-owned and transferred to the handler, which adopts them into
-    /// the slot for `url`. Covers are URL-keyed and window-agnostic, so a result is
-    /// always a valid cover for `url` even if the window changed mid-flight — no
-    /// stale-drop; the handler frees `rgba` only if no slot can hold it (OOM).
+    /// Discover-grid cover done (ROD-243). URL-keyed, window-agnostic: no stale-drop.
+    /// Handler frees `rgba` only if no slot can hold it (OOM).
     discover_cover_done: struct {
         url: []const u8,
         rgba: []u8,
         width: u32,
         height: u32,
     },
-    /// A Discover-grid cover fetch failed (ROD-243); payload is the gpa-owned url.
-    /// The handler records the per-url failure cooldown (so a transient miss doesn't
-    /// hammer the network) and frees the url.
+    /// Discover-grid cover failed (ROD-243). gpa-owned url; handler records cooldown and frees.
     discover_cover_error: []const u8,
     /// Live playback position from mpv IPC.
     position_update: struct {
         time_pos: f64,
         duration: f64,
     },
-    /// mpv exited cleanly; payload carries the final observed authoritative position, if any.
+    /// mpv exited cleanly; final authoritative position if any.
     play_done: ?PositionUpdate,
-    /// resolve failed or mpv exited badly. `final` carries the last observed
-    /// position (if any) so a watch that errored at the very end still counts;
-    /// `cause` is the failure reason, so a non-completed failure names its class
-    /// (network / blocked / server — ROD-173). `cause` covers the resolve path;
-    /// the mpv-spawn classes (MpvNotFound/MpvFailed) ride the same slot and are
-    /// refined into their own copy by ROD-230.
+    /// resolve failed or mpv exited badly. `final` still counts a late-end watch;
+    /// `cause` classifies (ROD-173; MpvNotFound/MpvFailed refined by ROD-230).
     play_error: struct { final: ?PositionUpdate, cause: anyerror },
-    /// A pre-playback stream open failed (CDN 403 in a Cloudflare penalty window) and
-    /// the worker is re-resolving after a backoff rather than giving up (ROD-309).
-    /// `attempt` is the 1-based retry number, `max` the total retries available, so the
-    /// UI can show a "retrying N/M" toast instead of the backoff reading as a freeze.
+    /// Pre-playback stream open failed in a CDN penalty window; worker re-resolves
+    /// after backoff (ROD-309). `attempt` 1-based, `max` total, for "retrying N/M" toast.
     play_retry: struct { attempt: u8, max: u8 },
-    /// Periodic 100ms heartbeat: advances spinner, fires debounced search.
+    /// Periodic 100ms heartbeat: spinner + debounced search.
     tick,
 };
 
