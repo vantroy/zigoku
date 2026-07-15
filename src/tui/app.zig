@@ -2080,16 +2080,10 @@ pub const App = struct {
     /// Detached refresh worker: GPA identity stub (seed_rec dies with fireEpisodes arena).
     fn fireRefreshEnrich(self: *App, loop: *Loop, io: std.Io, source: []const u8, source_id: []const u8, rec: AnimeRecord) void {
         const gpa = self.gpa;
-        const id = gpa.dupe(u8, source_id) catch return;
-        const name = gpa.dupe(u8, rec.title) catch {
-            gpa.free(id);
-            return;
-        };
-        const src = gpa.dupe(u8, source) catch {
-            gpa.free(id);
-            gpa.free(name);
-            return;
-        };
+        const copies = workers.dupeAll(gpa, 3, .{ source_id, rec.title, source }) catch return;
+        const id = copies[0];
+        const name = copies[1];
+        const src = copies[2];
         const english: ?[]const u8 = if (rec.title_english) |e| (gpa.dupe(u8, e) catch null) else null;
         const stub: Anime = .{
             .id = id,

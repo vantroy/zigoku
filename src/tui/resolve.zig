@@ -82,24 +82,14 @@ pub fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry
     }
 
     // Two GPA-duped copies: for_id for App, one for the task event.
-    // Set `loading` only once the spawn is committed: OOM mid-dupe must not strand the spinner.
-    const id_for_app = self.gpa.dupe(u8, source_id) catch {
+    // Set `loading` only once the dupes are committed: OOM mid-dupe must not strand the spinner.
+    const copies = workers.dupeAll(self.gpa, 3, .{ source_id, source, source_id }) catch {
         self.episodes.loading = false;
         return;
     };
-    const src_for_app = self.gpa.dupe(u8, source) catch {
-        self.gpa.free(id_for_app);
-        self.episodes.loading = false;
-        return;
-    };
-    const id_for_task = self.gpa.dupe(u8, source_id) catch {
-        self.gpa.free(id_for_app);
-        self.gpa.free(src_for_app);
-        self.episodes.loading = false;
-        return;
-    };
-    self.episodes.for_id = id_for_app;
-    self.episodes.for_source = src_for_app;
+    self.episodes.for_id = copies[0];
+    self.episodes.for_source = copies[1];
+    const id_for_task = copies[2];
 
     self.episodes.loading = true;
     self.async_start_ms = self.now_ms;
@@ -590,16 +580,10 @@ pub fn firePlay(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
     else
         null;
 
-    const id_copy = self.gpa.dupe(u8, selected_id) catch return;
-    const ep_copy = self.gpa.dupe(u8, ep.raw) catch {
-        self.gpa.free(id_copy);
-        return;
-    };
-    const title_copy = self.gpa.dupe(u8, title_src) catch {
-        self.gpa.free(id_copy);
-        self.gpa.free(ep_copy);
-        return;
-    };
+    const copies = workers.dupeAll(self.gpa, 3, .{ selected_id, ep.raw, title_src }) catch return;
+    const id_copy = copies[0];
+    const ep_copy = copies[1];
+    const title_copy = copies[2];
 
     self.current_position = 0;
     self.current_duration = 0;

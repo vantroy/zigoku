@@ -148,6 +148,20 @@ pub fn dupeOptText(alloc: Allocator, s: ?[]const u8) !?[]const u8 {
     return if (s) |x| try alloc.dupe(u8, x) else null;
 }
 
+/// Dupe `sources` into `alloc` as one commit (ROD-401): any failure frees everything
+/// already duped instead of stranding it, so callers don't hand-roll an N-deep
+/// catch/free ladder per spawn site. Caller arms `loading` only after this succeeds.
+pub fn dupeAll(alloc: Allocator, comptime n: usize, sources: [n][]const u8) ![n][]u8 {
+    var out: [n][]u8 = undefined;
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |s| alloc.free(s);
+    for (sources, 0..) |s, i| {
+        out[i] = try alloc.dupe(u8, s);
+        filled = i + 1;
+    }
+    return out;
+}
+
 /// Deep-copy string list (genres, studios): owned slice + owned elements, freeable by
 /// `freeOwnedAnime`. Empty input returns `&.{}` (no alloc).
 pub fn dupeOwnedStrList(alloc: Allocator, items: []const []const u8) ![]const []const u8 {
