@@ -1344,23 +1344,7 @@ pub const App = struct {
                 self.async_start_ms = 0;
                 self.pushToast(.@"error", msg, true);
             },
-            .sync_flushed => |outcome| {
-                // Action flush or launch pull (pushed==0); worker already cleared inflight (ROD-291/293).
-                if (outcome.reconciled > 0) {
-                    self.history_dirty = true;
-                    var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
-                    self.pushToast(.info, msg, false);
-                }
-                // Stop do-nothing flushes; reconnect nudge is ROD-295.
-                if (outcome.expired) self.anilist_connected = false;
-                // Silent on no-op; ↓ then ↑ so both-direction flushes read in order.
-                if (outcome.pushed > 0) {
-                    var buf: [40]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
-                    self.pushToast(.info, msg, false);
-                }
-            },
+            .sync_flushed => |outcome| self.handleSyncFlushed(outcome),
             .update_available => {
                 // Fixed copy so the command never clips; version is in Settings (ROD-370).
                 self.pushToast(.info, "update available · run zigoku update", false);
@@ -1378,44 +1362,12 @@ pub const App = struct {
 
             .discover_feed => |ev| if (self.handleDiscoverFeed(ev)) return,
 
-            .discover_feed_error => |ev| {
-                // Failed slot + persistent feed toast; retry via refreshDiscover (ROD-239, §9.3b).
-                const slot = &self.discover.slots[@intFromEnum(ev.axis)];
-                slot.loading = false;
-                slot.failed = true;
-                if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
-                log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
-                self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
-            },
-            .enrichment_refreshed => |ev| {
-                // Persist + stamp only when AniList answered; transport fail must not advance TTL (ROD-182/278).
-                if (ev.answered) {
-                    if (self.store) |st| {
-                        // history_visible false: MAX-merge keeps hidden rows hidden.
-                        var arena = std.heap.ArenaAllocator.init(self.gpa);
-                        defer arena.deinit();
-                        st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
-                            log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
-                        self.history_dirty = true;
-                    }
-                }
-                freeOwnedAnime(self.gpa, ev.result);
-                self.gpa.free(ev.source);
-            },
+            .discover_feed_error => |ev| self.handleDiscoverFeedError(ev),
+            .enrichment_refreshed => |ev| self.handleEnrichmentRefreshed(ev),
             .episodes_done => |ev| if (self.handleEpisodesDone(loop, io, registry, ev)) return,
             .episodes_error => |ev| if (self.handleEpisodesError(loop, io, registry, ev)) return,
             .cover_done => |ev| if (self.handleCoverDone(ev)) return,
-            .cover_error => |for_id| {
-                defer self.gpa.free(for_id);
-                if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return;
-                self.cover.loading = false;
-                self.cover.joinThread();
-                if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
-                // Before clear() frees inflight_url.
-                self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
-                self.cover.clear(self.gpa);
-                std.log.debug("cover fetch/decode failed for {s}", .{for_id});
-            },
+            .cover_error => |for_id| if (self.handleCoverError(for_id)) return,
             .discover_cover_done => |ev| {
                 // URL-keyed; always adopt for ev.url (recreate slot if mid-flight eviction).
                 defer self.gpa.free(ev.url);
@@ -1798,6 +1750,63 @@ pub const App = struct {
         } else {
             resolve.clearFallback(self);
         }
+        return false;
+    }
+
+    fn handleSyncFlushed(self: *App, outcome: event_mod.SyncFlushOutcome) void {
+        // Action flush or launch pull (pushed==0); worker already cleared inflight (ROD-291/293).
+        if (outcome.reconciled > 0) {
+            self.history_dirty = true;
+            var buf: [40]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "↓ {d} from AniList", .{outcome.reconciled}) catch "↓ from AniList";
+            self.pushToast(.info, msg, false);
+        }
+        // Stop do-nothing flushes; reconnect nudge is ROD-295.
+        if (outcome.expired) self.anilist_connected = false;
+        // Silent on no-op; ↓ then ↑ so both-direction flushes read in order.
+        if (outcome.pushed > 0) {
+            var buf: [40]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "↑ {d} to AniList", .{outcome.pushed}) catch "↑ to AniList";
+            self.pushToast(.info, msg, false);
+        }
+    }
+
+    fn handleDiscoverFeedError(self: *App, ev: anytype) void {
+        // Failed slot + persistent feed toast; retry via refreshDiscover (ROD-239, §9.3b).
+        const slot = &self.discover.slots[@intFromEnum(ev.axis)];
+        slot.loading = false;
+        slot.failed = true;
+        if (@intFromEnum(ev.axis) == @intFromEnum(self.discover.axis)) self.async_start_ms = 0;
+        log.debug("discover feed fetch failed: {s}", .{@errorName(ev.cause)});
+        self.pushToastTopic(.@"error", "can't reach the feed", true, .feed);
+    }
+
+    fn handleEnrichmentRefreshed(self: *App, ev: anytype) void {
+        // Persist + stamp only when AniList answered; transport fail must not advance TTL (ROD-182/278).
+        if (ev.answered) {
+            if (self.store) |st| {
+                // history_visible false: MAX-merge keeps hidden rows hidden.
+                var arena = std.heap.ArenaAllocator.init(self.gpa);
+                defer arena.deinit();
+                st.upsertEnriched(ev.source, ev.result, self.translation, false, true, Store.nowSecs(), arena.allocator()) catch |e|
+                    log.debug("enrichment refresh upsert failed: {s}", .{@errorName(e)});
+                self.history_dirty = true;
+            }
+        }
+        freeOwnedAnime(self.gpa, ev.result);
+        self.gpa.free(ev.source);
+    }
+
+    fn handleCoverError(self: *App, for_id: []const u8) bool {
+        defer self.gpa.free(for_id);
+        if (self.cover.for_id == null or !std.mem.eql(u8, for_id, self.cover.for_id.?)) return true;
+        self.cover.loading = false;
+        self.cover.joinThread();
+        if (!self.search.loading and !self.episodes.loading and !self.playing) self.async_start_ms = 0;
+        // Before clear() frees inflight_url.
+        self.cover.noteFailure(self.gpa, self.now_ms, for_id, self.cover.inflight_url);
+        self.cover.clear(self.gpa);
+        std.log.debug("cover fetch/decode failed for {s}", .{for_id});
         return false;
     }
 
