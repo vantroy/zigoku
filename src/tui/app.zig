@@ -664,48 +664,35 @@ pub const App = struct {
     /// Like pushToast, with recovery scope (ROD-239): persistent errors clear only
     /// on their own subsystem's recovery, never cross-view.
     fn pushToastTopic(self: *App, kind: Toast.Kind, text: []const u8, persistent: bool, topic: Toast.Topic) void {
-        const cap = self.toast_queue.len;
+        const q = &self.toast_queue;
 
-        // Per-topic singleton (ROD-293): refresh in place. Without this, repeated
-        // failures fill all 3 slots with persistent toasts and starve transients.
-        if (persistent) {
-            for (&self.toast_queue) |*slot| {
-                if (slot.*) |existing| {
-                    if (existing.persistent and existing.topic == topic) {
-                        slot.* = makeToast(kind, text, persistent, topic);
-                        return;
-                    }
-                }
-            }
-        }
+        // 1. Per-topic singleton (ROD-293): a persistent toast refreshes its topic's
+        // slot in place, so repeated failures can't fill all 3 and starve transients.
+        if (persistent) for (q) |*slot| {
+            if (slot.*) |t| if (t.persistent and t.topic == topic) {
+                slot.* = makeToast(kind, text, persistent, topic);
+                return;
+            };
+        };
 
-        var idx: usize = cap; // no free slot yet
-        for (self.toast_queue, 0..) |slot, i| {
-            if (slot == null) {
-                idx = i;
-                break;
-            }
-        }
-        if (idx == cap) {
-            // Evict oldest non-persistent so a still-showing error survives a
-            // transient (ROD-293). Singleton above should guarantee a victim exists.
-            var victim: usize = 0;
-            const found = for (self.toast_queue, 0..) |slot, i| {
-                if (slot) |t| {
-                    if (!t.persistent) break i;
-                }
-            } else null;
-            if (found) |v| {
-                victim = v;
-            } else {
-                log.debug("toast: queue all-persistent, evicting oldest (unexpected — the per-topic singleton should prevent this)", .{});
-            }
-            // Compact left; preserves oldest→newest for TTL sweep and this evict.
-            var j = victim;
-            while (j + 1 < cap) : (j += 1) self.toast_queue[j] = self.toast_queue[j + 1];
-            idx = cap - 1;
-        }
-        self.toast_queue[idx] = makeToast(kind, text, persistent, topic);
+        // 2. Take a free slot.
+        for (q) |*slot| if (slot.* == null) {
+            slot.* = makeToast(kind, text, persistent, topic);
+            return;
+        };
+
+        // 3. Full: evict the oldest non-persistent so a still-showing error survives
+        // a transient (ROD-293); rule 1 should guarantee one exists. Compact left to
+        // keep oldest→newest for the TTL sweep, then append.
+        const victim = for (q, 0..) |slot, i| {
+            if (slot) |t| if (!t.persistent) break i;
+        } else v: {
+            log.debug("toast: queue all-persistent, evicting oldest (singleton should prevent this)", .{});
+            break :v 0;
+        };
+        var j = victim;
+        while (j + 1 < q.len) : (j += 1) q[j] = q[j + 1];
+        q[q.len - 1] = makeToast(kind, text, persistent, topic);
     }
 
     /// Cap copy to the §4.7 36-col budget here so long payloads get "…" not a silent
