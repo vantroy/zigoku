@@ -1,42 +1,26 @@
-//! Zigoku — the `SourceProvider` interface.
-//!
-//! THE seam. The entire defensive architecture is one idea: the app talks only to this
-//! vtable, never to a concrete site. When a provider dies, you write a new struct satisfying
-//! this interface and change one line of wiring; the app upstream never learns the source
-//! changed.
-//!
-//! Implemented as Zig's idiomatic "fat pointer" interface: a type-erased `*anyopaque` self
-//! paired with a `*const VTable` of function pointers, and each provider exposes a
-//! `provider()` that packs itself into one. (A vtable, not a comptime/generic interface, so
-//! one runtime value can hold ANY provider, necessary the moment we have more than one.)
+//! `SourceProvider` interface: the app talks only to this vtable, never a concrete site.
+//! Fat pointer (`*anyopaque` + `*const VTable`); each provider's `provider()` packs itself.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const domain = @import("domain.zig");
 
-/// Canonical search page size — how many results a single page fetches and the UI
-/// appends per load-more. The browse footer (`╌ more ╌`) and the load-more trigger
-/// both key off `results.len % search_page_size == 0`, so this MUST equal the count
-/// a full page actually returns. Workers pass it as `SearchOptions.limit`; the
-/// provider's query asks for exactly this many so the server's page stride matches
-/// the UI's. Change the page size here and nowhere else (ROD-201).
+/// Results per page / load-more stride. Browse footer and load-more key off
+/// `results.len % search_page_size == 0`; must match what a full page returns (ROD-201).
 pub const search_page_size: usize = 26;
 
 pub const SearchOptions = struct {
     translation: domain.Translation = .sub,
-    /// Cap on results returned after ranking.
+    /// Cap on results after ranking.
     limit: usize = 20,
-    /// Page number for pagination (1-indexed).
+    /// 1-indexed page.
     page: u32 = 1,
 };
 
-/// A resolved, fetchable cover request (ROD-267). A provider turns a stored cover ref (which
-/// may be a provider-relative `mcovers/…` path with no host) into an absolute URL plus
-/// whatever headers its cover CDN gates on. `url` is owned by the allocator passed to
-/// `coverRequest` (caller frees); `referer`/`user_agent` are static or null and must NOT be
-/// freed (a null header means "don't send it"). This is the seam that keeps the cover-CDN
-/// host behind the provider: the app fetches an opaque URL and never learns which host served it.
+/// Fetchable cover request (ROD-267). Provider turns a stored ref (maybe relative) into
+/// absolute URL + optional headers. `url` owned by `coverRequest`'s allocator; headers
+/// static/null, not freed. Keeps the cover CDN host behind the seam.
 pub const CoverRequest = struct {
     url: []const u8,
     referer: ?[]const u8 = null,
@@ -48,48 +32,25 @@ pub const SourceProvider = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Stable source identity used by persistence keys, e.g. "allanime".
+        /// Stable persistence key, e.g. "allanime".
         name: *const fn (ptr: *anyopaque) []const u8,
-        /// Human-facing source name for user-visible copy (toasts, CLI, banners),
-        /// e.g. "AllAnime". Distinct from `name`: that one is the stable
-        /// persistence key DB rows depend on; this one is free to read however it
-        /// looks best to a user. THE seam for the site name above the vtable — no
-        /// copy upstream of here hardcodes it, since the source is swappable.
+        /// User-visible name (toasts, CLI). Free to change; `name` is not.
         displayName: *const fn (ptr: *anyopaque) []const u8,
-        /// Search this provider's OWN catalog; return shows ranked best-match-first.
-        /// ROD-328: this is the resolver's per-provider CATALOG primitive: the tier-C
-        /// binding path (fuzzy-match a known canonical title against the provider's own
-        /// library to recover its opaque id). It is NOT user-facing discovery search:
-        /// that moved to AniList, off this vtable (see `anilist.search`), so do not
-        /// re-wire the browse/search UI back onto this. Its only caller is the resolver,
-        /// used when a provider can't tier-A (`canonicalKey` returned null).
+        /// Provider catalog search for tier-C binding (ROD-328). NOT user-facing discovery
+        /// (that is AniList). Only the resolver calls this when `canonicalKey` is null.
         search: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, query: []const u8, opts: SearchOptions) anyerror![]domain.Anime,
-        /// Tier-A binding key (ROD-328): if this provider keys its own catalog by a
-        /// canonical id (senshi's show id IS the stringified MAL id), return that
-        /// provider-opaque id for `canonical`, else null. PURE key derivation, no
-        /// network; the caller confirms the provider actually stocks the id via
-        /// `episodes`. A null return means "I do not id-key on a canonical" (the
-        /// resolver falls to tier-C `search`), NOT "not stocked". The returned string is
-        /// owned by `arena`.
+        /// Tier-A key (ROD-328): pure derivation of provider-opaque id from a canonical
+        /// (e.g. stringified mal_id). Null = "I do not id-key on a canonical" (fall to
+        /// tier-C), NOT "not stocked". Caller confirms stock via `episodes`. Arena-owned.
         canonicalKey: *const fn (ptr: *anyopaque, arena: Allocator, canonical: domain.Anime) anyerror!?[]const u8,
-        /// List a show's episode numbers in the given track, numerically sorted.
-        /// An EMPTY list is authoritative "not stocked" (probe callers cache it,
-        /// ROD-347); a provider that can't answer must error instead.
-        /// `count_hint` is the canonical's expected episode count
-        /// (`domain.expectedEpisodeCount`, ROD-359), for a provider whose catalog
-        /// has no listing endpoint (megaplay: per-episode MAL-keyed routes only)
-        /// to mint positional labels from; providers with real listings ignore
-        /// it, and probe callers that only need existence pass null.
+        /// Episode list for track, sorted. Empty = authoritative not stocked (ROD-347);
+        /// cannot-answer must error. `count_hint` for providers without listing endpoints
+        /// (megaplay mint); real listings ignore it.
         episodes: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, tt: domain.Translation, count_hint: ?u32) anyerror![]domain.EpisodeNumber,
-        /// Resolve a playable stream for one episode at the requested quality.
-        /// `quality` is the user's preference (ROD-152); a source with no variants
-        /// is free to ignore it.
+        /// Playable stream at `quality` (ROD-152; free to ignore if no variants).
         resolve: *const fn (ptr: *anyopaque, arena: Allocator, io: Io, show_id: []const u8, episode: domain.EpisodeNumber, tt: domain.Translation, quality: domain.Quality) anyerror!domain.StreamLink,
-        /// Resolve a stored cover ref into a fetchable request (absolute URL + any
-        /// headers this source's cover CDN requires). Absolute refs pass through
-        /// unchanged (e.g. AniList/MAL covers); a provider-relative ref gets the
-        /// site's cover CDN prepended. `CoverRequest.url` is owned by `gpa`. Keeps
-        /// the cover-CDN host behind the seam — no copy upstream names it (ROD-267).
+        /// Cover ref → fetchable request. Absolute pass-through; relative gets CDN host.
+        /// `url` owned by `gpa` (ROD-267).
         coverRequest: *const fn (ptr: *anyopaque, gpa: Allocator, ref: []const u8) anyerror!CoverRequest,
     };
 
@@ -116,34 +77,26 @@ pub const SourceProvider = struct {
     }
 };
 
-/// The ordered set of live providers (ROD-343). Construction order is the
-/// DEFAULT resolve precedence: index 0 (senshi) leads, and that slice is
-/// immutable for the process. Worker threads walk it concurrently, so the
-/// user's order preference (ROD-344) is a VIEW computed per walk via
-/// `ordered`/`preferred`, never an in-place reorder.
+/// Live providers in construction order = default resolve precedence (ROD-343).
+/// Slice is process-immutable; user order (ROD-344) is a per-walk VIEW via
+/// `ordered`/`preferred`, never in-place reorder.
 ///
-/// The preference applies only to NEW canonical resolution (which provider
-/// gets first shot). A provider-keyed id of unknown owner (legacy `.direct`
-/// rows, a missing `for_source`) must keep falling back to `primary()`:
-/// the historical owner is index 0, and re-routing those by preference
-/// would persist the id under the wrong provider.
+/// Preference applies only to NEW canonical resolution. Provider-keyed ids of
+/// unknown owner (legacy `.direct`, missing `for_source`) keep falling back to
+/// `primary()`: re-routing would persist under the wrong provider.
 ///
-/// This registry covers the catalog-binding + play axis ONLY. User-facing
-/// discovery/search lives on AniList, off the vtable (see `VTable.search`);
-/// never add a "search all providers" convenience here.
+/// Catalog-binding + play only. Discovery lives on AniList; no "search all" here.
 pub const Registry = struct {
     /// Non-empty, fixed at construction.
     providers: []const SourceProvider,
 
-    /// The default provider for flows with no persisted binding to honor.
+    /// Default for flows with no persisted binding.
     pub fn primary(self: Registry) SourceProvider {
         return self.providers[0];
     }
 
-    /// The provider owning a persisted `source` key (`name()` output). Rows
-    /// keyed `(source, source_id)` MUST route through this, never `primary()`:
-    /// playing/persisting a row on the wrong provider silently corrupts the
-    /// binding. Null = the row's provider isn't registered (retired source).
+    /// Owner of a persisted `source` key. Rows keyed `(source, source_id)` MUST use this,
+    /// never `primary()` (wrong provider silently corrupts the binding). Null = retired.
     pub fn byName(self: Registry, source_name: []const u8) ?SourceProvider {
         for (self.providers) |p| {
             if (std.mem.eql(u8, p.name(), source_name)) return p;
@@ -151,25 +104,17 @@ pub const Registry = struct {
         return null;
     }
 
-    /// The provider a preference names, else `primary()`. The default-provider
-    /// accessor for preference-aware flows (ROD-344): an empty or unregistered
-    /// name degrades to construction order, same contract as `ordered`.
+    /// Named preference or `primary()` (ROD-344). Empty/unregistered → construction order.
     pub fn preferred(self: Registry, preferred_name: []const u8) SourceProvider {
         return self.byName(preferred_name) orelse self.primary();
     }
 
-    /// Effective-order iteration (ROD-344): the preferred provider first, then
-    /// the rest in construction order. `preferred_name` empty or unregistered
-    /// yields plain construction order. The name is read only during `ordered`
-    /// itself, so any lifetime works; per-show overrides (ROD-345) are just a
-    /// different name resolved by the caller before this point.
+    /// Preferred first, then construction order (ROD-344). Empty/unknown → plain order.
     pub fn ordered(self: Registry, preferred_name: []const u8) OrderedIter {
         return .{ .providers = self.providers, .pref = self.indexOf(preferred_name) };
     }
 
-    /// `ordered` materialized into a gpa-owned slice, for handing a worker a
-    /// stable snapshot at spawn time (the registry's own slice never mutates,
-    /// but the *order* is per-spawn). Caller (in practice the worker) frees.
+    /// Materialized order snapshot for a worker spawn. Caller frees.
     pub fn orderedAlloc(self: Registry, gpa: Allocator, preferred_name: []const u8) ![]SourceProvider {
         const out = try gpa.alloc(SourceProvider, self.providers.len);
         var it = self.ordered(preferred_name);
@@ -188,7 +133,6 @@ pub const Registry = struct {
 
 pub const OrderedIter = struct {
     providers: []const SourceProvider,
-    /// Construction index of the preferred provider; null = no reordering.
     pref: ?usize,
     i: usize = 0,
     yielded_pref: bool = false,
@@ -212,7 +156,7 @@ pub const OrderedIter = struct {
     }
 };
 
-/// Minimal vtable satisfier for registry tests: only `name` is live.
+/// Minimal vtable for registry tests: only `name` is live.
 const TestProvider = struct {
     id: []const u8,
 
@@ -291,7 +235,6 @@ test "Registry.ordered promotes the preferred provider, keeps the rest in constr
     const reg = Registry{ .providers = &.{ a.provider(), b.provider(), c.provider() } };
     try expectOrder(reg, "anipub", &.{ "anipub", "senshi", "third" });
     try expectOrder(reg, "third", &.{ "third", "senshi", "anipub" });
-    // Preferring the leader is a no-op, not a duplicate yield.
     try expectOrder(reg, "senshi", &.{ "senshi", "anipub", "third" });
 }
 
