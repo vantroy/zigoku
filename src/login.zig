@@ -1,14 +1,8 @@
-//! Zigoku — AniList OAuth login capture (ROD-283).
+//! AniList OAuth login capture (ROD-283).
 //!
-//! `zigoku login` walks the Implicit Grant capture by hand: print the authorize URL, take
-//! the redirected URL back on stdin (SSH-safe manual paste), pull the bearer token from the
-//! `#access_token=` fragment, verify it with a live `Viewer` call, and persist identity +
-//! token to `auth.zon` (0600) via `auth.zig`.
-//!
-//! The capture CORE, `completeLogin`, is deliberately I/O-and-prompt free and injects its
-//! clock, so slice 2b's loopback listener drives the exact same extract/verify/persist
-//! sequence by handing it the relayed query string. That shared core guarantees "verify
-//! before persist" for both paths from one place. This paste path stays the SSH-safe fallback.
+//! `zigoku login` walks Implicit Grant by hand: authorize URL, paste redirect (SSH-safe),
+//! extract token, live Viewer verify, persist via auth.zig. `completeLogin` is I/O-free so
+//! the loopback path drives the same extract/verify/persist (verify-before-persist once).
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,44 +13,30 @@ const c = @cImport({
     @cInclude("time.h"); // time(2) — current unix seconds, matching store.zig
 });
 
-/// Wall-clock ceiling for the `Viewer` verify POST (ROD-286), matching the AniList
-/// enrichment deadline in anilist.zig (ROD-262). std has no per-socket read timeout,
-/// so a reachable-but-silent host would otherwise hang the call forever — harmless-ish
-/// in the CLI (Ctrl-C kills it), but in the TUI the connect worker runs this, and
-/// teardown joins that worker on the render thread: an unbounded verify there freezes
-/// the whole UI, unkillable from inside. The bound turns that into a `.verify_failed`.
+/// Viewer verify ceiling (ROD-286). TUI connect worker is joined on the render thread;
+/// unbounded verify freezes the UI.
 const VIEWER_DEADLINE_S = 10;
 
 pub const CLIENT_ID = "43536";
-/// The loopback port — the single source of truth. `REDIRECT` is derived from it,
-/// and `login_loopback` binds it via `login.PORT`; changing it here moves both so
-/// the listener can't drift off the URL AniList redirects to.
+/// Loopback port: single source of truth for REDIRECT and login_loopback bind.
 pub const PORT: u16 = 8765;
 pub const REDIRECT = std.fmt.comptimePrint("http://localhost:{d}", .{PORT});
 const ENDPOINT = "https://graphql.anilist.co";
-// redirect_uri is omitted: the app has a single registered redirect (REDIRECT),
-// so AniList uses it automatically. Adding it here would need URL-encoding for no gain.
+// Single registered redirect; AniList uses it without redirect_uri in the authorize URL.
 pub const AUTHORIZE = "https://anilist.co/api/v2/oauth/authorize?client_id=" ++ CLIENT_ID ++ "&response_type=token";
 
-/// Just enough of the `Viewer` query to confirm the token and stamp identity.
 const Viewer = struct { id: i64 = 0, name: []const u8 = "" };
 
-/// Outcome of a capture attempt, independent of how the raw redirect text was
-/// obtained (stdin paste in 2a, loopback query string in 2b). The caller renders
-/// each variant however it likes — CLI text here, an HTML page in 2b.
+/// Capture outcome for paste (2a) or loopback query (2b).
 pub const LoginResult = union(enum) {
     ok: auth.Auth,
-    no_token, //           no `access_token=` in the input
-    rejected, //           AniList parsed clean but returned no Viewer (bad/expired token)
-    verify_failed: anyerror, // couldn't reach/parse AniList to verify
-    save_failed: anyerror, //   verified, but the write to auth.zon failed
+    no_token,
+    rejected, // AniList parsed clean but no Viewer (bad/expired token)
+    verify_failed: anyerror,
+    save_failed: anyerror,
 };
 
-/// The shared OAuth-capture core. `raw` is a pasted redirect URL (2a) or a
-/// loopback request's relayed query string (2b) — both land here identically.
-/// `now_unix` is injected (matching `AniListAuth.isExpired`'s convention) so the
-/// sequence is clock-free and the control flow — never persist before a live
-/// verify — is enforced here once for every caller.
+/// Shared OAuth core. Never persist before live verify. `now_unix` injected (clock-free).
 pub fn completeLogin(arena: Allocator, io: Io, raw: []const u8, path: []const u8, now_unix: i64) LoginResult {
     const token = extractToken(raw);
     if (token.len < 20) return .no_token;
@@ -75,10 +55,7 @@ pub fn completeLogin(arena: Allocator, io: Io, raw: []const u8, path: []const u8
     return .{ .ok = record };
 }
 
-/// Did a completed login actually persist a token? `.ok` is the only arm that
-/// wrote auth.zon; every other arm aborted before saving. `main` gates the
-/// ROD-292 post-login bootstrap sync on this, so a rejected, unreachable, or
-/// unsaved attempt never triggers a stray sync report.
+/// True only if auth.zon was written (ROD-292 bootstrap sync gate).
 pub fn signedIn(result: LoginResult) bool {
     return switch (result) {
         .ok => true,
@@ -86,10 +63,7 @@ pub fn signedIn(result: LoginResult) bool {
     };
 }
 
-/// Run the interactive paste login. Builds its own wide stdin reader: a pasted
-/// redirect URL carries a ~1KB JWT, far past main's 256-byte prompt buffer.
-/// Returns whether a token was persisted (`signedIn`) so `main` can bootstrap
-/// one full sync on a fresh sign-in (ROD-292); an aborted paste returns false.
+/// Interactive paste login. Wide stdin (JWT ~1KB). Returns whether a token was persisted.
 pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !bool {
     const path = try auth.defaultPath(arena);
     const existing = auth.load(arena, io, path);
@@ -139,11 +113,8 @@ pub fn run(arena: Allocator, io: Io, out: *Io.Writer) !bool {
     return signedIn(result);
 }
 
-/// Pull the JWT out of a pasted redirect URL (`…#access_token=<jwt>&…`) or a bare
-/// token. Cuts at the first URL/whitespace delimiter so trailing `&token_type=…`
-/// never rides along. Returns `""` when there's nothing token-shaped, so a denial
-/// redirect (`?error=access_denied…`) or a bare `?state=…` isn't mistaken for a
-/// token and fired at AniList as a bogus Bearer.
+/// JWT from `#access_token=` or bare eyJ… paste. Empty for deny redirects / bare state
+/// (must not fire non-tokens at AniList as Bearer).
 pub fn extractToken(raw: []const u8) []const u8 {
     const needle = "access_token=";
     if (std.mem.indexOf(u8, raw, needle)) |i| {
@@ -151,17 +122,13 @@ pub fn extractToken(raw: []const u8) []const u8 {
         const end = std.mem.indexOfAny(u8, start, "&\r\n\t \"'") orelse start.len;
         return std.mem.trim(u8, start[0..end], " \t\r\n\"'");
     }
-    // No `access_token=` — only accept a bare paste that actually looks like a JWT.
-    // Every AniList JWT starts `eyJ` (base64 of `{"typ"…`); anything else is not a
-    // token we should try.
     const bare = std.mem.trim(u8, raw, " \t\r\n\"'");
     if (!std.mem.startsWith(u8, bare, "eyJ")) return "";
     const end = std.mem.indexOfAny(u8, bare, "&\r\n\t \"'") orelse bare.len;
     return bare[0..end];
 }
 
-/// Read `expires_in=<secs>` from the fragment, 0 if absent. A bare-token paste has
-/// no expiry → 0, which `auth.isExpired` treats as live (send it, let AniList 401).
+/// `expires_in` seconds, or 0 (auth.isExpired treats 0 as live; AniList 401s if dead).
 pub fn extractExpiresIn(raw: []const u8) i64 {
     const needle = "expires_in=";
     const i = std.mem.indexOf(u8, raw, needle) orelse return 0;
@@ -170,12 +137,7 @@ pub fn extractExpiresIn(raw: []const u8) i64 {
     return std.fmt.parseInt(i64, rest[0..end], 10) catch 0;
 }
 
-/// Map a raw `{Viewer{id name}}` response body to a Viewer. The token-validity
-/// decision, split out from the network call so it's testable against canned JSON:
-///   - `error.BadJson` → body didn't parse (server outage / HTML error page)
-///   - `null`          → parsed, but no viewer — AniList returns `data:null` with
-///                       an `errors` array for an invalid/expired token
-///   - `Viewer`        → success
+/// Map Viewer JSON: BadJson / null (invalid token) / Viewer. Split from network for tests.
 fn parseViewerResponse(arena: Allocator, raw_json: []const u8) error{BadJson}!?Viewer {
     const Resp = struct { data: ?struct { Viewer: ?Viewer = null } = null };
     const parsed = std.json.parseFromSlice(Resp, arena, raw_json, .{
@@ -185,21 +147,13 @@ fn parseViewerResponse(arena: Allocator, raw_json: []const u8) error{BadJson}!?V
     return data.Viewer;
 }
 
-/// One authenticated `{ Viewer { id name } }` call, bounded by `VIEWER_DEADLINE_S`
-/// (ROD-286). A stalled fetch surfaces as `error.Timeout` — which `completeLogin`
-/// folds into `.verify_failed`, exactly like any other transport failure — instead of
-/// hanging the caller (in the TUI, the connect worker the render thread must join).
+/// Bounded verify (ROD-286). Timeout → verify_failed, same as other transport errors.
 fn fetchViewer(arena: Allocator, io: Io, token: []const u8) !?Viewer {
     return deadline.withDeadline(io, .fromSeconds(VIEWER_DEADLINE_S), fetchViewerOnce, .{ arena, io, token });
 }
 
-/// The un-bounded verify POST, run as a cancelable unit by `fetchViewer`'s `withDeadline`
-/// (ROD-262): it owns `client` (defer deinit), so the deadline's cancel turns the blocked
-/// recv into `error.Canceled` and this frame unwinds, freeing the client rather than leaking
-/// it. Transport failures propagate; an unparseable body surfaces as `error.BadJson`; a
-/// parsed-but-viewerless body (bad token) returns null. Status is intentionally NOT gated on:
-/// AniList answers an invalid token with HTTP 400 AND a JSON error body, so the parse outcome,
-/// not the status, is the reliable "is this token good" signal.
+/// Unbounded POST as cancelable unit. Status intentionally not gated: invalid token is
+/// HTTP 400 + JSON errors; parse outcome is the reliable "is this token good" signal.
 fn fetchViewerOnce(arena: Allocator, io: Io, token: []const u8) !?Viewer {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
@@ -238,11 +192,9 @@ test "extractToken trims stray quotes and whitespace" {
 }
 
 test "extractToken returns empty for non-token queries (deny redirect, bare state)" {
-    // A denial redirect or a bare state param must not be fired at AniList as a token.
     try testing.expectEqualStrings("", extractToken("error=access_denied&error_description=denied"));
     try testing.expectEqualStrings("", extractToken("state=6269b8e26c3de42af04f6a4c6e948f8f"));
     try testing.expectEqualStrings("", extractToken("a long string that is not token-shaped at all"));
-    // …but an access_token= anywhere still wins.
     try testing.expectEqualStrings("eyJreal.tok.en", extractToken("error=x&access_token=eyJreal.tok.en"));
 }
 
@@ -265,11 +217,8 @@ test "parseViewerResponse returns null for a viewerless body (bad token)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // data present, Viewer explicitly null
     try testing.expect((try parseViewerResponse(a, "{\"data\":{\"Viewer\":null}}")) == null);
-    // AniList's invalid-token shape: errors array + data null
     try testing.expect((try parseViewerResponse(a, "{\"errors\":[{\"message\":\"Invalid token\"}],\"data\":null}")) == null);
-    // data key missing entirely
     try testing.expect((try parseViewerResponse(a, "{\"errors\":[{\"message\":\"x\"}]}")) == null);
 }
 
@@ -280,9 +229,6 @@ test "parseViewerResponse errors on an unparseable body" {
 }
 
 test "signedIn is true only for the persisted-token (.ok) arm (ROD-292)" {
-    // Only `.ok` wrote auth.zon, so only it may trigger the post-login bootstrap
-    // sync — every failure arm must return false or a rejected login would fire a
-    // stray sync report.
     try testing.expect(signedIn(.{ .ok = .{} }));
     try testing.expect(!signedIn(.no_token));
     try testing.expect(!signedIn(.rejected));
