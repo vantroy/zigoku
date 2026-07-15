@@ -1,16 +1,11 @@
-//! Current-selection resolution (ROD-277), carved out of app.zig.
+//! Current-selection resolution (ROD-277). Pure reads of App nav state: which
+//! anime/record is focused, plus formatters into App-owned scratch (season chip,
+//! detail meta fields). At most one read-only `store.getAnime`; no spawn/write/
+//! toast. Threads `*App`.
 //!
-//! One closed, side-effect-free concern: given the current navigation state, resolve WHICH
-//! anime/record is focused across Browse / History / Discover / Detail, and format the
-//! derived display strings (the top-bar season chip, the detail meta-rail fields) into
-//! App-owned scratch. Every function is a pure read of App state plus at most one read-only
-//! `store.getAnime`; none spawn work, write the store, or touch toast/undo. Functions thread
-//! `*App` rather than owning state.
-//!
-//! Lifetime note: the formatters write into `chip_buf` / `detail_meta_buf` /
-//! `detail_meta_fields`, which are App-owned precisely because vaxis cells hold a SLICE into
-//! the text and the frame isn't emitted until after the pass returns (the ROD-141 trap).
-//! They must not be moved to stack locals here.
+//! Lifetime: formatters write `chip_buf` / `detail_meta_buf` / `detail_meta_fields`
+//! (App-owned). vaxis cells hold a SLICE; the frame emits after the pass returns
+//! (ROD-141). Do not move these to stack locals.
 
 const std = @import("std");
 const vaxis = @import("vaxis");
@@ -32,40 +27,28 @@ pub fn selectedAnime(self: *const App) ?Anime {
     return self.search.results.items[self.list_cursor];
 }
 
-/// The Discover card under the grid cursor (ROD-239) — the show a zoom opened
-/// from Discover (`detail_origin == .discover`) is committed to. Reads the
-/// active axis's slot.
+/// Discover card under the grid cursor (ROD-239); active axis slot.
 pub fn selectedDiscoverAnime(self: *const App) ?Anime {
     const items = self.discover.activeSlot().results.items;
     if (self.discover.cursor >= items.len) return null;
     return items[self.discover.cursor];
 }
 
-/// Terminal cell size in pixels as `.{ w, h }`, or `.{ 0, 0 }` when the terminal
-/// doesn't report pixel metrics (tmux/headless). Discover sizes its cover boxes
-/// from this so a poster fills its width (ROD-247); 0 → the fixed fallback height.
+/// Cell size in pixels `.{ w, h }`, or `.{ 0, 0 }` when unreported (tmux/headless).
+/// Discover cover boxes use this (ROD-247); 0 → fixed fallback height.
 pub fn cellPx(self: *const App) [2]u16 {
     if (self.term_cols == 0 or self.term_rows == 0 or self.term_x_pixel == 0 or self.term_y_pixel == 0)
         return .{ 0, 0 };
     return .{ self.term_x_pixel / self.term_cols, self.term_y_pixel / self.term_rows };
 }
 
-/// ROD-186: the top-bar season/year chip text (e.g. "冬 2024"), formatted into App-owned
-/// `chip_buf` (not a stack local, the ROD-141 lifetime trap). Returns "" when no chip
-/// should render.
-///
-/// Content rule: show the selected show's season+year when a row is selected and both are
-/// known; otherwise the current real-world cour from the system clock. The detail zoom is
-/// the exception: committed to one show, it shows only that show's season with no cour
-/// fallback (an unenriched show shows no chip, never a misleading season). Settings has no
-/// show context and shows no chip.
+/// ROD-186: top-bar season/year chip into App-owned `chip_buf` (ROD-141). "" = no chip.
+/// Selected show's season+year when known; else real-world cour. Detail zoom: only
+/// that show's season (no cour fallback). Settings: none.
 pub fn topBarSeasonChip(self: *App) []const u8 {
     switch (self.active_view) {
         .settings => return "",
-        // The Discover GRID chip reads the selected card's season: AniList feed
-        // rows arrive fully enriched (ROD-336), so it's present whenever AniList
-        // knows it. A season-null card shows no chip, "" (never a misleading
-        // cour fallback here, matching the zoom arm).
+        // Discover grid: card season only (feed enriched, ROD-336); null → no chip.
         .discover => {
             const a = selectedDiscoverAnime(self) orelse return "";
             if (a.season != null and a.year != null)
@@ -104,30 +87,23 @@ pub fn topBarSeasonChip(self: *App) []const u8 {
     }
 }
 
-/// Format a season+year into `chip_buf`. "" if either half is unknown — the
-/// chip is the kanji glyph plus the year; a season with no year (or vice
-/// versa) isn't renderable as "季 YYYY" (§2.3: never an empty/partial chip).
+/// season+year into `chip_buf`. "" if either half missing (§2.3: no partial chip).
 fn seasonChipText(self: *App, season: ?domain.Season, year: ?u32) []const u8 {
     const sea = season orelse return "";
     const yr = year orelse return "";
     return std.fmt.bufPrint(&self.chip_buf, "{s} {d}", .{ sea.kanji(), yr }) catch "";
 }
 
-/// The current real-world cour, formatted into `chip_buf` — the no-selection
-/// fallback for the Browse/History chip. Reads `now_ms` (wall-clock epoch ms,
-/// refreshed every .tick) rather than re-querying the clock, so the render pass
-/// stays io-free. Before the first tick `now_ms` is 0; we render no chip then
-/// rather than flash 冬 1970 for one frame.
+/// Real-world cour into `chip_buf` (Browse/History no-selection fallback). Uses
+/// `now_ms` (io-free render). Before first tick `now_ms` is 0: no chip (not 冬 1970).
 fn courChip(self: *App) []const u8 {
     if (self.now_ms <= 0) return "";
     const c = domain.currentCour(self.now_ms);
     return seasonChipText(self, c.season, c.year);
 }
 
-/// Whether `a` is a current-cour release — the basis for the Discover NEW badge
-/// (ROD-239). True when the show's season+year match the current real-world
-/// cour. Needs `now_ms` (≤0 before the first tick → false, so no NEW flashes on
-/// frame zero). The TOP badge is pure rank (#1) and is decided render-side.
+/// Current-cour release (Discover NEW badge, ROD-239). `now_ms` ≤0 → false (no
+/// frame-zero NEW). TOP badge is rank #1, render-side.
 pub fn isNewRelease(self: *const App, a: Anime) bool {
     if (self.now_ms <= 0) return false;
     const year = a.year orelse return false;
@@ -144,11 +120,9 @@ fn historyYear(r: AnimeRecord) ?u32 {
     return if (r.year) |x| std.math.cast(u32, x) else null;
 }
 
-/// A borrowed view: the returned `Anime`'s slice fields (name, genres,
-/// status, …) alias `rec`'s arena memory — this is NOT an ownership transfer.
-/// Used transiently on the stack within render/nav; never store it past the
-/// record's arena and never hand it to `freeOwnedAnime` (that frees gpa-owned
-/// shapes; use `hydrateAnimeFromRecord` when you need a gpa-owned copy).
+/// Borrowed view: slice fields alias `rec` arena memory, NOT ownership transfer.
+/// Stack-transient only; never past the record's arena; never freeOwnedAnime
+/// (use hydrateAnimeFromRecord for a gpa-owned copy).
 pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
     return .{
         .id = rec.source_id,
@@ -179,12 +153,8 @@ pub fn animeFromHistoryRecord(rec: AnimeRecord) Anime {
     };
 }
 
-/// Whether a history-origin detail surface is active *and focused* — either
-/// the persistent two-pane with the detail pane focused (active_view ==
-/// .history, active_pane == .detail) or the full-screen zoom promoted from it
-/// (active_view == .detail, detail_origin == .history). ROD-170 unified these:
-/// both resolve the focused history record as the detail show, so the source/
-/// status/record helpers and the play path treat them identically.
+/// History-origin detail active *and focused* (ROD-170): two-pane with detail
+/// focus, or full-screen zoom from history. Play/cache helpers treat both the same.
 fn historyDetailActive(self: *const App) bool {
     return (self.active_view == .history and self.active_pane == .detail) or
         (self.active_view == .detail and self.detail_origin == .history);
@@ -198,27 +168,19 @@ pub fn currentDetailAnime(self: *const App) ?Anime {
             .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
             .discover => selectedDiscoverAnime(self),
         },
-        // ROD-170: the focused record is the "actively-focused detail show"
-        // only when the detail pane is focused — list focus must not let the
-        // play/cache paths fire against a merely-previewed show.
+        // ROD-170: only when detail pane focused; list focus must not play/cache preview.
         .history => if (self.active_pane == .detail)
             (if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null)
         else
             null,
         .settings => null,
-        // Discover is single-pane: no in-view detail show (Enter opens the
-        // standalone zoom, handled under .detail above).
+        // Discover single-pane: Enter opens zoom under .detail.
         .discover => null,
     };
 }
 
-/// Whether the interactive episode grid should render in the detail pane — true
-/// only for an actively-focused detail show (currentDetailAnime), not a mere
-/// preview. A list-focused preview is null there, so a stale grid from a prior
-/// detail visit can't bleed in (ROD-222: H from a focused History detail into
-/// Browse leaves episodes.results loaded, and the Browse two-pane draws every
-/// frame). Mirrors the gridless History preview and ROD-202's "grid on detail
-/// entry, not on list hover." A render decision lifted to a testable predicate.
+/// Interactive episode grid only for focused detail, not preview (ROD-222).
+/// Stale episodes.results after H→Browse must not bleed into list-focused preview.
 pub fn episodeGridVisible(self: *const App) bool {
     return currentDetailAnime(self) != null;
 }
@@ -231,21 +193,16 @@ fn renderedDetailAnime(self: *const App) ?Anime {
             .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
             .discover => selectedDiscoverAnime(self),
         },
-        // ROD-170: the preview pane always shows the focused record, whichever
-        // pane has focus — the cover/metadata track the list cursor like Browse.
+        // ROD-170: preview always tracks focused record (either pane).
         .history => if (self.selectedHistoryRecord()) |rec| animeFromHistoryRecord(rec) else null,
         .settings => null,
-        .discover => null, // single-pane; no in-view detail preview
+        .discover => null,
     };
 }
 
-/// The show whose cover should be synced from the current navigation state. When a
-/// preview/detail pane is on-screen alongside the list, this is the list cursor, so the
-/// cover tracks the cursor like the cheap synchronous fields do via renderedDetailAnime:
-///   - split browse (cols >= 60, list pane active): the results cursor;
-///   - two-pane history (cols >= pane_split_min, ROD-170): the focused record.
-/// Everywhere else it defers to currentDetailAnime's "actively-focused show" contract,
-/// which play/cache/stale-check paths depend on and must not shift (ROD-156).
+/// Cover sync target from nav. Split browse / two-pane history: list cursor so
+/// cover tracks like renderedDetailAnime. Elsewhere: currentDetailAnime (play/
+/// cache/stale-check; do not shift, ROD-156).
 pub fn detailSyncTarget(self: *const App) ?Anime {
     if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
         return selectedAnime(self);
@@ -256,20 +213,15 @@ pub fn detailSyncTarget(self: *const App) ?Anime {
     return currentDetailAnime(self);
 }
 
-/// The incremental list-scroll keys — j/k and ↓/↑. The cover-settle debounce
-/// arms only for these: jump keys (g/G), filter input, and view/pane switches
-/// all move the cursor too, but they're *discrete settle points*, so the cover
-/// should sync at once rather than wait out the scroll debounce (ROD-202 review:
-/// the cursor-delta proxy alone misfired on all three).
+/// j/k ↓/↑ only. Cover-settle debounce arms for these; jump keys (g/G), filter,
+/// view/pane switch settle immediately (ROD-202: cursor-delta alone misfired).
 pub fn isListScrollKey(key: vaxis.Key) bool {
     return key.matches('j', .{}) or key.matches('k', .{}) or
         key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.up, .{});
 }
 
-/// Whether a list-cursor move changes detailSyncTarget — i.e. the cover preview
-/// is on-screen and tracks the cursor (the two cursor-driven branches above).
-/// Elsewhere the cover follows the focused detail, which a cursor move doesn't
-/// touch, so no settle debounce is needed. Gates the cover-settle timer (ROD-202).
+/// True when list cursor moves change detailSyncTarget (cover tracks cursor).
+/// Gates cover-settle timer (ROD-202).
 pub fn coverTracksCursor(self: *const App) bool {
     if (self.active_view == .browse and self.active_pane == .list and self.term_cols >= 60) {
         return self.search.results.items.len > 0;
@@ -277,10 +229,8 @@ pub fn coverTracksCursor(self: *const App) bool {
     return self.active_view == .history and self.term_cols >= App.pane_split_min;
 }
 
-/// Resolve the cover target from nav state and hand the primitives to the
-/// subsystem (CoverState never reaches into selection state itself — ROD-160).
-/// Called immediately for discrete nav (pane/view switch) and from the .tick
-/// settle for cursor-tracked scrolling (ROD-202).
+/// Cover target from nav → CoverState (subsystem never reads selection, ROD-160).
+/// Immediate for discrete nav; .tick settle for cursor scroll (ROD-202).
 pub fn syncCover(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
     const anime = detailSyncTarget(self);
     const started = self.cover.sync(
@@ -303,9 +253,7 @@ pub const DetailRenderInfo = struct {
 
 pub fn detailRenderInfo(self: *App) DetailRenderInfo {
     const anime = renderedDetailAnime(self);
-    // Primary label under the title-language preference (ROD-205); the resolver's
-    // never-blank chain backstops to romaji, and "—" catches the pathological
-    // all-empty case the same way the old romaji-only path did.
+    // Primary under title-language pref (ROD-205); empty-title placeholder when blank.
     const title: []const u8 = if (anime) |a| blk: {
         const resolved = a.displayTitle(self.config.titleLanguageEnum());
         break :blk if (resolved.len > 0) resolved else "—";
@@ -313,49 +261,31 @@ pub fn detailRenderInfo(self: *App) DetailRenderInfo {
     return .{ .anime = anime, .title = title };
 }
 
-/// One detail-metadata field (ROD-260). Both the compact `drawMetaLine` and
-/// the roomy `drawMetaRail` render from a shared, ordered `[]MetaField`, so
-/// the two forms can't drift — same source, same order, same value strings.
+/// One detail-metadata field (ROD-260). Compact line and rail share ordered
+/// `[]MetaField` so the two forms cannot drift.
 pub const MetaField = struct {
-    /// Rail-form label ("Episodes"/"Format"/"Studios") — ≤ 8 chars, the rail
-    /// aligns values at a fixed column past the 8-col label gutter.
+    /// Rail label (≤8 chars; values align past 8-col gutter).
     label: []const u8,
-    /// The value, identical in both forms: the rail draws it after the label,
-    /// the compact line joins it with `·`. Formatted values live in the
-    /// App-owned buffers above so vaxis's slice outlives the frame.
+    /// Value in both forms. Lives in App-owned buffers (vaxis slice outlives frame).
     value: []const u8,
-    /// Compact-line-only unit suffix (" eps") for a field whose rail label
-    /// already implies the unit — empty for everything else. Lets `Episodes 13`
-    /// (rail) and `13 eps` (line) share one `value` without a second string.
+    /// Compact-line unit suffix (" eps") when the rail label implies the unit.
     unit: []const u8 = "",
-    /// Render `value` in `fg3` (dim) rather than `fg2` — the "? eps" count
-    /// degrade only; present enrichment is always `fg2`.
+    /// fg3 instead of fg2 (only "? eps" degrade).
     dim: bool = false,
-    /// ROD-261/348: skipped by `drawMetaLine`, never a meta-LINE segment. Rank,
-    /// Provider, and Pinned are today's rail-only fields; Provider/Pinned still
-    /// reach the compact form via the dedicated `drawProviderLine` row
-    /// (ROD-348/356), just not the joined line. All rail-only fields still ride
-    /// the one ordered list, so the two forms stay in sync everywhere else.
+    /// ROD-261/348: skipped by drawMetaLine. Rank/Provider/Pinned; Provider/Pinned
+    /// still reach compact via drawProviderLine (ROD-348/356).
     rail_only: bool = false,
 };
 
-/// The ordered detail-metadata fields (ROD-260), highest-priority first so a height-starved
-/// rail sheds from the bottom (Episodes, emitted first, never drops). Ships the enrichment
-/// that survives to the store: Episodes (always) and Format (the persisted `kind`). Both
-/// renderers iterate the list generically, so later fields (studios/source/duration/rank)
-/// land here as data only, no renderer change. A field is emitted only when it has a value
-/// (§9.1: no empty segment, no orphan `·`, no bare rail row); Episodes is the floor,
-/// degrading to a dim "?" so neither form renders empty.
+/// Ordered meta fields, highest priority first (ROD-260). Height-starved rail
+/// sheds from the bottom. Emit only with a value (§9.1); Episodes is the floor
+/// (dim "?" so neither form is empty).
 pub fn detailMetaFields(self: *App) []const MetaField {
     const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
     var n = base.len;
-    // Provider then Pinned (ROD-348/345): session/user state, not enrichment,
-    // so both trail the sextet and shed first, Pinned before Provider (real DB
-    // state outranks a manual override, §5.3a). rail_only keeps them off the
-    // meta LINE; the compact form surfaces them on a dedicated row instead
-    // (drawProviderLine). Nav-state form only: the History preview renders
-    // the CURSOR row's record, whose pin/availability isn't the cached one,
-    // so it must not inherit either field.
+    // Provider then Pinned (ROD-348/345): trail the enrichment sextet; shed first.
+    // rail_only off the meta LINE; compact uses drawProviderLine. Nav-state only
+    // (History preview must not inherit pin/availability of a different row).
     if (providerField(self)) |f| {
         self.detail_meta_fields[n] = f;
         n += 1;
@@ -367,14 +297,9 @@ pub fn detailMetaFields(self: *App) []const MetaField {
     return self.detail_meta_fields[0..n];
 }
 
-/// The Provider field value (ROD-348/356), shared by both render forms: one
-/// token per registry provider in construction order (never the preference
-/// view, §5.3a: a stable reference list, not a resolve-order hint). Dim only
-/// when every token is `?` (nothing known); a fresh negative is real
-/// information and renders full-strength. Omitted when the show has no
-/// canonical identity, when no registry names were injected, or when the
-/// value overflows its buffer (a registry past ~4 providers needs
-/// `detail_provider_buf` widened).
+/// Provider field (ROD-348/356): one token per registry name in construction order
+/// (not preference order, §5.3a). Dim only when all `?`. Omitted without canonical
+/// id, empty names, or buffer overflow.
 fn providerField(self: *App) ?MetaField {
     if (self.show_avail_aid == null) return null;
     const names = self.settings.provider_names;
@@ -397,12 +322,8 @@ fn providerField(self: *App) ?MetaField {
     return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
 }
 
-/// Same ordered field list, but for an explicitly-supplied anime rather than the
-/// one `renderedDetailAnime` resolves from nav state. The History list preview
-/// (`drawHistoryPreview`) is fed a record directly and can't read
-/// `renderedDetailAnime` (it resolves null in the History list view), so it routes
-/// through here to render the SAME metadata as the focused detail — otherwise the
-/// preview silently omits the whole rail (even Format). Writes App-owned buffers.
+/// Same field list for an explicit anime (History preview cannot use
+/// renderedDetailAnime). App-owned buffers.
 pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
     var n: usize = 0;
     const a = maybe_a orelse {
@@ -410,8 +331,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
         return self.detail_meta_fields[0..1];
     };
 
-    // Episodes — the floor field. fg2 real count when either the per-track
-    // count or the AniList total is known, else a dim "?" degrade.
+    // Episodes floor: real count or dim "?".
     const eps = a.episodeCount(self.translation);
     const total: ?u32 = if (eps > 0) eps else a.total_episodes;
     if (total) |t| {
@@ -422,7 +342,6 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
     }
     n += 1;
 
-    // Format (AniList `kind`, e.g. "TV") — omitted entirely when absent.
     if (a.kind) |kind| {
         if (kind.len > 0) {
             self.detail_meta_fields[n] = .{ .label = "Format", .value = kind };
@@ -430,9 +349,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
         }
     }
 
-    // Source (ROD-261) — adaptation origin, prettified from the raw AniList enum
-    // (LIGHT_NOVEL → "Light novel"). Slotted between Format and Duration per §5.3a;
-    // omitted when absent.
+    // Source (ROD-261): after Format, before Duration (§5.3a).
     if (a.source_material) |src| {
         const v = formatSource(&self.detail_source_buf, src);
         if (v.len > 0) {
@@ -441,9 +358,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
         }
     }
 
-    // Duration (ROD-261) — per-episode runtime as "N min", slotted between Source
-    // and Studios per §5.3a. Omitted when null or zero (a 0-minute runtime is a
-    // missing value, not a fact).
+    // Duration (ROD-261): omit null/zero.
     if (a.duration) |dur| {
         if (dur > 0) {
             const v = std.fmt.bufPrint(&self.detail_duration_buf, "{d} min", .{dur}) catch "";
@@ -454,9 +369,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
         }
     }
 
-    // Studios (ROD-261) — main animation studios, collapse-formatted A / A, B /
-    // A, B +N. Second-to-last in priority (only rail-only Rank follows), so a
-    // height-starved rail sheds it early; omitted outright when empty (§9.1).
+    // Studios (ROD-261): second-to-last; shed early on short rail.
     if (a.studios.len > 0) {
         const v = formatStudios(&self.detail_studios_buf, a.studios);
         if (v.len > 0) {
@@ -465,9 +378,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
         }
     }
 
-    // Rank (ROD-261) — rail-only (never on the compact line), the verbose standing
-    // last in priority order. Emits only with both a position and a type; a
-    // contextual pick carries its year, an all-time one doesn't (§5.3a).
+    // Rank (ROD-261): rail-only, last; needs position + type.
     if (a.rank) |rank| {
         if (a.rank_type) |rtype| {
             const v = formatRank(&self.detail_rank_buf, rank, rtype, a.rank_year);
@@ -481,9 +392,7 @@ pub fn detailMetaFieldsFor(self: *App, maybe_a: ?Anime) []const MetaField {
     return self.detail_meta_fields[0..n];
 }
 
-/// Prettify the raw AniList `source` enum for the rail (ROD-261): underscores to
-/// spaces, everything lowercased, first letter capitalized — `LIGHT_NOVEL` →
-/// `Light novel`, `ORIGINAL` → `Original`. Writes into the App-owned `buf`.
+/// AniList source enum → rail text (ROD-261): `LIGHT_NOVEL` → `Light novel`.
 fn formatSource(buf: []u8, raw: []const u8) []const u8 {
     if (raw.len == 0) return "";
     var n: usize = 0;
@@ -496,10 +405,8 @@ fn formatSource(buf: []u8, raw: []const u8) []const u8 {
     return buf[0..n];
 }
 
-/// Compose the rail-only Rank value (ROD-261): `#{rank} {type} {year}` for a
-/// contextual pick, `#{rank} {type}` for an all-time one. The type is lowercased
-/// (`RATED` → `rated`); the season name is deliberately dropped — the header's
-/// season/year chip already carries that context (§5.3a).
+/// Rail Rank (ROD-261): `#{rank} {type} {year}` or without year. Type lowercased;
+/// season omitted (header chip already has it, §5.3a).
 fn formatRank(buf: []u8, rank: u32, rank_type: []const u8, rank_year: ?u32) []const u8 {
     var tbuf: [16]u8 = undefined;
     var tn: usize = 0;
@@ -515,12 +422,8 @@ fn formatRank(buf: []u8, rank: u32, rank_type: []const u8, rank_year: ?u32) []co
         std.fmt.bufPrint(buf, "#{d} {s}", .{ rank, tl }) catch "";
 }
 
-/// Collapse a studio list to the rail form: `A`, `A, B`, or `A, B +N` (ROD-261,
-/// §5.3a). Caps at two named studios — mirroring the §3.8a genre-glyph cap — so a
-/// long co-production credit can't blow the rail's 8-col gutter; the overflow
-/// rides a `+N` suffix. Writes into the App-owned `buf` (slice must outlive the
-/// frame); a name too long for `buf` degrades to the borrowed first name, whose
-/// lifetime matches the field's `a` exactly as Format's borrowed `kind` does.
+/// Studios: `A`, `A, B`, or `A, B +N` (ROD-261, §5.3a). Cap two names; overflow
+/// as +N. App-owned `buf`; oversize name degrades to borrowed first name.
 fn formatStudios(buf: []u8, studios: []const []const u8) []const u8 {
     return switch (studios.len) {
         0 => "",
@@ -537,24 +440,17 @@ pub fn currentDetailSourceName(self: *const App, registry: Registry) []const u8 
     return registry.primary().name();
 }
 
-/// Resolve the history record whose cursor should seed the episode grid, or
-/// null when the current nav state isn't history-origin detail. The episode
-/// subsystem never reads nav state (ROD-180); the controller hands it the
-/// record (or null) for both the cache-hit and fresh-fetch seed paths.
+/// History record for episode-grid seed, or null. Episode subsystem never reads
+/// nav (ROD-180); controller hands the record.
 fn historyDetailRecord(self: *App) ?AnimeRecord {
     if (historyDetailActive(self)) return self.selectedHistoryRecord();
     return null;
 }
 
-/// Resolve the record that seeds the detail grid's §4.6 watched-dim + resume cursor, for
-/// EITHER detail origin (ROD-163). History-origin reuses the in-memory history record;
-/// browse-origin reads the show's stored row so a Browse-opened show dims its watched
-/// episodes exactly as a History-opened one does (the asymmetry ROD-131 left). `arena` backs
-/// the browse-origin store read, so the returned record is valid only until the arena is
-/// freed: seed synchronously. Null when there's no detail show or no stored row. `source` is
-/// optional for the browse path only (history-origin carries its own); a null source can't
-/// key a store read, so we return null explicitly rather than query with an empty string (a
-/// silent masked miss).
+/// Seed for §4.6 watched-dim + resume (ROD-163). History: in-memory record.
+/// Browse: store row (same dim as History). Arena-backed browse read: seed
+/// synchronously. Null without detail show / store row. Null source → null
+/// (no empty-string store key).
 pub fn detailSeedRecord(self: *App, arena: Allocator, source: ?[]const u8, source_id: []const u8) ?AnimeRecord {
     if (historyDetailRecord(self)) |rec| return rec;
     const st = self.store orelse return null;
