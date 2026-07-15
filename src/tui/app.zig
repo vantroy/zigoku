@@ -197,6 +197,7 @@ pub fn run(
     defer if (app.sync_thread) |t| t.join();
     // Error-unwind/test: cancel+join+close. Quit `_exit` abandons; worker skips postEvent on cancel (ROD-286).
     defer app.teardownConnect(io);
+    // ThreadDrain contract (all 7, incl. discover_cover below): begin() before spawn, finish() after the worker's last postEvent, drain() only on teardown.
     defer app.discover_drain.drain();
     defer app.episode_drain.drain();
     defer app.enrich_refresh_drain.drain(); // ROD-182 refresh-on-view
