@@ -46,6 +46,15 @@ fn canonicalAid(sel: Anime) ?i64 {
     return std.math.cast(i64, sel.anilist_id orelse return null);
 }
 
+/// ROD-398: true when `sel` is keyed by its canonical id (id == stringified
+/// anilist_id) rather than a specific provider entry.
+fn isCanonicalKeyed(sel: Anime) bool {
+    const aid = sel.anilist_id orelse return false;
+    var buf: [24]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{aid}) catch return false;
+    return std.mem.eql(u8, sel.id, s);
+}
+
 /// `count_hint`: expected episode count for listing-less providers (megaplay).
 /// Null → derive from the seed record below when a binding already exists.
 pub fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry, source_id: []const u8, origin: ?[]const u8, count_hint: ?u32) void {
@@ -121,10 +130,8 @@ pub fn fireEpisodesForId(self: *App, loop: *Loop, io: std.Io, registry: Registry
 pub fn browseResolveTarget(registry: Registry, preferred: []const u8, sel: Anime, store: ?*Store, scratch: Allocator) App.ResolveVerdict {
     const aid = sel.anilist_id orelse return .{ .direct = sel.id };
     const aid_i64 = std.math.cast(i64, aid) orelse return .{ .direct = sel.id };
-    var idbuf: [24]u8 = undefined;
-    const aid_str = std.fmt.bufPrint(&idbuf, "{d}", .{aid}) catch return .{ .direct = sel.id };
     // Already provider-keyed (id is not the stringified anilist_id).
-    if (!std.mem.eql(u8, sel.id, aid_str)) return .{ .direct = sel.id };
+    if (!isCanonicalKeyed(sel)) return .{ .direct = sel.id };
     // Tier 0: existing binding, effective order on ties.
     if (store) |st| {
         var it = registry.ordered(preferred);
@@ -149,6 +156,11 @@ pub fn fireEpisodesCanonical(self: *App, loop: *Loop, io: std.Io, registry: Regi
     // `.needs_search` never enters fireEpisodesForId; kill stale walk / play-search want here.
     clearFallback(self);
     self.resolve.play_resolve_aid = null;
+    // ROD-398: honor the global preference, but only for a canonical-keyed selection;
+    // a provider-keyed .direct pick is deliberate and must not be overridden.
+    if (isCanonicalKeyed(sel)) {
+        if (routePreferred(self, loop, io, registry, canonicalAid(sel).?)) return;
+    }
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     const hint = domain.expectedEpisodeCount(sel);
@@ -488,6 +500,58 @@ pub fn toastFlipExhaust(self: *App, failed_name: ?[]const u8) bool {
     return true;
 }
 
+/// ROD-398: route an unpinned open under the live global preferred_provider. Stale
+/// (pref changed since the show settled, or never settled) forces the preferred
+/// provider once via its own Tier 0/A/C, stamping the settle-marker at decision time
+/// so a miss can't loop. Returns true if it fired the open, false to open normally.
+fn routePreferred(self: *App, loop: *Loop, io: std.Io, registry: Registry, aid: i64) bool {
+    const st = self.store orelse return false;
+    const pref = self.config.preferred_provider;
+    if (pref.len == 0) return false; // empty = follow-leader
+
+    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    if ((st.getProviderPin(scratch, aid) catch null) != null) return false; // pin overrides
+
+    const settled = st.getRouteResolvedPref(scratch, aid) catch null;
+    if (settled != null and std.mem.eql(u8, settled.?, pref)) {
+        // Settled: open pref's binding directly.
+        if (st.bindingSourceId(scratch, pref, aid) catch null) |sid| {
+            fireEpisodesForId(self, loop, io, registry, sid, pref, null);
+            return true;
+        }
+        return false; // pref never bound: caller opens the existing binding
+    }
+
+    // Stale: force pref once, ahead of any other binding.
+    const p = registry.byName(pref) orelse return false; // retired/unknown pref
+    const canon_rec = (st.getCanonicalByAnilistId(scratch, aid) catch null) orelse return false;
+    // Stamp before the fetch so a miss reads non-stale next open (no loop).
+    st.setRouteResolvedPref(aid, pref) catch {};
+    const sel = selection.animeFromHistoryRecord(canon_rec);
+
+    if (st.bindingSourceId(scratch, pref, aid) catch null) |sid| { // Tier 0
+        fireEpisodesForId(self, loop, io, registry, sid, pref, null);
+        return true;
+    }
+    if (p.canonicalKey(scratch, sel) catch null) |key| { // Tier A: mint on episodes_done
+        fireEpisodesResolved(self, loop, io, registry, pref, key, aid, domain.expectedEpisodeCount(sel));
+        return true;
+    }
+    // Tier C: single-provider manual walk. The marker caps it at one search per flip.
+    const canonical = workers.dupeOwnedAnime(self.gpa, sel) catch return false;
+    const providers = self.gpa.alloc(SourceProvider, 1) catch {
+        workers.freeOwnedAnime(self.gpa, canonical);
+        return false;
+    };
+    providers[0] = p;
+    clearFallback(self);
+    self.resolve.fallback = .{ .canonical = canonical, .anilist_id = aid, .providers = providers, .tried = 0, .manual = true };
+    return advanceFallback(self, loop, io, registry, null, null);
+}
+
 /// History episode-grid open. One gate so unbound sentinels render "no source"
 /// instead of fetching. Keys on `rec.source` (animeFromHistoryRecord drops it).
 /// Unbound clears the grid: leftover results would let firePlay launch the
@@ -518,6 +582,10 @@ pub fn fireEpisodesForHistoryRecord(self: *App, loop: *Loop, io: std.Io, registr
         const sid = (st.bindingSourceId(arena.allocator(), pin, aid) catch null) orelse break :pin;
         fireEpisodesForId(self, loop, io, registry, sid, pin, null);
         return;
+    }
+    // ROD-398: unpinned opens honor the live global preference.
+    if (rec.anilist_id) |aid| {
+        if (routePreferred(self, loop, io, registry, aid)) return;
     }
     fireEpisodesForId(self, loop, io, registry, rec.source_id, rec.source, null);
 }
