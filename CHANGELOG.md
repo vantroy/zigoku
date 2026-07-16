@@ -14,6 +14,80 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-07-17
+
+### Added
+
+- **zigoku is on the AUR**: Arch users can now install and update it with
+  `paru -S zigoku` or `yay -S zigoku`, no more cloning and building by hand.
+
+- **Flipping your preferred source now reaches shows you're already
+  watching**: the Settings preferred-source control used to only steer shows
+  opened for the first time after the change; a show you'd already started
+  kept whatever source it first resolved to. Opening it now re-checks against
+  the current setting and switches over if it's changed. A show you've pinned
+  to a specific source is untouched.
+
+- **Delete a show from your watchlist for good**: shift+X on a focused show
+  arms a confirm, then y removes it and its full episode history. It's the
+  one destructive action in zigoku with no undo, so it always asks first.
+
+### Changed
+
+- **The source-availability line moved next to the episode grid**: which
+  source is serving a show, which others have it, the pin, and the switch
+  hint used to sit in the detail sidebar. They're now a caption row right
+  above the episode grid, next to what they describe.
+
+- **Keybind hints are bolder**: the per-key hints on the idle help line now
+  render bold, easier to pick out at a glance.
+
+### Fixed
+
+- **Returning from an episode no longer jumps you to the wrong show**: a
+  post-playback history refresh could leave the detail panel and cover
+  pointing at a different show than the one you just watched, even though
+  the episode grid stayed correct. The whole view now follows the show you
+  were watching.
+
+- **Descriptions in CJK text no longer garble at the wrap point**: long
+  synopses in Chinese, Japanese, or Korean could split a character in half
+  where the text wrapped, showing corrupted text. They now wrap cleanly.
+
+- **Centered text lines up correctly for wide and multibyte characters**:
+  loading messages and search text with CJK characters or symbols used to
+  sit visibly left of center. They're centered correctly now.
+
+- **Fixed a rendering glitch on very long-running shows**: on shows with
+  large episode counts filling more than a screen's worth of cells, the
+  episode grid could occasionally show a stray, incorrect episode number.
+  Fixed.
+
+- **Hardened stream resolution against malicious redirects and forged
+  links**: closed two gaps, on certain shows, where a compromised or
+  malicious embed could redirect zigoku's own network request elsewhere, or
+  slip an unsafe value through to the player. Other resolution paths already
+  carried these checks; now all of them do.
+
+- **Cover art decodes with a smaller memory ceiling**: tightened the memory
+  zigoku allows itself when decoding cover images, lowering peak memory use
+  with no visible change in quality.
+
+### Known Issues
+
+- **A resume marker can land one episode behind after switching sources**: on
+  a show where two sources number episodes differently, switching a show to a
+  different source can leave the "continue watching" marker parked one
+  episode behind where you actually left off. The watched count stays
+  correct; only the resume cursor is off. Selecting the right episode fixes
+  it on the spot, and a proper fix is planned.
+
+- **A first-time open under a search-only preferred source can land on an
+  empty episode grid**: if your preferred source has never resolved that show
+  before and a title search for it comes up empty, the episode grid can come
+  up blank instead of falling back to a source you're already using. Closing
+  and reopening the show recovers immediately; nothing is lost.
+
 ## [0.4.5] - 2026-07-13
 
 ### Added
@@ -324,7 +398,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/vantroy/zigoku/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/vantroy/zigoku/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/vantroy/zigoku/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/vantroy/zigoku/compare/v0.4.2...v0.4.3
