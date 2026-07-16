@@ -266,60 +266,123 @@ jobs:
             git push origin main
           fi
 
-  # ── AUR source-archive checksum — tag pushes only ─────────────────────────
-  # AUR new-account registration is still closed (packaging/aur/README.md), so
-  # nothing is pushed to the registry yet — that end-state mirrors update-tap and
-  # lands when registration reopens (Tier 3). What this DOES kill now is the one
-  # genuinely painful step of the manual per-release bump: the sha256 of GitHub's
-  # on-demand source archive (archive/refs/tags/vX.Y.Z.tar.gz), which is unknowable
-  # until the tag exists. We compute it on the tag and print a paste-ready PKGBUILD
-  # block to the run summary. No mutation, no write-back token, no Arch container,
-  # no new secret — a pure read that replaces a local `updpkgsums`. (ROD-273)
-  aur-checksum:
+  # ── AUR auto-publish (tag pushes only) ────────────────────────────────────
+  # Mirror of update-tap for the AUR: bump packaging/aur/zigoku/PKGBUILD to the
+  # release, regenerate .SRCINFO, and push both to the AUR git repo so
+  # `paru -S zigoku` tracks the tag. Runs in an Arch container because .SRCINFO
+  # must come from `makepkg --printsrcinfo`; a hand-edited .SRCINFO that drifts
+  # from PKGBUILD is exactly what AUR rejects on. Uses AUR_SSH_PRIVATE_KEY (its
+  # public half is registered on the AUR account). Does NOT write the bump back
+  # to master: the in-repo PKGBUILD is the template, the AUR repo is the deployed
+  # copy, the same split as packaging/homebrew/ vs the tap. (ROD-408)
+  update-aur:
     needs: [guard, release]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    permissions: {}   # pure external read + local hash — no GITHUB_TOKEN wanted
+    container: archlinux:base-devel
+    permissions:
+      contents: read
     steps:
-      - name: Compute source-archive sha256 + emit a paste-ready PKGBUILD block
+      # git for a real checkout with history; openssh for the AUR push. base-devel
+      # already carries makepkg. Full -Syu since the container is ephemeral.
+      - name: Install git + ssh
+        run: pacman -Syu --noconfirm --needed git openssh
+
+      - uses: actions/checkout@v4
+
+      - name: Compute source-archive sha256
+        id: sha
         run: |
           v="${{ needs.guard.outputs.version }}"
           url="https://github.com/vantroy/zigoku/archive/refs/tags/v${v}.tar.gz"
-          # Same retry posture as update-tap: the tag exists at push time, but
-          # codeload's CDN can 404 for a beat right after publish — ride it out.
-          # --connect-timeout/--max-time so a stalled connection can't hang the
-          # job to the 6h default (retries only fire on a *completed* failure).
+          # The tag exists at push time, but codeload's CDN can 404 for a beat
+          # right after publish, so ride it out. Bounded timeouts so a stalled
+          # connection can't hang the job to the 6h default.
           curl -fsSL --connect-timeout 30 --max-time 120 \
             --retry 5 --retry-delay 3 --retry-all-errors "$url" -o src.tar.gz
           # curl -f gates on HTTP status, not body: a 200 carrying a CDN
-          # interstitial or an incident page would hash clean and we'd print a
-          # confident-but-wrong checksum. Refuse anything that isn't a real
-          # gzip tarball before we hash it.
+          # interstitial would hash clean. Refuse anything that isn't a real
+          # gzip tarball before we trust the checksum.
           tar tzf src.tar.gz >/dev/null 2>&1 \
-            || { echo "::error::downloaded archive is not a valid gzip tarball — refusing to hash"; exit 1; }
+            || { echo "::error::downloaded archive is not a valid gzip tarball"; exit 1; }
           sum="$(sha256sum src.tar.gz | awk '{print $1}')"
           echo "source-archive sha256 for v${v}: ${sum}"
-          # NOTE: GitHub does not durably guarantee auto-generated archive
-          # checksums — they shifted once (Feb 2023) and the stability pledge
-          # lapsed Feb 2024. If a future toolchain change makes makepkg reject
-          # this sha, it's NOT a packaging regression: re-run this job (or
-          # `updpkgsums` locally, see packaging/aur/README.md) to refresh it.
-          # Source-build AUR pins the tag archive by convention; the git-source
-          # deps stay SKIP-pinned by commit, so only this one value can drift.
-          # Land the block in the run summary so the bump is a copy-paste, not a
-          # hunt through logs. Manual for now; Tier 3 pushes it straight to AUR.
-          {
-            echo "### AUR \`packaging/aur/zigoku/PKGBUILD\` bump — v${v}"
-            echo ""
-            echo "Registration is still closed, so this is a manual paste"
-            echo "(steps in \`packaging/aur/README.md\`). Bump these, then regen \`.SRCINFO\`:"
-            echo ""
-            echo '```bash'
-            echo "pkgver=${v}"
-            echo "pkgrel=1"
-            echo "# first entry of the sha256sums=() array:"
-            echo "'${sum}'"
-            echo '```'
-            echo ""
-            echo "Source archive: ${url}"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "sum=${sum}" >> "$GITHUB_OUTPUT"
+
+      # If build.zig.zon bumped a dep but the PKGBUILD pins didn't follow, the
+      # AUR build would resolve the wrong source. Catch that here, not in users'
+      # chroots. zigimg is transitive (pinned in vaxis's zon, not zigoku's), so
+      # it moves only with the vaxis pin and isn't cross-checkable here.
+      - name: Verify PKGBUILD dep pins match build.zig.zon
+        run: |
+          pk=packaging/aur/zigoku/PKGBUILD
+          fail=0
+          check() {  # label  pkg-commit  pkg-hash  zon-commit  zon-hash
+            if [ "$2" != "$4" ] || [ "$3" != "$5" ]; then
+              echo "::error::$1 pin drift: PKGBUILD ($2 / $3) != build.zig.zon ($4 / $5)"
+              fail=1
+            fi
+          }
+          pv_c=$(grep -oP 'libvaxis\.git#commit=\K[0-9a-f]+' "$pk")
+          pv_h=$(grep -oP "_vaxis_hash='\K[^']+" "$pk")
+          pu_c=$(grep -oP 'uucode\.git#commit=\K[0-9a-f]+' "$pk")
+          pu_h=$(grep -oP "_uucode_hash='\K[^']+" "$pk")
+          zv_c=$(grep -oP 'libvaxis#\K[0-9a-f]+' build.zig.zon)
+          zv_h=$(grep -oP '"\Kvaxis-[^"]+' build.zig.zon)
+          zu_c=$(grep -oP 'uucode#\K[0-9a-f]+' build.zig.zon)
+          zu_h=$(grep -oP '"\Kuucode-[^"]+' build.zig.zon)
+          check vaxis  "$pv_c" "$pv_h" "$zv_c" "$zv_h"
+          check uucode "$pu_c" "$pu_h" "$zu_c" "$zu_h"
+          [ "$fail" = 0 ] || { echo "bump the PKGBUILD dep pins to match, then re-run"; exit 1; }
+          echo "dep pins consistent"
+
+      - name: Bump PKGBUILD + regenerate .SRCINFO
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          sum="${{ steps.sha.outputs.sum }}"
+          cd packaging/aur/zigoku
+          sed -i -E "s/^pkgver=.*/pkgver=${v}/" PKGBUILD
+          sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          # Only sha256sums[0] is a 64-hex literal; the git-source entries are
+          # 'SKIP'. So this pattern hits the tarball checksum and nothing else.
+          sed -i -E "s/^([[:space:]]*)'[0-9a-f]{64}'/\1'${sum}'/" PKGBUILD
+          echo "----- bumped PKGBUILD -----"; cat PKGBUILD
+          # makepkg refuses to run as root; run --printsrcinfo as an unprivileged
+          # user. It's a pure parse of PKGBUILD: no network, no build.
+          useradd -m builder
+          chown -R builder .
+          su builder -c 'makepkg --printsrcinfo' > .SRCINFO
+          echo "----- .SRCINFO -----"; cat .SRCINFO
+          # Belt-and-suspenders: the regenerated .SRCINFO must carry this version,
+          # else the push would be the pkgver/.SRCINFO mismatch AUR rejects.
+          grep -q "pkgver = ${v}" .SRCINFO \
+            || { echo "::error::.SRCINFO did not regenerate to v${v}"; exit 1; }
+
+      - name: Set up AUR deploy key
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_KEY" > ~/.ssh/aur_key
+          chmod 600 ~/.ssh/aur_key
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Push to AUR
+        env:
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
+        run: |
+          v="${{ needs.guard.outputs.version }}"
+          git clone ssh://aur@aur.archlinux.org/zigoku.git aur
+          cp packaging/aur/zigoku/PKGBUILD packaging/aur/zigoku/.SRCINFO aur/
+          cd aur
+          git config user.name "zigoku-release"
+          git config user.email "actions@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already current for v${v}, nothing to push"
+            echo "AUR already current for v${v}." >> "$GITHUB_STEP_SUMMARY"
+          else
+            git commit -m "zigoku v${v}"
+            git push origin master
+            echo "Pushed zigoku v${v} to the AUR." >> "$GITHUB_STEP_SUMMARY"
+          fi
