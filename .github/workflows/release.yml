@@ -387,7 +387,9 @@ jobs:
       - name: Push to AUR
         env:
           VERSION: ${{ needs.guard.outputs.version }}
-          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
+          # accept-new: the container's ssh-keyscan can come back empty, so trust the
+          # AUR host key on first connect (same TOFU model keyscan gives). ROD-408.
+          GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
         run: |
           v="$VERSION"
           git clone ssh://aur@aur.archlinux.org/zigoku.git aur
