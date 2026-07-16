@@ -213,18 +213,18 @@ const min_cover_rows: u16 = 6;
 
 /// Blank row `drawCover` folds into its return after the poster.
 const cover_spacer_rows: u16 = 1;
-/// Blank row `drawGrid` leads with before the episode grid.
-const grid_spacer_rows: u16 = 1;
+/// Caption row above the episode grid (provider surface, ROD-397). Always reserved.
+const grid_caption_rows: u16 = 1;
 
 /// Single-column reservation below the cover (ROD-137): trailing cover spacer +
 /// max header + min synopsis + grid spacer + min grid. Single source for
 /// synopsisCap and the invariant test.
-const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_spacer_rows + min_grid_rows;
+const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_caption_rows + min_grid_rows;
 
 /// Synopsis rows in single-column: max(1, remaining_h - (grid_spacer + min_grid)).
 /// ROD-137/ROD-141: at 35-row terminal the grid must keep ≥2 visible rows.
 fn synopsisCap(remaining_h: u16) u16 {
-    const reserved: u16 = grid_spacer_rows + min_grid_rows;
+    const reserved: u16 = grid_caption_rows + min_grid_rows;
     if (remaining_h <= reserved) return 1;
     return remaining_h - reserved;
 }
@@ -428,34 +428,37 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
         row = drawMetaRail(self, win, w, h, fields, row);
     } else if (row < h) {
         row = drawMetaLine(self, win, w, fields, row);
-        // ROD-348/356: Provider/Pinned are rail_only; this row is their compact surface.
-        if (row < h) row = drawProviderLine(self, win, fields, row);
     }
     return row;
 }
 
-/// Compact provider row under the meta line (ROD-348/356): same field entries as
-/// the rail (no recompute). Only pin keeps a `pin ` marker. No row without Provider.
-fn drawProviderLine(self: *App, win: vaxis.Window, fields: []const App.MetaField, start_row: u16) u16 {
+/// Provider caption (ROD-397): registry names with the serving ▸ marker · pin ·
+/// dim [v]. wrap=.none clips the tail, so print order is priority order: [v] sheds
+/// first (it is in the help bar too), then pin, then the names.
+fn drawProviderCaption(self: *App, win: vaxis.Window, fields: []const App.MetaField, row: u16) void {
     var provider: ?App.MetaField = null;
     var pinned: ?App.MetaField = null;
     for (fields) |f| {
+        if (!f.caption) continue;
         if (std.mem.eql(u8, f.label, "Provider")) provider = f;
         if (std.mem.eql(u8, f.label, "Pinned")) pinned = f;
     }
-    const p = provider orelse return start_row;
-    const col = win.print(
+    const p = provider orelse return;
+    var col = win.print(
         &.{.{ .text = p.value, .style = self.s(if (p.dim) self.palette.fg3 else self.palette.fg2, .{}) }},
-        .{ .row_offset = start_row, .col_offset = 0, .wrap = .none },
+        .{ .row_offset = row, .col_offset = 0, .wrap = .none },
     ).col;
     if (pinned) |pf| {
-        _ = win.print(&.{
+        col = win.print(&.{
             .{ .text = " · ", .style = self.s(self.palette.fg3, .{}) },
             .{ .text = "pin ", .style = self.s(self.palette.fg2, .{}) },
             .{ .text = pf.value, .style = self.s(self.palette.fg2, .{}) },
-        }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none });
+        }, .{ .row_offset = row, .col_offset = col, .wrap = .none }).col;
     }
-    return start_row + 1;
+    _ = win.print(
+        &.{.{ .text = " · [v]", .style = self.s(self.palette.fg3, .{}) }},
+        .{ .row_offset = row, .col_offset = col, .wrap = .none },
+    );
 }
 
 /// Compact meta line (ROD-260): values joined by ` · `, one row. Cursor by print
@@ -465,7 +468,7 @@ fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaF
     // `printed` drives the separator so rail_only (Rank, ROD-261) leaves no orphan ` · `.
     var printed: usize = 0;
     for (fields) |f| {
-        if (f.rail_only) continue;
+        if (f.rail_only or f.caption) continue;
         if (col >= w) break;
         if (printed > 0) {
             col = win.print(
@@ -492,6 +495,7 @@ fn drawMetaRail(self: *App, win: vaxis.Window, w: u16, h: u16, fields: []const A
     const value_x: u16 = label_w + 2;
     var row = start_row;
     for (fields) |f| {
+        if (f.caption) continue;
         if (row >= h) break;
         // Clip label to gutter so over-length labels never bleed into values (ROD-260).
         putClipped(win, row, 0, @min(w, label_w), f.label, self.s(self.palette.fg3, .{}));
@@ -548,10 +552,17 @@ fn drawSynopsis(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, st
     return row;
 }
 
-/// Spacer row, then episode grid filling the rest of `win` below `start_row`.
-fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16) void {
-    var row = start_row;
-    if (row < h) row += 1;
+/// First grid-body row below the caption (ROD-397): reserves exactly
+/// grid_caption_rows when it fits, so grid height never depends on whether the
+/// caption painted a provider. Keeps the ROD-137 floor across the relocation.
+fn gridBodyRow(start_row: u16, h: u16) u16 {
+    return if (start_row < h) start_row + grid_caption_rows else start_row;
+}
+
+/// Provider caption, then the episode grid fills the rest below it (ROD-397).
+fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16, fields: []const App.MetaField) void {
+    if (start_row < h) drawProviderCaption(self, win, fields, start_row);
+    const row = gridBodyRow(start_row, h);
     if (row >= h) return;
     const grid_h: u16 = h - row;
     const grid_win = win.child(.{ .x_off = 0, .y_off = row, .width = w, .height = grid_h });
@@ -588,7 +599,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         // Right column is dedicated: no synopsis cap. Dropping the grid leaves empty
         // bottom rows; no relayout (unlike single-column reclaim).
         const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
-        if (show_grid) drawGrid(self, right_win, right_w, h, rrow);
+        if (show_grid) drawGrid(self, right_win, right_w, h, rrow, self.detailMetaFields());
         return;
     }
 
@@ -601,7 +612,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
     if (show_grid) {
         const cap = synopsisCap(if (h > row) h - row else 0);
         row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
-        drawGrid(self, win, w, h, row);
+        drawGrid(self, win, w, h, row, self.detailMetaFields());
     } else {
         // Preview: no grid reservation; synopsis takes remaining height (ROD-222).
         _ = drawSynopsis(self, win, w, h, info.anime, row);
@@ -884,6 +895,24 @@ test "coverHeightCap: bounds the cover to protect the grid (ROD-137)" {
     try t.expectEqual(@as(u16, 1), coverHeightCap(cover_reserve + 1));
 }
 
+test "ROD-397: gridBodyRow reserves exactly the caption row, provider-independent" {
+    const t = std.testing;
+    // Exactly grid_caption_rows reserved when the row fits, 0 past the pane floor;
+    // gridBodyRow takes no fields, so provider presence can't move the grid.
+    try t.expectEqual(@as(u16, 1), grid_caption_rows);
+
+    try t.expectEqual(@as(u16, 6), gridBodyRow(5, 32));
+    try t.expectEqual(@as(u16, 1), gridBodyRow(0, 2));
+    try t.expectEqual(@as(u16, 32), gridBodyRow(32, 32));
+    try t.expectEqual(@as(u16, 33), gridBodyRow(33, 32));
+
+    var start: u16 = 0;
+    while (start < 40) : (start += 1) {
+        const reserved = gridBodyRow(start, 32) - start;
+        try t.expectEqual(@as(u16, if (start < 32) 1 else 0), reserved);
+    }
+}
+
 /// No-pixel-geometry single-column budget (coverSlotHeight returns full cap).
 /// Mirrors drawDetailPane; returns resulting episode-grid row count.
 fn worstCaseGridRows(h: u16) u16 {
@@ -895,7 +924,7 @@ fn worstCaseGridRows(h: u16) u16 {
     const remaining = h - after_header;
     const synopsis = @min(synopsisCap(remaining), remaining);
     const after_synopsis = after_header + synopsis;
-    const after_spacer = @min(h, after_synopsis + grid_spacer_rows);
+    const after_spacer = @min(h, after_synopsis + grid_caption_rows);
     return h - after_spacer;
 }
 

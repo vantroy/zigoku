@@ -272,9 +272,10 @@ pub const MetaField = struct {
     unit: []const u8 = "",
     /// fg3 instead of fg2 (only "? eps" degrade).
     dim: bool = false,
-    /// ROD-261/348: skipped by drawMetaLine. Rank/Provider/Pinned; Provider/Pinned
-    /// still reach compact via drawProviderLine (ROD-348/356).
+    /// In the two-column rail only, not the compact meta line. Rank (ROD-261).
     rail_only: bool = false,
+    /// In the episode-grid caption only, not the meta line or rail. Provider/Pinned (ROD-397).
+    caption: bool = false,
 };
 
 /// Ordered meta fields, highest priority first (ROD-260). Height-starved rail
@@ -283,15 +284,14 @@ pub const MetaField = struct {
 pub fn detailMetaFields(self: *App) []const MetaField {
     const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
     var n = base.len;
-    // Provider then Pinned (ROD-348/345): trail the enrichment sextet; shed first.
-    // rail_only off the meta LINE; compact uses drawProviderLine. Nav-state only
-    // (History preview must not inherit pin/availability of a different row).
+    // Provider then Pinned (ROD-348/345), caption fields (ROD-397). Nav-state only:
+    // History preview must not inherit another row's pin/availability.
     if (providerField(self)) |f| {
         self.detail_meta_fields[n] = f;
         n += 1;
     }
     if (self.show_pin) |pin| {
-        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
+        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .caption = true };
         n += 1;
     }
     return self.detail_meta_fields[0..n];
@@ -319,7 +319,7 @@ fn providerField(self: *App) ?MetaField {
         const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, name }) catch return null;
         w += written.len;
     }
-    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
+    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .caption = true };
 }
 
 /// Same field list for an explicit anime (History preview cannot use
