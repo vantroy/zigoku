@@ -292,8 +292,10 @@ jobs:
 
       - name: Compute source-archive sha256
         id: sha
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
         run: |
-          v="${{ needs.guard.outputs.version }}"
+          v="$VERSION"
           url="https://github.com/vantroy/zigoku/archive/refs/tags/v${v}.tar.gz"
           # The tag exists at push time, but codeload's CDN can 404 for a beat
           # right after publish, so ride it out. Bounded timeouts so a stalled
@@ -331,15 +333,23 @@ jobs:
           zv_h=$(grep -oP '"\Kvaxis-[^"]+' build.zig.zon)
           zu_c=$(grep -oP 'uucode#\K[0-9a-f]+' build.zig.zon)
           zu_h=$(grep -oP '"\Kuucode-[^"]+' build.zig.zon)
+          # Fail closed if any extraction came back empty (a PKGBUILD/zon format
+          # change), so an empty-vs-empty comparison can't rubber-stamp the guard.
+          for x in "$pv_c" "$pv_h" "$pu_c" "$pu_h" "$zv_c" "$zv_h" "$zu_c" "$zu_h"; do
+            [ -n "$x" ] || { echo "::error::a dep-pin extraction came back empty"; exit 1; }
+          done
           check vaxis  "$pv_c" "$pv_h" "$zv_c" "$zv_h"
           check uucode "$pu_c" "$pu_h" "$zu_c" "$zu_h"
           [ "$fail" = 0 ] || { echo "bump the PKGBUILD dep pins to match, then re-run"; exit 1; }
           echo "dep pins consistent"
 
       - name: Bump PKGBUILD + regenerate .SRCINFO
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+          SUM: ${{ steps.sha.outputs.sum }}
         run: |
-          v="${{ needs.guard.outputs.version }}"
-          sum="${{ steps.sha.outputs.sum }}"
+          v="$VERSION"
+          sum="$SUM"
           cd packaging/aur/zigoku
           sed -i -E "s/^pkgver=.*/pkgver=${v}/" PKGBUILD
           sed -i -E "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
@@ -347,15 +357,22 @@ jobs:
           # 'SKIP'. So this pattern hits the tarball checksum and nothing else.
           sed -i -E "s/^([[:space:]]*)'[0-9a-f]{64}'/\1'${sum}'/" PKGBUILD
           echo "----- bumped PKGBUILD -----"; cat PKGBUILD
+          # Assert the sha256 actually landed: it's the one value that changes
+          # every release and comes from outside the repo, so verify the sed
+          # rather than trust it (a no-op sed would regenerate a self-consistent
+          # .SRCINFO that AUR accepts, then fail every user's makepkg integrity).
+          grep -q "'${sum}'" PKGBUILD \
+            || { echo "::error::sha256 bump did not land in PKGBUILD"; exit 1; }
           # makepkg refuses to run as root; run --printsrcinfo as an unprivileged
           # user. It's a pure parse of PKGBUILD: no network, no build.
           useradd -m builder
           chown -R builder .
           su builder -c 'makepkg --printsrcinfo' > .SRCINFO
           echo "----- .SRCINFO -----"; cat .SRCINFO
-          # Belt-and-suspenders: the regenerated .SRCINFO must carry this version,
-          # else the push would be the pkgver/.SRCINFO mismatch AUR rejects.
-          grep -q "pkgver = ${v}" .SRCINFO \
+          # The regenerated .SRCINFO must carry this version, else the push would
+          # be the pkgver/.SRCINFO mismatch AUR rejects. Anchor to end-of-line so
+          # v0.4.6 can't match a v0.4.60 line.
+          grep -q "pkgver = ${v}$" .SRCINFO \
             || { echo "::error::.SRCINFO did not regenerate to v${v}"; exit 1; }
 
       - name: Set up AUR deploy key
@@ -369,9 +386,10 @@ jobs:
 
       - name: Push to AUR
         env:
+          VERSION: ${{ needs.guard.outputs.version }}
           GIT_SSH_COMMAND: "ssh -i ~/.ssh/aur_key -o IdentitiesOnly=yes"
         run: |
-          v="${{ needs.guard.outputs.version }}"
+          v="$VERSION"
           git clone ssh://aur@aur.archlinux.org/zigoku.git aur
           cp packaging/aur/zigoku/PKGBUILD packaging/aur/zigoku/.SRCINFO aur/
           cd aur
