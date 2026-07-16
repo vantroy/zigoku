@@ -272,9 +272,10 @@ pub const MetaField = struct {
     unit: []const u8 = "",
     /// fg3 instead of fg2 (only "? eps" degrade).
     dim: bool = false,
-    /// ROD-261/348: skipped by drawMetaLine. Rank/Provider/Pinned; Provider/Pinned
-    /// still reach compact via drawProviderLine (ROD-348/356).
+    /// In the two-column rail only, not the compact meta line. Rank (ROD-261).
     rail_only: bool = false,
+    /// In the episode-grid caption only, not the meta line or rail. Provider/Pinned (ROD-397).
+    caption: bool = false,
 };
 
 /// Ordered meta fields, highest priority first (ROD-260). Height-starved rail
@@ -283,32 +284,53 @@ pub const MetaField = struct {
 pub fn detailMetaFields(self: *App) []const MetaField {
     const base = detailMetaFieldsFor(self, renderedDetailAnime(self));
     var n = base.len;
-    // Provider then Pinned (ROD-348/345): trail the enrichment sextet; shed first.
-    // rail_only off the meta LINE; compact uses drawProviderLine. Nav-state only
-    // (History preview must not inherit pin/availability of a different row).
+    // Provider then Pinned (ROD-348/345), caption fields (ROD-397). Nav-state only:
+    // History preview must not inherit another row's pin/availability.
     if (providerField(self)) |f| {
         self.detail_meta_fields[n] = f;
         n += 1;
     }
     if (self.show_pin) |pin| {
-        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .rail_only = true };
+        self.detail_meta_fields[n] = .{ .label = "Pinned", .value = pin, .caption = true };
         n += 1;
     }
     return self.detail_meta_fields[0..n];
 }
 
-/// Provider field (ROD-348/356): one token per registry name in construction order
-/// (not preference order, §5.3a). Dim only when all `?`. Omitted without canonical
-/// id, empty names, or buffer overflow.
+/// Provider field (ROD-348/356): one token per registry name with an availability
+/// marker (▸ serving, + bound, - absent, ? unchecked). The serving provider leads
+/// so its marker+name is never the token the caption tail-clips (ROD-397); the rest
+/// follow in registry order. Dim only when all `?`. Omitted without canonical id,
+/// empty names, or buffer overflow.
 fn providerField(self: *App) ?MetaField {
     if (self.show_avail_aid == null) return null;
     const names = self.settings.provider_names;
     if (names.len == 0) return null;
+    const cap = @min(names.len, self.show_avail.len);
+
+    // Serving first, then registry order (ROD-397): wrap=.none clips the tail, so the
+    // one token the ticket says must never drop has to be printed first.
+    const serving: ?usize = for (names[0..cap], 0..) |name, i| {
+        if (self.episodes.for_source) |s| {
+            if (std.mem.eql(u8, s, name)) break i;
+        }
+    } else null;
+    var order: [App.max_rail_providers]usize = undefined;
+    var n: usize = 0;
+    if (serving) |si| {
+        order[n] = si;
+        n += 1;
+    }
+    for (0..cap) |i| {
+        if (serving != null and serving.? == i) continue;
+        order[n] = i;
+        n += 1;
+    }
+
     var w: usize = 0;
     var informative = false;
-    for (names, 0..) |name, i| {
-        if (i >= self.show_avail.len) break;
-        const is_serving = if (self.episodes.for_source) |s| std.mem.eql(u8, s, name) else false;
+    for (order[0..n]) |i| {
+        const is_serving = serving != null and serving.? == i;
         const marker: []const u8 = if (is_serving) "▸" else switch (self.show_avail[i]) {
             .bound => "+",
             .absent => "-",
@@ -316,10 +338,10 @@ fn providerField(self: *App) ?MetaField {
         };
         if (is_serving or self.show_avail[i] != .unchecked) informative = true;
         const sep: []const u8 = if (w > 0) " " else "";
-        const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, name }) catch return null;
+        const written = std.fmt.bufPrint(self.detail_provider_buf[w..], "{s}{s}{s}", .{ sep, marker, names[i] }) catch return null;
         w += written.len;
     }
-    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .rail_only = true };
+    return .{ .label = "Provider", .value = self.detail_provider_buf[0..w], .dim = !informative, .caption = true };
 }
 
 /// Same field list for an explicit anime (History preview cannot use

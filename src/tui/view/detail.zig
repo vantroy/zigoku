@@ -213,18 +213,19 @@ const min_cover_rows: u16 = 6;
 
 /// Blank row `drawCover` folds into its return after the poster.
 const cover_spacer_rows: u16 = 1;
-/// Blank row `drawGrid` leads with before the episode grid.
-const grid_spacer_rows: u16 = 1;
+/// Caption zone above the episode grid (ROD-397): a blank buffer row, then the
+/// provider-surface caption. Reserved whole so the grid geometry stays fixed.
+const grid_caption_rows: u16 = 2;
 
 /// Single-column reservation below the cover (ROD-137): trailing cover spacer +
-/// max header + min synopsis + grid spacer + min grid. Single source for
+/// max header + min synopsis + grid caption + min grid. Single source for
 /// synopsisCap and the invariant test.
-const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_spacer_rows + min_grid_rows;
+const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_caption_rows + min_grid_rows;
 
-/// Synopsis rows in single-column: max(1, remaining_h - (grid_spacer + min_grid)).
+/// Synopsis rows in single-column: max(1, remaining_h - (grid_caption + min_grid)).
 /// ROD-137/ROD-141: at 35-row terminal the grid must keep ≥2 visible rows.
 fn synopsisCap(remaining_h: u16) u16 {
-    const reserved: u16 = grid_spacer_rows + min_grid_rows;
+    const reserved: u16 = grid_caption_rows + min_grid_rows;
     if (remaining_h <= reserved) return 1;
     return remaining_h - reserved;
 }
@@ -428,34 +429,37 @@ fn drawHeader(self: *App, win: vaxis.Window, w: u16, h: u16, info: DetailRenderI
         row = drawMetaRail(self, win, w, h, fields, row);
     } else if (row < h) {
         row = drawMetaLine(self, win, w, fields, row);
-        // ROD-348/356: Provider/Pinned are rail_only; this row is their compact surface.
-        if (row < h) row = drawProviderLine(self, win, fields, row);
     }
     return row;
 }
 
-/// Compact provider row under the meta line (ROD-348/356): same field entries as
-/// the rail (no recompute). Only pin keeps a `pin ` marker. No row without Provider.
-fn drawProviderLine(self: *App, win: vaxis.Window, fields: []const App.MetaField, start_row: u16) u16 {
+/// Provider caption (ROD-397): registry names with the serving ▸ marker · pin ·
+/// dim [v]. wrap=.none clips the tail, so print order is priority order: [v] sheds
+/// first (it is in the help bar too), then pin, then the names.
+fn drawProviderCaption(self: *App, win: vaxis.Window, fields: []const App.MetaField, row: u16) void {
     var provider: ?App.MetaField = null;
     var pinned: ?App.MetaField = null;
     for (fields) |f| {
+        if (!f.caption) continue;
         if (std.mem.eql(u8, f.label, "Provider")) provider = f;
         if (std.mem.eql(u8, f.label, "Pinned")) pinned = f;
     }
-    const p = provider orelse return start_row;
-    const col = win.print(
+    const p = provider orelse return;
+    var col = win.print(
         &.{.{ .text = p.value, .style = self.s(if (p.dim) self.palette.fg3 else self.palette.fg2, .{}) }},
-        .{ .row_offset = start_row, .col_offset = 0, .wrap = .none },
+        .{ .row_offset = row, .col_offset = 0, .wrap = .none },
     ).col;
     if (pinned) |pf| {
-        _ = win.print(&.{
+        col = win.print(&.{
             .{ .text = " · ", .style = self.s(self.palette.fg3, .{}) },
             .{ .text = "pin ", .style = self.s(self.palette.fg2, .{}) },
             .{ .text = pf.value, .style = self.s(self.palette.fg2, .{}) },
-        }, .{ .row_offset = start_row, .col_offset = col, .wrap = .none });
+        }, .{ .row_offset = row, .col_offset = col, .wrap = .none }).col;
     }
-    return start_row + 1;
+    _ = win.print(
+        &.{.{ .text = " · [v]", .style = self.s(self.palette.fg3, .{}) }},
+        .{ .row_offset = row, .col_offset = col, .wrap = .none },
+    );
 }
 
 /// Compact meta line (ROD-260): values joined by ` · `, one row. Cursor by print
@@ -465,7 +469,7 @@ fn drawMetaLine(self: *App, win: vaxis.Window, w: u16, fields: []const App.MetaF
     // `printed` drives the separator so rail_only (Rank, ROD-261) leaves no orphan ` · `.
     var printed: usize = 0;
     for (fields) |f| {
-        if (f.rail_only) continue;
+        if (f.rail_only or f.caption) continue;
         if (col >= w) break;
         if (printed > 0) {
             col = win.print(
@@ -492,6 +496,7 @@ fn drawMetaRail(self: *App, win: vaxis.Window, w: u16, h: u16, fields: []const A
     const value_x: u16 = label_w + 2;
     var row = start_row;
     for (fields) |f| {
+        if (f.caption) continue;
         if (row >= h) break;
         // Clip label to gutter so over-length labels never bleed into values (ROD-260).
         putClipped(win, row, 0, @min(w, label_w), f.label, self.s(self.palette.fg3, .{}));
@@ -548,10 +553,18 @@ fn drawSynopsis(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, st
     return row;
 }
 
-/// Spacer row, then episode grid filling the rest of `win` below `start_row`.
-fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16) void {
-    var row = start_row;
-    if (row < h) row += 1;
+/// First grid-body row below the caption zone (ROD-397): reserves grid_caption_rows
+/// (blank buffer + caption), clamped to the pane, so grid height never depends on
+/// whether the caption painted a provider. Keeps the ROD-137 floor.
+fn gridBodyRow(start_row: u16, h: u16) u16 {
+    return if (start_row < h) @min(h, start_row + grid_caption_rows) else start_row;
+}
+
+/// Blank buffer, the provider caption, then the episode grid below (ROD-397).
+fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16, fields: []const App.MetaField) void {
+    // Buffer at start_row keeps the caption off the synopsis; caption on the next row.
+    if (start_row + 1 < h) drawProviderCaption(self, win, fields, start_row + 1);
+    const row = gridBodyRow(start_row, h);
     if (row >= h) return;
     const grid_h: u16 = h - row;
     const grid_win = win.child(.{ .x_off = 0, .y_off = row, .width = w, .height = grid_h });
@@ -588,20 +601,20 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
         // Right column is dedicated: no synopsis cap. Dropping the grid leaves empty
         // bottom rows; no relayout (unlike single-column reclaim).
         const rrow = drawSynopsis(self, right_win, right_w, h, info.anime, 0);
-        if (show_grid) drawGrid(self, right_win, right_w, h, rrow);
+        if (show_grid) drawGrid(self, right_win, right_w, h, rrow, self.detailMetaFields());
         return;
     }
 
     // Single-column (ROD-137): coverHeightCap so cover can't starve the grid when
     // no pixel geometry returns the full 28-row aesthetic; synopsisCap leaves ≥2
-    // grid rows. Worst case 35-row terminal: cover=19, synopsis=2, grid=2 (invariant test).
+    // grid rows. Worst case 35-row terminal: cover=18, synopsis=2, grid=2 (invariant test).
     var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
     // Compact meta (no room to bloom) (ROD-260).
     row = drawHeader(self, win, w, h, info, row, false);
     if (show_grid) {
         const cap = synopsisCap(if (h > row) h - row else 0);
         row = drawSynopsisLimited(self, win, w, h, info.anime, row, cap);
-        drawGrid(self, win, w, h, row);
+        drawGrid(self, win, w, h, row, self.detailMetaFields());
     } else {
         // Preview: no grid reservation; synopsis takes remaining height (ROD-222).
         _ = drawSynopsis(self, win, w, h, info.anime, row);
@@ -863,9 +876,9 @@ test "coverWidthFor: tiers off the pane width, capped at 20 (ROD-170 §3.3)" {
 test "synopsisCap: reserves spacer + min grid rows" {
     const t = std.testing;
 
-    try t.expectEqual(@as(u16, 1), synopsisCap(3)); // exactly reservation → floor 1
-    try t.expectEqual(@as(u16, 5), synopsisCap(8));
-    try t.expectEqual(@as(u16, 12), synopsisCap(15));
+    try t.expectEqual(@as(u16, 1), synopsisCap(4)); // exactly reservation → floor 1
+    try t.expectEqual(@as(u16, 4), synopsisCap(8));
+    try t.expectEqual(@as(u16, 11), synopsisCap(15));
     try t.expectEqual(@as(u16, 1), synopsisCap(0));
     try t.expectEqual(@as(u16, 1), synopsisCap(1));
     try t.expectEqual(@as(u16, 1), synopsisCap(2));
@@ -874,14 +887,32 @@ test "synopsisCap: reserves spacer + min grid rows" {
 test "coverHeightCap: bounds the cover to protect the grid (ROD-137)" {
     const t = std.testing;
 
-    // 35-row terminal → pane h=32: cover = h - cover_reserve(13) = 19.
-    try t.expectEqual(@as(u16, 19), coverHeightCap(32));
+    // 35-row terminal → pane h=32: cover = h - cover_reserve(14) = 18.
+    try t.expectEqual(@as(u16, 18), coverHeightCap(32));
     // Cap grows; drawCover @min with aesthetic 28/20 still wins at draw time.
-    try t.expectEqual(@as(u16, 27), coverHeightCap(40));
+    try t.expectEqual(@as(u16, 26), coverHeightCap(40));
     try t.expectEqual(@as(u16, 0), coverHeightCap(cover_reserve));
     try t.expectEqual(@as(u16, 0), coverHeightCap(10));
     try t.expectEqual(@as(u16, 0), coverHeightCap(0));
     try t.expectEqual(@as(u16, 1), coverHeightCap(cover_reserve + 1));
+}
+
+test "ROD-397: gridBodyRow reserves the caption zone, provider-independent" {
+    const t = std.testing;
+    // The caption zone (blank buffer + provider caption) is a constant reservation
+    // above the grid; gridBodyRow takes no fields, so provider presence can't move
+    // the grid. Reserves grid_caption_rows when they fit, clamped to the pane.
+    try t.expectEqual(@as(u16, 2), grid_caption_rows);
+
+    try t.expectEqual(@as(u16, 7), gridBodyRow(5, 32));
+    try t.expectEqual(@as(u16, 2), gridBodyRow(0, 2));
+    try t.expectEqual(@as(u16, 32), gridBodyRow(31, 32));
+    try t.expectEqual(@as(u16, 32), gridBodyRow(32, 32));
+    try t.expectEqual(@as(u16, 33), gridBodyRow(33, 32));
+
+    // Never returns below start_row (the caller's grid_h math can't underflow).
+    var start: u16 = 0;
+    while (start < 40) : (start += 1) try t.expect(gridBodyRow(start, 32) >= start);
 }
 
 /// No-pixel-geometry single-column budget (coverSlotHeight returns full cap).
@@ -895,17 +926,16 @@ fn worstCaseGridRows(h: u16) u16 {
     const remaining = h - after_header;
     const synopsis = @min(synopsisCap(remaining), remaining);
     const after_synopsis = after_header + synopsis;
-    const after_spacer = @min(h, after_synopsis + grid_spacer_rows);
+    const after_spacer = @min(h, after_synopsis + grid_caption_rows);
     return h - after_spacer;
 }
 
 test "ROD-137 invariant: worst-case single-column keeps >= min_grid_rows across heights" {
     const t = std.testing;
-    // Sweep pins the budget: shrink any reserve and some height fails. h ≥ 11
-    // hosts header + synopsis + min_grid_rows; upper bound past aesthetic cover
-    // cap (28) exercises synopsis-absorbs-slack. Includes cover-drop (h ≤ 18)
-    // and the h≈19 cliff.
-    var h: u16 = 11;
+    // Sweep pins the budget: shrink any reserve and some height fails. h ≥ 12
+    // hosts header + synopsis + the caption zone + min_grid_rows; upper bound past
+    // aesthetic cover cap (28) exercises synopsis-absorbs-slack.
+    var h: u16 = 12;
     while (h <= 60) : (h += 1) {
         try t.expect(worstCaseGridRows(h) >= min_grid_rows);
     }
@@ -913,9 +943,9 @@ test "ROD-137 invariant: worst-case single-column keeps >= min_grid_rows across 
 
 test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane h=32)" {
     const t = std.testing;
-    // cover 19 + spacer, 7-row header, 2-line synopsis, grid spacer, 2 grid rows.
+    // cover 18 + spacer, 7-row header, 2-line synopsis, caption zone (2), 2 grid rows.
     const h: u16 = 32;
-    try t.expectEqual(@as(u16, 19), coverHeightCap(h));
+    try t.expectEqual(@as(u16, 18), coverHeightCap(h));
     try t.expectEqual(min_grid_rows, worstCaseGridRows(h));
     const after_header = (coverHeightCap(h) + cover_spacer_rows) + max_header_rows;
     try t.expectEqual(min_synopsis_rows, synopsisCap(h - after_header));

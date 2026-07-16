@@ -2873,7 +2873,7 @@ test "detail meta fields degrade episodes to a dim '?' for an unenriched show (R
     app.search.results.deinit(std.testing.allocator);
 }
 
-test "Provider/Pinned append at the tail, rail-only, full base intact (ROD-348/356)" {
+test "Provider/Pinned append at the tail, caption-only, full base intact (ROD-348/356/397)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
@@ -2900,21 +2900,21 @@ test "Provider/Pinned append at the tail, rail-only, full base intact (ROD-348/3
         .rank_year = 2016,
     });
 
-    // The §5.3a base order is untouched; Provider then Pinned trail it,
-    // rail-only (the compact form carries them on the dedicated provider row
-    // instead, never as meta-line segments: Rod's call, DESIGN.md §8).
+    // Base §5.3a order untouched; Provider then Pinned trail it. Rank rail-only,
+    // Provider/Pinned caption-only (ROD-397).
     const fields = app.detailMetaFields();
     const want = [_][]const u8{ "Episodes", "Format", "Source", "Duration", "Studios", "Rank", "Provider", "Pinned" };
     try testing.expectEqual(want.len, fields.len);
     for (want, fields) |label, f| try testing.expectEqualStrings(label, f.label);
-    for (fields[0..5]) |f| try testing.expect(!f.rail_only);
-    for (fields[5..8]) |f| try testing.expect(f.rail_only);
+    for (fields[0..5]) |f| try testing.expect(!f.rail_only and !f.caption);
+    try testing.expect(fields[5].rail_only and !fields[5].caption);
+    for (fields[6..8]) |f| try testing.expect(f.caption and !f.rail_only);
 
     for (app.search.results.items) |r| freeOwnedAnime(std.testing.allocator, r);
     app.search.results.deinit(std.testing.allocator);
 }
 
-test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-348/356)" {
+test "Provider caption field: markers, serving, dim, and shed order vs Pinned (ROD-348/356/397)" {
     var app: App = .{};
     app.gpa = std.testing.allocator;
     app.active_view = .browse;
@@ -2932,7 +2932,7 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
         try testing.expectEqualStrings("Provider", fields[1].label);
         try testing.expectEqualStrings("?senshi ?megaplay", fields[1].value);
         try testing.expect(fields[1].dim);
-        try testing.expect(fields[1].rail_only); // meta line never carries it; the provider row does
+        try testing.expect(fields[1].caption);
     }
 
     // Bound + fresh negative: real information, full-strength, registry order.
@@ -2962,11 +2962,32 @@ test "Provider rail field: markers, serving, dim, and shed order vs Pinned (ROD-
         try testing.expectEqual(@as(usize, 3), fields.len);
         try testing.expectEqualStrings("Provider", fields[1].label);
         try testing.expectEqualStrings("Pinned", fields[2].label);
-        try testing.expect(fields[2].rail_only);
+        try testing.expect(fields[2].caption);
     }
 
     // The explicit-record form (History preview) never carries either field.
     try testing.expectEqual(@as(usize, 1), app.detailMetaFieldsFor(null).len);
+}
+
+test "Provider caption: the serving provider leads regardless of registry order (ROD-397)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
+    app.show_avail_aid = 901;
+    app.show_avail[0] = .bound;
+    app.show_avail[1] = .bound;
+
+    // Serving a provider that is NOT first in registry order: it must lead so
+    // wrap=.none tail-clipping can never drop the serving marker+name (the token the
+    // ticket says never drops). Registry order is senshi, megaplay.
+    app.episodes.for_source = "megaplay";
+    try testing.expectEqualStrings("▸megaplay +senshi", app.detailMetaFields()[1].value);
+
+    // Serving the first registry provider leaves the order unchanged.
+    app.episodes.for_source = "senshi";
+    try testing.expectEqualStrings("▸senshi +megaplay", app.detailMetaFields()[1].value);
 }
 
 test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
