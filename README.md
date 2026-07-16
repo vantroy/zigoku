@@ -151,20 +151,18 @@ authenticity, since the checksums ride the same channel as the release.
 
 ### AUR (Arch Linux)
 
-`paru -S zigoku` (or `yay`) is the goal, but AUR new-account registration has
-been closed since mid-June 2026, so the package isn't on the registry yet. The
-[`PKGBUILD`](packaging/aur/zigoku/PKGBUILD) is done and tested, though — build it
-straight from the repo in the meantime:
-
 ```sh
-git clone https://github.com/vantroy/zigoku.git
-cd zigoku/packaging/aur/zigoku
-makepkg -si          # compiles the release with your system Zig, then installs
+paru -S zigoku       # or: yay -S zigoku
 ```
 
-It's a from-source package: it links your system `sqlite` and pulls `mpv` at
-runtime. The moment registration reopens, this lands on the AUR and the one-liner
-above becomes `paru -S zigoku`.
+A from-source package: it compiles the tagged release with your system Zig,
+links your system `sqlite`, and shells out to `mpv` at runtime. Prefer to read
+the [`PKGBUILD`](packaging/aur/zigoku/PKGBUILD) first, or build without a helper?
+
+```sh
+git clone https://aur.archlinux.org/zigoku.git
+cd zigoku && makepkg -si
+```
 
 ### macOS: Homebrew
 
@@ -323,7 +321,7 @@ A record of the journey — `ROD-NN` issue IDs in commit messages map to each mi
 | **M7** | Distribution & hardening: error/logging pass ✅, cross-platform paths ✅, installer & release build ✅ | ✅ done |
 | **M8** | Nice-to-haves: quality selector ✅, wide-terminal history layout ✅, detail/episode caching ✅, post-playback state sync ✅ | ✅ done |
 | **M9** | Polish — *the watchlist Odyssey*: watch-state machine + grouped history ✅, add-to-watchlist from browse ✅, progress recompute + single-level undo ✅, episode resume/watched chips ✅, richer detail metadata as kanji chips ✅, History↔Browse two-pane unification ✅, selection & active-pane focus hierarchy ✅, in-session refresh after playback ✅, four god-file carvings + tick/draw split ✅, DESIGN.md reconciliation ✅ | ✅ done |
-| **M10** | Release: tag-driven builds + GitHub Releases ✅, Homebrew ✅, macOS CI ✅, README badges & media ✅ — AUR pending (see [Install](#install)) | ✅ mostly done |
+| **M10** | Release: tag-driven builds + GitHub Releases ✅, Homebrew ✅, AUR ✅, macOS CI ✅, README badges & media ✅ | ✅ done |
 
 ## License
 
