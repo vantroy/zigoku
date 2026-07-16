@@ -2192,7 +2192,7 @@ pub const App = struct {
     }
 
     /// One-shot last_watched open after initial history load (ROD-229). Failed grid demotes.
-    fn maybeResumeLanding(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
+    pub fn maybeResumeLanding(self: *App, loop: *Loop, io: std.Io, registry: Registry) void {
         if (self.resume_landing_done) return;
         self.resume_landing_done = true;
         if (self.config.landingEnum() != .last_watched) return;
@@ -2209,8 +2209,10 @@ pub const App = struct {
         } else {
             resolve.openHistoryZoom(self, loop, io, registry, rec);
         }
-        // Arm demote only if async; cache hit already has the grid.
-        self.resume_landing_pending = self.episodes.loading;
+        // Arm demote only if async; cache hit already has the grid. A stale-preference
+        // Tier-C force (ROD-398) fetches via play_resolving, not episodes.loading, so
+        // the demote contract must key on either or an unservable resume strands.
+        self.resume_landing_pending = self.episodes.loading or self.resolve.play_resolving;
     }
 
     /// Load-more when cursor within ~2 card-rows of end (ROD-239).

@@ -6801,6 +6801,51 @@ test "ROD-398: re-routing carries progress from the old binding via the sibling 
     app.episodes.deinit(app.gpa); // frees the primed LRU
 }
 
+test "ROD-398: auto-resume onto a stale Tier-C show still arms the demote contract (ROD-229)" {
+    var alpha = RecordingProvider{ .id = "alpha" }; // search-only; the force falls to Tier C
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // No mal_id → alpha's Tier A misses, so the stale force reaches Tier C (a search).
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    app.config.landing = "last_watched"; // arm the one-shot resume open
+    defer resolve.clearFallback(&app);
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900, .last_watched_at = 5000, .history_visible = true },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    app.maybeResumeLanding(&loop, io, registry);
+
+    // The resume open forced Tier C (play_resolving, not episodes.loading). The demote
+    // contract must still be armed, else a search miss strands the user (ROD-398 H1).
+    try testing.expect(app.resolve.play_resolving);
+    try testing.expect(!app.episodes.loading);
+    try testing.expect(app.resume_landing_pending);
+
+    app.resolve.play_drain.drain();
+    try testing.expect(alpha.search_hit.load(.acquire)); // Tier C searched alpha
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
 test "ROD-343: browse open dispatches the fetch to the provider the verdict bound" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta" };
