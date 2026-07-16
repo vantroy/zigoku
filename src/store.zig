@@ -28,7 +28,7 @@ pub const Error = error{ Open, Exec, Prepare, Step, Bind, OutOfMemory, SchemaToo
 
 /// Schema version this build expects. Bump + add `MIGRATION_Vn` + migrate branch;
 /// never ALTER-and-ignore.
-const SCHEMA_VERSION: c_int = 17;
+const SCHEMA_VERSION: c_int = 18;
 
 /// SQLITE_BUSY wait (ms) set in `open` (ROD-287). Writer-vs-writer only (WAL lets
 /// readers through). Short: TUI writes on the render thread; 250ms caps a stall while
@@ -384,6 +384,16 @@ const MIGRATION_V17 =
     \\DELETE FROM anime WHERE source = 'anipub';
     \\UPDATE provider_pins SET provider = 'megaplay' WHERE provider = 'anipub';
     \\DELETE FROM provider_absences WHERE provider = 'anipub';
+;
+
+// ROD-398: per-canonical record of the preferred_provider a show last settled
+// under. Absence or a mismatch against the live preference = stale (re-route once).
+// Own table so enrichment upsert cannot touch it (V14/V15/V16 invariant).
+const MIGRATION_V18 =
+    \\CREATE TABLE provider_routes (
+    \\    canonical_id  INTEGER PRIMARY KEY REFERENCES canonical_anime(anilist_id),
+    \\    resolved_pref TEXT NOT NULL
+    \\);
 ;
 
 // ── Records ─────────────────────────────────────────────────────────────────
@@ -1297,6 +1307,28 @@ pub const Store = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
     }
 
+    /// ROD-398: the global preferred_provider a canonical last settled under, or
+    /// null (never stale-resolved).
+    pub fn getRouteResolvedPref(self: *Store, arena: Allocator, canonical_id: i64) Error!?[]const u8 {
+        const stmt = try self.prepare("SELECT resolved_pref FROM provider_routes WHERE canonical_id = ?;");
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        return try dupeText(arena, stmt, 0);
+    }
+
+    /// ROD-398: stamp the preference this canonical settled under (idempotent upsert).
+    pub fn setRouteResolvedPref(self: *Store, canonical_id: i64, pref: []const u8) Error!void {
+        const stmt = try self.prepare(
+            \\INSERT INTO provider_routes (canonical_id, resolved_pref) VALUES (?, ?)
+            \\ON CONFLICT(canonical_id) DO UPDATE SET resolved_pref = excluded.resolved_pref
+        );
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindOptI64(stmt, 1, canonical_id);
+        try bindText(stmt, 2, pref);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.Step;
+    }
+
     // ── ROD-347: provider-absence negative cache ─────────────────────────────
 
     /// TTL for "not stocked" rows. Stale reads as unchecked so resolve re-probes.
@@ -1910,6 +1942,10 @@ pub const Store = struct {
         if (v < 17) {
             try self.exec(MIGRATION_V17);
             v = 17;
+        }
+        if (v < 18) {
+            try self.exec(MIGRATION_V18);
+            v = 18;
         }
         // Invariant: the ladder must have reached the target. Under the old code a
         // forgotten `if (v < N)` branch (a dev bumps SCHEMA_VERSION but skips the step)
@@ -3567,6 +3603,37 @@ test "provider pin: set, overwrite, clear, and per-canonical isolation (ROD-345)
     try testing.expect((try s.getProviderPin(arena, 901)) == null);
     try s.setProviderPin(901, null);
     try testing.expect((try s.getProviderPin(arena, 901)) == null);
+}
+
+test "provider_routes: settle-marker round-trips, per-canonical, empty is a real value (ROD-398)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // A fresh DB replays the ladder through the new version.
+    try testing.expectEqual(SCHEMA_VERSION, try s.userVersion());
+
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (901, 'Frieren');");
+    try s.exec("INSERT INTO canonical_anime (anilist_id, title) VALUES (902, 'Apothecary');");
+
+    // No record = never stale-resolved.
+    try testing.expect((try s.getRouteResolvedPref(arena, 901)) == null);
+
+    try s.setRouteResolvedPref(901, "senshi");
+    try testing.expectEqualStrings("senshi", (try s.getRouteResolvedPref(arena, 901)).?);
+    // Per canonical: the sibling is independent.
+    try testing.expect((try s.getRouteResolvedPref(arena, 902)) == null);
+
+    // Re-stamp overwrites (a flip settles the show under the new preference).
+    try s.setRouteResolvedPref(901, "megaplay");
+    try testing.expectEqualStrings("megaplay", (try s.getRouteResolvedPref(arena, 901)).?);
+
+    // "" round-trips as a value, not NULL. The API is agnostic; the running app
+    // never writes "" (routePreferred bails on an empty preference before stamping).
+    try s.setRouteResolvedPref(901, "");
+    try testing.expectEqualStrings("", (try s.getRouteResolvedPref(arena, 901)).?);
 }
 
 test "provider absence: mark, TTL, refresh, isolation; bindCanonical clears it (ROD-347)" {

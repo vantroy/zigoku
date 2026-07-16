@@ -6478,6 +6478,329 @@ test "ROD-343: a history row fetches episodes on its owning provider, not the de
     app.episodes.freeResults(app.gpa);
 }
 
+test "ROD-398: an unpinned History open re-routes off a stale binding to the preferred provider" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, store_mod.Store.nowSecs(), arena));
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha"; // prefer alpha over the beta-serving row
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // The open fetched alpha (the preference), not the stored beta binding, and
+    // stamped the settle-marker so subsequent opens are not stale.
+    try testing.expect(alpha.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+    try testing.expectEqualStrings("alpha", (try st.getRouteResolvedPref(arena, 900)).?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: a pinned show ignores the global preference and never stale-resolves" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, store_mod.Store.nowSecs(), arena));
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+    try st.setProviderPin(900, "beta"); // explicit pin wins over the global
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // Opened the pinned beta, not the preferred alpha; a pinned show writes no marker.
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expect((try st.getRouteResolvedPref(arena, 900)) == null);
+
+    if (app.show_pin) |p| app.gpa.free(p); // refreshShowPin duped the pin on open
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: a show already settled under the preference opens it directly, not the stored binding" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, store_mod.Store.nowSecs(), arena));
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+    try st.setRouteResolvedPref(900, "alpha"); // already settled under alpha (non-stale)
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // Non-stale: opens alpha's binding directly (deterministic), still off the beta row.
+    try testing.expect(alpha.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: a Browse open of an already-bound canonical also honors the preference" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "154587", .name = "Frieren", .anilist_id = 154587 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 154587, true, store_mod.Store.nowSecs(), arena));
+    try testing.expect(try st.bindCanonical("beta", "b1", 154587, true, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.term_cols = 120;
+    try app.search.results.ensureTotalCapacity(app.gpa, 1);
+    app.search.results.appendAssumeCapacity(.{
+        .id = try app.gpa.dupe(u8, "154587"), // canonical-keyed: id == stringified anilist_id
+        .name = try app.gpa.dupe(u8, "Frieren"),
+        .anilist_id = 154587,
+    });
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv('l', .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // The Browse open re-routed to alpha too (the bug is symmetric with History).
+    try testing.expect(alpha.hit.load(.acquire));
+    try testing.expect(!beta.hit.load(.acquire));
+    try testing.expectEqualStrings("alpha", (try st.getRouteResolvedPref(arena, 154587)).?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    for (app.search.results.items) |r| freeOwnedAnime(app.gpa, r);
+    app.search.results.deinit(app.gpa);
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: a settled preference whose provider never bound falls back without re-searching (no loop)" {
+    var alpha = RecordingProvider{ .id = "alpha" }; // search-only; must NOT be searched here
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+    // Already settled under alpha, but alpha never actually bound (a prior force
+    // missed and stamped the marker at decision time).
+    try st.setRouteResolvedPref(900, "alpha");
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // Non-stale + alpha unbound: opens the existing beta binding and does NOT
+    // re-force (no alpha search, no alpha fetch). The marker is the loop guard.
+    try testing.expect(beta.hit.load(.acquire));
+    try testing.expect(!alpha.hit.load(.acquire));
+    try testing.expect(!alpha.search_hit.load(.acquire));
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: a stale open forces a search-only preferred provider (Tier C, full symmetry)" {
+    var alpha = RecordingProvider{ .id = "alpha" }; // tier_a = false → reachable only by search
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    // No mal_id → alpha's canonicalKey returns null → the force falls to Tier C.
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    defer resolve.clearFallback(&app);
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.resolve.play_drain.drain();
+
+    // The force reached Tier C and searched alpha (not beta), and settled the marker.
+    try testing.expect(alpha.search_hit.load(.acquire));
+    try testing.expectEqualStrings("alpha", (try st.getRouteResolvedPref(arena, 900)).?);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+}
+
+test "ROD-398: re-routing carries progress from the old binding via the sibling union" {
+    var alpha = RecordingProvider{ .id = "alpha" };
+    var beta = RecordingProvider{ .id = "beta" };
+    const slots = [_]SourceProvider{ alpha.provider(), beta.provider() };
+    const registry: source_mod.Registry = .{ .providers = &slots };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var st = try store_mod.Store.openMemory();
+    defer st.close();
+    try st.upsertCanonicalOnly(.{ .id = "900", .name = "Frieren", .anilist_id = 900 }, true, store_mod.Store.nowSecs(), arena);
+    try testing.expect(try st.bindCanonical("alpha", "a1", 900, true, store_mod.Store.nowSecs(), arena));
+    try testing.expect(try st.bindCanonical("beta", "b1", 900, true, store_mod.Store.nowSecs(), arena));
+    // Watched five episodes on the beta binding; alpha is fresh at zero.
+    var ep_buf: [2]u8 = undefined;
+    for (1..6) |n| {
+        const label = try std.fmt.bufPrint(&ep_buf, "{d}", .{n});
+        try st.saveProgress("beta", "b1", .sub, label, 950, 1000, 5000 + @as(i64, @intCast(n)));
+    }
+
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.store = &st;
+    app.config.preferred_provider = "alpha";
+    var recs = [_]AnimeRecord{
+        .{ .source = "beta", .source_id = "b1", .title = "Frieren", .anilist_id = 900, .canonical_id = 900 },
+    };
+    app.setHistory(&recs);
+    app.term_cols = 120;
+    app.active_view = .history;
+    app.active_pane = .list;
+    app.list_cursor = 0;
+
+    // Prime alpha's grid so the re-routed open lands synchronously (landing raises progress).
+    const cached = try workers.dupEpisodesOwned(app.gpa, &.{
+        .{ .raw = "1" }, .{ .raw = "2" }, .{ .raw = "3" }, .{ .raw = "4" }, .{ .raw = "5" },
+    });
+    try app.episodes.lru.putOwned(app.gpa, "alpha\x00a1\x00sub", .{ .episodes = cached, .expires_at = std.math.maxInt(i64) });
+
+    var loop = initTestLoop();
+    const io = std.testing.io;
+    try app.tick(keyEv(vaxis.Key.enter, .{}), &loop, io, registry);
+    app.episode_drain.drain();
+
+    // The re-route did not lose watch history: alpha's binding inherits beta's five
+    // via unionHighWater on the landing.
+    try testing.expectEqual(@as(i64, 5), (try st.getAnime(arena, "alpha", "a1")).?.progress);
+
+    while (loop.queue.tryPop() catch null) |ev| freeTestEvent(app.gpa, ev);
+    app.cover.joinThread();
+    app.episodes.freeResults(app.gpa);
+    app.episodes.deinit(app.gpa); // frees the primed LRU
+}
+
 test "ROD-343: browse open dispatches the fetch to the provider the verdict bound" {
     var alpha = RecordingProvider{ .id = "alpha" };
     var beta = RecordingProvider{ .id = "beta" };
