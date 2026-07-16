@@ -213,8 +213,9 @@ const min_cover_rows: u16 = 6;
 
 /// Blank row `drawCover` folds into its return after the poster.
 const cover_spacer_rows: u16 = 1;
-/// Caption row above the episode grid (provider surface, ROD-397). Always reserved.
-const grid_caption_rows: u16 = 1;
+/// Caption zone above the episode grid (ROD-397): a blank buffer row, then the
+/// provider-surface caption. Reserved whole so the grid geometry stays fixed.
+const grid_caption_rows: u16 = 2;
 
 /// Single-column reservation below the cover (ROD-137): trailing cover spacer +
 /// max header + min synopsis + grid caption + min grid. Single source for
@@ -552,16 +553,17 @@ fn drawSynopsis(self: *App, win: vaxis.Window, w: u16, h: u16, anime: ?Anime, st
     return row;
 }
 
-/// First grid-body row below the caption (ROD-397): reserves exactly
-/// grid_caption_rows when it fits, so grid height never depends on whether the
-/// caption painted a provider. Keeps the ROD-137 floor across the relocation.
+/// First grid-body row below the caption zone (ROD-397): reserves grid_caption_rows
+/// (blank buffer + caption), clamped to the pane, so grid height never depends on
+/// whether the caption painted a provider. Keeps the ROD-137 floor.
 fn gridBodyRow(start_row: u16, h: u16) u16 {
-    return if (start_row < h) start_row + grid_caption_rows else start_row;
+    return if (start_row < h) @min(h, start_row + grid_caption_rows) else start_row;
 }
 
-/// Provider caption, then the episode grid fills the rest below it (ROD-397).
+/// Blank buffer, the provider caption, then the episode grid below (ROD-397).
 fn drawGrid(self: *App, win: vaxis.Window, w: u16, h: u16, start_row: u16, fields: []const App.MetaField) void {
-    if (start_row < h) drawProviderCaption(self, win, fields, start_row);
+    // Buffer at start_row keeps the caption off the synopsis; caption on the next row.
+    if (start_row + 1 < h) drawProviderCaption(self, win, fields, start_row + 1);
     const row = gridBodyRow(start_row, h);
     if (row >= h) return;
     const grid_h: u16 = h - row;
@@ -605,7 +607,7 @@ pub fn drawDetailPane(self: *App, vx: *vaxis.Vaxis, writer: *std.Io.Writer, win:
 
     // Single-column (ROD-137): coverHeightCap so cover can't starve the grid when
     // no pixel geometry returns the full 28-row aesthetic; synopsisCap leaves ≥2
-    // grid rows. Worst case 35-row terminal: cover=19, synopsis=2, grid=2 (invariant test).
+    // grid rows. Worst case 35-row terminal: cover=18, synopsis=2, grid=2 (invariant test).
     var row: u16 = drawCover(self, vx, writer, win, info.anime, w, coverHeightCap(h));
     // Compact meta (no room to bloom) (ROD-260).
     row = drawHeader(self, win, w, h, info, row, false);
@@ -874,9 +876,9 @@ test "coverWidthFor: tiers off the pane width, capped at 20 (ROD-170 §3.3)" {
 test "synopsisCap: reserves spacer + min grid rows" {
     const t = std.testing;
 
-    try t.expectEqual(@as(u16, 1), synopsisCap(3)); // exactly reservation → floor 1
-    try t.expectEqual(@as(u16, 5), synopsisCap(8));
-    try t.expectEqual(@as(u16, 12), synopsisCap(15));
+    try t.expectEqual(@as(u16, 1), synopsisCap(4)); // exactly reservation → floor 1
+    try t.expectEqual(@as(u16, 4), synopsisCap(8));
+    try t.expectEqual(@as(u16, 11), synopsisCap(15));
     try t.expectEqual(@as(u16, 1), synopsisCap(0));
     try t.expectEqual(@as(u16, 1), synopsisCap(1));
     try t.expectEqual(@as(u16, 1), synopsisCap(2));
@@ -885,32 +887,32 @@ test "synopsisCap: reserves spacer + min grid rows" {
 test "coverHeightCap: bounds the cover to protect the grid (ROD-137)" {
     const t = std.testing;
 
-    // 35-row terminal → pane h=32: cover = h - cover_reserve(13) = 19.
-    try t.expectEqual(@as(u16, 19), coverHeightCap(32));
+    // 35-row terminal → pane h=32: cover = h - cover_reserve(14) = 18.
+    try t.expectEqual(@as(u16, 18), coverHeightCap(32));
     // Cap grows; drawCover @min with aesthetic 28/20 still wins at draw time.
-    try t.expectEqual(@as(u16, 27), coverHeightCap(40));
+    try t.expectEqual(@as(u16, 26), coverHeightCap(40));
     try t.expectEqual(@as(u16, 0), coverHeightCap(cover_reserve));
     try t.expectEqual(@as(u16, 0), coverHeightCap(10));
     try t.expectEqual(@as(u16, 0), coverHeightCap(0));
     try t.expectEqual(@as(u16, 1), coverHeightCap(cover_reserve + 1));
 }
 
-test "ROD-397: gridBodyRow reserves exactly the caption row, provider-independent" {
+test "ROD-397: gridBodyRow reserves the caption zone, provider-independent" {
     const t = std.testing;
-    // Exactly grid_caption_rows reserved when the row fits, 0 past the pane floor;
-    // gridBodyRow takes no fields, so provider presence can't move the grid.
-    try t.expectEqual(@as(u16, 1), grid_caption_rows);
+    // The caption zone (blank buffer + provider caption) is a constant reservation
+    // above the grid; gridBodyRow takes no fields, so provider presence can't move
+    // the grid. Reserves grid_caption_rows when they fit, clamped to the pane.
+    try t.expectEqual(@as(u16, 2), grid_caption_rows);
 
-    try t.expectEqual(@as(u16, 6), gridBodyRow(5, 32));
-    try t.expectEqual(@as(u16, 1), gridBodyRow(0, 2));
+    try t.expectEqual(@as(u16, 7), gridBodyRow(5, 32));
+    try t.expectEqual(@as(u16, 2), gridBodyRow(0, 2));
+    try t.expectEqual(@as(u16, 32), gridBodyRow(31, 32));
     try t.expectEqual(@as(u16, 32), gridBodyRow(32, 32));
     try t.expectEqual(@as(u16, 33), gridBodyRow(33, 32));
 
+    // Never returns below start_row (the caller's grid_h math can't underflow).
     var start: u16 = 0;
-    while (start < 40) : (start += 1) {
-        const reserved = gridBodyRow(start, 32) - start;
-        try t.expectEqual(@as(u16, if (start < 32) 1 else 0), reserved);
-    }
+    while (start < 40) : (start += 1) try t.expect(gridBodyRow(start, 32) >= start);
 }
 
 /// No-pixel-geometry single-column budget (coverSlotHeight returns full cap).
@@ -930,11 +932,10 @@ fn worstCaseGridRows(h: u16) u16 {
 
 test "ROD-137 invariant: worst-case single-column keeps >= min_grid_rows across heights" {
     const t = std.testing;
-    // Sweep pins the budget: shrink any reserve and some height fails. h ≥ 11
-    // hosts header + synopsis + min_grid_rows; upper bound past aesthetic cover
-    // cap (28) exercises synopsis-absorbs-slack. Includes cover-drop (h ≤ 18)
-    // and the h≈19 cliff.
-    var h: u16 = 11;
+    // Sweep pins the budget: shrink any reserve and some height fails. h ≥ 12
+    // hosts header + synopsis + the caption zone + min_grid_rows; upper bound past
+    // aesthetic cover cap (28) exercises synopsis-absorbs-slack.
+    var h: u16 = 12;
     while (h <= 60) : (h += 1) {
         try t.expect(worstCaseGridRows(h) >= min_grid_rows);
     }
@@ -942,9 +943,9 @@ test "ROD-137 invariant: worst-case single-column keeps >= min_grid_rows across 
 
 test "ROD-137 invariant: exact budget at the DoD geometry (35-row terminal, pane h=32)" {
     const t = std.testing;
-    // cover 19 + spacer, 7-row header, 2-line synopsis, grid spacer, 2 grid rows.
+    // cover 18 + spacer, 7-row header, 2-line synopsis, caption zone (2), 2 grid rows.
     const h: u16 = 32;
-    try t.expectEqual(@as(u16, 19), coverHeightCap(h));
+    try t.expectEqual(@as(u16, 18), coverHeightCap(h));
     try t.expectEqual(min_grid_rows, worstCaseGridRows(h));
     const after_header = (coverHeightCap(h) + cover_spacer_rows) + max_header_rows;
     try t.expectEqual(min_synopsis_rows, synopsisCap(h - after_header));
