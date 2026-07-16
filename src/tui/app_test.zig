@@ -2969,6 +2969,27 @@ test "Provider caption field: markers, serving, dim, and shed order vs Pinned (R
     try testing.expectEqual(@as(usize, 1), app.detailMetaFieldsFor(null).len);
 }
 
+test "Provider caption: the serving provider leads regardless of registry order (ROD-397)" {
+    var app: App = .{};
+    app.gpa = std.testing.allocator;
+    app.active_view = .browse;
+    app.active_pane = .list;
+    app.settings.provider_names = &.{ "senshi", "megaplay" };
+    app.show_avail_aid = 901;
+    app.show_avail[0] = .bound;
+    app.show_avail[1] = .bound;
+
+    // Serving a provider that is NOT first in registry order: it must lead so
+    // wrap=.none tail-clipping can never drop the serving marker+name (the token the
+    // ticket says never drops). Registry order is senshi, megaplay.
+    app.episodes.for_source = "megaplay";
+    try testing.expectEqualStrings("▸megaplay +senshi", app.detailMetaFields()[1].value);
+
+    // Serving the first registry provider leaves the order unchanged.
+    app.episodes.for_source = "senshi";
+    try testing.expectEqualStrings("▸senshi +megaplay", app.detailMetaFields()[1].value);
+}
+
 test "Browse preview hides a stale episode grid carried over from History detail (ROD-222)" {
     // Repro: a focused History detail loads an episode grid; pressing B switches to
     // Browse and resets pane focus to .list, but leaves episodes.results loaded

@@ -217,11 +217,11 @@ const cover_spacer_rows: u16 = 1;
 const grid_caption_rows: u16 = 1;
 
 /// Single-column reservation below the cover (ROD-137): trailing cover spacer +
-/// max header + min synopsis + grid spacer + min grid. Single source for
+/// max header + min synopsis + grid caption + min grid. Single source for
 /// synopsisCap and the invariant test.
 const cover_reserve: u16 = cover_spacer_rows + max_header_rows + min_synopsis_rows + grid_caption_rows + min_grid_rows;
 
-/// Synopsis rows in single-column: max(1, remaining_h - (grid_spacer + min_grid)).
+/// Synopsis rows in single-column: max(1, remaining_h - (grid_caption + min_grid)).
 /// ROD-137/ROD-141: at 35-row terminal the grid must keep ≥2 visible rows.
 fn synopsisCap(remaining_h: u16) u16 {
     const reserved: u16 = grid_caption_rows + min_grid_rows;
