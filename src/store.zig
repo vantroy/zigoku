@@ -473,7 +473,14 @@ pub const AnimeRecord = struct {
             .status = a.status,
             .description = a.description,
             .score = if (a.score) |s| std.math.cast(i64, s) else null,
-            .total_episodes = if (a.total_episodes) |n| @intCast(n) else if (eps > 0) @intCast(eps) else null,
+            // Available count stands in for total only once settled; while airing it is
+            // aired-so-far and would pin a stale total (ROD-419).
+            .total_episodes = if (a.total_episodes) |n|
+                @intCast(n)
+            else if (eps > 0 and !domain.isStillAiring(a.status))
+                @intCast(eps)
+            else
+                null,
             .duration = if (a.duration) |d| @intCast(d) else null,
             .source_material = a.source_material,
             .rank = if (a.rank) |r| @intCast(r) else null,
@@ -614,7 +621,8 @@ pub const Store = struct {
             \\    status         = COALESCE(excluded.status, anime.status),
             \\    description    = COALESCE(excluded.description, anime.description),
             \\    score          = COALESCE(excluded.score, anime.score),
-            \\    total_episodes = COALESCE(excluded.total_episodes, anime.total_episodes),
+            \\    total_episodes = CASE WHEN ?40 THEN NULL
+            \\        ELSE COALESCE(excluded.total_episodes, anime.total_episodes) END,
             \\    season         = COALESCE(excluded.season, anime.season),
             \\    native_name    = COALESCE(excluded.native_name, anime.native_name),
             \\    kind           = COALESCE(excluded.kind, anime.kind),
@@ -691,8 +699,24 @@ pub const Store = struct {
         // preserves any existing link); set to anilist_id by upsertEnriched once the
         // canonical row exists, so the FK to canonical_anime(anilist_id) is satisfied.
         try bindOptI64(stmt, 39, a.canonical_id);
+        // ?40: clear a stale availability-snapshot total (ROD-419).
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 40, @intFromBool(clearsStaleTotal(a))));
 
         try self.stepDone(stmt);
+    }
+
+    /// ROD-419: an enrichment-stamped row (confirmed AniList answer) that carries no
+    /// total while the show is airing proves the stored total is an availability
+    /// snapshot, not the finale. The upsert must clear it; COALESCE would pin it forever
+    /// (AniList keeps `episodes` null until the finale count is known).
+    ///
+    /// Relies on the stamp_fresh full-fieldset contract (see upsertCanonicalOnly):
+    /// isStillAiring(null) defaults to airing, so a stamped partial row with a null
+    /// status would wipe a real total. Never stamp partial field sets.
+    fn clearsStaleTotal(a: AnimeRecord) bool {
+        return a.enrichment_fetched_at != null and
+            a.total_episodes == null and
+            domain.isStillAiring(a.status);
     }
 
     /// Persist enrichment on the canonical spine (ROD-312), id-bearing rows only.
@@ -719,7 +743,8 @@ pub const Store = struct {
             \\        WHEN canonical_anime.cover_url GLOB 'http://*' OR canonical_anime.cover_url GLOB 'https://*' THEN canonical_anime.cover_url
             \\        ELSE COALESCE(excluded.cover_url, canonical_anime.cover_url)
             \\    END,
-            \\    total_episodes = COALESCE(excluded.total_episodes, canonical_anime.total_episodes),
+            \\    total_episodes = CASE WHEN ?30 THEN NULL
+            \\        ELSE COALESCE(excluded.total_episodes, canonical_anime.total_episodes) END,
             \\    year           = COALESCE(excluded.year, canonical_anime.year),
             \\    status         = COALESCE(excluded.status, canonical_anime.status),
             \\    description    = COALESCE(excluded.description, canonical_anime.description),
@@ -789,6 +814,8 @@ pub const Store = struct {
         try bindOptText(stmt, 28, a.country);
         // ?29: real romaji present (title anti-downgrade CASE).
         try checkBind(stmt, c.sqlite3_bind_int64(stmt, 29, if (romaji != null) 1 else 0));
+        // ?30: clear a stale availability-snapshot total (ROD-419, see clearsStaleTotal).
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 30, @intFromBool(clearsStaleTotal(a))));
 
         try self.stepDone(stmt);
     }
@@ -897,7 +924,21 @@ pub const Store = struct {
             try self.upsertCanonical(rec, scratch);
             rec.canonical_id = rec.anilist_id;
         }
-        return self.upsertAnime(rec, now, scratch);
+        try self.upsertAnime(rec, now, scratch);
+        // ROD-419: the heal must reach every sibling binding, not just the serving
+        // row: loadHistory falls back per-column to anime-local when canonical is
+        // NULL, and any sibling can be the group's representative.
+        if (clearsStaleTotal(rec)) {
+            if (rec.canonical_id) |cid| try self.clearSiblingTotals(cid);
+        }
+    }
+
+    /// ROD-419 heal sweep across a canonical group's bindings.
+    fn clearSiblingTotals(self: *Store, canonical_id: i64) Error!void {
+        const stmt = try self.prepare("UPDATE anime SET total_episodes = NULL WHERE canonical_id = ?");
+        defer _ = c.sqlite3_finalize(stmt);
+        try checkBind(stmt, c.sqlite3_bind_int64(stmt, 1, canonical_id));
+        try self.stepDone(stmt);
     }
 
     /// Engaged shows, most-recently-watched then added. Text into arena.
@@ -2186,7 +2227,8 @@ test "upsertAnime + loadHistory round-trips" {
     var s = try Store.openMemory();
     defer s.close();
 
-    const a = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "abc", .name = "Frieren", .eps_sub = 28 }, .sub);
+    // Settled status: unknown-status availability no longer mints a total (ROD-419).
+    const a = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "abc", .name = "Frieren", .eps_sub = 28, .status = "FINISHED" }, .sub);
     try s.upsertAnime(a, 1000, arena);
 
     const rows = try s.loadHistory(arena);
@@ -4249,6 +4291,69 @@ test "upsertAnime cover_url: 'http'-prefixed non-URL garbage neither sticks nor 
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "https://s4.anilist.co/real.jpg" }, 1002, arena);
     try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "h", .title = "H", .cover_url = "HTTPFOO-GARBAGE" }, 1003, arena);
     try testing.expectEqualStrings("https://s4.anilist.co/real.jpg", (try s.getAnime(arena, T_SOURCE, "h")).?.cover_url.?);
+}
+
+test "fromDomain: available count stands in for total only once settled (ROD-419)" {
+    const airing = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "1", .name = "X", .eps_sub = 3, .status = "RELEASING" }, .sub);
+    try testing.expectEqual(@as(?i64, null), airing.total_episodes);
+    // Unknown status defaults to airing: never mint a total from availability.
+    const unknown = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "1", .name = "X", .eps_sub = 3 }, .sub);
+    try testing.expectEqual(@as(?i64, null), unknown.total_episodes);
+    const settled = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "1", .name = "X", .eps_sub = 12, .status = "FINISHED" }, .sub);
+    try testing.expectEqual(@as(?i64, 12), settled.total_episodes);
+    // A real metadata total passes through regardless of status.
+    const claimed = AnimeRecord.fromDomain(T_SOURCE, .{ .id = "1", .name = "X", .total_episodes = 12, .status = "RELEASING" }, .sub);
+    try testing.expectEqual(@as(?i64, 12), claimed.total_episodes);
+}
+
+test "upsertAnime: stamped airing answer with no total clears the snapshot, unstamped preserves (ROD-419)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Pre-419 row: added while 1 episode had aired, snapshot stored as total.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "cat", .title = "Cat", .total_episodes = 1, .status = "RELEASING" }, 1000, arena);
+
+    // Unstamped re-search with no total: COALESCE keeps the stored value.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "cat", .title = "Cat", .status = "RELEASING" }, 1001, arena);
+    try testing.expectEqual(@as(?i64, 1), (try s.getAnime(arena, T_SOURCE, "cat")).?.total_episodes);
+
+    // Stamped AniList answer, still airing, episodes unknown → snapshot cleared.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "cat", .title = "Cat", .status = "RELEASING", .enrichment_fetched_at = 2000 }, 2000, arena);
+    try testing.expectEqual(@as(?i64, null), (try s.getAnime(arena, T_SOURCE, "cat")).?.total_episodes);
+
+    // A stamped answer that knows the planned total keeps it while airing.
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "cat", .title = "Cat", .total_episodes = 12, .status = "RELEASING", .enrichment_fetched_at = 3000 }, 3000, arena);
+    try testing.expectEqual(@as(?i64, 12), (try s.getAnime(arena, T_SOURCE, "cat")).?.total_episodes);
+
+    // Stamped null total on a settled show never clears (finale count is real).
+    try s.upsertAnime(.{ .source = T_SOURCE, .source_id = "cat", .title = "Cat", .status = "FINISHED", .enrichment_fetched_at = 4000 }, 4000, arena);
+    try testing.expectEqual(@as(?i64, 12), (try s.getAnime(arena, T_SOURCE, "cat")).?.total_episodes);
+}
+
+test "upsertEnriched heals the canonical snapshot total on a stamped airing answer (ROD-419)" {
+    var arena_inst = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var s = try Store.openMemory();
+    defer s.close();
+
+    // Pre-419 state: canonical spine carries the availability snapshot as total,
+    // and a sibling binding holds its own stale local copy.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "9", .name = "Cat", .anilist_id = 9, .total_episodes = 1, .status = "RELEASING" }, .sub, true, false, 1000, arena);
+    try s.upsertAnime(.{ .source = "sib", .source_id = "s9", .title = "Cat", .anilist_id = 9, .canonical_id = 9, .total_episodes = 1, .status = "RELEASING" }, 1001, arena);
+
+    // Stamped AniList refresh (airing, episodes unknown): canonical, the serving
+    // row, AND the sibling binding all clear; loadHistory's per-column
+    // COALESCE(canonical, local) must read null whichever row represents the group.
+    try s.upsertEnriched(T_SOURCE, .{ .id = "9", .name = "Cat", .anilist_id = 9, .status = "RELEASING" }, .sub, true, true, 2000, arena);
+    const rows = try s.loadHistory(arena);
+    try testing.expectEqual(@as(usize, 1), rows.len);
+    try testing.expectEqual(@as(?i64, null), rows[0].total_episodes);
+    try testing.expectEqual(@as(?i64, null), (try s.getAnime(arena, "sib", "s9")).?.total_episodes);
+    try testing.expectEqual(@as(?i64, null), (try s.getAnime(arena, T_SOURCE, "9")).?.total_episodes);
 }
 
 test "MIGRATION_V12 re-keys an enriched allanime row onto senshi, leaves dark rows (ROD-304)" {
