@@ -709,6 +709,10 @@ pub const Store = struct {
     /// total while the show is airing proves the stored total is an availability
     /// snapshot, not the finale. The upsert must clear it; COALESCE would pin it forever
     /// (AniList keeps `episodes` null until the finale count is known).
+    ///
+    /// Relies on the stamp_fresh full-fieldset contract (see upsertCanonicalOnly):
+    /// isStillAiring(null) defaults to airing, so a stamped partial row with a null
+    /// status would wipe a real total. Never stamp partial field sets.
     fn clearsStaleTotal(a: AnimeRecord) bool {
         return a.enrichment_fetched_at != null and
             a.total_episodes == null and
