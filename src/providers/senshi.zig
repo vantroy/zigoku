@@ -136,6 +136,7 @@ pub const Senshi = struct {
         } else null;
 
         const total_eps: ?u32 = if (s.ani_episodes) |e| parseLeadingUint(u32, e) else null;
+        const status = mapStatus(s.ani_status);
 
         return .{
             // Stringified MAL id is the provider show handle; must round-trip into episodes/resolve.
@@ -151,12 +152,14 @@ pub const Senshi = struct {
             // Catalog has no sub/dub split; surface total as eps_sub so ranking/has(.sub) work.
             .eps_sub = total_eps orelse 0,
             .eps_dub = 0,
-            .total_episodes = total_eps,
+            // While airing the catalog count is aired-so-far, not the finale; claiming
+            // it as total pins a stale "N / N eps" in History (ROD-419).
+            .total_episodes = if (domain.isStillAiring(status)) null else total_eps,
             .duration = if (s.duration) |d| parseLeadingUint(u32, d) else null,
             .year = s.ani_year,
             .season = if (s.ani_season) |q| domain.Season.fromString(q) else null,
             .start_date = if (s.ani_year) |y| domain.Date{ .year = y } else null,
-            .status = mapStatus(s.ani_status),
+            .status = status,
             .description = s.ani_description,
             .genres = try splitCsv(arena, s.genres),
             .studios = try splitCsv(arena, s.studios),
@@ -601,6 +604,19 @@ test "parseEpisodes maps ep_id to numerically-sorted labels (ROD-301)" {
     try testing.expectEqualStrings("2", eps[1].raw);
     try testing.expectEqualStrings("3", eps[2].raw);
     try testing.expectEqualStrings("10", eps[3].raw);
+}
+
+test "mapAnime: airing catalog count is availability only, settled claims it as total (ROD-419)" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const airing = try Senshi.mapAnime(a, .{ .id = 1, .title = "Yani Neko", .ani_episodes = "3", .ani_status = "Currently Airing" });
+    try testing.expectEqual(@as(u32, 3), airing.eps_sub);
+    try testing.expectEqual(@as(?u32, null), airing.total_episodes);
+
+    const settled = try Senshi.mapAnime(a, .{ .id = 2, .title = "Done", .ani_episodes = "12", .ani_status = "Finished Airing" });
+    try testing.expectEqual(@as(?u32, 12), settled.total_episodes);
 }
 
 test "epLabel: integral drops the decimal, fractional keeps it" {
