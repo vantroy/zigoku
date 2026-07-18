@@ -80,8 +80,9 @@ pub fn play(
 
     // mpv fetches the loopback master; referer/UA stay on the link so the softsub CDN
     // (separate host, not proxied) still authenticates. The link's cloaked_segments flag
-    // is now belt-and-suspenders: loopback URLs end in .ts, which already clears mpv's
-    // extension gate, so the allowed_extensions=ALL it appends is redundant, not required.
+    // (the ROD-301 fake-extension one, not decloak_segments) is now belt-and-suspenders:
+    // loopback URLs end in .ts, which already clears mpv's extension gate, so the
+    // allowed_extensions=ALL it appends is redundant, not required.
     var relinked = link;
     relinked.url = try p.loopbackUrl(arena, link.url);
     return player.play(arena, io, mpv_path, relinked, title, start_seconds, position_callback, skip);
@@ -99,19 +100,22 @@ const Gate = struct {
         _ = g.count.fetchSub(1, .acq_rel);
     }
     /// Wait out in-flight handlers. Caller must have stopped new `begin`s (accept thread
-    /// joined). Sleeps between checks (never a hot spin) and gives up past DRAIN_CAP_MS so
-    /// a wedged handler cannot hang teardown; with FETCH_DEADLINE_S bounding each fetch,
-    /// the cap is only ever reached if something below std stalls uncancellably.
-    fn drain(g: *Gate, io: Io) void {
+    /// joined). Returns true when the count reached 0 (safe to free), false when it gave up
+    /// past `cap_ms` with a handler still live. Sleeps between checks (never a hot spin);
+    /// with FETCH_DEADLINE_S bounding each fetch, the cap is only reached if something below
+    /// std stalls uncancellably (e.g. withDeadline's inline-degrade path under pool
+    /// exhaustion).
+    fn drain(g: *Gate, io: Io, cap_ms: u64) bool {
         var waited_ms: u64 = 0;
         while (g.count.load(.acquire) != 0) {
-            if (waited_ms >= DRAIN_CAP_MS) {
-                log.warn("proxy drain: {d} handler(s) still in flight after {d}ms, abandoning", .{ g.count.load(.acquire), waited_ms });
-                return;
+            if (waited_ms >= cap_ms) {
+                log.warn("proxy drain: {d} handler(s) still in flight after {d}ms; leaking Proxy to stay memory-safe", .{ g.count.load(.acquire), waited_ms });
+                return false;
             }
             io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch {};
             waited_ms += 5;
         }
+        return true;
     }
 };
 
@@ -168,7 +172,12 @@ pub const Proxy = struct {
         // right after accept returns and exits.
         self.wakeAccept();
         self.accept_thread.join();
-        self.gate.drain(io);
+        // A handler that outlived the drain cap still holds a raw pointer to `self` (its
+        // `defer gate.end()` writes a decrement into it). Freeing here would be a
+        // use-after-free, and stop() is per-playback, not process exit, so the page WILL be
+        // reused. Leak the Proxy + socket + duped strings instead: a bounded one-time leak
+        // on a rare hostile-slow-CDN path is the memory-safe disposition.
+        if (!self.gate.drain(io, DRAIN_CAP_MS)) return;
         self.server.deinit(io);
         if (self.referer) |r| proxy_alloc.free(r);
         if (self.user_agent) |u| proxy_alloc.free(u);
@@ -643,6 +652,27 @@ test "looksLikeFmp4 distinguishes ISO-BMFF from a TS-cloak that outgrew the wind
     try testing.expect(looksLikeFmp4("\x00\x00\x00\x18moof...."));
     try testing.expect(!looksLikeFmp4("\x89PNG\r\n\x1a\n"));
     try testing.expect(!looksLikeFmp4("\x47\x40\x00")); // too short / TS
+}
+
+test "Gate.drain reports clean drain vs abandon (the leak-not-free contract)" {
+    // Abandon warns by design; keep suite output clean.
+    const prev = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var g: Gate = .{};
+    // count 0 → drains clean → stop() frees.
+    try testing.expect(g.drain(io, 50));
+    // count 1 with a zero cap → abandons → stop() must leak, never free.
+    g.begin();
+    try testing.expect(!g.drain(io, 0));
+    // count back to 0 → clean again.
+    g.end();
+    try testing.expect(g.drain(io, 50));
 }
 
 test "Proxy lifecycle: stop() wakes accept and drains, no hang, after a live connection" {
