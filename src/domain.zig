@@ -340,6 +340,10 @@ pub const StreamLink = struct {
     user_agent: ?[]const u8 = null,
     /// HLS segments cloaked as .jpg (senshi, ROD-301); player must relax demuxer gate.
     cloaked_segments: bool = false,
+    /// Segments carry a decoy image-header prefix before the real TS (megaplay/anineko,
+    /// ROD-443); no ffmpeg flag reaches the inner demuxer, so playback must route through
+    /// the local stripping proxy (`proxy.play`) instead of handing mpv the URL directly.
+    decloak_segments: bool = false,
     /// External WebVTT (megaplay softsub, ROD-354); null if hardsub/none. Untrusted like url.
     sub_url: ?[]const u8 = null,
 };

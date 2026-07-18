@@ -9,6 +9,7 @@ const anilist = @import("../anilist.zig");
 const resolver = @import("../resolver.zig");
 const cover_mod = @import("../cover.zig");
 const player_mod = @import("../player.zig");
+const proxy_mod = @import("../proxy.zig");
 const aniskip = @import("../aniskip.zig");
 const paths = @import("../paths.zig");
 const lru_mod = @import("../util/lru.zig");
@@ -1004,7 +1005,7 @@ pub fn playTask(loop: *Loop, gpa: Allocator, io: std.Io, provider: SourceProvide
 
         // Fresh per attempt; play() joins its watcher before return so nothing races progress.
         progress = .{};
-        player_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
+        proxy_mod.play(arena.allocator(), io, mpv_path, link, title, start_seconds, .{
             .ctx = @ptrCast(&callback_ctx),
             .func = postPositionUpdate,
         }, skip) catch |e| {
