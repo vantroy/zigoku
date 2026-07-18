@@ -25,6 +25,7 @@ const domain = @import("domain.zig");
 const player = @import("player.zig");
 const hls = @import("providers/hls.zig");
 const fetchguard = @import("util/fetchguard.zig");
+const deadline = @import("util/deadline.zig");
 const log = @import("log.zig");
 
 /// TS packet size; three consecutive sync bytes at this stride mark a real stream.
@@ -36,6 +37,13 @@ const MAX_PREFIX_SCAN = 4096;
 const MAX_BODY = 32 << 20;
 /// Redirect hops per upstream fetch (the ibyteimg 302 is one; leave headroom).
 const MAX_REDIRECTS = 5;
+/// Wall-clock ceiling on one upstream fetch (redirect chain + body). std has no
+/// per-socket read timeout, so without this a CDN that accepts then goes silent parks a
+/// handler forever and wedges stop()/play() through the drain (ROD-443 hardening).
+const FETCH_DEADLINE_S = 30;
+/// Backstop on drain(): handlers are bounded by FETCH_DEADLINE_S, so anything past this
+/// is a stuck thread we abandon (the OS reclaims it at exit) rather than spin on.
+const DRAIN_CAP_MS = 90_000;
 
 /// Loopback request path + query prefix. The `.ts` suffix is deliberate: it sits in
 /// ffmpeg's default extension allowlist (both allowed_extensions and, on ffmpeg 8+,
@@ -71,15 +79,16 @@ pub fn play(
     defer p.stop();
 
     // mpv fetches the loopback master; referer/UA stay on the link so the softsub CDN
-    // (separate host, not proxied) still authenticates. cloaked_segments stays set so
-    // mpv relaxes its extension gate for the extensionless loopback URLs.
+    // (separate host, not proxied) still authenticates. The link's cloaked_segments flag
+    // is now belt-and-suspenders: loopback URLs end in .ts, which already clears mpv's
+    // extension gate, so the allowed_extensions=ALL it appends is redundant, not required.
     var relinked = link;
     relinked.url = try p.loopbackUrl(arena, link.url);
     return player.play(arena, io, mpv_path, relinked, title, start_seconds, position_callback, skip);
 }
 
 /// In-flight handler accounting so `stop` cannot free `Proxy` mid-request. Plain atomics
-/// (no Io.Mutex): drained once per playback end, so the yield-spin is never hot.
+/// (no Io.Mutex): drained once per playback end.
 const Gate = struct {
     count: std.atomic.Value(usize) = .init(0),
 
@@ -89,9 +98,20 @@ const Gate = struct {
     fn end(g: *Gate) void {
         _ = g.count.fetchSub(1, .acq_rel);
     }
-    /// Caller must have already stopped new `begin`s (accept thread joined).
-    fn drain(g: *Gate) void {
-        while (g.count.load(.acquire) != 0) std.Thread.yield() catch {};
+    /// Wait out in-flight handlers. Caller must have stopped new `begin`s (accept thread
+    /// joined). Sleeps between checks (never a hot spin) and gives up past DRAIN_CAP_MS so
+    /// a wedged handler cannot hang teardown; with FETCH_DEADLINE_S bounding each fetch,
+    /// the cap is only ever reached if something below std stalls uncancellably.
+    fn drain(g: *Gate, io: Io) void {
+        var waited_ms: u64 = 0;
+        while (g.count.load(.acquire) != 0) {
+            if (waited_ms >= DRAIN_CAP_MS) {
+                log.warn("proxy drain: {d} handler(s) still in flight after {d}ms, abandoning", .{ g.count.load(.acquire), waited_ms });
+                return;
+            }
+            io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch {};
+            waited_ms += 5;
+        }
     }
 };
 
@@ -142,26 +162,42 @@ pub const Proxy = struct {
     pub fn stop(self: *Proxy) void {
         const io = self.io;
         self.shutting_down.store(true, .release);
-        // shutdown() is the documented accept cancellation: unblocks the loop with
-        // SocketNotListening. close() alone need not wake a blocked accept.
-        const listener: Io.net.Stream = .{ .socket = self.server.socket };
-        listener.shutdown(io, .both) catch {};
+        // Unblock a thread parked in accept(). shutdown()-wakes-accept holds only on Linux
+        // (macOS/BSD returns ENOTCONN and leaves accept blocked), so self-dial the listener
+        // once, mirroring login_loopback's requestCancel: the loop re-checks shutting_down
+        // right after accept returns and exits.
+        self.wakeAccept();
         self.accept_thread.join();
-        self.gate.drain();
+        self.gate.drain(io);
         self.server.deinit(io);
         if (self.referer) |r| proxy_alloc.free(r);
         if (self.user_agent) |u| proxy_alloc.free(u);
         proxy_alloc.destroy(self);
     }
 
+    /// One best-effort loopback dial to wake a blocked accept(); a refused dial means the
+    /// listener is already gone. Caller must have set shutting_down first.
+    fn wakeAccept(self: *Proxy) void {
+        var addr: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(self.port) };
+        const stream = addr.connect(self.io, .{ .mode = .stream }) catch return;
+        stream.close(self.io);
+    }
+
     fn acceptLoop(self: *Proxy) void {
         while (true) {
+            if (self.shutting_down.load(.acquire)) return;
             const stream = self.server.accept(self.io) catch {
                 if (self.shutting_down.load(.acquire)) return;
-                // Transient accept error while live: yield the loop rather than spin.
-                std.Thread.yield() catch {};
+                // Transient accept error while live: back off, don't hot-spin the core
+                // (fd exhaustion would otherwise feed itself).
+                self.io.sleep(Io.Duration.fromMilliseconds(5), .awake) catch {};
                 continue;
             };
+            if (self.shutting_down.load(.acquire)) {
+                // The wake dial (or a late real conn) landed during shutdown; drop it.
+                stream.close(self.io);
+                return;
+            }
             self.gate.begin();
             const t = std.Thread.spawn(.{}, handleConn, .{ self, stream }) catch {
                 self.gate.end();
@@ -208,8 +244,10 @@ pub const Proxy = struct {
             return req.respond("", .{ .status = .not_found, .keep_alive = false });
 
         const upstream = try percentDecode(arena, target[PATH_PREFIX.len..]);
-        try fetchguard.guardFetchUrl(upstream);
-        const fetched = try fetchUpstream(arena, self.io, upstream, self.referer, self.user_agent);
+        // Bound the whole fetch (redirect chain + body read): a hostile CDN that accepts
+        // then goes silent would otherwise park this handler forever. Byte-sanitise and
+        // the per-hop SSRF guard both live inside fetchUpstream (covers redirects too).
+        const fetched = try deadline.withDeadline(self.io, Io.Duration.fromSeconds(FETCH_DEADLINE_S), fetchUpstream, .{ arena, self.io, upstream, self.referer, self.user_agent });
 
         if (isPlaylist(fetched.body)) {
             const rewritten = try rewritePlaylist(arena, fetched.body, fetched.final_url, self.port);
@@ -241,6 +279,10 @@ fn fetchUpstream(arena: Allocator, io: Io, start_url: []const u8, referer: ?[]co
     var url = start_url;
     var hops: u8 = 0;
     while (true) {
+        // Reject control bytes BEFORE Uri.parse: a decoded upstream or a redirect Location
+        // carrying CR/LF/NUL would otherwise reach the outbound request line unescaped
+        // (Uri.parse does not strip them). Runs on every hop, so redirects get it too.
+        if (!urlBytesClean(url)) return error.BadUpstreamUrl;
         try fetchguard.guardFetchUrl(url);
         const uri = std.Uri.parse(url) catch return error.BadUpstreamUrl;
 
@@ -277,7 +319,10 @@ fn fetchUpstream(arena: Allocator, io: Io, start_url: []const u8, referer: ?[]co
         }
         if (status.class() != .success) return error.UpstreamStatus;
 
-        var transfer_buf: [64]u8 = undefined;
+        // 16 KiB, not 64 B: on the hot segment path a chunked upstream would otherwise read
+        // in per-chunk-header sips and throttle throughput on a body run hundreds of times
+        // per episode.
+        var transfer_buf: [16 * 1024]u8 = undefined;
         const body_reader = response.reader(&transfer_buf);
         const body = try body_reader.allocRemaining(arena, .limited(MAX_BODY));
         return .{ .body = body, .final_url = url };
@@ -285,11 +330,16 @@ fn fetchUpstream(arena: Allocator, io: Io, start_url: []const u8, referer: ?[]co
 }
 
 /// A leading `#EXTM3U` (past an optional BOM/whitespace) marks a playlist vs a segment.
+/// A NUL in the head rejects it: real m3u8 is text, so a binary segment wearing an
+/// `#EXTM3U` prefix (the cloak trick in reverse, to route a segment into the rewriter
+/// and get it shredded) fails the sniff and falls to the de-cloak path instead.
 fn isPlaylist(body: []const u8) bool {
     var b = body;
     if (b.len >= 3 and b[0] == 0xEF and b[1] == 0xBB and b[2] == 0xBF) b = b[3..];
     b = std.mem.trimStart(u8, b, " \t\r\n");
-    return std.mem.startsWith(u8, b, "#EXTM3U");
+    if (!std.mem.startsWith(u8, b, "#EXTM3U")) return false;
+    const head = body[0..@min(body.len, 1024)];
+    return std.mem.indexOfScalar(u8, head, 0) == null;
 }
 
 /// Strip any decoy prefix to the first TS-sync triple (0x47 at i, i+188, i+376). Clean
@@ -303,7 +353,28 @@ fn decloak(body: []const u8) []const u8 {
         if (body[i] == 0x47 and body[i + stride] == 0x47 and body[i + 2 * stride] == 0x47)
             return body[i..];
     }
+    // No sync in the window. Legit for fMP4; otherwise a segment whose decoy prefix
+    // outgrew MAX_PREFIX_SCAN, which silently un-fixes ROD-443. Log so a prefix-size shift
+    // is visible instead of a mute black screen (ROD-444 is the in-app surface for this).
+    if (body.len >= 2 * stride and !looksLikeFmp4(body))
+        log.warn("decloak: no TS sync in first {d}B of a {d}B segment; decoy prefix may exceed the scan window", .{ limit, body.len });
     return body;
+}
+
+/// ISO-BMFF (fMP4) starts with a box whose type at offset 4 is ftyp/styp/moof. Distinguishes
+/// a legitimately-not-TS segment from one whose TS sync sits past the scan window.
+fn looksLikeFmp4(body: []const u8) bool {
+    if (body.len < 8) return false;
+    const tag = body[4..8];
+    return std.mem.eql(u8, tag, "ftyp") or std.mem.eql(u8, tag, "styp") or std.mem.eql(u8, tag, "moof");
+}
+
+/// Printable ASCII only (0x21-0x7e): a URL a real CDN serves. Rejects control bytes
+/// (CR/LF/NUL), spaces, and high bytes that could split the outbound request line.
+fn urlBytesClean(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < 0x21 or c > 0x7e) return false;
+    return true;
 }
 
 /// Rewrite every URI in a playlist to a loopback `/r?u=…` ref so variants and segments
@@ -524,4 +595,68 @@ test "buildLoopbackUrl encodes upstream into a decodable loopback ref" {
     try testing.expect(std.mem.count(u8, lb, ".ts") == 1);
     const enc = lb["http://127.0.0.1:3210/r.ts?u=".len..];
     try testing.expectEqualStrings(up, try percentDecode(a, enc));
+}
+
+test "urlBytesClean rejects CR/LF/NUL and other non-printables that could split a request" {
+    try testing.expect(urlBytesClean("https://cdn.example/x/master.m3u8?sig=ab-cd_ef.gh"));
+    // Decoded bytes a hostile playlist/redirect could smuggle past Uri.parse.
+    try testing.expect(!urlBytesClean("https://cdn.example/x\r\nX-Injected: evil"));
+    try testing.expect(!urlBytesClean("https://cdn.example/x\ny"));
+    try testing.expect(!urlBytesClean("https://cdn.example/x\x00y"));
+    try testing.expect(!urlBytesClean("https://cdn.example/a b")); // space
+    try testing.expect(!urlBytesClean("https://cdn.example/\x7f")); // DEL
+    try testing.expect(!urlBytesClean("")); // empty is not a URL
+}
+
+test "isPlaylist rejects a binary segment wearing an EXTM3U prefix (sniff spoof)" {
+    // A real playlist is text and sniffs true.
+    try testing.expect(isPlaylist("#EXTM3U\n#EXT-X-VERSION:3\nseg0\n"));
+    // A TS segment prefixed with the magic bytes but carrying NULs must NOT be treated as a
+    // playlist (would be shredded through the rewriter); it falls to the de-cloak path.
+    var spoof: [512]u8 = undefined;
+    @memcpy(spoof[0..8], "#EXTM3U\n");
+    for (spoof[8..], 0..) |*b, i| b.* = if (i % 7 == 0) 0x00 else 0x47;
+    try testing.expect(!isPlaylist(&spoof));
+}
+
+test "decloak passes through when the sync triple sits past the scan window" {
+    // Exhaust path warns by design; keep the suite output clean (no std_options logFn here).
+    const prev = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = prev;
+    // Sync at offset 5000 (> MAX_PREFIX_SCAN): returned unchanged, never a wrong-offset
+    // strip. Documents the ceiling so a prefix-size regression is a known pass-through.
+    const stride = TS_PACKET;
+    var buf: [5000 + 3 * TS_PACKET]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(i % 251);
+    buf[0] = 0x89;
+    buf[5000] = 0x47;
+    buf[5000 + stride] = 0x47;
+    buf[5000 + 2 * stride] = 0x47;
+    try testing.expectEqual(@as(usize, buf.len), decloak(&buf).len);
+    try testing.expectEqual(@as(u8, 0x89), decloak(&buf)[0]);
+}
+
+test "looksLikeFmp4 distinguishes ISO-BMFF from a TS-cloak that outgrew the window" {
+    try testing.expect(looksLikeFmp4("\x00\x00\x00\x18ftypmp42"));
+    try testing.expect(looksLikeFmp4("\x00\x00\x00\x18styp...."));
+    try testing.expect(looksLikeFmp4("\x00\x00\x00\x18moof...."));
+    try testing.expect(!looksLikeFmp4("\x89PNG\r\n\x1a\n"));
+    try testing.expect(!looksLikeFmp4("\x47\x40\x00")); // too short / TS
+}
+
+test "Proxy lifecycle: stop() wakes accept and drains, no hang, after a live connection" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const link: domain.StreamLink = .{ .url = "https://example.invalid/master.m3u8", .decloak_segments = true };
+    var p = try Proxy.start(io, link);
+    // Open then close a client: exercises accept + a handler whose receiveHead sees EOF, so
+    // no upstream fetch runs (no network). stop() must self-dial to unblock accept and drain
+    // to completion; a regression here surfaces as this test hanging under the CI timeout.
+    var addr: Io.net.IpAddress = .{ .ip4 = Io.net.Ip4Address.loopback(p.port) };
+    const client = try addr.connect(io, .{ .mode = .stream });
+    client.close(io);
+    p.stop();
 }
