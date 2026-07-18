@@ -225,6 +225,9 @@ pub const MegaPlay = struct {
                 .user_agent = UA,
                 // Segment CDN serves .ts as .jpg (content-filter dodge, ROD-301).
                 .cloaked_segments = true,
+                // Segments also carry a decoy PNG-header prefix (ROD-443): route through
+                // the stripping proxy, which strips to the first TS sync before mpv.
+                .decloak_segments = true,
                 .sub_url = if (tt == .sub) pickSubtitle(tracks.items) else null,
             },
             .tracks = tracks.items,

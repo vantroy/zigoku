@@ -260,6 +260,23 @@ pub fn build(b: *std.Build) void {
     const spike_megaplay_step = b.step("spike-megaplay", "ROD-359: live megaplay provider check");
     spike_megaplay_step.dependOn(&run_spike_megaplay.step);
 
+    // spike-decloak: prove the ROD-443 de-cloaking proxy turns a PNG-cloaked megaplay
+    // stream playable. ffprobe the raw master (Video: png) vs the proxied one (h264).
+    const spike_decloak = b.addExecutable(.{
+        .name = "spike-decloak",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/spikes/decloak_proxy.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zigoku", .module = mod }},
+        }),
+    });
+    const run_spike_decloak = b.addRunArtifact(spike_decloak);
+    if (b.args) |args| run_spike_decloak.addArgs(args);
+    const spike_decloak_step = b.step("spike-decloak", "ROD-443: de-cloak proxy live proof");
+    spike_decloak_step.dependOn(&run_spike_decloak.step);
+
     // spike-tui: prove libvaxis boots under Zig 0.16 (ROD-71). Renders a
     // Terminal Ghost frame + event loop in a real terminal.
     const spike_tui = b.addExecutable(.{

@@ -457,7 +457,7 @@ fn run(arena: std.mem.Allocator, io: Io, out: *Io.Writer, in: *Io.Reader, cli: C
     try out.flush();
 
     var progress: PlaybackProgress = .{};
-    zigoku.player.play(arena, io, cfg.mpv_path, link, title, start_seconds, .{
+    zigoku.proxy.play(arena, io, cfg.mpv_path, link, title, start_seconds, .{
         .ctx = @ptrCast(&progress),
         .func = recordPlaybackProgress,
     }, skip) catch |err| {

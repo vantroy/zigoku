@@ -12,6 +12,7 @@ const std = @import("std");
 pub const domain = @import("domain.zig");
 pub const source = @import("source.zig");
 pub const player = @import("player.zig");
+pub const proxy = @import("proxy.zig");
 pub const store = @import("store.zig");
 pub const anilist = @import("anilist.zig");
 pub const resolver = @import("resolver.zig");
@@ -96,6 +97,7 @@ test {
     _ = domain;
     _ = source;
     _ = player;
+    _ = proxy; // ROD-443: run the de-cloak proxy pure-unit tests
     _ = store;
     _ = anilist;
     _ = resolver;
