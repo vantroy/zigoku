@@ -14,6 +14,13 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-07-19
+
+### Fixed
+
+- **Some streams play again**: a source that had stopped serving playable
+  video is working once more.
+
 ## [0.4.7] - 2026-07-18
 
 ### Fixed
@@ -417,7 +424,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/vantroy/zigoku/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/vantroy/zigoku/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/vantroy/zigoku/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/vantroy/zigoku/compare/v0.4.4...v0.4.5
