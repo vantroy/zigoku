@@ -1,5 +1,5 @@
 //! Boot-time update check (ROD-370). Best-effort: compare built-in version to GitHub
-//! latest tag; return newer version for toast, else null. Cached 6h; every failure
+//! latest tag; return newer version for toast, else null. Cached 1h; every failure
 //! (offline, rate-limit, bad body, no cache dir) → null. Never blocks startup, never
 //! surfaces errors. Caller's config (`check_for_updates`) gates whether to run.
 //!
@@ -17,7 +17,7 @@ const deadline = @import("util/deadline.zig");
 const log = std.log.scoped(.update_check);
 
 /// Ambient re-check window; stays under GitHub unauth rate limit across launches.
-pub const CHECK_TTL_SECS: i64 = 6 * 60 * 60;
+pub const CHECK_TTL_SECS: i64 = 1 * 60 * 60;
 
 /// GitHub API rejects requests without User-Agent (403).
 const USER_AGENT = "zigoku-update-check";
@@ -39,7 +39,7 @@ pub fn check(arena: Allocator, io: Io, current_version: []const u8, now: i64) ?[
     return if (semver.isNewer(latest, current_version)) latest else null;
 }
 
-/// Fresh network tag (bypasses 6h cache; refreshes it). For `zigoku update` (ROD-371).
+/// Fresh network tag (bypasses 1h cache; refreshes it). For `zigoku update` (ROD-371).
 pub fn latestFresh(arena: Allocator, io: Io, now: i64) ?[]const u8 {
     const tag = fetchLatest(arena, io) catch return null;
     writeCache(arena, io, now, tag);

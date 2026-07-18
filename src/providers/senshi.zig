@@ -174,8 +174,9 @@ pub const Senshi = struct {
         // romaji `name` (English query would miss it). Trust server order; trim to limit.
         const body = try std.fmt.allocPrint(
             arena,
-            "{{\"searchTerm\":\"{s}\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\",\"languagePreference\":\"{s}\"}}",
-            .{ try json_escape.escape(arena, query), opts.page, source.search_page_size, langPref(opts.translation) },
+            // No languagePreference: server deprecated the field and 400s any value (ROD-442).
+            "{{\"searchTerm\":\"{s}\",\"types\":[],\"genres\":[],\"status\":[],\"seasons\":[],\"year\":\"\",\"studios\":[],\"producers\":[],\"languages\":[],\"page\":{d},\"limit\":{d},\"sortBy\":\"score_desc\"}}",
+            .{ try json_escape.escape(arena, query), opts.page, source.search_page_size },
         );
 
         const raw = try request(arena, io, .POST, API ++ "/anime/filter", body);
@@ -449,14 +450,6 @@ pub const Senshi = struct {
 
     fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
         return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
-    }
-
-    /// Filter languagePreference: JP = sub, EN = dub.
-    fn langPref(tt: domain.Translation) []const u8 {
-        return switch (tt) {
-            .sub => "JP",
-            .dub => "EN",
-        };
     }
 
     /// Split comma-space CSV into owned slices. Null/empty → empty list.
