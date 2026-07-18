@@ -1,6 +1,6 @@
 .{
     .name = .zigoku,
-    .version = "0.4.6",
+    .version = "0.4.7",
     .fingerprint = 0xcc45ee402eed1502, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

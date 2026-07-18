@@ -14,6 +14,25 @@ version in build.zig.zon + src/root.zig, and refresh the compare links below.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-07-18
+
+### Fixed
+
+- **Search works again**: a streaming source changed its API and started
+  refusing every search request, so looking for new shows came back empty.
+  zigoku no longer sends the parameter that began getting rejected.
+
+- **Episode counts stay correct for airing shows**: a show that was still
+  airing could have its real episode total overwritten by a "latest
+  available" number, leaving a wrong count. That snapshot is no longer
+  mistaken for the total.
+
+### Changed
+
+- **New-release notifications surface sooner**: zigoku re-checks for a newer
+  version about once an hour now instead of every six, so an available update
+  shows up faster after launch.
+
 ## [0.4.6] - 2026-07-17
 
 ### Added
@@ -398,7 +417,8 @@ Zig. See the [README](README.md) for the full story.
   override and uninstall, plus an offline-safe end-to-end harness
   (`scripts/e2e.sh`).
 
-[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/vantroy/zigoku/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/vantroy/zigoku/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/vantroy/zigoku/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/vantroy/zigoku/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/vantroy/zigoku/compare/v0.4.3...v0.4.4
